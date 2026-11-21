@@ -1,0 +1,70 @@
+{
+  "name": "omni-sns",
+  "version": "1.0.0",
+  "description": "Windows向け 全SNS・マッチングアプリ統合メッセージングブラウザ (All-in-One SNS & Matching Desk)",
+  "main": "dist/main/main.js",
+  "author": "Darksan",
+  "license": "MIT",
+  "keywords": [
+    "electron",
+    "windows",
+    "sns",
+    "messaging",
+    "matching-app",
+    "browser",
+    "all-in-one"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "start": "npm run build && electron .",
+    "test": "npm run build && node --test dist/tests/core.test.js",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:win:dir": "npm run build && electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  },
+  "build": {
+    "appId": "com.pgdarksan.omnisns",
+    "productName": "OmniSNS",
+    "copyright": "Copyright © 2026 Darksan",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "assets/**/*",
+      "!dist/tests/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png",
+      "artifactName": "${productName}-${version}-win-${arch}-${target}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

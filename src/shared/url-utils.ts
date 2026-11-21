@@ -1,0 +1,174 @@
+import { UserAgentMode } from './types';
+
+/**
+ * Electron / Chromium バージョンに基づき、GoogleログインやWhatsApp Web等に弾かれない
+ * クリーンなChrome互換User-Agentを生成する。
+ */
+export function buildUserAgent(mode: UserAgentMode, chromeVersion = '136.0.0.0'): string {
+  const safeVersion = /^\d+\.\d+\.\d+\.\d+$/.test(chromeVersion)
+    ? chromeVersion
+    : '136.0.0.0';
+
+  if (mode === 'mobile') {
+    return (
+      `Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 ` +
+      `(KHTML, like Gecko) Chrome/${safeVersion} Mobile Safari/537.36`
+    );
+  }
+
+  return (
+    `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ` +
+    `(KHTML, like Gecko) Chrome/${safeVersion} Safari/537.36`
+  );
+}
+
+/**
+ * ユーザー入力URLを正規化し、安全な http/https URL のみ許可する。
+ */
+export function normalizeServiceUrl(rawInput: string): string | null {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return null;
+
+  const candidate = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(trimmed)
+    ? trimmed
+    : `https://${trimmed}`;
+
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return null;
+    }
+    if (!parsed.hostname) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ページタイトルから未読件数を抽出する。
+ * 例: "(3) X / Messages", "[12] Discord", "• 5 messages", "99+ 未読"
+ */
+export function parseUnreadCountFromTitle(title: string): number {
+  if (!title) return 0;
+
+  // パターン1: 先頭や括弧内の数値 "(3)", "(99+)", "[5]"
+  const bracketMatch = title.match(/^\s*[(\[]\s*(\d+)\+?\s*[)\]]/);
+  if (bracketMatch) {
+    return Math.min(999, parseInt(bracketMatch[1], 10) || 0);
+  }
+
+  // パターン2: タイトル途中の "(3)" 等（ただし西暦2024など4桁以上は除外）
+  const inlineMatch = title.match(/[(\[](\d{1,3})\+?[)\]]/);
+  if (inlineMatch) {
+    return Math.min(999, parseInt(inlineMatch[1], 10) || 0);
+  }
+
+  // パターン3: 未読ドット記号（Discord/Slackの "•" や "●"）
+  if (/^\s*[•●🔴]/.test(title)) {
+    return 1;
+  }
+
+  return 0;
+}
+
+const AUTH_HOST_PATTERNS: RegExp[] = [
+  /(^|\.)accounts\.google\.com$/i,
+  /(^|\.)appleid\.apple\.com$/i,
+  /(^|\.)access\.line\.me$/i,
+  /(^|\.)login\.microsoftonline\.com$/i,
+  /(^|\.)login\.live\.com$/i,
+  /(^|\.)auth\.login\.yahoo\.co\.jp$/i,
+  /(^|\.)login\.yahoo\.co\.jp$/i,
+  /(^|\.)facebook\.com$/i,
+  /(^|\.)api\.twitter\.com$/i,
+  /(^|\.)twitter\.com$/i,
+  /(^|\.)x\.com$/i,
+  /(^|\.)github\.com$/i,
+  /(^|\.)discord\.com$/i,
+  /(^|\.)id\.mixi\.social$/i,
+  /(^|\.)id\.pairs\.lv$/i,
+  /(^|\.)auth\./i,
+  /(^|\.)sso\./i,
+  /(^|\.)oauth\./i,
+  /(^|\.)login\./i,
+  /(^|\.)signin\./i
+];
+
+const AUTH_PATH_KEYWORDS = [
+  '/oauth',
+  '/auth',
+  '/login',
+  '/signin',
+  '/sign-in',
+  '/sso',
+  '/authorize',
+  '/dialog/oauth',
+  '/verify',
+  '/captcha',
+  '/challenge'
+];
+
+/**
+ * ポップアップURLが認証（OAuth / SSO / 本人確認）や同一サービスのサブウィンドウかを判定する。
+ * true なら同じセッションパーティションを共有するアプリ内子ウィンドウで開く。
+ */
+export function shouldOpenInAppPopup(targetUrl: string, currentServiceUrl: string): boolean {
+  try {
+    const target = new URL(targetUrl);
+    if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+      return false;
+    }
+
+    if (AUTH_HOST_PATTERNS.some((pattern) => pattern.test(target.hostname))) {
+      return true;
+    }
+
+    const lowerPath = target.pathname.toLowerCase();
+    if (AUTH_PATH_KEYWORDS.some((kw) => lowerPath.includes(kw))) {
+      return true;
+    }
+
+    // 同一ルートドメイン（サブドメイン含む）のウィンドウ（例: 認証やメディアビューア）はアプリ内で許可
+    const current = new URL(currentServiceUrl);
+    if (getRegistrableDomainHint(target.hostname) === getRegistrableDomainHint(current.hostname)) {
+      return true;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 簡易的にルートドメイン末尾2〜3ラベル（co.jp 等考慮）を取り出す。
+ */
+export function getRegistrableDomainHint(hostname: string): string {
+  const parts = hostname.toLowerCase().split('.').filter(Boolean);
+  if (parts.length <= 2) return parts.join('.');
+  const lastTwo = parts.slice(-2).join('.');
+  if (['co.jp', 'ne.jp', 'or.jp', 'ac.jp', 'go.jp', 'co.uk', 'com.au'].includes(lastTwo)) {
+    return parts.slice(-3).join('.');
+  }
+  return lastTwo;
+}
+
+/**
+ * サービス名から最大2文字のバッジ文字を生成する。
+ */
+export function makeBadgeText(name: string): string {
+  const cleaned = name.trim();
+  if (!cleaned) return 'SN';
+
+  const asciiWords = cleaned.match(/[A-Za-z0-9]+/g);
+  if (asciiWords && asciiWords.length >= 2) {
+    return (asciiWords[0][0] + asciiWords[1][0]).toUpperCase();
+  }
+  if (asciiWords && asciiWords.length === 1 && asciiWords[0].length >= 2) {
+    return asciiWords[0].slice(0, 2).toUpperCase();
+  }
+  return Array.from(cleaned).slice(0, 2).join('').toUpperCase();
+}

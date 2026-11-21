@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="ja" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; img-src 'self' https: http: data:; style-src 'self' 'unsafe-inline'; script-src 'self';"
+  />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OmniSNS</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- 左サイドバー -->
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <div class="brand-logo" aria-hidden="true">O</div>
+          <div class="brand-text">
+            <span class="brand-name">OmniSNS</span>
+            <span id="app-version" class="brand-sub">Windows Desk</span>
+          </div>
+        </div>
+        <span id="total-unread-badge" class="badge-pill hidden" title="合計未読数">0</span>
+      </div>
+
+      <div class="sidebar-search-wrap">
+        <input
+          id="sidebar-filter"
+          type="search"
+          class="input-compact"
+          placeholder="追加済みSNSを絞り込み..."
+          autocomplete="off"
+        />
+      </div>
+
+      <div id="service-list" class="service-list" role="tablist" aria-label="登録済みSNS一覧"></div>
+
+      <div class="sidebar-footer">
+        <button id="btn-open-catalog" class="btn-primary btn-full" title="全61種＋カスタム追加 (Ctrl+K)">
+          ＋ SNS・マッチングを追加
+        </button>
+        <div class="sidebar-footer-actions">
+          <button id="btn-toggle-matching" class="btn-icon-label" title="マッチング・出会い系の表示切替">
+            <span id="matching-toggle-icon">♥</span>
+            <span id="matching-toggle-text">マッチング表示</span>
+          </button>
+          <button id="btn-lock-app" class="btn-icon" title="プライバシーロック (Ctrl+Shift+L)" aria-label="プライバシーロック">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </button>
+          <button id="btn-open-settings" class="btn-icon" title="アプリ設定" aria-label="アプリ設定">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 右メインエリア -->
+    <div class="main-area">
+      <!-- トップツールバー (高さ50px固定) -->
+      <header id="toolbar" class="toolbar">
+        <div class="toolbar-nav">
+          <button id="btn-back" class="tool-btn" title="戻る" disabled>←</button>
+          <button id="btn-forward" class="tool-btn" title="進む" disabled>→</button>
+          <button id="btn-reload" class="tool-btn" title="再読み込み (Shift+クリックでスーパーリロード)">↻</button>
+          <button id="btn-home" class="tool-btn" title="このサービスのDM/ホーム画面へ戻る">⌂</button>
+        </div>
+
+        <div class="toolbar-address">
+          <span id="active-service-dot" class="status-dot"></span>
+          <span id="active-service-name" class="active-name">サービス未選択</span>
+          <button id="btn-copy-url" class="url-display" title="クリックして現在のURLをコピー">
+            <span id="active-url-text">—</span>
+          </button>
+          <button id="btn-open-external" class="tool-btn" title="既定のブラウザで開く">↗</button>
+        </div>
+
+        <div class="toolbar-controls">
+          <button id="btn-toggle-ua" class="tool-pill" title="PC版 / モバイル版 User-Agent を切り替え">PC版</button>
+          <button id="btn-toggle-mute" class="tool-btn" title="ミュート切替" aria-label="ミュート切替">🔊</button>
+          <div class="zoom-group">
+            <button id="btn-zoom-out" class="tool-btn-sm" title="縮小">−</button>
+            <button id="btn-zoom-reset" class="tool-zoom-label" title="100%にリセット">100%</button>
+            <button id="btn-zoom-in" class="tool-btn-sm" title="拡大">＋</button>
+          </div>
+          <button id="btn-sleep-tab" class="tool-btn" title="このタブを休止してメモリ解放" aria-label="タブ休止">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </button>
+          <button id="btn-clear-session" class="tool-btn" title="このサービスのログイン情報・Cookieを初期化" aria-label="セッション初期化">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+          </button>
+          <button id="btn-devtools" class="tool-btn" title="開発者ツール (DevTools)" aria-label="開発者ツール">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- WebContentsView 表示領域（未ロード・休止・エラー時のフォールバック表示） -->
+      <main id="viewport" class="viewport">
+        <div id="empty-state" class="viewport-placeholder hidden">
+          <h2>サービスを追加して始めましょう</h2>
+          <p>X・Instagram・Threads・Bluesky・mixi2・Discord・主要マッチングアプリまで、すべて独立セッションでまとめて使えます。</p>
+          <button id="btn-empty-add" class="btn-primary">＋ カタログから追加 (Ctrl+K)</button>
+        </div>
+
+        <div id="sleeping-state" class="viewport-placeholder hidden">
+          <div class="placeholder-icon">☾</div>
+          <h2 id="sleeping-title">タブを休止しています</h2>
+          <p>メモリを節約するためWeb表示を一時停止中です。ログイン状態は保持されています。</p>
+          <button id="btn-wake-tab" class="btn-primary">このサービスを再開する</button>
+        </div>
+
+        <div id="error-state" class="viewport-placeholder hidden">
+          <div class="placeholder-icon">⚠</div>
+          <h2>ページの読み込みに失敗しました</h2>
+          <p id="error-detail" class="error-detail"></p>
+          <div class="placeholder-actions">
+            <button id="btn-error-reload" class="btn-primary">再読み込み</button>
+            <button id="btn-error-external" class="btn-secondary">既定ブラウザで開く</button>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- サービスカタログモーダル -->
+  <div id="catalog-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="catalog-title">
+    <div class="modal-dialog modal-xl">
+      <div class="modal-header">
+        <div>
+          <h2 id="catalog-title">SNS・マッチングアプリ カタログ</h2>
+          <p class="modal-subtitle">WebブラウザからDM・メッセージ送信できる全サービスを収録。同じSNSの複数アカウント追加も可能です。</p>
+        </div>
+        <button id="btn-close-catalog" class="btn-icon" aria-label="閉じる">✕</button>
+      </div>
+
+      <div class="catalog-toolbar">
+        <input
+          id="catalog-search"
+          type="search"
+          class="input-field"
+          placeholder="サービス名・キーワードで検索（例: Pairs, Tinder, mixi2, Instagram, SMS...）"
+          autocomplete="off"
+        />
+        <label class="checkbox-inline">
+          <input id="catalog-show-matching" type="checkbox" checked />
+          <span>マッチング・出会い系を表示</span>
+        </label>
+      </div>
+
+      <div id="catalog-categories" class="category-tabs"></div>
+
+      <div id="catalog-body" class="catalog-body">
+        <div id="catalog-grid" class="catalog-grid"></div>
+
+        <!-- カスタム追加フォーム -->
+        <form id="custom-service-form" class="custom-form hidden">
+          <h3>カスタムSNS / 分散サーバー / 任意URLを追加</h3>
+          <p class="form-hint">Mastodon・Misskeyの独自インスタンスや、社内チャット、その他のWeb版SNSを独立セッションで追加できます。</p>
+          <div class="form-grid">
+            <label class="form-field">
+              <span>表示名 *</span>
+              <input id="custom-name" type="text" class="input-field" placeholder="例: Misskey (個人サーバー)" required />
+            </label>
+            <label class="form-field">
+              <span>初期URL (https://...) *</span>
+              <input id="custom-url" type="url" class="input-field" placeholder="https://misskey.io/" required />
+            </label>
+            <label class="form-field">
+              <span>カテゴリ</span>
+              <select id="custom-category" class="input-field">
+                <option value="custom">カスタム追加</option>
+                <option value="major-sns">メジャーSNS</option>
+                <option value="messaging">チャット・メッセージ</option>
+                <option value="matching-jp">国内マッチング・婚活</option>
+                <option value="matching-global">海外マッチング</option>
+                <option value="matching-dating">国内メッセージ・出会い系</option>
+                <option value="business-creative">ビジネス・創作・趣味</option>
+              </select>
+            </label>
+            <label class="form-field">
+              <span>User-Agent</span>
+              <select id="custom-ua" class="input-field">
+                <option value="desktop">PC版 (Chrome Windows)</option>
+                <option value="mobile">モバイル版 (Android Chrome)</option>
+              </select>
+            </label>
+            <label class="form-field">
+              <span>アクセントカラー</span>
+              <input id="custom-color" type="color" class="input-color" value="#3B82F6" />
+            </label>
+            <label class="form-field checkbox-field">
+              <input id="custom-is-matching" type="checkbox" />
+              <span>マッチング・18+フィルター対象にする</span>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="btn-primary">このサービスを追加して開く</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- タブ詳細追加 / 編集モーダル -->
+  <div id="edit-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+    <div class="modal-dialog modal-sm">
+      <div class="modal-header">
+        <h2 id="edit-modal-title">サービス設定</h2>
+        <button id="btn-close-edit" class="btn-icon" aria-label="閉じる">✕</button>
+      </div>
+      <form id="edit-service-form" class="modal-form">
+        <label class="form-field">
+          <span>表示名（マルチアカウント識別用）</span>
+          <input id="edit-name" type="text" class="input-field" required />
+        </label>
+        <label class="form-field">
+          <span>ホーム / DM画面 URL</span>
+          <input id="edit-url" type="url" class="input-field" required />
+        </label>
+        <label class="form-field">
+          <span>User-Agent</span>
+          <select id="edit-ua" class="input-field">
+            <option value="desktop">PC版 (Chrome Windows)</option>
+            <option value="mobile">モバイル版 (Android Chrome)</option>
+          </select>
+        </label>
+        <label class="form-field">
+          <span>アクセントカラー</span>
+          <input id="edit-color" type="color" class="input-color" value="#3B82F6" />
+        </label>
+        <label class="form-field checkbox-field">
+          <input id="edit-notifications" type="checkbox" checked />
+          <span>未読バッジ監視を有効にする</span>
+        </label>
+        <div class="form-actions">
+          <button type="button" id="btn-cancel-edit" class="btn-secondary">キャンセル</button>
+          <button type="submit" class="btn-primary">保存する</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- アプリ設定モーダル -->
+  <div id="settings-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-dialog modal-md">
+      <div class="modal-header">
+        <h2 id="settings-title">アプリ設定</h2>
+        <button id="btn-close-settings" class="btn-icon" aria-label="閉じる">✕</button>
+      </div>
+      <div class="settings-body">
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">テーマ</div>
+            <div class="setting-desc">ウィンドウ全体の配色を切り替えます</div>
+          </div>
+          <select id="setting-theme" class="input-field input-narrow">
+            <option value="dark">ダークモード</option>
+            <option value="light">ライトモード</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">マッチング・出会い系を表示</div>
+            <div class="setting-desc">OFFにするとサイドバーとカタログから一括非表示にします</div>
+          </div>
+          <input id="setting-show-matching" type="checkbox" class="toggle-check" />
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">閉じるときにタスクトレイへ最小化</div>
+            <div class="setting-desc">バックグラウンドで未読チェックを維持したい場合に有効にします</div>
+          </div>
+          <input id="setting-minimize-tray" type="checkbox" class="toggle-check" />
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">サイドバー幅 (<span id="setting-sidebar-width-val">248</span>px)</div>
+            <div class="setting-desc">左サイドバーの横幅を調整します</div>
+          </div>
+          <input id="setting-sidebar-width" type="range" min="190" max="340" step="4" value="248" />
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">プライバシーロック用PIN（任意）</div>
+            <div class="setting-desc">空欄ならワンクリックでロック解除。設定すると解除時にPIN入力を求めます</div>
+          </div>
+          <input id="setting-lock-pin" type="password" class="input-field input-narrow" placeholder="未設定" maxlength="16" />
+        </div>
+
+        <div class="shortcut-box">
+          <h3>キーボードショートカット</h3>
+          <ul>
+            <li><kbd>Ctrl</kbd> + <kbd>K</kbd> : SNS・マッチングアプリ カタログを開く</li>
+            <li><kbd>Ctrl</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> : 登録済みサービスを素早く切り替え</li>
+            <li><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>L</kbd> : プライバシーロック（全画面即時隠蔽）</li>
+          </ul>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-save-settings" class="btn-primary">設定を保存して閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- プライバシーロック画面 -->
+  <div id="lock-overlay" class="lock-overlay hidden" role="dialog" aria-modal="true">
+    <div class="lock-card">
+      <div class="lock-icon">🔒</div>
+      <h2>OmniSNS はロック中です</h2>
+      <p>すべてのSNS・マッチング画面を非表示にしています。</p>
+      <form id="unlock-form" class="unlock-form">
+        <input
+          id="unlock-pin-input"
+          type="password"
+          class="input-field hidden"
+          placeholder="PINコードを入力..."
+          autocomplete="off"
+        />
+        <div id="unlock-error" class="unlock-error hidden"></div>
+        <button type="submit" class="btn-primary btn-full">ロックを解除する</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- トースト通知 -->
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="./renderer.js"></script>
+</body>
+</html>
