@@ -1,26 +1,28 @@
-# OmniSNS — Windows向け 全SNS・マッチングアプリ統合ブラウザ
+# OmniSNS — Windows & Android 向け 全SNS・マッチングアプリ統合ブラウザ
 
-**OmniSNS** は、Webブラウザから **DM / メッセージ送信に対応した主要SNS・メッセンジャー・マッチングアプリ（全61種＋カスタムURL）** を、1つのWindowsデスクトップアプリ内で切り替えて使える統合ブラウザアプリ（Electron製）です。
+**OmniSNS** は、Webブラウザから **DM / メッセージ送信に対応した主要SNS・メッセンジャー・マッチングアプリ（全61種＋カスタムURL）** を、1つのアプリ内で切り替えて使える統合ブラウザアプリです。
+
+- **Windows 版**: Electron + `WebContentsView`（サービスごと完全セッション分離 / インストーラー＆ポータブル `.exe`）
+- **Android 版**: Flutter + Android WebView（下部クイックタブ切替 / ドロワー並び替え / リリース `.apk`）
+
+> ビルド済みバイナリ（Windows `.exe` / Android `.apk`）は **[GitHub Releases](https://github.com/PG-Darksan/omni-sns/releases)** からダウンロードできます。
 
 ---
 
 ## 主な特徴
 
-- **全61種のDM送信対応SNS・マッチングアプリをプリセット収録**
+- **全61種のDM送信対応SNS・マッチングアプリをプリセット収録（Windows / Android 共通カタログ）**
   - メジャーSNS、チャット/メッセンジャー、国内・海外マッチングアプリ、出会い系、ビジネス/創作系まで網羅
   - Mastodon / Misskey の独自インスタンスや社内チャットも「カスタム追加」から自由に登録可能
-- **サービスごとの完全セッション分離 & マルチアカウント対応**
-  - Electron の `WebContentsView` + 独立パーティション（`persist:omnisns-<instanceId>`）を採用
-  - Cookie・ログイン状態がサービスごとに分離＆永続化され、同じSNSを複数アカウントで同時利用可能
 - **PC版 / モバイル版 User-Agent をタブごとにワンクリック切替**
-  - 標準でクリーンな最新 Chrome User-Agent を設定し、Googleログイン・WhatsApp Web・Snapchat Web・mixi2・東カレデート等に対応
-  - OAuth / SSO ポップアップ（Google / Apple / LINE / Facebookログイン等）も同一パーティションの子ウィンドウでシームレスに完了
+  - 標準でクリーンな最新 Chrome User-Agent を設定し、WhatsApp Web・Snapchat Web・mixi2・東カレデート等に対応
+  - Windows版では独立パーティション（`persist:omnisns-<instanceId>`）による完全セッション分離＆マルチアカウント・OAuthポップアップに対応
 - **プライバシー保護機能**
-  - **クイックロック（`Ctrl + Shift + L`）**: 人前で即座に全画面を隠蔽（任意PINコード対応）
-  - **マッチング・出会い系の一括表示/非表示切替**: サイドバーとカタログからワンクリックで隠蔽
-- **メモリ節約 & デスクトップ統合**
-  - 遅延ロード + ワンクリック **タブ休止（スリープ）** で多数のSNSを登録しても軽量動作
-  - 未読バッジ監視（タイトル変化から自動集計）、ドラッグ＆ドロップ並び替え、ズーム、ミュート、ダーク/ライトテーマ、Windowsタスクトレイ常駐対応
+  - **クイックロック**: ワンクリック（Windowsは `Ctrl + Shift + L`）で全画面を即座に隠蔽（任意PINコード対応）
+  - **マッチング・出会い系の一括表示/非表示切替**: タブ一覧とカタログからワンクリックで隠蔽
+- **メモリ節約 & 快適操作**
+  - 遅延ロード + **タブ休止（スリープ）** で多数のSNSを登録しても軽量動作
+  - 未読バッジ自動集計、ドラッグ＆ドロップ並び替え、ダーク/ライトテーマ対応
 
 ---
 
@@ -48,7 +50,7 @@
 
 ---
 
-## キーボードショートカット
+## キーボードショートカット（Windows版）
 
 | ショートカット | 動作 |
 | :--- | :--- |
@@ -59,31 +61,30 @@
 
 ---
 
-## セットアップ & 起動方法（Windows）
+## ビルド・開発方法
 
-### 必要環境
-- Windows 10 / 11 (x64)
-- Node.js 20 以上
+### Windows 版（Electron）
+- 必要環境: Windows 10 / 11 (x64), Node.js 20 以上
 
-### 開発・起動
 ```bash
-git clone https://github.com/PG-Darksan/omni-sns.git
-cd omni-sns
 npm install
-npm start
+npm start          # 開発起動
+npm run typecheck  # TypeScript型チェック
+npm test           # ユニットテスト
+npm run dist:win   # NSISインストーラー & ポータブル .exe を release/ へ出力
 ```
 
-### 型チェック & テスト
-```bash
-npm run typecheck
-npm test
-```
+### Android 版（Flutter）
+- 必要環境: Flutter 3.x / Android SDK
 
-### Windows インストーラー / ポータブル版のビルド
 ```bash
-npm run dist:win
+npm run export:catalog          # 共通カタログを mobile/assets/catalog.json へ同期
+cd mobile
+flutter pub get
+flutter analyze                 # 静的解析
+flutter test                    # テスト
+flutter build apk --release     # APKビルド (build/app/outputs/flutter-apk/app-release.apk)
 ```
-ビルド成果物は `release/` フォルダに出力されます（NSISインストーラー `.exe` およびポータブル `.exe`）。
 
 ---
 
@@ -91,28 +92,20 @@ npm run dist:win
 
 ```text
 omni-sns/
-├── assets/
-│   ├── icon.svg             # アプリアイコン (SVG)
-│   └── icon.png             # アプリアイコン (512x512 PNG)
+├── assets/                  # Windows/共通アプリアイコン (SVG / 512x512 PNG)
 ├── scripts/
-│   └── build.mjs            # esbuild ビルドスクリプト
-├── src/
-│   ├── shared/
-│   │   ├── types.ts         # 共有型定義
-│   │   ├── catalog.ts       # 全61種プリセットカタログマスタ
-│   │   └── url-utils.ts     # UA生成・URL正規化・未読数解析・OAuth判定
-│   ├── main/
-│   │   ├── main.ts          # Electronメインプロセス・ウィンドウ・トレイ・IPC
-│   │   ├── view-manager.ts  # WebContentsView制御・パーティション・UA・コンテキストメニュー
-│   │   └── store.ts         # 原子的ファイル書き込みによる設定・インスタンス永続化
-│   ├── preload/
-│   │   └── preload.ts       # contextIsolation対応の安全なIPCブリッジ
-│   └── renderer/
-│       ├── index.html       # シェルUI HTML
-│       ├── styles.css       # ダーク/ライトテーマ対応スタイル
-│       └── renderer.ts      # サイドバー・カタログ・設定・ロック画面ロジック
-└── tests/
-    └── core.test.ts         # ユニットテスト
+│   ├── build.mjs            # Electron esbuild ビルドスクリプト
+│   └── export-catalog.mjs   # 共通61種カタログJSON書き出しスクリプト
+├── src/                     # Windows版 (Electron + TypeScript)
+│   ├── shared/              # 型定義・全61種カタログ・URL/UA/未読解析
+│   ├── main/                # メインプロセス・WebContentsView管理・設定永続化
+│   ├── preload/             # 安全なIPCブリッジ
+│   └── renderer/            # シェルUI (HTML / CSS / TS)
+├── tests/                   # Windows版ユニットテスト
+└── mobile/                  # Android版 (Flutter + WebView)
+    ├── assets/catalog.json  # 共通61種カタログマスタ
+    ├── lib/                 # Flutter UI・WebViewタブ管理・設定永続化
+    └── test/                # Flutterテスト
 ```
 
 ---
