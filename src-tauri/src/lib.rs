@@ -21,8 +21,8 @@ use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, State, Theme, Webv
 
 use gesture::GestureSettings;
 use models::{
-    AddInstancePayload, AddTabResponse, AppConfig, AppSettings, BootstrapPayload, LockResult,
-    ServiceInstance, UpdateInstancePatch, UpdateSettingsPatch, WindowBounds,
+    AddInstancePayload, AddTabResponse, AppConfig, AppSettings, BootstrapPayload, ServiceInstance,
+    UpdateInstancePatch, UpdateSettingsPatch, WindowBounds,
 };
 use store::ConfigStore;
 use url_utils::is_http_url;
@@ -41,18 +41,17 @@ async fn app_get_bootstrap(
     let active_id = view_manager::ensure_safe_active_instance(&shared);
     let should_activate = {
         let guard = shared.inner.lock().unwrap();
-        !guard.overlay_visible && !guard.is_locked
+        !guard.overlay_visible
     };
     if should_activate {
         view_manager::activate_tab(&app, &shared, active_id);
     }
 
-    let (config, runtime_states, is_locked, closed_tabs_count) = {
+    let (config, runtime_states, closed_tabs_count) = {
         let guard = shared.inner.lock().unwrap();
         (
             guard.store.get_config(),
             SharedState::build_all_runtime_states(&guard),
-            guard.is_locked,
             guard.closed_tabs.len(),
         )
     };
@@ -66,7 +65,6 @@ async fn app_get_bootstrap(
         categories: catalog::categories().to_vec(),
         runtime_states,
         app_version: app.package_info().version.to_string(),
-        is_locked,
         closed_tabs_count,
     })
 }
@@ -137,6 +135,26 @@ async fn tab_remove(
     {
         let mut guard = shared.inner.lock().unwrap();
         guard.store.remove_instance(&instance_id);
+    }
+
+    view_manager::sync_instances(&app, &shared);
+    let next_active = view_manager::ensure_safe_active_instance(&shared);
+    view_manager::activate_tab(&app, &shared, next_active);
+    view_manager::emit_state_updated(&app, &shared);
+
+    let guard = shared.inner.lock().unwrap();
+    Ok(guard.store.get_config())
+}
+
+#[tauri::command]
+async fn tab_remove_many(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_ids: Vec<String>,
+) -> Result<AppConfig, String> {
+    {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.store.remove_instances(&instance_ids);
     }
 
     view_manager::sync_instances(&app, &shared);
@@ -298,32 +316,6 @@ async fn ui_set_overlay(
 }
 
 #[tauri::command]
-async fn ui_set_locked(
-    app: AppHandle,
-    shared: State<'_, SharedState>,
-    locked: bool,
-    pin_attempt: Option<String>,
-) -> Result<LockResult, String> {
-    if !locked {
-        let expected_pin = {
-            let guard = shared.inner.lock().unwrap();
-            guard.store.get_settings().lock_pin
-        };
-        if !expected_pin.is_empty() && pin_attempt.as_deref() != Some(expected_pin.as_str()) {
-            return Ok(LockResult {
-                ok: false,
-                error: Some("PINコードが一致しません。".to_string()),
-            });
-        }
-    }
-    view_manager::set_locked_state(&app, &shared, locked);
-    Ok(LockResult {
-        ok: true,
-        error: None,
-    })
-}
-
-#[tauri::command]
 fn ui_copy_text(text: String) {
     #[cfg(windows)]
     platform_win::copy_text_to_clipboard(&text);
@@ -433,17 +425,10 @@ fn resolve_config_path(app: &AppHandle) -> PathBuf {
 
 fn setup_tray(app: &AppHandle, shared: SharedState) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, "show", "OmniSNS を表示", true, None::<&str>)?;
-    let lock_item = MenuItem::with_id(
-        app,
-        "lock",
-        "プライバシーロック (Ctrl+Shift+L)",
-        true,
-        None::<&str>,
-    )?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit_item = MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[&show_item, &lock_item, &sep, &quit_item])?;
+    let menu = Menu::with_items(app, &[&show_item, &sep, &quit_item])?;
 
     let mut tray_builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("OmniSNS - All-in-One SNS Desk")
@@ -456,14 +441,6 @@ fn setup_tray(app: &AppHandle, shared: SharedState) -> tauri::Result<()> {
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
-            }
-            "lock" => {
-                if let Some(win) = app.get_window("main") {
-                    let _ = win.unminimize();
-                    let _ = win.show();
-                    let _ = win.set_focus();
-                }
-                view_manager::set_locked_state(app, &shared, true);
             }
             "quit" => {
                 {
@@ -681,13 +658,17 @@ pub fn run() {
                 std::thread::spawn(move || {
                     for _ in 0..40 {
                         std::thread::sleep(std::time::Duration::from_millis(200));
-                        let (bootstrapped, open_tabs) = {
+                        let (bootstrapped, open_tabs, instance_count) = {
                             let g = shared_smoke.inner.lock().unwrap();
-                            (g.bootstrapped, SharedState::open_webview_count(&g))
+                            (
+                                g.bootstrapped,
+                                SharedState::open_webview_count(&g),
+                                g.store.get_instances().len(),
+                            )
                         };
-                        if bootstrapped && open_tabs >= 1 {
+                        if bootstrapped && (open_tabs >= 1 || instance_count == 0) {
                             println!(
-                                "[smoke-test] OK: bootstrapped=true, open_tabs={open_tabs}, shell_ready=true"
+                                "[smoke-test] OK: bootstrapped=true, open_tabs={open_tabs}, instances={instance_count}, shell_ready=true"
                             );
                             shutdown_gesture_host(&shared_smoke);
                             view_manager::destroy_all_views(&app_smoke, &shared_smoke);
@@ -716,6 +697,7 @@ pub fn run() {
             tab_activate,
             tab_add,
             tab_remove,
+            tab_remove_many,
             tab_update,
             tab_reorder,
             tab_action,
@@ -728,7 +710,6 @@ pub fn run() {
             gesture_update_settings,
             settings_update,
             ui_set_overlay,
-            ui_set_locked,
             ui_copy_text,
             app_open_external_url
         ])

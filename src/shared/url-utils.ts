@@ -89,7 +89,6 @@ const AUTH_HOST_PATTERNS: RegExp[] = [
   /(^|\.)github\.com$/i,
   /(^|\.)discord\.com$/i,
   /(^|\.)id\.mixi\.social$/i,
-  /(^|\.)id\.pairs\.lv$/i,
   /(^|\.)auth\./i,
   /(^|\.)sso\./i,
   /(^|\.)oauth\./i,
@@ -171,4 +170,73 @@ export function makeBadgeText(name: string): string {
     return asciiWords[0].slice(0, 2).toUpperCase();
   }
   return Array.from(cleaned).slice(0, 2).join('').toUpperCase();
+}
+
+/**
+ * 同一SNSをグルーピングするためのキーを返す。
+ * カタログ登録サービスは serviceId で束ね、カスタムサービスはホスト名単位で束ねる。
+ */
+export function getServiceGroupKey(inst: {
+  serviceId: string;
+  url: string;
+  instanceId: string;
+}): string {
+  const sid = inst.serviceId?.trim();
+  if (sid && sid !== 'custom') {
+    return sid;
+  }
+  try {
+    const parsed = new URL(inst.url);
+    if (parsed.hostname) {
+      return `custom:${parsed.hostname.toLowerCase()}`;
+    }
+  } catch {
+    // ignore
+  }
+  return `custom:${inst.instanceId}`;
+}
+
+/**
+ * 同一SNS内でのアカウント表示名（ヘッダー切替ピル用）を決定する。
+ */
+export function getAccountDisplayLabel(
+  inst: { name: string; accountLabel?: string },
+  siblingIndex: number,
+  baseServiceName?: string
+): string {
+  const explicit = inst.accountLabel?.trim();
+  if (explicit) return explicit;
+
+  const rawName = inst.name.trim();
+  const base = baseServiceName?.trim();
+  if (base && rawName) {
+    if (rawName === base) {
+      return siblingIndex === 0 ? 'メイン' : `アカウント ${siblingIndex + 1}`;
+    }
+    if (rawName.startsWith(base)) {
+      const rest = rawName.slice(base.length).trim();
+      const numMatch = rest.match(/^\((\d+)\)$/);
+      if (numMatch) {
+        return `アカウント ${numMatch[1]}`;
+      }
+      const cleaned = rest.replace(/^[-–—・:/／\s]+/, '').trim();
+      if (cleaned) return cleaned;
+    }
+    return rawName;
+  }
+
+  return siblingIndex === 0 ? 'メイン' : `アカウント ${siblingIndex + 1}`;
+}
+
+/**
+ * 既存アカウント名と重複しない次の既定アカウント名を返す。
+ */
+export function nextDefaultAccountLabel(existingLabels: string[]): string {
+  const used = new Set(existingLabels.map((s) => s.trim()).filter(Boolean));
+  if (used.size === 0) return 'メイン';
+  let n = used.size + 1;
+  while (used.has(`アカウント ${n}`)) {
+    n += 1;
+  }
+  return `アカウント ${n}`;
 }

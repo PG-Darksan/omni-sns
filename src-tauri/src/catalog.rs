@@ -35,9 +35,32 @@ mod tests {
     fn embedded_catalog_is_complete_and_valid() {
         let cats = categories();
         let svcs = services();
-        assert_eq!(cats.len(), 7);
-        assert_eq!(svcs.len(), 60);
-        assert!(!svcs.iter().any(|s| s.id == "x"), "X must be removed from catalog");
+        assert_eq!(cats.len(), 5);
+        assert_eq!(svcs.len(), 44);
+        for removed in [
+            "x",
+            "pairs",
+            "with",
+            "tapple",
+            "omiai",
+            "marrish",
+            "ange",
+            "youbride",
+            "bridalnet",
+            "tokyo-calendar-date",
+            "match",
+            "grindr",
+            "happymail",
+            "wakuwaku",
+            "pcmax",
+            "ikukuru",
+            "meetup",
+        ] {
+            assert!(
+                !svcs.iter().any(|s| s.id == removed),
+                "{removed} must be removed from catalog"
+            );
+        }
 
         let cat_ids: HashSet<&str> = cats.iter().map(|c| c.id.as_str()).collect();
         let mut seen = HashSet::new();

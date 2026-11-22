@@ -14,7 +14,7 @@ async function build() {
   fs.mkdirSync(path.join(distDir, 'renderer'), { recursive: true });
   fs.mkdirSync(path.join(distDir, 'tests'), { recursive: true });
 
-  // 1. Export shared 61-service catalog JSON for Tauri (embedded via include_str!)
+  // 1. Export shared catalog JSON for Tauri (embedded via include_str!)
   await exportCatalogFiles({ includeMobile: false });
 
   // 2. Renderer script bundle (Browser IIFE, minified for release size)

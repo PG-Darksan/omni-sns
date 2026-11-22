@@ -3,7 +3,7 @@
     {
       "id": "major-sns",
       "label": "メジャーSNS",
-      "description": "WebブラウザからDM・メッセージ送信に対応した主要SNS"
+      "description": "Webブラウザから無料でDM・メッセージ送信に対応した主要SNS"
     },
     {
       "id": "messaging",
@@ -11,24 +11,14 @@
       "description": "リアルタイムチャット・通話・SMS連携対応のメッセンジャー"
     },
     {
-      "id": "matching-jp",
-      "label": "国内マッチング・婚活",
-      "description": "ブラウザ版から検索・メッセージ送信に対応した国内恋活/婚活サービス"
-    },
-    {
       "id": "matching-global",
-      "label": "海外マッチング",
-      "description": "グローバル対応のWeb版マッチングサービス"
-    },
-    {
-      "id": "matching-dating",
-      "label": "国内メッセージ・出会い系",
-      "description": "Webブラウザ版が主軸の国内メッセージ系出会いサービス"
+      "label": "マッチング",
+      "description": "無料プランでWeb版からメッセージ送信に対応したマッチングサービス"
     },
     {
       "id": "business-creative",
       "label": "ビジネス・創作・趣味",
-      "description": "キャリア・クリエイター・語学・コミュニティ向けDM対応サービス"
+      "description": "キャリア・クリエイター・語学・コミュニティ向け無料DM対応サービス"
     },
     {
       "id": "custom",
@@ -472,152 +462,6 @@
       "description": "Android端末とQR連携してPCからSMS/RCSを送受信可能。"
     },
     {
-      "id": "pairs",
-      "name": "Pairs (ペアーズ)",
-      "aliases": [
-        "ペアーズ",
-        "マッチング",
-        "恋活",
-        "婚活"
-      ],
-      "category": "matching-jp",
-      "url": "https://pairs.lv/",
-      "homeUrl": "https://www.pairs.lv/",
-      "color": "#2CB5E8",
-      "badge": "PR",
-      "defaultUa": "desktop",
-      "description": "国内最大級の恋活・婚活マッチング。ブラウザ版フル対応。",
-      "defaultPinned": true
-    },
-    {
-      "id": "with",
-      "name": "with (ウィズ)",
-      "aliases": [
-        "ウィズ",
-        "マッチング",
-        "恋活"
-      ],
-      "category": "matching-jp",
-      "url": "https://with.is/",
-      "homeUrl": "https://with.is/",
-      "color": "#EC4899",
-      "badge": "WI",
-      "defaultUa": "desktop",
-      "description": "心理テスト・価値観重視のマッチング。ブラウザ版でメッセージ可。"
-    },
-    {
-      "id": "tapple",
-      "name": "タップル (tapple)",
-      "aliases": [
-        "タップル",
-        "マッチング",
-        "恋活"
-      ],
-      "category": "matching-jp",
-      "url": "https://tapple.me/",
-      "homeUrl": "https://tapple.me/",
-      "color": "#FF5A79",
-      "badge": "TP",
-      "defaultUa": "desktop",
-      "description": "趣味タグ・おでかけ機能付き恋活アプリ。ブラウザ版対応。"
-    },
-    {
-      "id": "omiai",
-      "name": "Omiai (オミアイ)",
-      "aliases": [
-        "オミアイ",
-        "マッチング",
-        "婚活"
-      ],
-      "category": "matching-jp",
-      "url": "https://www.omiai-jp.com/",
-      "homeUrl": "https://www.omiai-jp.com/",
-      "color": "#F97316",
-      "badge": "OM",
-      "defaultUa": "desktop",
-      "description": "真剣な恋活・婚活向けマッチング。Web版からメッセージ送信可。"
-    },
-    {
-      "id": "marrish",
-      "name": "マリッシュ (marrish)",
-      "aliases": [
-        "マリッシュ",
-        "婚活",
-        "再婚"
-      ],
-      "category": "matching-jp",
-      "url": "https://marrish.com/",
-      "homeUrl": "https://marrish.com/",
-      "color": "#D946EF",
-      "badge": "MR",
-      "defaultUa": "desktop",
-      "description": "婚活・再婚活向けマッチング。Web版フル対応。"
-    },
-    {
-      "id": "ange",
-      "name": "アンジュ (ange)",
-      "aliases": [
-        "アンジュ",
-        "婚活",
-        "30代"
-      ],
-      "category": "matching-jp",
-      "url": "https://ange.gift/",
-      "homeUrl": "https://ange.gift/",
-      "color": "#EF4444",
-      "badge": "AG",
-      "defaultUa": "desktop",
-      "description": "30歳以上限定の大人向け恋活・婚活マッチング。Web版対応。"
-    },
-    {
-      "id": "youbride",
-      "name": "ユーブライド (youbride)",
-      "aliases": [
-        "ユーブライド",
-        "婚活"
-      ],
-      "category": "matching-jp",
-      "url": "https://youbride.jp/",
-      "homeUrl": "https://youbride.jp/",
-      "color": "#FB7185",
-      "badge": "YB",
-      "defaultUa": "desktop",
-      "description": "成婚実績豊富な真剣婚活サービス。PC/Web版フル対応。"
-    },
-    {
-      "id": "bridalnet",
-      "name": "ブライダルネット",
-      "aliases": [
-        "ブライダルネット",
-        "ibj",
-        "婚活"
-      ],
-      "category": "matching-jp",
-      "url": "https://www.bridalnet.co.jp/",
-      "homeUrl": "https://www.bridalnet.co.jp/",
-      "color": "#F43F5E",
-      "badge": "BN",
-      "defaultUa": "desktop",
-      "description": "IBJ運営の婚活サービス。日記・チャットまでブラウザ対応。"
-    },
-    {
-      "id": "tokyo-calendar-date",
-      "name": "東カレデート",
-      "aliases": [
-        "東カレ",
-        "東京カレンダー",
-        "審査制"
-      ],
-      "category": "matching-jp",
-      "url": "https://tokyo-calendar-date.jp/",
-      "homeUrl": "https://tokyo-calendar-date.jp/",
-      "color": "#991B1B",
-      "badge": "TK",
-      "defaultUa": "desktop",
-      "description": "完全審査制マッチング。PCブラウザ版からメッセージ可能。",
-      "note": "PC用User-Agentでの利用を推奨します。"
-    },
-    {
       "id": "tinder",
       "name": "Tinder",
       "aliases": [
@@ -630,7 +474,7 @@
       "color": "#FE3C72",
       "badge": "TD",
       "defaultUa": "desktop",
-      "description": "世界最大級のスワイプ型マッチング。Tinder Webフル対応。"
+      "description": "世界最大級のスワイプ型マッチング。無料プランでTinder Webからメッセージ送信対応。"
     },
     {
       "id": "bumble",
@@ -645,7 +489,7 @@
       "color": "#FBBF24",
       "badge": "BM",
       "defaultUa": "desktop",
-      "description": "恋活・友達作り（BFF）対応。Bumble Webで快適にチャット可能。"
+      "description": "恋活・友達作り（BFF）対応。無料プランでBumble Webからチャット可能。"
     },
     {
       "id": "okcupid",
@@ -660,22 +504,7 @@
       "color": "#2563EB",
       "badge": "OK",
       "defaultUa": "desktop",
-      "description": "価値観質問ベースのグローバルマッチング。Web版フル対応。"
-    },
-    {
-      "id": "match",
-      "name": "Match (マッチドットコム)",
-      "aliases": [
-        "マッチドットコム",
-        "婚活"
-      ],
-      "category": "matching-global",
-      "url": "https://jp.match.com/",
-      "homeUrl": "https://jp.match.com/",
-      "color": "#1D4ED8",
-      "badge": "MC",
-      "defaultUa": "desktop",
-      "description": "老舗グローバル婚活サービス。Web版機能が非常に充実。"
+      "description": "価値観質問ベースのグローバルマッチング。無料プランでメッセージ送受信対応。"
     },
     {
       "id": "badoo",
@@ -690,7 +519,7 @@
       "color": "#7C3AED",
       "badge": "BA",
       "defaultUa": "desktop",
-      "description": "欧州・南米を中心に人気のマッチングSNS。Web版対応。"
+      "description": "欧州・南米を中心に人気のマッチングSNS。無料プランでWeb版チャット対応。"
     },
     {
       "id": "pof",
@@ -705,82 +534,7 @@
       "color": "#0284C7",
       "badge": "PF",
       "defaultUa": "desktop",
-      "description": "英語圏定番のマッチングサイト。Webからメッセージ送信可能。"
-    },
-    {
-      "id": "grindr",
-      "name": "Grindr Web",
-      "aliases": [
-        "グラインダー",
-        "lgbtq"
-      ],
-      "category": "matching-global",
-      "url": "https://web.grindr.com/",
-      "homeUrl": "https://www.grindr.com/",
-      "color": "#F59E0B",
-      "badge": "GR",
-      "defaultUa": "desktop",
-      "description": "Grindrの公式Web版クライアント。"
-    },
-    {
-      "id": "happymail",
-      "name": "ハッピーメール",
-      "aliases": [
-        "ハピメ",
-        "出会い系"
-      ],
-      "category": "matching-dating",
-      "url": "https://happymail.co.jp/",
-      "homeUrl": "https://happymail.co.jp/",
-      "color": "#EC4899",
-      "badge": "HM",
-      "defaultUa": "desktop",
-      "description": "国内大手出会い系。Web版は検索・メッセージともフル機能。"
-    },
-    {
-      "id": "wakuwaku",
-      "name": "ワクワクメール",
-      "aliases": [
-        "ワクワク",
-        "出会い系"
-      ],
-      "category": "matching-dating",
-      "url": "https://550909.com/",
-      "homeUrl": "https://550909.com/",
-      "color": "#10B981",
-      "badge": "WK",
-      "defaultUa": "desktop",
-      "description": "ブラウザ版フル機能で掲示板・メール送受信に対応。"
-    },
-    {
-      "id": "pcmax",
-      "name": "PCMAX",
-      "aliases": [
-        "ピーシーマックス",
-        "出会い系"
-      ],
-      "category": "matching-dating",
-      "url": "https://pcmax.jp/",
-      "homeUrl": "https://pcmax.jp/",
-      "color": "#3B82F6",
-      "badge": "PM",
-      "defaultUa": "desktop",
-      "description": "Webブラウザ版がメインの老舗出会い系サービス。"
-    },
-    {
-      "id": "ikukuru",
-      "name": "イククル",
-      "aliases": [
-        "194964",
-        "出会い系"
-      ],
-      "category": "matching-dating",
-      "url": "https://194964.com/",
-      "homeUrl": "https://194964.com/",
-      "color": "#F97316",
-      "badge": "IK",
-      "defaultUa": "desktop",
-      "description": "Web版からプロフィール検索・メッセージ送受信が可能。"
+      "description": "英語圏定番のマッチングサイト。無料プランでWebからメッセージ送信可能。"
     },
     {
       "id": "linkedin",
@@ -951,21 +705,6 @@
       "badge": "ND",
       "defaultUa": "desktop",
       "description": "地域コミュニティSNS。近隣ユーザー間のDMに対応。"
-    },
-    {
-      "id": "meetup",
-      "name": "Meetup",
-      "aliases": [
-        "ミートアップ",
-        "イベント"
-      ],
-      "category": "business-creative",
-      "url": "https://www.meetup.com/messages/",
-      "homeUrl": "https://www.meetup.com/",
-      "color": "#ED1C40",
-      "badge": "MU",
-      "defaultUa": "desktop",
-      "description": "イベント・コミュニティSNSのメッセージ機能。"
     }
   ]
 }

@@ -501,7 +501,7 @@ pub fn attach_tab_handlers(
             );
         }
 
-        // 6. AcceleratorKeyPressed (SNSフォーカス中でも Ctrl+K / Ctrl+1..9 / Ctrl+Shift+L を捕捉)
+        // 6. AcceleratorKeyPressed (SNSフォーカス中でも Ctrl+K / Ctrl+1..9 / Ctrl+Alt+1..9 等を捕捉)
         {
             let cb = callbacks.on_shortcut.clone();
             let mut token = Default::default();
@@ -532,10 +532,22 @@ pub fn attach_tab_handlers(
                         return Ok(());
                     }
 
-                    // Ctrl + Shift + L (0x4C)
-                    if shift && !alt && vkey == 0x4C {
+                    // Ctrl + Alt + 1..9 (0x31..=0x39) -> 同一SNS内のアカウント切替
+                    if !shift && alt && (0x31..=0x39).contains(&vkey) {
                         let _ = args.SetHandled(true);
-                        cb("toggle-lock", None);
+                        cb("switch-account", Some((vkey - 0x31) as usize));
+                        return Ok(());
+                    }
+
+                    // Ctrl + Alt + Left (0x25) / Right (0x27) -> 同一SNS内の前/次アカウント切替
+                    if !shift && alt && vkey == 0x25 {
+                        let _ = args.SetHandled(true);
+                        cb("previous-account", None);
+                        return Ok(());
+                    }
+                    if !shift && alt && vkey == 0x27 {
+                        let _ = args.SetHandled(true);
+                        cb("next-account", None);
                         return Ok(());
                     }
 
@@ -574,7 +586,7 @@ pub fn attach_tab_handlers(
                         return Ok(());
                     }
 
-                    // Ctrl + 1..9 (0x31..=0x39)
+                    // Ctrl + 1..9 (0x31..=0x39) -> サイドバーのSNS切替
                     if !shift && !alt && (0x31..=0x39).contains(&vkey) {
                         let _ = args.SetHandled(true);
                         cb("switch-tab", Some((vkey - 0x31) as usize));

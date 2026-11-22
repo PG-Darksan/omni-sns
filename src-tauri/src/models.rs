@@ -36,6 +36,8 @@ pub struct ServiceInstance {
     pub instance_id: String,
     pub service_id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
     pub category: String,
     pub url: String,
     pub color: String,
@@ -88,7 +90,6 @@ pub struct TabRuntimeState {
 pub struct AppSettings {
     pub theme: String,
     pub minimize_to_tray: bool,
-    pub lock_pin: String,
     pub sidebar_width: u32,
     pub active_instance_id: Option<String>,
     #[serde(default)]
@@ -123,6 +124,8 @@ pub struct AppConfig {
 pub struct AddInstancePayload {
     pub service_id: String,
     pub name: String,
+    #[serde(default)]
+    pub account_label: Option<String>,
     pub category: String,
     pub url: String,
     pub color: String,
@@ -134,6 +137,7 @@ pub struct AddInstancePayload {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateInstancePatch {
     pub name: Option<String>,
+    pub account_label: Option<String>,
     pub url: Option<String>,
     pub ua_mode: Option<String>,
     pub muted: Option<bool>,
@@ -148,7 +152,6 @@ pub struct UpdateInstancePatch {
 pub struct UpdateSettingsPatch {
     pub theme: Option<String>,
     pub minimize_to_tray: Option<bool>,
-    pub lock_pin: Option<String>,
     pub sidebar_width: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub active_instance_id: Option<Option<String>>,
@@ -171,7 +174,6 @@ pub struct BootstrapPayload {
     pub categories: Vec<CategoryMeta>,
     pub runtime_states: Vec<TabRuntimeState>,
     pub app_version: String,
-    pub is_locked: bool,
     pub closed_tabs_count: usize,
 }
 
@@ -180,7 +182,6 @@ pub struct BootstrapPayload {
 pub struct StateUpdatedPayload {
     pub config: AppConfig,
     pub runtime_states: Vec<TabRuntimeState>,
-    pub is_locked: bool,
     pub closed_tabs_count: usize,
 }
 
@@ -189,14 +190,6 @@ pub struct StateUpdatedPayload {
 pub struct AddTabResponse {
     pub created: ServiceInstance,
     pub config: AppConfig,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LockResult {
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -17,9 +17,11 @@ pub const GESTURE_ACTIONS: &[&str] = &[
     "close-tab",
     "close-other-tabs",
     "restore-closed",
-    // SNS サービス切替
+    // SNS サービス / アカウント切替
     "previous-service",
     "next-service",
+    "previous-account",
+    "next-account",
     "open-catalog",
     "sleep-tab",
     // ページ・ナビゲーション
@@ -42,7 +44,6 @@ pub const GESTURE_ACTIONS: &[&str] = &[
     "zoom-out",
     "zoom-reset",
     "open-external",
-    "toggle-lock",
     "gesture:settings",
 ];
 
@@ -213,6 +214,8 @@ pub fn action_label_ja(action: &str) -> &'static str {
         "restore-closed" => "閉じたタブを復元",
         "previous-service" => "前のSNSへ",
         "next-service" => "次のSNSへ",
+        "previous-account" => "前のアカウントへ",
+        "next-account" => "次のアカウントへ",
         "open-catalog" => "SNSカタログを開く",
         "sleep-tab" => "このSNSを休止",
         "go-back" => "戻る",
@@ -232,7 +235,6 @@ pub fn action_label_ja(action: &str) -> &'static str {
         "zoom-out" => "縮小",
         "zoom-reset" => "ズームリセット",
         "open-external" => "既定ブラウザで開く",
-        "toggle-lock" => "プライバシーロック",
         "gesture:settings" => "ジェスチャー設定を開く",
         _ => "未割り当て",
     }

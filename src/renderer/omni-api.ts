@@ -17,14 +17,12 @@ export interface BootstrapPayload {
   categories: CategoryMeta[];
   runtimeStates: TabRuntimeState[];
   appVersion: string;
-  isLocked: boolean;
   closedTabsCount: number;
 }
 
 export interface StateUpdatedPayload {
   config: AppConfig;
   runtimeStates: TabRuntimeState[];
-  isLocked: boolean;
   closedTabsCount: number;
 }
 
@@ -38,9 +36,12 @@ export interface OmniApi {
   activateTab: (instanceId: string | null) => Promise<AppConfig>;
   addTab: (payload: AddInstancePayload) => Promise<{ created: ServiceInstance; config: AppConfig }>;
   removeTab: (instanceId: string) => Promise<AppConfig>;
+  removeTabs: (instanceIds: string[]) => Promise<AppConfig>;
   updateTab: (
     instanceId: string,
-    patch: Partial<Pick<ServiceInstance, 'name' | 'url' | 'notificationsEnabled' | 'color' | 'badge'>>
+    patch: Partial<
+      Pick<ServiceInstance, 'name' | 'accountLabel' | 'url' | 'notificationsEnabled' | 'color' | 'badge'>
+    >
   ) => Promise<ServiceInstance | null>;
   reorderTabs: (orderedIds: string[]) => Promise<AppConfig>;
   tabAction: (instanceId: string, action: string) => Promise<void>;
@@ -53,7 +54,6 @@ export interface OmniApi {
   updateGestureSettings: (gesture: GestureSettings) => Promise<GestureSettings>;
   updateSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>;
   setOverlayVisible: (visible: boolean) => Promise<void>;
-  setLocked: (locked: boolean, pinAttempt?: string) => Promise<{ ok: boolean; error?: string }>;
   copyText: (text: string) => Promise<void>;
   openExternalUrl: (url: string) => Promise<void>;
   onStateUpdated: (listener: (payload: StateUpdatedPayload) => void) => () => void;
@@ -89,6 +89,7 @@ export const omniApi: OmniApi = {
   addTab: (payload) =>
     invoke<{ created: ServiceInstance; config: AppConfig }>('tab_add', { payload }),
   removeTab: (instanceId) => invoke<AppConfig>('tab_remove', { instanceId }),
+  removeTabs: (instanceIds) => invoke<AppConfig>('tab_remove_many', { instanceIds }),
   updateTab: (instanceId, patch) =>
     invoke<ServiceInstance | null>('tab_update', { instanceId, patch }),
   reorderTabs: (orderedIds) => invoke<AppConfig>('tab_reorder', { orderedIds }),
@@ -108,11 +109,6 @@ export const omniApi: OmniApi = {
     invoke<GestureSettings>('gesture_update_settings', { gesture }),
   updateSettings: (patch) => invoke<AppSettings>('settings_update', { patch }),
   setOverlayVisible: (visible) => invoke<void>('ui_set_overlay', { visible }),
-  setLocked: (locked, pinAttempt) =>
-    invoke<{ ok: boolean; error?: string }>('ui_set_locked', {
-      locked,
-      pinAttempt: pinAttempt ?? null
-    }),
   copyText: (text) => invoke<void>('ui_copy_text', { text }),
   openExternalUrl: (url) => invoke<void>('app_open_external_url', { url }),
   onStateUpdated: (listener) => subscribe<StateUpdatedPayload>('app:state-updated', listener),

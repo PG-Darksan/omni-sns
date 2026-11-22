@@ -1,9 +1,7 @@
 export type ServiceCategory =
   | 'major-sns'
   | 'messaging'
-  | 'matching-jp'
   | 'matching-global'
-  | 'matching-dating'
   | 'business-creative'
   | 'custom';
 
@@ -43,8 +41,10 @@ export interface ServiceInstance {
   instanceId: string;
   /** カタログID（カスタムサービスの場合は 'custom'） */
   serviceId: string;
-  /** ユーザー表示名（マルチアカウント時に変更可能） */
+  /** ユーザー表示名（サービス名） */
   name: string;
+  /** 同一SNS内のアカウント表示名（ヘッダー切替タブに表示。例: メイン, サブ, 仕事用） */
+  accountLabel?: string;
   /** カテゴリ */
   category: ServiceCategory;
   /** 初期URL（ホーム復帰先） */
@@ -127,8 +127,6 @@ export interface AppSettings {
   theme: ThemeMode;
   /** ウィンドウを閉じる際にトレイへ最小化するか */
   minimizeToTray: boolean;
-  /** プライバシーロック用の任意PIN（空文字ならワンクリック解除） */
-  lockPin: string;
   /** サイドバー幅（px） */
   sidebarWidth: number;
   /** 最後に開いていたサービスインスタンスID */
@@ -153,6 +151,7 @@ export interface AppConfig {
 export interface AddInstancePayload {
   serviceId: string;
   name: string;
+  accountLabel?: string;
   category: ServiceCategory;
   url: string;
   color: string;

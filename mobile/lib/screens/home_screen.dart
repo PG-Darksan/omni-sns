@@ -23,9 +23,26 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
+class _ServiceGroup {
+  const _ServiceGroup({
+    required this.key,
+    required this.serviceId,
+    required this.displayName,
+    required this.colorHex,
+    required this.badge,
+    required this.accounts,
+  });
+
+  final String key;
+  final String serviceId;
+  final String displayName;
+  final String colorHex;
+  final String badge;
+  final List<ServiceInstance> accounts;
+}
+
 class _HomeScreenState extends State<HomeScreen> {
   bool _initialized = false;
-  bool _isLocked = false;
   List<CategoryMeta> _categories = const [];
   List<CatalogService> _catalog = const [];
   List<ServiceInstance> _instances = [];
@@ -33,19 +50,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
   final Map<String, WebViewController> _controllers = {};
   final Map<String, TabRuntimeState> _runtimeMap = {};
-  final TextEditingController _unlockPinController = TextEditingController();
-  String? _unlockError;
+  final Map<String, String> _lastActiveByGroup = {};
 
   @override
   void initState() {
     super.initState();
     _bootstrap();
-  }
-
-  @override
-  void dispose() {
-    _unlockPinController.dispose();
-    super.dispose();
   }
 
   Future<void> _bootstrap() async {
@@ -76,6 +86,42 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<ServiceInstance> get _visibleInstances => _instances;
 
+  CatalogService? _catalogServiceFor(String serviceId) {
+    if (serviceId == 'custom') return null;
+    for (final svc in _catalog) {
+      if (svc.id == serviceId) return svc;
+    }
+    return null;
+  }
+
+  List<_ServiceGroup> get _serviceGroups {
+    final groups = <_ServiceGroup>[];
+    final indexMap = <String, int>{};
+    for (final inst in _instances) {
+      final key = serviceGroupKey(inst);
+      final existingIdx = indexMap[key];
+      if (existingIdx != null) {
+        groups[existingIdx].accounts.add(inst);
+      } else {
+        final cat = _catalogServiceFor(inst.serviceId);
+        final displayName = cat?.name ??
+            inst.name.replaceFirst(RegExp(r'\s*\(\d+\)\s*$'), '').trim();
+        indexMap[key] = groups.length;
+        groups.add(
+          _ServiceGroup(
+            key: key,
+            serviceId: inst.serviceId,
+            displayName: displayName.isEmpty ? inst.name : displayName,
+            colorHex: inst.colorHex,
+            badge: inst.badge,
+            accounts: [inst],
+          ),
+        );
+      }
+    }
+    return groups;
+  }
+
   ServiceInstance? get _activeInstance {
     final activeId = _settings.activeInstanceId;
     if (activeId == null) return null;
@@ -85,8 +131,27 @@ class _HomeScreenState extends State<HomeScreen> {
     return null;
   }
 
+  _ServiceGroup? get _activeGroup {
+    final active = _activeInstance;
+    if (active == null) return null;
+    final key = serviceGroupKey(active);
+    for (final grp in _serviceGroups) {
+      if (grp.key == key) return grp;
+    }
+    return null;
+  }
+
+  ServiceInstance _pickTargetAccountForGroup(_ServiceGroup group) {
+    final savedId = _lastActiveByGroup[group.key];
+    if (savedId != null) {
+      for (final acc in group.accounts) {
+        if (acc.instanceId == savedId) return acc;
+      }
+    }
+    return group.accounts.first;
+  }
+
   int get _totalUnread {
-    if (_isLocked) return 0;
     var sum = 0;
     for (final inst in _visibleInstances) {
       if (!inst.notificationsEnabled) continue;
@@ -108,6 +173,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     if (activeId != null) {
       final inst = visible.firstWhere((i) => i.instanceId == activeId);
+      _lastActiveByGroup[serviceGroupKey(inst)] = inst.instanceId;
       _ensureController(inst);
     }
     if (mounted) setState(() {});
@@ -235,11 +301,72 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _activateInstance(ServiceInstance inst) {
+    _lastActiveByGroup[serviceGroupKey(inst)] = inst.instanceId;
     setState(() {
       _settings = _settings.copyWith(activeInstanceId: inst.instanceId);
     });
     _ensureController(inst);
     _persist();
+  }
+
+  void _activateGroup(_ServiceGroup group) {
+    _activateInstance(_pickTargetAccountForGroup(group));
+  }
+
+  Future<void> _addAccountForActiveService() async {
+    final active = _activeInstance;
+    final group = _activeGroup;
+    if (active == null || group == null) return;
+
+    final existingLabels = List.generate(
+      group.accounts.length,
+      (idx) => accountDisplayLabel(
+        group.accounts[idx],
+        idx,
+        baseServiceName: group.displayName,
+      ),
+    );
+    final nextLabel = nextDefaultAccountLabel(existingLabels);
+    final catSvc = _catalogServiceFor(active.serviceId);
+
+    final randHex = Random()
+        .nextInt(0xFFFFFF)
+        .toRadixString(16)
+        .padLeft(6, '0');
+    final safePrefix =
+        active.serviceId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
+    final newInstance = ServiceInstance(
+      instanceId: 'svc-${safePrefix.isEmpty ? 'custom' : safePrefix}-$randHex',
+      serviceId: active.serviceId,
+      name: group.displayName,
+      accountLabel: nextLabel,
+      category: active.category,
+      url: catSvc?.url ?? active.url,
+      colorHex: active.colorHex,
+      badge: active.badge,
+      uaMode: active.uaMode,
+      notificationsEnabled: true,
+      order: _instances.length,
+    );
+
+    _lastActiveByGroup[serviceGroupKey(newInstance)] = newInstance.instanceId;
+    final newGroupKey = serviceGroupKey(newInstance);
+    final lastSiblingIdx = _instances.lastIndexWhere(
+      (i) => serviceGroupKey(i) == newGroupKey,
+    );
+    final insertAt = lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
+    setState(() {
+      _instances.insert(insertAt, newInstance);
+      _runtimeMap[newInstance.instanceId] = TabRuntimeState(
+        currentUrl: newInstance.url,
+        title: newInstance.name,
+        isSleeping: true,
+      );
+      _settings = _settings.copyWith(activeInstanceId: newInstance.instanceId);
+    });
+    _ensureController(newInstance);
+    await _persist();
+    _showSnack('「${group.displayName} / $nextLabel」を追加しました');
   }
 
   void _sleepInstance(String instanceId) {
@@ -307,6 +434,7 @@ class _HomeScreenState extends State<HomeScreen> {
       instanceId: 'svc-${safePrefix.isEmpty ? 'custom' : safePrefix}-$randHex',
       serviceId: req.serviceId,
       name: req.name,
+      accountLabel: req.accountLabel,
       category: req.category,
       url: req.url,
       colorHex: req.colorHex,
@@ -316,8 +444,14 @@ class _HomeScreenState extends State<HomeScreen> {
       order: _instances.length,
     );
 
+    _lastActiveByGroup[serviceGroupKey(newInstance)] = newInstance.instanceId;
+    final newGroupKey = serviceGroupKey(newInstance);
+    final lastSiblingIdx = _instances.lastIndexWhere(
+      (i) => serviceGroupKey(i) == newGroupKey,
+    );
+    final insertAt = lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
     setState(() {
-      _instances.add(newInstance);
+      _instances.insert(insertAt, newInstance);
       _runtimeMap[newInstance.instanceId] = TabRuntimeState(
         currentUrl: newInstance.url,
         title: newInstance.name,
@@ -327,7 +461,10 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     _ensureController(newInstance);
     await _persist();
-    _showSnack('「${newInstance.name}」を追加しました');
+    final suffix = (newInstance.accountLabel?.isNotEmpty ?? false)
+        ? ' / ${newInstance.accountLabel}'
+        : '';
+    _showSnack('「${newInstance.name}$suffix」を追加しました');
   }
 
   Future<void> _openSettings() async {
@@ -354,6 +491,19 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _editInstance(ServiceInstance inst) async {
+    final grp = _serviceGroups.cast<_ServiceGroup?>().firstWhere(
+          (g) => g?.key == serviceGroupKey(inst),
+          orElse: () => null,
+        );
+    final siblingIdx = grp == null
+        ? 0
+        : max(0, grp.accounts.indexWhere((a) => a.instanceId == inst.instanceId));
+    final curAccLabel = accountDisplayLabel(
+      inst,
+      siblingIdx,
+      baseServiceName: grp?.displayName,
+    );
+    final accCtrl = TextEditingController(text: curAccLabel);
     final nameCtrl = TextEditingController(text: inst.name);
     final urlCtrl = TextEditingController(text: inst.url);
     var uaMode = inst.uaMode;
@@ -363,15 +513,24 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
-          title: Text('「${inst.name}」を編集'),
+          title: Text('「${grp?.displayName ?? inst.name} · $curAccLabel」を編集'),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
                 TextField(
+                  controller: accCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'アカウント名（ヘッダー表示名）',
+                    hintText: '例: メイン / サブ / 仕事用',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
                   controller: nameCtrl,
                   decoration: const InputDecoration(
-                    labelText: '表示名',
+                    labelText: 'サービス表示名',
                     border: OutlineInputBorder(),
                   ),
                 ),
@@ -429,11 +588,14 @@ class _HomeScreenState extends State<HomeScreen> {
                   );
                   return;
                 }
+                final trimmedAcc = accCtrl.text.trim();
                 Navigator.of(ctx).pop(
                   inst.copyWith(
                     name: nameCtrl.text.trim().isEmpty
                         ? inst.name
                         : nameCtrl.text.trim(),
+                    accountLabel: trimmedAcc.isEmpty ? null : trimmedAcc,
+                    clearAccountLabel: trimmedAcc.isEmpty,
                     url: normalized,
                     uaMode: uaMode,
                     notificationsEnabled: notify,
@@ -447,6 +609,7 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
 
+    accCtrl.dispose();
     nameCtrl.dispose();
     urlCtrl.dispose();
 
@@ -470,11 +633,28 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _removeInstance(ServiceInstance inst) async {
+    final groupKey = serviceGroupKey(inst);
+    final grp = _serviceGroups.cast<_ServiceGroup?>().firstWhere(
+          (g) => g?.key == groupKey,
+          orElse: () => null,
+        );
+    final siblingIdx = grp == null
+        ? 0
+        : max(0, grp.accounts.indexWhere((a) => a.instanceId == inst.instanceId));
+    final label = accountDisplayLabel(
+      inst,
+      siblingIdx,
+      baseServiceName: grp?.displayName,
+    );
+    final displayTitle = grp != null && grp.accounts.length >= 2
+        ? '${grp.displayName} / $label'
+        : (grp?.displayName ?? inst.name);
+
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('サービスを削除'),
-        content: Text('「${inst.name}」を一覧から削除しますか？'),
+        title: const Text('アカウントを削除'),
+        content: Text('「$displayTitle」を削除しますか？'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
@@ -489,14 +669,63 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     if (ok != true) return;
 
+    final wasActive = _settings.activeInstanceId == inst.instanceId;
     _controllers.remove(inst.instanceId);
     _runtimeMap.remove(inst.instanceId);
     setState(() {
       _instances.removeWhere((i) => i.instanceId == inst.instanceId);
+      if (wasActive) {
+        final sameGroupNext = _instances
+            .cast<ServiceInstance?>()
+            .firstWhere((i) => i != null && serviceGroupKey(i) == groupKey,
+                orElse: () => null);
+        if (sameGroupNext != null) {
+          _settings = _settings.copyWith(activeInstanceId: sameGroupNext.instanceId);
+        }
+      }
     });
     _ensureSafeActiveAndLoad();
     await _persist();
-    _showSnack('「${inst.name}」を削除しました');
+    _showSnack('「$displayTitle」を削除しました');
+  }
+
+  Future<void> _removeGroup(_ServiceGroup group) async {
+    if (group.accounts.length == 1) {
+      await _removeInstance(group.accounts.first);
+      return;
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('サービスを削除'),
+        content: Text(
+          '「${group.displayName}」（全${group.accounts.length}アカウント）を削除しますか？',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('削除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    final ids = group.accounts.map((a) => a.instanceId).toSet();
+    for (final id in ids) {
+      _controllers.remove(id);
+      _runtimeMap.remove(id);
+    }
+    setState(() {
+      _instances.removeWhere((i) => ids.contains(i.instanceId));
+    });
+    _ensureSafeActiveAndLoad();
+    await _persist();
+    _showSnack('「${group.displayName}」を削除しました');
   }
 
   void _showSnack(String message) {
@@ -511,19 +740,6 @@ class _HomeScreenState extends State<HomeScreen> {
       );
   }
 
-  void _attemptUnlock() {
-    final expected = _settings.lockPin;
-    if (expected.isNotEmpty && _unlockPinController.text != expected) {
-      setState(() => _unlockError = 'PINコードが一致しません');
-      return;
-    }
-    setState(() {
-      _isLocked = false;
-      _unlockError = null;
-      _unlockPinController.clear();
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     if (!_initialized) {
@@ -532,14 +748,12 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    if (_isLocked) {
-      return _buildLockScreen();
-    }
-
     final active = _activeInstance;
+    final activeGroup = _activeGroup;
     final activeRt =
         active != null ? _runtimeMap[active.instanceId] : null;
     final visible = _visibleInstances;
+    final groups = _serviceGroups;
 
     return PopScope(
       canPop: false,
@@ -555,9 +769,9 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       },
       child: Scaffold(
-        drawer: _buildDrawer(visible),
+        drawer: _buildDrawer(groups, activeGroup),
         appBar: AppBar(
-          toolbarHeight: 52,
+          toolbarHeight: 50,
           titleSpacing: 4,
           title: active == null
               ? const Text('OmniSNS')
@@ -594,7 +808,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             Text(
-                              active.name,
+                              activeGroup?.displayName ?? active.name,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
@@ -636,11 +850,6 @@ class _HomeScreenState extends State<HomeScreen> {
               icon: const Icon(Icons.add_circle_outline),
               tooltip: 'サービスを追加',
               onPressed: _openCatalog,
-            ),
-            IconButton(
-              icon: const Icon(Icons.lock_outline),
-              tooltip: 'プライバシーロック',
-              onPressed: () => setState(() => _isLocked = true),
             ),
             PopupMenuButton<String>(
               onSelected: (value) async {
@@ -720,8 +929,153 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         body: Column(
           children: [
+            if (active != null && activeGroup != null)
+              _buildAccountSwitcherBar(activeGroup, active),
             Expanded(child: _buildViewport(visible, active, activeRt)),
-            _buildBottomTabStrip(visible, active),
+            _buildBottomTabStrip(groups, activeGroup),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAccountSwitcherBar(
+    _ServiceGroup group,
+    ServiceInstance active,
+  ) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Material(
+      color: colorScheme.surfaceContainerLow,
+      child: Container(
+        height: 40,
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(
+              color: colorScheme.outlineVariant.withValues(alpha: 0.5),
+            ),
+          ),
+        ),
+        child: ListView(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          children: [
+            for (var i = 0; i < group.accounts.length; i++)
+              Builder(
+                builder: (context) {
+                  final inst = group.accounts[i];
+                  final isCurrent = inst.instanceId == active.instanceId;
+                  final rt = _runtimeMap[inst.instanceId];
+                  final unread = inst.notificationsEnabled
+                      ? (rt?.unreadCount ?? 0)
+                      : 0;
+                  final label = accountDisplayLabel(
+                    inst,
+                    i,
+                    baseServiceName: group.displayName,
+                  );
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(99),
+                      onTap: () {
+                        if (!isCurrent) _activateInstance(inst);
+                      },
+                      onLongPress: () => _showInstanceActionSheet(inst),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        decoration: BoxDecoration(
+                          color: isCurrent
+                              ? colorScheme.primaryContainer
+                              : colorScheme.surface,
+                          borderRadius: BorderRadius.circular(99),
+                          border: Border.all(
+                            color: isCurrent
+                                ? colorScheme.primary
+                                : colorScheme.outlineVariant,
+                            width: isCurrent ? 1.3 : 1,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 7,
+                              height: 7,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: rt?.isLoading == true
+                                    ? colorScheme.primary
+                                    : rt?.isSleeping == true
+                                        ? Colors.grey
+                                        : Colors.green,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              label,
+                              style: TextStyle(
+                                fontSize: 12,
+                                fontWeight: isCurrent
+                                    ? FontWeight.bold
+                                    : FontWeight.w500,
+                              ),
+                            ),
+                            if (unread > 0) ...[
+                              const SizedBox(width: 5),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 5,
+                                  vertical: 1,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.redAccent,
+                                  borderRadius: BorderRadius.circular(99),
+                                ),
+                                child: Text(
+                                  unread > 99 ? '99+' : '$unread',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 9.5,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            InkWell(
+              borderRadius: BorderRadius.circular(99),
+              onTap: _addAccountForActiveService,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(99),
+                  border: Border.all(
+                    color: colorScheme.outlineVariant,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.add, size: 14, color: colorScheme.primary),
+                    const SizedBox(width: 3),
+                    Text(
+                      'アカウント追加',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        color: colorScheme.primary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -748,7 +1102,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(height: 8),
               const Text(
-                '全60種のDM送信対応サービスから選んでワンタップで切り替えられます。',
+                '無料プランでDM送信できる全44種のサービスから選んでワンタップで切り替えられます。',
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
@@ -853,8 +1207,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildBottomTabStrip(
-    List<ServiceInstance> visible,
-    ServiceInstance? active,
+    List<_ServiceGroup> groups,
+    _ServiceGroup? activeGroup,
   ) {
     final surface = Theme.of(context).colorScheme.surfaceContainerHighest;
     return Material(
@@ -873,22 +1227,29 @@ class _HomeScreenState extends State<HomeScreen> {
                     horizontal: 8,
                     vertical: 7,
                   ),
-                  itemCount: visible.length,
+                  itemCount: groups.length,
                   itemBuilder: (context, index) {
-                    final inst = visible[index];
-                    final isActive = inst.instanceId == active?.instanceId;
-                    final rt = _runtimeMap[inst.instanceId];
-                    final unread = inst.notificationsEnabled
-                        ? (rt?.unreadCount ?? 0)
-                        : 0;
-                    final color = parseHexColor(inst.colorHex);
+                    final group = groups[index];
+                    final isActive = group.key == activeGroup?.key;
+                    final primary = isActive && _activeInstance != null
+                        ? _activeInstance!
+                        : _pickTargetAccountForGroup(group);
+                    final allSleeping = group.accounts.every(
+                      (a) => _runtimeMap[a.instanceId]?.isSleeping != false,
+                    );
+                    var unread = 0;
+                    for (final acc in group.accounts) {
+                      if (!acc.notificationsEnabled) continue;
+                      unread += _runtimeMap[acc.instanceId]?.unreadCount ?? 0;
+                    }
+                    final color = parseHexColor(primary.colorHex);
 
                     return Padding(
                       padding: const EdgeInsets.only(right: 6),
                       child: InkWell(
                         borderRadius: BorderRadius.circular(12),
-                        onTap: () => _activateInstance(inst),
-                        onLongPress: () => _showInstanceActionSheet(inst),
+                        onTap: () => _activateGroup(group),
+                        onLongPress: () => _showInstanceActionSheet(primary),
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 10),
                           decoration: BoxDecoration(
@@ -913,13 +1274,13 @@ class _HomeScreenState extends State<HomeScreen> {
                                 height: 22,
                                 decoration: BoxDecoration(
                                   color: color.withValues(
-                                    alpha: rt?.isSleeping == true ? 0.45 : 1.0,
+                                    alpha: allSleeping ? 0.45 : 1.0,
                                   ),
                                   borderRadius: BorderRadius.circular(6),
                                 ),
                                 alignment: Alignment.center,
                                 child: Text(
-                                  inst.badge,
+                                  primary.badge,
                                   style: const TextStyle(
                                     color: Colors.white,
                                     fontSize: 9.5,
@@ -931,7 +1292,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               ConstrainedBox(
                                 constraints: const BoxConstraints(maxWidth: 96),
                                 child: Text(
-                                  inst.name,
+                                  group.displayName,
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
@@ -942,6 +1303,17 @@ class _HomeScreenState extends State<HomeScreen> {
                                   ),
                                 ),
                               ),
+                              if (group.accounts.length >= 2) ...[
+                                const SizedBox(width: 4),
+                                Text(
+                                  '${group.accounts.length}垢',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                    color: Theme.of(context).colorScheme.primary,
+                                  ),
+                                ),
+                              ],
                               if (unread > 0) ...[
                                 const SizedBox(width: 5),
                                 Container(
@@ -984,6 +1356,18 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _showInstanceActionSheet(ServiceInstance inst) async {
+    final grp = _serviceGroups.cast<_ServiceGroup?>().firstWhere(
+          (g) => g?.key == serviceGroupKey(inst),
+          orElse: () => null,
+        );
+    final idx = grp == null
+        ? 0
+        : max(0, grp.accounts.indexWhere((a) => a.instanceId == inst.instanceId));
+    final accLabel = accountDisplayLabel(
+      inst,
+      idx,
+      baseServiceName: grp?.displayName,
+    );
     await showModalBottomSheet<void>(
       context: context,
       builder: (ctx) => SafeArea(
@@ -992,7 +1376,7 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             ListTile(
               title: Text(
-                inst.name,
+                '${grp?.displayName ?? inst.name} · $accLabel',
                 style: const TextStyle(fontWeight: FontWeight.bold),
               ),
               subtitle: Text(inst.url),
@@ -1000,7 +1384,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const Divider(height: 1),
             ListTile(
               leading: const Icon(Icons.edit_outlined),
-              title: const Text('名前・URL・UA設定を編集'),
+              title: const Text('アカウント名・URL・UA設定を編集'),
               onTap: () {
                 Navigator.of(ctx).pop();
                 _editInstance(inst);
@@ -1008,7 +1392,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             ListTile(
               leading: const Icon(Icons.bedtime_outlined),
-              title: const Text('このタブを休止（メモリ解放）'),
+              title: const Text('このアカウントを休止（メモリ解放）'),
               onTap: () {
                 Navigator.of(ctx).pop();
                 _sleepInstance(inst.instanceId);
@@ -1017,7 +1401,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ListTile(
               leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
               title: const Text(
-                '一覧から削除',
+                'このアカウントを削除',
                 style: TextStyle(color: Colors.redAccent),
               ),
               onTap: () {
@@ -1025,14 +1409,29 @@ class _HomeScreenState extends State<HomeScreen> {
                 _removeInstance(inst);
               },
             ),
+            if (grp != null && grp.accounts.length >= 2)
+              ListTile(
+                leading: const Icon(Icons.delete_sweep_outlined,
+                    color: Colors.redAccent),
+                title: Text(
+                  '「${grp.displayName}」の全${grp.accounts.length}アカウントを削除',
+                  style: const TextStyle(color: Colors.redAccent),
+                ),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  _removeGroup(grp);
+                },
+              ),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildDrawer(List<ServiceInstance> visible) {
-    final activeId = _settings.activeInstanceId;
+  Widget _buildDrawer(
+    List<_ServiceGroup> groups,
+    _ServiceGroup? activeGroup,
+  ) {
     return Drawer(
       child: SafeArea(
         child: Column(
@@ -1077,7 +1476,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ),
                         Text(
-                          'Android · v1.1.0',
+                          'Android · v1.2.0',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],
@@ -1108,39 +1507,41 @@ class _HomeScreenState extends State<HomeScreen> {
             const Divider(height: 1),
             Expanded(
               child: ReorderableListView.builder(
-                itemCount: visible.length,
+                itemCount: groups.length,
                 onReorder: (oldIndex, newIndex) async {
                   if (newIndex > oldIndex) newIndex -= 1;
-                  final moved = visible[oldIndex];
-                  final target = visible[newIndex];
-                  final fullFrom = _instances
-                      .indexWhere((i) => i.instanceId == moved.instanceId);
-                  final fullTo = _instances
-                      .indexWhere((i) => i.instanceId == target.instanceId);
-                  if (fullFrom == -1 || fullTo == -1) return;
+                  final reorderedGroups = List<_ServiceGroup>.from(groups);
+                  final moved = reorderedGroups.removeAt(oldIndex);
+                  reorderedGroups.insert(newIndex, moved);
                   setState(() {
-                    final item = _instances.removeAt(fullFrom);
-                    _instances.insert(fullTo, item);
+                    _instances = reorderedGroups
+                        .expand((g) => g.accounts)
+                        .toList();
                   });
                   await _persist();
                 },
                 itemBuilder: (context, index) {
-                  final inst = visible[index];
-                  final rt = _runtimeMap[inst.instanceId];
-                  final selected = inst.instanceId == activeId;
+                  final group = groups[index];
+                  final selected = group.key == activeGroup?.key;
+                  final primary = selected && _activeInstance != null
+                      ? _activeInstance!
+                      : _pickTargetAccountForGroup(group);
+                  final allSleeping = group.accounts.every(
+                    (a) => _runtimeMap[a.instanceId]?.isSleeping != false,
+                  );
                   return ListTile(
-                    key: ValueKey('drawer-${inst.instanceId}'),
+                    key: ValueKey('drawer-${group.key}'),
                     selected: selected,
                     leading: Container(
                       width: 32,
                       height: 32,
                       decoration: BoxDecoration(
-                        color: parseHexColor(inst.colorHex),
+                        color: parseHexColor(primary.colorHex),
                         borderRadius: BorderRadius.circular(8),
                       ),
                       alignment: Alignment.center,
                       child: Text(
-                        inst.badge,
+                        primary.badge,
                         style: const TextStyle(
                           color: Colors.white,
                           fontSize: 11,
@@ -1149,14 +1550,18 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ),
                     title: Text(
-                      inst.name,
+                      group.displayName,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
                     subtitle: Text(
                       [
-                        inst.uaMode == UserAgentMode.desktop ? 'PC版UA' : 'スマホUA',
-                        if (rt?.isSleeping == true) '休止中',
+                        if (group.accounts.length >= 2)
+                          '${group.accounts.length}アカウント',
+                        primary.uaMode == UserAgentMode.desktop
+                            ? 'PC版UA'
+                            : 'スマホUA',
+                        if (allSleeping) '休止中',
                       ].join(' · '),
                       style: const TextStyle(fontSize: 11),
                     ),
@@ -1164,12 +1569,12 @@ class _HomeScreenState extends State<HomeScreen> {
                       icon: const Icon(Icons.more_vert, size: 18),
                       onPressed: () {
                         Navigator.of(context).pop();
-                        _showInstanceActionSheet(inst);
+                        _showInstanceActionSheet(primary);
                       },
                     ),
                     onTap: () {
                       Navigator.of(context).pop();
-                      _activateInstance(inst);
+                      _activateGroup(group);
                     },
                   );
                 },
@@ -1207,66 +1612,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLockScreen() {
-    final hasPin = _settings.lockPin.isNotEmpty;
-    return Scaffold(
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(28),
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 340),
-            child: Card(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.lock_outline, size: 46),
-                    const SizedBox(height: 12),
-                    const Text(
-                      'OmniSNS はロック中です',
-                      style: TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    const Text(
-                      'すべてのサービス画面を非表示にしています。',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 12.5),
-                    ),
-                    if (hasPin) ...[
-                      const SizedBox(height: 14),
-                      TextField(
-                        controller: _unlockPinController,
-                        obscureText: true,
-                        decoration: InputDecoration(
-                          labelText: 'PINコード',
-                          errorText: _unlockError,
-                          border: const OutlineInputBorder(),
-                        ),
-                        onSubmitted: (_) => _attemptUnlock(),
-                      ),
-                    ],
-                    const SizedBox(height: 16),
-                    SizedBox(
-                      width: double.infinity,
-                      child: FilledButton(
-                        onPressed: _attemptUnlock,
-                        child: const Text('ロックを解除する'),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
         ),
       ),
     );

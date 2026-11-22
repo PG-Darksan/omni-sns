@@ -16,8 +16,9 @@
   --danger: #ef4444;
   --success: #22c55e;
   --sidebar-width: 248px;
-  --toolbar-height: 50px;
-  --tabbar-height: 36px;
+  --accountbar-height: 40px;
+  --toolbar-height: 44px;
+  --tabbar-height: 34px;
   --teal: #159cab;
   --teal-soft: rgba(21, 156, 171, 0.18);
   --gesture-amber: #ffb74d;
@@ -86,7 +87,7 @@ body {
 }
 
 .sidebar-header {
-  height: var(--toolbar-height);
+  height: var(--accountbar-height);
   padding: 0 12px;
   display: flex;
   align-items: center;
@@ -286,6 +287,13 @@ body {
   border: 1px solid var(--border-color);
 }
 
+.tag-mini.accent-tag {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: rgba(59, 130, 246, 0.3);
+  font-weight: 700;
+}
+
 .service-right {
   display: flex;
   align-items: center;
@@ -427,13 +435,231 @@ body {
   color: var(--text-primary);
 }
 
-/* ==================== Main Area & Toolbar ==================== */
+/* ==================== Main Area, Account Header & Toolbar ==================== */
 .main-area {
   flex: 1;
   min-width: 0;
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+.accountbar {
+  height: var(--accountbar-height);
+  min-height: var(--accountbar-height);
+  max-height: var(--accountbar-height);
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border-color);
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.accountbar-service {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+  max-width: 190px;
+}
+
+.accountbar-avatar {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.accountbar-avatar img {
+  width: 15px;
+  height: 15px;
+  object-fit: contain;
+  border-radius: 2px;
+}
+
+.accountbar-service-name {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.accountbar-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--border-strong);
+  flex-shrink: 0;
+}
+
+.account-strip {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.account-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.account-pill {
+  height: 28px;
+  max-width: 200px;
+  padding: 0 8px 0 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.account-pill:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.account-pill.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text-primary);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25);
+}
+
+.account-pill.dragging {
+  opacity: 0.45;
+}
+
+.account-pill.drag-over {
+  border-color: var(--gesture-amber);
+}
+
+.account-pill-dot {
+  width: 7px;
+  height: 7px;
+  min-width: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.account-pill-dot.ready {
+  background: var(--success);
+}
+
+.account-pill-dot.loading {
+  background: var(--accent);
+  animation: pulse 1s infinite;
+}
+
+.account-pill-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.account-pill-unread {
+  background: var(--danger);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 5px;
+  line-height: 16px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.account-pill-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  margin-left: 1px;
+  opacity: 0.55;
+  transition: opacity 0.12s ease;
+}
+
+.account-pill:hover .account-pill-actions,
+.account-pill.active .account-pill-actions {
+  opacity: 1;
+}
+
+.account-pill-btn {
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.account-pill-btn:hover {
+  background: rgba(148, 163, 184, 0.22);
+  color: var(--text-primary);
+}
+
+.account-pill-btn.danger:hover {
+  background: rgba(239, 68, 68, 0.22);
+  color: var(--danger);
+}
+
+.account-add-btn {
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.account-add-btn:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  border-style: solid;
+  color: var(--accent);
+}
+
+.account-add-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
 }
 
 .toolbar {
@@ -944,58 +1170,11 @@ kbd {
   color: var(--text-primary);
 }
 
-/* ==================== Lock Screen ==================== */
-.lock-overlay {
-  position: fixed;
-  inset: 0;
-  background: var(--bg-app);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 2000;
-}
-
-.lock-card {
-  width: 340px;
-  background: var(--bg-sidebar);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-lg);
-  padding: 28px 24px;
-  text-align: center;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-  box-shadow: var(--shadow-modal);
-}
-
-.lock-icon {
-  font-size: 36px;
-}
-
-.lock-card p {
-  color: var(--text-secondary);
-  font-size: 12.5px;
-}
-
-.unlock-form {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-top: 8px;
-}
-
-.unlock-error {
-  color: var(--danger);
-  font-size: 12px;
-}
-
 /* ==================== Toast ==================== */
 .toast {
   position: fixed;
-  top: 58px;
-  right: 16px;
+  top: 48px;
+  right: 14px;
   background: var(--bg-sidebar);
   color: var(--text-primary);
   border: 1px solid var(--border-strong);

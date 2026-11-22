@@ -17,26 +17,17 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   late bool _isDarkMode;
-  late final TextEditingController _pinController;
 
   @override
   void initState() {
     super.initState();
     _isDarkMode = widget.settings.isDarkMode;
-    _pinController = TextEditingController(text: widget.settings.lockPin);
-  }
-
-  @override
-  void dispose() {
-    _pinController.dispose();
-    super.dispose();
   }
 
   void _saveAndClose() {
     Navigator.of(context).pop(
       widget.settings.copyWith(
         isDarkMode: _isDarkMode,
-        lockPin: _pinController.text.trim(),
       ),
     );
   }
@@ -62,23 +53,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             value: _isDarkMode,
             onChanged: (v) => setState(() => _isDarkMode = v),
           ),
-          const Divider(),
-          const SizedBox(height: 8),
-          const Text(
-            'プライバシーロック用PIN（任意）',
-            style: TextStyle(fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 6),
-          TextField(
-            controller: _pinController,
-            obscureText: true,
-            maxLength: 16,
-            decoration: const InputDecoration(
-              hintText: '空欄ならワンタップでロック解除',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 16),
           const Divider(),
           ListTile(
             leading: const Icon(Icons.delete_outline, color: Colors.redAccent),

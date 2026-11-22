@@ -10,14 +10,29 @@ import {
   TabRuntimeState,
   UserAgentMode
 } from '../shared/types';
-import { makeBadgeText, normalizeServiceUrl } from '../shared/url-utils';
+import {
+  getAccountDisplayLabel,
+  getServiceGroupKey,
+  makeBadgeText,
+  nextDefaultAccountLabel,
+  normalizeServiceUrl
+} from '../shared/url-utils';
+
+interface ServiceGroup {
+  key: string;
+  serviceId: string;
+  displayName: string;
+  color: string;
+  badge: string;
+  accounts: ServiceInstance[];
+}
 
 interface UiState {
   config: AppConfig | null;
   catalog: CatalogService[];
   categories: CategoryMeta[];
   runtimeMap: Map<string, TabRuntimeState>;
-  isLocked: boolean;
+  lastActiveByGroup: Map<string, string>;
   closedTabsCount: number;
   selectedCatalogCategory: ServiceCategory | 'all';
   catalogSearchQuery: string;
@@ -32,7 +47,7 @@ const state: UiState = {
   catalog: [],
   categories: [],
   runtimeMap: new Map(),
-  isLocked: false,
+  lastActiveByGroup: new Map(),
   closedTabsCount: 0,
   selectedCatalogCategory: 'all',
   catalogSearchQuery: '',
@@ -43,7 +58,8 @@ const state: UiState = {
 };
 
 let toastTimer: number | null = null;
-let dragSourceId: string | null = null;
+let dragSourceGroupKey: string | null = null;
+let dragSourceAccountId: string | null = null;
 let gestureModal: GestureBoardModal | null = null;
 
 function el<T extends HTMLElement>(id: string): T {
@@ -79,17 +95,8 @@ async function syncOverlayToMain(): Promise<void> {
   await omniApi.setOverlayVisible(isAnyModalOpen());
 }
 
-function getVisibleInstances(): ServiceInstance[] {
-  if (!state.config) return [];
-  const query = state.sidebarFilterQuery.trim().toLowerCase();
-
-  return state.config.instances.filter((inst) => {
-    if (!query) return true;
-    return (
-      inst.name.toLowerCase().includes(query) ||
-      inst.url.toLowerCase().includes(query)
-    );
-  });
+function getCatalogService(serviceId: string): CatalogService | undefined {
+  return state.catalog.find((s) => s.id === serviceId);
 }
 
 function getActiveInstance(): ServiceInstance | undefined {
@@ -97,6 +104,77 @@ function getActiveInstance(): ServiceInstance | undefined {
   return state.config.instances.find(
     (item) => item.instanceId === state.config?.settings.activeInstanceId
   );
+}
+
+function recordLastActiveForCurrent(): void {
+  const active = getActiveInstance();
+  if (!active) return;
+  state.lastActiveByGroup.set(getServiceGroupKey(active), active.instanceId);
+}
+
+function getServiceGroups(): ServiceGroup[] {
+  if (!state.config) return [];
+  const groups: ServiceGroup[] = [];
+  const groupMap = new Map<string, ServiceGroup>();
+
+  for (const inst of state.config.instances) {
+    const key = getServiceGroupKey(inst);
+    const existing = groupMap.get(key);
+    if (existing) {
+      existing.accounts.push(inst);
+    } else {
+      const catSvc = inst.serviceId !== 'custom' ? getCatalogService(inst.serviceId) : undefined;
+      const displayName = catSvc?.name ?? inst.name.replace(/\s*\(\d+\)\s*$/, '').trim();
+      const grp: ServiceGroup = {
+        key,
+        serviceId: inst.serviceId,
+        displayName: displayName || inst.name,
+        color: inst.color,
+        badge: inst.badge,
+        accounts: [inst]
+      };
+      groupMap.set(key, grp);
+      groups.push(grp);
+    }
+  }
+  return groups;
+}
+
+function getVisibleServiceGroups(): ServiceGroup[] {
+  const groups = getServiceGroups();
+  const query = state.sidebarFilterQuery.trim().toLowerCase();
+  if (!query) return groups;
+
+  return groups.filter((grp) => {
+    if (grp.displayName.toLowerCase().includes(query)) return true;
+    return grp.accounts.some(
+      (inst) =>
+        inst.name.toLowerCase().includes(query) ||
+        (inst.accountLabel?.toLowerCase().includes(query) ?? false) ||
+        inst.url.toLowerCase().includes(query)
+    );
+  });
+}
+
+function getActiveGroup(): ServiceGroup | undefined {
+  const active = getActiveInstance();
+  if (!active) return undefined;
+  const key = getServiceGroupKey(active);
+  return getServiceGroups().find((g) => g.key === key);
+}
+
+function pickTargetAccountForGroup(group: ServiceGroup): ServiceInstance {
+  const rememberedId = state.lastActiveByGroup.get(group.key);
+  if (rememberedId) {
+    const found = group.accounts.find((a) => a.instanceId === rememberedId);
+    if (found) return found;
+  }
+  return group.accounts[0];
+}
+
+async function activateGroup(group: ServiceGroup): Promise<void> {
+  const target = pickTargetAccountForGroup(group);
+  await omniApi.activateTab(target.instanceId);
 }
 
 function applyThemeAndLayout(): void {
@@ -116,8 +194,9 @@ function applyThemeAndLayout(): void {
 function renderSidebar(): void {
   if (!state.config) return;
   const listEl = el<HTMLDivElement>('service-list');
-  const visible = getVisibleInstances();
-  const activeId = state.config.settings.activeInstanceId;
+  const visibleGroups = getVisibleServiceGroups();
+  const active = getActiveInstance();
+  const activeGroupKey = active ? getServiceGroupKey(active) : null;
 
   let totalUnread = 0;
   for (const inst of state.config.instances) {
@@ -126,7 +205,7 @@ function renderSidebar(): void {
   }
 
   const totalBadge = el<HTMLSpanElement>('total-unread-badge');
-  if (totalUnread > 0 && !state.isLocked) {
+  if (totalUnread > 0) {
     totalBadge.textContent = totalUnread > 99 ? '99+' : String(totalUnread);
     totalBadge.classList.remove('hidden');
   } else {
@@ -135,7 +214,7 @@ function renderSidebar(): void {
 
   listEl.innerHTML = '';
 
-  if (visible.length === 0) {
+  if (visibleGroups.length === 0) {
     const emptyMsg = document.createElement('div');
     emptyMsg.style.padding = '16px 10px';
     emptyMsg.style.color = 'var(--text-muted)';
@@ -148,31 +227,37 @@ function renderSidebar(): void {
     return;
   }
 
-  visible.forEach((inst) => {
-    const rt = state.runtimeMap.get(inst.instanceId);
+  visibleGroups.forEach((group) => {
+    const isActiveGroup = group.key === activeGroupKey;
+    const primary = isActiveGroup && active ? active : pickTargetAccountForGroup(group);
+    const primaryRt = state.runtimeMap.get(primary.instanceId);
+    const allSleeping = group.accounts.every(
+      (a) => state.runtimeMap.get(a.instanceId)?.isSleeping !== false
+    );
+
     const item = document.createElement('div');
     item.className = 'service-item';
     item.setAttribute('role', 'tab');
-    item.setAttribute('aria-selected', String(inst.instanceId === activeId));
+    item.setAttribute('aria-selected', String(isActiveGroup));
     item.draggable = !state.sidebarFilterQuery;
-    item.dataset.instanceId = inst.instanceId;
+    item.dataset.groupKey = group.key;
 
-    if (inst.instanceId === activeId) item.classList.add('active');
-    if (rt?.isSleeping) item.classList.add('sleeping');
+    if (isActiveGroup) item.classList.add('active');
+    if (allSleeping) item.classList.add('sleeping');
 
-    // Drag & drop reorder
+    // Drag & drop reorder by SNS group
     item.addEventListener('dragstart', (e) => {
-      dragSourceId = inst.instanceId;
+      dragSourceGroupKey = group.key;
       item.classList.add('dragging');
-      e.dataTransfer?.setData('text/plain', inst.instanceId);
+      e.dataTransfer?.setData('text/plain', group.key);
     });
     item.addEventListener('dragend', () => {
-      dragSourceId = null;
+      dragSourceGroupKey = null;
       item.classList.remove('dragging');
       listEl.querySelectorAll('.drag-over').forEach((node) => node.classList.remove('drag-over'));
     });
     item.addEventListener('dragover', (e) => {
-      if (!dragSourceId || dragSourceId === inst.instanceId) return;
+      if (!dragSourceGroupKey || dragSourceGroupKey === group.key) return;
       e.preventDefault();
       item.classList.add('drag-over');
     });
@@ -182,36 +267,41 @@ function renderSidebar(): void {
     item.addEventListener('drop', async (e) => {
       e.preventDefault();
       item.classList.remove('drag-over');
-      if (!dragSourceId || dragSourceId === inst.instanceId || !state.config) return;
+      if (!dragSourceGroupKey || dragSourceGroupKey === group.key) return;
 
-      const ids = state.config.instances.map((x) => x.instanceId);
-      const fromIndex = ids.indexOf(dragSourceId);
-      const toIndex = ids.indexOf(inst.instanceId);
+      const allGroups = getServiceGroups();
+      const fromIndex = allGroups.findIndex((g) => g.key === dragSourceGroupKey);
+      const toIndex = allGroups.findIndex((g) => g.key === group.key);
       if (fromIndex === -1 || toIndex === -1) return;
 
-      ids.splice(fromIndex, 1);
-      ids.splice(toIndex, 0, dragSourceId);
-      await omniApi.reorderTabs(ids);
+      const [moved] = allGroups.splice(fromIndex, 1);
+      allGroups.splice(toIndex, 0, moved);
+      const flattenedIds = allGroups.flatMap((g) => g.accounts.map((a) => a.instanceId));
+      await omniApi.reorderTabs(flattenedIds);
     });
 
     item.addEventListener('click', async () => {
-      await omniApi.activateTab(inst.instanceId);
+      await activateGroup(group);
     });
 
     // Avatar
     const avatar = document.createElement('div');
     avatar.className = 'service-avatar';
-    avatar.style.background = inst.color;
-    if (rt?.faviconUrl) {
+    avatar.style.background = primary.color;
+    const groupFavicon =
+      primaryRt?.faviconUrl ??
+      group.accounts.map((a) => state.runtimeMap.get(a.instanceId)?.faviconUrl).find(Boolean) ??
+      null;
+    if (groupFavicon) {
       const img = document.createElement('img');
-      img.src = rt.faviconUrl;
+      img.src = groupFavicon;
       img.alt = '';
       img.onerror = () => {
-        avatar.textContent = inst.badge;
+        avatar.textContent = primary.badge;
       };
       avatar.appendChild(img);
     } else {
-      avatar.textContent = inst.badge;
+      avatar.textContent = primary.badge;
     }
 
     // Meta
@@ -220,27 +310,33 @@ function renderSidebar(): void {
 
     const nameEl = document.createElement('div');
     nameEl.className = 'service-name';
-    nameEl.textContent = inst.name;
+    nameEl.textContent = group.displayName;
 
     const subEl = document.createElement('div');
     subEl.className = 'service-sub';
-    if (inst.uaMode === 'mobile') {
+    if (group.accounts.length >= 2) {
+      const accTag = document.createElement('span');
+      accTag.className = 'tag-mini accent-tag';
+      accTag.textContent = `${group.accounts.length}垢`;
+      subEl.appendChild(accTag);
+    }
+    if (primary.uaMode === 'mobile') {
       const uaTag = document.createElement('span');
       uaTag.className = 'tag-mini';
       uaTag.textContent = 'スマホUA';
       subEl.appendChild(uaTag);
     }
-    if ((rt?.tabs?.length ?? 0) >= 2) {
+    if ((primaryRt?.tabs?.length ?? 0) >= 2) {
       const tabTag = document.createElement('span');
       tabTag.className = 'tag-mini';
-      tabTag.textContent = `${rt!.tabs.length}タブ`;
+      tabTag.textContent = `${primaryRt!.tabs.length}タブ`;
       subEl.appendChild(tabTag);
     }
-    if (rt?.isSleeping) {
+    if (allSleeping) {
       const sleepTag = document.createElement('span');
       sleepTag.textContent = '休止中';
       subEl.appendChild(sleepTag);
-    } else if (inst.muted) {
+    } else if (primary.muted) {
       const muteTag = document.createElement('span');
       muteTag.textContent = 'ミュート';
       subEl.appendChild(muteTag);
@@ -251,15 +347,19 @@ function renderSidebar(): void {
       meta.appendChild(subEl);
     }
 
-    // Right side (unread badge + hover actions)
+    // Right side (aggregated unread badge + hover actions)
     const right = document.createElement('div');
     right.className = 'service-right';
 
-    const unread = inst.notificationsEnabled ? rt?.unreadCount ?? 0 : 0;
-    if (unread > 0) {
+    let groupUnread = 0;
+    for (const acc of group.accounts) {
+      if (!acc.notificationsEnabled) continue;
+      groupUnread += state.runtimeMap.get(acc.instanceId)?.unreadCount ?? 0;
+    }
+    if (groupUnread > 0) {
       const badge = document.createElement('span');
       badge.className = 'unread-badge';
-      badge.textContent = unread > 99 ? '99+' : String(unread);
+      badge.textContent = groupUnread > 99 ? '99+' : String(groupUnread);
       right.appendChild(badge);
     }
 
@@ -272,19 +372,29 @@ function renderSidebar(): void {
     editBtn.textContent = '✎';
     editBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      void openEditModalForExisting(inst);
+      void openEditModalForExisting(primary, false);
     });
 
     const delBtn = document.createElement('button');
     delBtn.className = 'mini-action-btn danger';
-    delBtn.title = 'サイドバーから削除';
+    delBtn.title =
+      group.accounts.length >= 2
+        ? `「${group.displayName}」の全${group.accounts.length}アカウントを削除`
+        : 'サイドバーから削除';
     delBtn.textContent = '✕';
     delBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      const confirmed = window.confirm(`「${inst.name}」を一覧から削除しますか？`);
-      if (!confirmed) return;
-      await omniApi.removeTab(inst.instanceId);
-      showToast(`「${inst.name}」を削除しました`);
+      const msg =
+        group.accounts.length >= 2
+          ? `「${group.displayName}」（全${group.accounts.length}アカウント）を一覧から削除しますか？\n※ 特定のアカウントだけ消す場合はヘッダーのアカウントタブから ✕ を押してください。`
+          : `「${group.displayName}」を一覧から削除しますか？`;
+      if (!window.confirm(msg)) return;
+      if (group.accounts.length === 1) {
+        await omniApi.removeTab(group.accounts[0].instanceId);
+      } else {
+        await omniApi.removeTabs(group.accounts.map((a) => a.instanceId));
+      }
+      showToast(`「${group.displayName}」を削除しました`);
     });
 
     actions.appendChild(editBtn);
@@ -298,10 +408,208 @@ function renderSidebar(): void {
   });
 }
 
+function renderAccountBar(): void {
+  const avatarEl = el<HTMLSpanElement>('accountbar-avatar');
+  const serviceNameEl = el<HTMLSpanElement>('accountbar-service-name');
+  const stripEl = el<HTMLDivElement>('account-strip');
+  const addBtn = el<HTMLButtonElement>('btn-add-account');
+
+  const active = getActiveInstance();
+  const group = getActiveGroup();
+
+  stripEl.innerHTML = '';
+  if (!active || !group) {
+    avatarEl.style.background = 'var(--accent)';
+    avatarEl.textContent = 'O';
+    serviceNameEl.textContent = 'サービス未選択';
+    addBtn.disabled = true;
+    return;
+  }
+
+  addBtn.disabled = false;
+  addBtn.title = `「${group.displayName}」に独立セッションの別アカウントを追加`;
+
+  const activeRt = state.runtimeMap.get(active.instanceId);
+  avatarEl.innerHTML = '';
+  avatarEl.style.background = active.color;
+  if (activeRt?.faviconUrl) {
+    const img = document.createElement('img');
+    img.src = activeRt.faviconUrl;
+    img.alt = '';
+    img.onerror = () => {
+      avatarEl.textContent = active.badge;
+    };
+    avatarEl.appendChild(img);
+  } else {
+    avatarEl.textContent = active.badge;
+  }
+  serviceNameEl.textContent = group.displayName;
+
+  group.accounts.forEach((inst, idx) => {
+    const rt = state.runtimeMap.get(inst.instanceId);
+    const isCurrent = inst.instanceId === active.instanceId;
+    const label = getAccountDisplayLabel(inst, idx, group.displayName);
+
+    const pill = document.createElement('div');
+    pill.className = 'account-pill';
+    pill.setAttribute('role', 'tab');
+    pill.setAttribute('aria-selected', String(isCurrent));
+    if (isCurrent) pill.classList.add('active');
+    pill.draggable = group.accounts.length >= 2;
+    pill.title = `${group.displayName} · ${label}\nクリックで瞬時切替 / ダブルクリックで名前変更${
+      idx < 9 ? ` (Ctrl+Alt+${idx + 1})` : ''
+    }`;
+
+    pill.addEventListener('click', () => {
+      if (!isCurrent) {
+        void omniApi.activateTab(inst.instanceId);
+      }
+    });
+    pill.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      void openEditModalForExisting(inst, true);
+    });
+
+    // Drag reorder accounts within the same SNS
+    if (group.accounts.length >= 2) {
+      pill.addEventListener('dragstart', (e) => {
+        dragSourceAccountId = inst.instanceId;
+        pill.classList.add('dragging');
+        e.dataTransfer?.setData('text/plain', inst.instanceId);
+      });
+      pill.addEventListener('dragend', () => {
+        dragSourceAccountId = null;
+        pill.classList.remove('dragging');
+        stripEl.querySelectorAll('.drag-over').forEach((n) => n.classList.remove('drag-over'));
+      });
+      pill.addEventListener('dragover', (e) => {
+        if (!dragSourceAccountId || dragSourceAccountId === inst.instanceId) return;
+        e.preventDefault();
+        pill.classList.add('drag-over');
+      });
+      pill.addEventListener('dragleave', () => {
+        pill.classList.remove('drag-over');
+      });
+      pill.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        pill.classList.remove('drag-over');
+        if (!dragSourceAccountId || dragSourceAccountId === inst.instanceId) return;
+        const allGroups = getServiceGroups();
+        const targetGroup = allGroups.find((g) => g.key === group.key);
+        if (!targetGroup) return;
+        const fromIdx = targetGroup.accounts.findIndex((a) => a.instanceId === dragSourceAccountId);
+        const toIdx = targetGroup.accounts.findIndex((a) => a.instanceId === inst.instanceId);
+        if (fromIdx === -1 || toIdx === -1) return;
+        const [moved] = targetGroup.accounts.splice(fromIdx, 1);
+        targetGroup.accounts.splice(toIdx, 0, moved);
+        const flattenedIds = allGroups.flatMap((g) => g.accounts.map((a) => a.instanceId));
+        await omniApi.reorderTabs(flattenedIds);
+      });
+    }
+
+    const dot = document.createElement('span');
+    dot.className = `account-pill-dot ${
+      rt?.isLoading ? 'loading' : rt?.isSleeping ? '' : 'ready'
+    }`;
+
+    const labelSpan = document.createElement('span');
+    labelSpan.className = 'account-pill-label';
+    labelSpan.textContent = label;
+
+    pill.appendChild(dot);
+    pill.appendChild(labelSpan);
+
+    const unread = inst.notificationsEnabled ? rt?.unreadCount ?? 0 : 0;
+    if (unread > 0) {
+      const badge = document.createElement('span');
+      badge.className = 'account-pill-unread';
+      badge.textContent = unread > 99 ? '99+' : String(unread);
+      pill.appendChild(badge);
+    }
+
+    const actions = document.createElement('span');
+    actions.className = 'account-pill-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'account-pill-btn';
+    editBtn.title = 'アカウント名・設定を編集';
+    editBtn.textContent = '✎';
+    editBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      void openEditModalForExisting(inst, true);
+    });
+    actions.appendChild(editBtn);
+
+    if (group.accounts.length >= 2) {
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'account-pill-btn danger';
+      delBtn.title = `アカウント「${label}」を削除`;
+      delBtn.textContent = '✕';
+      delBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const ok = window.confirm(
+          `「${group.displayName} / ${label}」を削除しますか？\n（このアカウントのログインセッションも削除されます）`
+        );
+        if (!ok) return;
+        await omniApi.removeTab(inst.instanceId);
+        showToast(`「${group.displayName} / ${label}」を削除しました`);
+      });
+      actions.appendChild(delBtn);
+    }
+
+    pill.appendChild(actions);
+    stripEl.appendChild(pill);
+  });
+}
+
+async function addAccountForActiveService(): Promise<void> {
+  const active = getActiveInstance();
+  const group = getActiveGroup();
+  if (!active || !group) return;
+
+  const catalogSvc = active.serviceId !== 'custom' ? getCatalogService(active.serviceId) : undefined;
+  const existingLabels = group.accounts.map((acc, idx) =>
+    getAccountDisplayLabel(acc, idx, group.displayName)
+  );
+  const nextLabel = nextDefaultAccountLabel(existingLabels);
+
+  if (catalogSvc?.requiresCustomUrl) {
+    await openEditModalForTemplate(catalogSvc, group.accounts.length, nextLabel);
+    return;
+  }
+
+  await omniApi.addTab({
+    serviceId: active.serviceId,
+    name: group.displayName,
+    accountLabel: nextLabel,
+    category: active.category,
+    url: catalogSvc?.url ?? active.url,
+    color: active.color,
+    badge: active.badge,
+    uaMode: active.uaMode
+  });
+  showToast(`「${group.displayName} / ${nextLabel}」を追加しました（独立セッション）`);
+}
+
 const ICON_VOLUME_ON =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>';
 const ICON_VOLUME_OFF =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>';
+
+function getActiveDisplayTitle(): string {
+  const active = getActiveInstance();
+  if (!active) return 'サービス未選択';
+  const group = getActiveGroup();
+  if (!group) return active.name;
+  const idx = Math.max(
+    0,
+    group.accounts.findIndex((a) => a.instanceId === active.instanceId)
+  );
+  const label = getAccountDisplayLabel(active, idx, group.displayName);
+  return `${group.displayName} · ${label}`;
+}
 
 function renderToolbarAndViewport(): void {
   const active = getActiveInstance();
@@ -338,10 +646,11 @@ function renderToolbarAndViewport(): void {
     return;
   }
 
+  const displayTitle = getActiveDisplayTitle();
   backBtn.disabled = !rt?.canGoBack;
   fwdBtn.disabled = !rt?.canGoForward;
   dotEl.className = `status-dot ${rt?.isLoading ? 'loading' : rt?.isSleeping ? '' : 'ready'}`;
-  nameEl.textContent = active.name;
+  nameEl.textContent = displayTitle;
   urlEl.textContent = rt?.currentUrl || active.url;
 
   const isMobile = active.uaMode === 'mobile';
@@ -352,31 +661,11 @@ function renderToolbarAndViewport(): void {
   zoomResetBtn.textContent = `${Math.round(active.zoomFactor * 100)}%`;
 
   if (rt?.isSleeping) {
-    el<HTMLHeadingElement>('sleeping-title').textContent = `「${active.name}」は休止中です`;
+    el<HTMLHeadingElement>('sleeping-title').textContent = `「${displayTitle}」は休止中です`;
     sleepingEl.classList.remove('hidden');
   } else if (rt?.loadError) {
     el<HTMLParagraphElement>('error-detail').textContent = rt.loadError;
     errorEl.classList.remove('hidden');
-  }
-}
-
-function renderLockOverlay(): void {
-  const overlay = el<HTMLDivElement>('lock-overlay');
-  const pinInput = el<HTMLInputElement>('unlock-pin-input');
-  const errEl = el<HTMLDivElement>('unlock-error');
-
-  if (!state.isLocked) {
-    overlay.classList.add('hidden');
-    pinInput.value = '';
-    errEl.classList.add('hidden');
-    return;
-  }
-
-  overlay.classList.remove('hidden');
-  const hasPin = Boolean(state.config?.settings.lockPin);
-  pinInput.classList.toggle('hidden', !hasPin);
-  if (hasPin) {
-    window.setTimeout(() => pinInput.focus(), 40);
   }
 }
 
@@ -516,14 +805,19 @@ function renderCatalog(): void {
     addBtn.className = 'btn-primary';
     addBtn.textContent = count > 0 ? '＋ 別アカウント追加' : '＋ 追加して開く';
     addBtn.addEventListener('click', async () => {
+      const existingForSvc = (state.config?.instances ?? []).filter((i) => i.serviceId === svc.id);
+      const existingLabels = existingForSvc.map((acc, idx) =>
+        getAccountDisplayLabel(acc, idx, svc.name)
+      );
+      const nextLabel = nextDefaultAccountLabel(existingLabels);
       if (svc.requiresCustomUrl) {
-        await openEditModalForTemplate(svc, count);
+        await openEditModalForTemplate(svc, count, nextLabel);
         return;
       }
-      const label = count > 0 ? `${svc.name} (${count + 1})` : svc.name;
       await addServiceAndCloseCatalog({
         serviceId: svc.id,
-        name: label,
+        name: svc.name,
+        accountLabel: nextLabel,
         category: svc.category,
         url: svc.url,
         color: svc.color,
@@ -536,9 +830,14 @@ function renderCatalog(): void {
     customizeBtn.type = 'button';
     customizeBtn.className = 'btn-secondary';
     customizeBtn.textContent = '詳細設定';
-    customizeBtn.title = '名前やURLを変更してから追加';
+    customizeBtn.title = 'アカウント名やURLを変更してから追加';
     customizeBtn.addEventListener('click', () => {
-      void openEditModalForTemplate(svc, count);
+      const existingForSvc = (state.config?.instances ?? []).filter((i) => i.serviceId === svc.id);
+      const existingLabels = existingForSvc.map((acc, idx) =>
+        getAccountDisplayLabel(acc, idx, svc.name)
+      );
+      const nextLabel = nextDefaultAccountLabel(existingLabels);
+      void openEditModalForTemplate(svc, count, nextLabel);
     });
 
     actions.appendChild(addBtn);
@@ -553,11 +852,11 @@ async function addServiceAndCloseCatalog(payload: AddInstancePayload): Promise<v
   el('catalog-modal').classList.add('hidden');
   el('edit-modal').classList.add('hidden');
   await syncOverlayToMain();
-  showToast(`「${payload.name}」を追加しました`);
+  const labelSuffix = payload.accountLabel ? ` / ${payload.accountLabel}` : '';
+  showToast(`「${payload.name}${labelSuffix}」を追加しました`);
 }
 
 async function openCatalogModal(): Promise<void> {
-  if (state.isLocked) return;
   el('catalog-modal').classList.remove('hidden');
   await syncOverlayToMain();
   renderCatalog();
@@ -571,13 +870,19 @@ async function closeCatalogModal(): Promise<void> {
   await syncOverlayToMain();
 }
 
-async function openEditModalForTemplate(svc: CatalogService, existingCount: number): Promise<void> {
+async function openEditModalForTemplate(
+  svc: CatalogService,
+  existingCount: number,
+  suggestedAccountLabel?: string
+): Promise<void> {
   state.editingMode = 'create';
   state.editingInstanceId = null;
   state.editingTemplate = svc;
 
   el<HTMLHeadingElement>('edit-modal-title').textContent = `${svc.name} を詳細追加`;
-  el<HTMLInputElement>('edit-name').value = existingCount > 0 ? `${svc.name} (${existingCount + 1})` : svc.name;
+  el<HTMLInputElement>('edit-account-label').value =
+    suggestedAccountLabel ?? (existingCount > 0 ? `アカウント ${existingCount + 1}` : 'メイン');
+  el<HTMLInputElement>('edit-name').value = svc.name;
   el<HTMLInputElement>('edit-url').value = svc.url;
   el<HTMLSelectElement>('edit-ua').value = svc.defaultUa;
   el<HTMLInputElement>('edit-color').value = svc.color;
@@ -585,15 +890,30 @@ async function openEditModalForTemplate(svc: CatalogService, existingCount: numb
 
   el('edit-modal').classList.remove('hidden');
   await syncOverlayToMain();
-  el<HTMLInputElement>('edit-name').focus();
+  const accInput = el<HTMLInputElement>('edit-account-label');
+  accInput.focus();
+  accInput.select();
 }
 
-async function openEditModalForExisting(inst: ServiceInstance): Promise<void> {
+async function openEditModalForExisting(
+  inst: ServiceInstance,
+  focusAccountLabel = true
+): Promise<void> {
   state.editingMode = 'edit';
   state.editingInstanceId = inst.instanceId;
   state.editingTemplate = null;
 
-  el<HTMLHeadingElement>('edit-modal-title').textContent = `「${inst.name}」の設定`;
+  const group = getServiceGroups().find((g) => g.key === getServiceGroupKey(inst));
+  const siblingIdx = group
+    ? Math.max(
+        0,
+        group.accounts.findIndex((a) => a.instanceId === inst.instanceId)
+      )
+    : 0;
+  const currentLabel = getAccountDisplayLabel(inst, siblingIdx, group?.displayName);
+
+  el<HTMLHeadingElement>('edit-modal-title').textContent = `「${group?.displayName ?? inst.name} · ${currentLabel}」の設定`;
+  el<HTMLInputElement>('edit-account-label').value = currentLabel;
   el<HTMLInputElement>('edit-name').value = inst.name;
   el<HTMLInputElement>('edit-url').value = inst.url;
   el<HTMLSelectElement>('edit-ua').value = inst.uaMode;
@@ -602,7 +922,9 @@ async function openEditModalForExisting(inst: ServiceInstance): Promise<void> {
 
   el('edit-modal').classList.remove('hidden');
   await syncOverlayToMain();
-  el<HTMLInputElement>('edit-name').focus();
+  const focusEl = el<HTMLInputElement>(focusAccountLabel ? 'edit-account-label' : 'edit-name');
+  focusEl.focus();
+  focusEl.select();
 }
 
 async function closeEditModal(): Promise<void> {
@@ -614,13 +936,12 @@ async function closeEditModal(): Promise<void> {
 }
 
 async function openSettingsModal(): Promise<void> {
-  if (!state.config || state.isLocked) return;
+  if (!state.config) return;
   const s = state.config.settings;
   el<HTMLSelectElement>('setting-theme').value = s.theme;
   el<HTMLInputElement>('setting-minimize-tray').checked = s.minimizeToTray;
   el<HTMLInputElement>('setting-sidebar-width').value = String(s.sidebarWidth);
   el<HTMLSpanElement>('setting-sidebar-width-val').textContent = String(s.sidebarWidth);
-  el<HTMLInputElement>('setting-lock-pin').value = s.lockPin;
 
   el('settings-modal').classList.remove('hidden');
   await syncOverlayToMain();
@@ -632,7 +953,7 @@ async function closeSettingsModal(): Promise<void> {
 }
 
 async function openGestureModal(): Promise<void> {
-  if (!state.config || state.isLocked || !gestureModal) return;
+  if (!state.config || !gestureModal) return;
   gestureModal.open(state.config.settings.gesture);
   await syncOverlayToMain();
 }
@@ -732,11 +1053,12 @@ function renderTabBar(): void {
 }
 
 function renderAll(): void {
+  recordLastActiveForCurrent();
   applyThemeAndLayout();
   renderSidebar();
+  renderAccountBar();
   renderToolbarAndViewport();
   renderTabBar();
-  renderLockOverlay();
   if (state.config?.settings.gesture) {
     gestureModal?.syncSettings(state.config.settings.gesture);
   }
@@ -754,12 +1076,12 @@ function bindEvents(): void {
 
   el<HTMLButtonElement>('btn-open-catalog').addEventListener('click', () => void openCatalogModal());
   el<HTMLButtonElement>('btn-empty-add').addEventListener('click', () => void openCatalogModal());
-
-  el<HTMLButtonElement>('btn-lock-app').addEventListener('click', async () => {
-    await omniApi.setLocked(true);
-  });
-
   el<HTMLButtonElement>('btn-open-settings').addEventListener('click', () => void openSettingsModal());
+
+  // Header account switcher add button
+  el<HTMLButtonElement>('btn-add-account').addEventListener('click', () => {
+    void addAccountForActiveService();
+  });
 
   // Toolbar actions
   const runActiveAction = async (action: string) => {
@@ -788,18 +1110,20 @@ function bindEvents(): void {
   el<HTMLButtonElement>('btn-sleep-tab').addEventListener('click', async () => {
     const active = getActiveInstance();
     if (!active) return;
+    const title = getActiveDisplayTitle();
     await omniApi.tabAction(active.instanceId, 'sleep');
-    showToast(`「${active.name}」を休止しました（メモリ解放）`);
+    showToast(`「${title}」を休止しました（メモリ解放）`);
   });
   el<HTMLButtonElement>('btn-clear-session').addEventListener('click', async () => {
     const active = getActiveInstance();
     if (!active) return;
+    const title = getActiveDisplayTitle();
     const ok = window.confirm(
-      `「${active.name}」のCookie・ログイン情報・キャッシュをすべて削除しますか？\n（他のサービスには影響しません）`
+      `「${title}」のCookie・ログイン情報・キャッシュをすべて削除しますか？\n（他のアカウント・サービスには影響しません）`
     );
     if (!ok) return;
     await omniApi.tabAction(active.instanceId, 'clear-session');
-    showToast(`「${active.name}」のセッションを初期化しました`);
+    showToast(`「${title}」のセッションを初期化しました`);
   });
   el<HTMLButtonElement>('btn-gesture-settings').addEventListener('click', () => void openGestureModal());
   el<HTMLButtonElement>('btn-devtools').addEventListener('click', () => void runActiveAction('devtools'));
@@ -884,6 +1208,7 @@ function bindEvents(): void {
     await addServiceAndCloseCatalog({
       serviceId: 'custom',
       name: name || 'カスタムSNS',
+      accountLabel: 'メイン',
       category,
       url: normalized,
       color,
@@ -898,6 +1223,7 @@ function bindEvents(): void {
   el<HTMLButtonElement>('btn-cancel-edit').addEventListener('click', () => void closeEditModal());
   el<HTMLFormElement>('edit-service-form').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const accountLabel = el<HTMLInputElement>('edit-account-label').value.trim();
     const name = el<HTMLInputElement>('edit-name').value.trim();
     const normalized = normalizeServiceUrl(el<HTMLInputElement>('edit-url').value);
     if (!normalized) {
@@ -913,6 +1239,7 @@ function bindEvents(): void {
       await addServiceAndCloseCatalog({
         serviceId: tpl.id,
         name: name || tpl.name,
+        accountLabel: accountLabel || 'メイン',
         category: tpl.category,
         url: normalized,
         color,
@@ -924,6 +1251,7 @@ function bindEvents(): void {
       const existing = state.config?.instances.find((x) => x.instanceId === targetId);
       await omniApi.updateTab(targetId, {
         name: name || existing?.name || 'SNS',
+        accountLabel,
         url: normalized,
         color,
         notificationsEnabled
@@ -932,7 +1260,7 @@ function bindEvents(): void {
         await omniApi.tabAction(targetId, 'toggle-ua');
       }
       await closeEditModal();
-      showToast('サービス設定を保存しました');
+      showToast('アカウント・サービス設定を保存しました');
     }
   });
 
@@ -946,24 +1274,10 @@ function bindEvents(): void {
     await omniApi.updateSettings({
       theme: el<HTMLSelectElement>('setting-theme').value as 'dark' | 'light',
       minimizeToTray: el<HTMLInputElement>('setting-minimize-tray').checked,
-      sidebarWidth: Number(el<HTMLInputElement>('setting-sidebar-width').value),
-      lockPin: el<HTMLInputElement>('setting-lock-pin').value
+      sidebarWidth: Number(el<HTMLInputElement>('setting-sidebar-width').value)
     });
     await closeSettingsModal();
     showToast('アプリ設定を保存しました');
-  });
-
-  // Unlock form
-  el<HTMLFormElement>('unlock-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const pin = el<HTMLInputElement>('unlock-pin-input').value;
-    const res = await omniApi.setLocked(false, pin);
-    if (!res.ok) {
-      const errEl = el<HTMLDivElement>('unlock-error');
-      errEl.textContent = res.error || '解除に失敗しました';
-      errEl.classList.remove('hidden');
-      el<HTMLInputElement>('unlock-pin-input').select();
-    }
   });
 
   // Global keyboard shortcuts inside shell UI
@@ -987,14 +1301,28 @@ function bindEvents(): void {
     if (!ctrl) return;
     const key = e.key.toLowerCase();
 
-    if (e.shiftKey && key === 'l') {
+    // Ctrl + Alt + 1..9 -> 同一SNS内のアカウント切替
+    if (!e.shiftKey && e.altKey && /^[1-9]$/.test(key)) {
       e.preventDefault();
-      if (!state.isLocked) {
-        void omniApi.setLocked(true);
-      } else if (!state.config?.settings.lockPin) {
-        void omniApi.setLocked(false);
-      } else {
-        el<HTMLInputElement>('unlock-pin-input').focus();
+      const idx = Number(key) - 1;
+      const group = getActiveGroup();
+      const target = group?.accounts[idx];
+      if (target) {
+        void omniApi.activateTab(target.instanceId);
+      }
+      return;
+    }
+
+    // Ctrl + Alt + ArrowLeft / ArrowRight -> 同一SNS内の前/次アカウント切替
+    if (!e.shiftKey && e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault();
+      const active = getActiveInstance();
+      const group = getActiveGroup();
+      if (active && group && group.accounts.length >= 2) {
+        const curIdx = group.accounts.findIndex((a) => a.instanceId === active.instanceId);
+        const delta = e.key === 'ArrowLeft' ? -1 : 1;
+        const nextIdx = (curIdx + delta + group.accounts.length) % group.accounts.length;
+        void omniApi.activateTab(group.accounts[nextIdx].instanceId);
       }
       return;
     }
@@ -1050,9 +1378,9 @@ function bindEvents(): void {
     if (!e.shiftKey && !e.altKey && /^[1-9]$/.test(key)) {
       e.preventDefault();
       const idx = Number(key) - 1;
-      const visible = getVisibleInstances();
-      if (visible[idx]) {
-        void omniApi.activateTab(visible[idx].instanceId);
+      const visibleGroups = getVisibleServiceGroups();
+      if (visibleGroups[idx]) {
+        void activateGroup(visibleGroups[idx]);
       }
     }
   });
@@ -1067,7 +1395,6 @@ async function bootstrap(): Promise<void> {
 
   omniApi.onStateUpdated((payload) => {
     state.config = payload.config;
-    state.isLocked = payload.isLocked;
     state.closedTabsCount = payload.closedTabsCount ?? 0;
     state.runtimeMap = new Map(payload.runtimeStates.map((rt) => [rt.instanceId, rt]));
     renderAll();
@@ -1076,6 +1403,7 @@ async function bootstrap(): Promise<void> {
   omniApi.onRuntimeUpdated((rt) => {
     state.runtimeMap.set(rt.instanceId, rt);
     renderSidebar();
+    renderAccountBar();
     renderToolbarAndViewport();
     renderTabBar();
   });
@@ -1086,13 +1414,11 @@ async function bootstrap(): Promise<void> {
     } else if (payload.action === 'open-gesture-settings') {
       void openGestureModal();
     } else if (payload.action === 'switch-tab' && typeof payload.payload === 'number') {
-      const visible = getVisibleInstances();
-      const target = visible[payload.payload];
+      const visibleGroups = getVisibleServiceGroups();
+      const target = visibleGroups[payload.payload];
       if (target) {
-        void omniApi.activateTab(target.instanceId);
+        void activateGroup(target);
       }
-    } else if (payload.action === 'focus-pin') {
-      el<HTMLInputElement>('unlock-pin-input').focus();
     }
   });
 
@@ -1100,7 +1426,6 @@ async function bootstrap(): Promise<void> {
   state.config = data.config;
   state.catalog = data.catalog;
   state.categories = data.categories;
-  state.isLocked = data.isLocked;
   state.closedTabsCount = data.closedTabsCount ?? 0;
   state.runtimeMap = new Map(data.runtimeStates.map((rt) => [rt.instanceId, rt]));
 

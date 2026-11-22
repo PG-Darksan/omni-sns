@@ -69,7 +69,6 @@ class CatalogService {
       'whatsapp',
       'snapchat',
       'mixi2',
-      'tokyo-calendar-date',
       'google-messages',
     };
     if (desktopRequiredIds.contains(id)) {
@@ -105,6 +104,7 @@ class ServiceInstance {
     required this.instanceId,
     required this.serviceId,
     required this.name,
+    this.accountLabel,
     required this.category,
     required this.url,
     required this.colorHex,
@@ -117,6 +117,7 @@ class ServiceInstance {
   final String instanceId;
   final String serviceId;
   final String name;
+  final String? accountLabel;
   final String category;
   final String url;
   final String colorHex;
@@ -127,6 +128,8 @@ class ServiceInstance {
 
   ServiceInstance copyWith({
     String? name,
+    String? accountLabel,
+    bool clearAccountLabel = false,
     String? url,
     String? colorHex,
     String? badge,
@@ -138,6 +141,8 @@ class ServiceInstance {
       instanceId: instanceId,
       serviceId: serviceId,
       name: name ?? this.name,
+      accountLabel:
+          clearAccountLabel ? null : (accountLabel ?? this.accountLabel),
       category: category,
       url: url ?? this.url,
       colorHex: colorHex ?? this.colorHex,
@@ -153,6 +158,8 @@ class ServiceInstance {
       'instanceId': instanceId,
       'serviceId': serviceId,
       'name': name,
+      if (accountLabel != null && accountLabel!.trim().isNotEmpty)
+        'accountLabel': accountLabel!.trim(),
       'category': category,
       'url': url,
       'colorHex': colorHex,
@@ -166,10 +173,12 @@ class ServiceInstance {
   factory ServiceInstance.fromJson(Map<String, dynamic> json, int index) {
     final name = (json['name'] as String?)?.trim();
     final safeName = (name == null || name.isEmpty) ? 'SNS' : name;
+    final rawLabel = (json['accountLabel'] as String?)?.trim();
     return ServiceInstance(
       instanceId: json['instanceId'] as String? ?? 'svc-$index',
       serviceId: json['serviceId'] as String? ?? 'custom',
       name: safeName,
+      accountLabel: (rawLabel == null || rawLabel.isEmpty) ? null : rawLabel,
       category: json['category'] as String? ?? 'custom',
       url: normalizeServiceUrl(json['url'] as String? ?? '') ??
           'https://example.com/',
@@ -185,23 +194,19 @@ class ServiceInstance {
 class AppSettings {
   const AppSettings({
     this.isDarkMode = true,
-    this.lockPin = '',
     this.activeInstanceId,
   });
 
   final bool isDarkMode;
-  final String lockPin;
   final String? activeInstanceId;
 
   AppSettings copyWith({
     bool? isDarkMode,
-    String? lockPin,
     String? activeInstanceId,
     bool clearActive = false,
   }) {
     return AppSettings(
       isDarkMode: isDarkMode ?? this.isDarkMode,
-      lockPin: lockPin ?? this.lockPin,
       activeInstanceId:
           clearActive ? null : (activeInstanceId ?? this.activeInstanceId),
     );
@@ -210,7 +215,6 @@ class AppSettings {
   Map<String, dynamic> toJson() {
     return {
       'isDarkMode': isDarkMode,
-      'lockPin': lockPin,
       'activeInstanceId': activeInstanceId,
     };
   }
@@ -218,7 +222,6 @@ class AppSettings {
   factory AppSettings.fromJson(Map<String, dynamic> json) {
     return AppSettings(
       isDarkMode: json['isDarkMode'] as bool? ?? true,
-      lockPin: json['lockPin'] as String? ?? '',
       activeInstanceId: json['activeInstanceId'] as String?,
     );
   }
@@ -349,4 +352,60 @@ Color parseHexColor(String hex) {
     if (val != null) return Color(val);
   }
   return const Color(0xFF3B82F6);
+}
+
+/// 同一SNSをグルーピングするためのキーを返す。
+String serviceGroupKey(ServiceInstance inst) {
+  final sid = inst.serviceId.trim();
+  if (sid.isNotEmpty && sid != 'custom') {
+    return sid;
+  }
+  final parsed = Uri.tryParse(inst.url);
+  if (parsed != null && parsed.host.isNotEmpty) {
+    return 'custom:${parsed.host.toLowerCase()}';
+  }
+  return 'custom:${inst.instanceId}';
+}
+
+/// 同一SNS内でのアカウント表示名（ヘッダー切替チップ用）を返す。
+String accountDisplayLabel(
+  ServiceInstance inst,
+  int siblingIndex, {
+  String? baseServiceName,
+}) {
+  final explicit = inst.accountLabel?.trim();
+  if (explicit != null && explicit.isNotEmpty) return explicit;
+
+  final rawName = inst.name.trim();
+  final base = baseServiceName?.trim();
+  if (base != null && base.isNotEmpty && rawName.isNotEmpty) {
+    if (rawName == base) {
+      return siblingIndex == 0 ? 'メイン' : 'アカウント ${siblingIndex + 1}';
+    }
+    if (rawName.startsWith(base)) {
+      final rest = rawName.substring(base.length).trim();
+      final numMatch = RegExp(r'^\((\d+)\)$').firstMatch(rest);
+      if (numMatch != null) {
+        return 'アカウント ${numMatch.group(1)}';
+      }
+      final cleaned = rest.replaceFirst(RegExp(r'^[-–—・:/／\s]+'), '').trim();
+      if (cleaned.isNotEmpty) return cleaned;
+    }
+    return rawName;
+  }
+  return siblingIndex == 0 ? 'メイン' : 'アカウント ${siblingIndex + 1}';
+}
+
+/// 既存アカウント名と重複しない次の既定アカウント名を返す。
+String nextDefaultAccountLabel(Iterable<String> existingLabels) {
+  final used = existingLabels
+      .map((s) => s.trim())
+      .where((s) => s.isNotEmpty)
+      .toSet();
+  if (used.isEmpty) return 'メイン';
+  var n = used.length + 1;
+  while (used.contains('アカウント $n')) {
+    n += 1;
+  }
+  return 'アカウント $n';
 }

@@ -38,17 +38,13 @@
       <div id="service-list" class="service-list" role="tablist" aria-label="登録済みSNS一覧"></div>
 
       <div class="sidebar-footer">
-        <button id="btn-open-catalog" class="btn-primary btn-full" title="全60種＋カスタム追加 (Ctrl+K)">
+        <button id="btn-open-catalog" class="btn-primary btn-full" title="全44種＋カスタム追加 (Ctrl+K)">
           ＋ サービスを追加
         </button>
         <div class="sidebar-footer-actions">
-          <button id="btn-lock-app" class="btn-icon-label" title="プライバシーロック (Ctrl+Shift+L)" aria-label="プライバシーロック">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-            <span>ロック</span>
-          </button>
           <button id="btn-open-settings" class="btn-icon-label" title="アプリ設定" aria-label="アプリ設定">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-            <span>設定</span>
+            <span>アプリ設定</span>
           </button>
         </div>
       </div>
@@ -56,13 +52,32 @@
 
     <!-- 右メインエリア -->
     <div class="main-area">
-      <!-- トップツールバー (高さ50px固定) -->
+      <!-- 同一SNS アカウント即時切替ヘッダー (高さ40px固定) -->
+      <div id="accountbar" class="accountbar" role="tablist" aria-label="同一SNSのアカウント切替">
+        <div id="accountbar-service" class="accountbar-service">
+          <span id="accountbar-avatar" class="accountbar-avatar">O</span>
+          <span id="accountbar-service-name" class="accountbar-service-name">サービス未選択</span>
+        </div>
+        <div class="accountbar-divider" aria-hidden="true"></div>
+        <div id="account-strip" class="account-strip"></div>
+        <button
+          id="btn-add-account"
+          type="button"
+          class="account-add-btn"
+          title="このSNSに独立セッションの別アカウントを追加"
+          disabled
+        >
+          ＋ アカウント追加
+        </button>
+      </div>
+
+      <!-- トップツールバー (高さ44px固定) -->
       <header id="toolbar" class="toolbar">
         <div class="toolbar-nav">
           <button id="btn-back" class="tool-btn" title="戻る" disabled>←</button>
           <button id="btn-forward" class="tool-btn" title="進む" disabled>→</button>
           <button id="btn-reload" class="tool-btn" title="再読み込み (Shift+クリックでスーパーリロード)">↻</button>
-          <button id="btn-home" class="tool-btn" title="このサービスのDM/ホーム画面へ戻る">⌂</button>
+          <button id="btn-home" class="tool-btn" title="このアカウントのDM/ホーム画面へ戻る">⌂</button>
         </div>
 
         <div class="toolbar-address">
@@ -97,7 +112,7 @@
         </div>
       </header>
 
-      <!-- マルチタブバー (高さ36px固定: 現在のSNS内で複数タブ切替・追加・複製・削除・復元) -->
+      <!-- マルチタブバー (高さ34px固定: 現在のアカウント内で複数タブ切替・追加・複製・削除・復元) -->
       <div id="tabbar" class="tabbar" role="tablist" aria-label="ブラウザタブ一覧">
         <div id="tab-strip" class="tab-strip"></div>
         <button id="btn-new-subtab" class="tabbar-btn" title="新しいタブを開く (Ctrl+T)">＋</button>
@@ -115,7 +130,7 @@
       <main id="viewport" class="viewport">
         <div id="empty-state" class="viewport-placeholder hidden">
           <h2>サービスを追加して始めましょう</h2>
-          <p>Instagram・Threads・Bluesky・mixi2・Discord・Pairsなど全60種のサービスを、すべて独立セッションでまとめて使えます。</p>
+          <p>Instagram・Threads・Bluesky・mixi2・Discord・Tinderなど無料メッセージ対応の全44種を、すべて独立セッション＆ヘッダーのアカウント即時切替でまとめて使えます。</p>
           <button id="btn-empty-add" class="btn-primary">＋ カタログから追加 (Ctrl+K)</button>
         </div>
 
@@ -145,7 +160,7 @@
       <div class="modal-header">
         <div>
           <h2 id="catalog-title">サービス カタログ</h2>
-          <p class="modal-subtitle">WebブラウザからDM・メッセージ送信できる全サービスを収録。同じサービスの複数アカウント追加も可能です。</p>
+          <p class="modal-subtitle">無料プランでWebブラウザからDM・メッセージ送信できる全サービスを収録。同一SNSの複数アカウントはヘッダーから瞬時に切り替えられます。</p>
         </div>
         <button id="btn-close-catalog" class="btn-icon" aria-label="閉じる">✕</button>
       </div>
@@ -155,7 +170,7 @@
           id="catalog-search"
           type="search"
           class="input-field"
-          placeholder="サービス名・キーワードで検索（例: Pairs, Tinder, mixi2, Instagram, SMS...）"
+          placeholder="サービス名・キーワードで検索（例: Instagram, Discord, Tinder, mixi2, SMS...）"
           autocomplete="off"
         />
       </div>
@@ -184,9 +199,7 @@
                 <option value="custom">カスタム追加</option>
                 <option value="major-sns">メジャーSNS</option>
                 <option value="messaging">チャット・メッセージ</option>
-                <option value="matching-jp">国内マッチング・婚活</option>
-                <option value="matching-global">海外マッチング</option>
-                <option value="matching-dating">国内メッセージ・出会い系</option>
+                <option value="matching-global">マッチング</option>
                 <option value="business-creative">ビジネス・創作・趣味</option>
               </select>
             </label>
@@ -219,7 +232,11 @@
       </div>
       <form id="edit-service-form" class="modal-form">
         <label class="form-field">
-          <span>表示名（マルチアカウント識別用）</span>
+          <span>アカウント名（ヘッダー切替タブの表示名）</span>
+          <input id="edit-account-label" type="text" class="input-field" placeholder="例: メイン / サブ / 仕事用" />
+        </label>
+        <label class="form-field">
+          <span>サービス表示名</span>
           <input id="edit-name" type="text" class="input-field" required />
         </label>
         <label class="form-field">
@@ -284,23 +301,15 @@
           <input id="setting-sidebar-width" type="range" min="190" max="340" step="4" value="248" />
         </div>
 
-        <div class="setting-row">
-          <div>
-            <div class="setting-label">プライバシーロック用PIN（任意）</div>
-            <div class="setting-desc">空欄ならワンクリックでロック解除。設定すると解除時にPIN入力を求めます</div>
-          </div>
-          <input id="setting-lock-pin" type="password" class="input-field input-narrow" placeholder="未設定" maxlength="16" />
-        </div>
-
         <div class="shortcut-box">
           <h3>キーボードショートカット &amp; ジェスチャー</h3>
           <ul>
-            <li><kbd>右ドラッグ</kbd> : マウスジェスチャー（タブ切替・追加・削除・連続スクロール等）</li>
+            <li><kbd>右ドラッグ</kbd> : マウスジェスチャー（タブ切替・アカウント切替・連続スクロール等）</li>
+            <li><kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> / <kbd>←</kbd> <kbd>→</kbd> : 同一SNS内のアカウントを瞬時に切り替え</li>
             <li><kbd>Ctrl</kbd> + <kbd>T</kbd> / <kbd>W</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> : 新しいタブ / タブを閉じる / 閉じたタブを復元</li>
             <li><kbd>Ctrl</kbd> + <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> : 次 / 前のタブへ切り替え</li>
             <li><kbd>Ctrl</kbd> + <kbd>K</kbd> : サービス カタログを開く</li>
-            <li><kbd>Ctrl</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> : 登録済みサービスを素早く切り替え</li>
-            <li><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>L</kbd> : プライバシーロック（全画面即時隠蔽）</li>
+            <li><kbd>Ctrl</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> : 登録済みSNSを素早く切り替え</li>
           </ul>
         </div>
       </div>
@@ -393,26 +402,6 @@
           </div>
         </div>
       </div>
-    </div>
-  </div>
-
-  <!-- プライバシーロック画面 -->
-  <div id="lock-overlay" class="lock-overlay hidden" role="dialog" aria-modal="true">
-    <div class="lock-card">
-      <div class="lock-icon">🔒</div>
-      <h2>OmniSNS はロック中です</h2>
-      <p>すべてのサービス画面を非表示にしています。</p>
-      <form id="unlock-form" class="unlock-form">
-        <input
-          id="unlock-pin-input"
-          type="password"
-          class="input-field hidden"
-          placeholder="PINコードを入力..."
-          autocomplete="off"
-        />
-        <div id="unlock-error" class="unlock-error hidden"></div>
-        <button type="submit" class="btn-primary btn-full">ロックを解除する</button>
-      </form>
     </div>
   </div>
 

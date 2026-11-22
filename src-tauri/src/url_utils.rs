@@ -173,7 +173,6 @@ const AUTH_EXACT_OR_SUBDOMAIN_HOSTS: &[&str] = &[
     "github.com",
     "discord.com",
     "id.mixi.social",
-    "id.pairs.lv",
 ];
 
 const AUTH_HOST_LABELS: &[&str] = &["auth", "sso", "oauth", "login", "signin"];
@@ -302,6 +301,23 @@ pub fn make_badge_text(name: &str) -> String {
     cleaned.chars().take(2).collect::<String>().to_uppercase()
 }
 
+/// 同一SNSをグルーピングするためのキーを返す。
+/// カタログ登録サービスは service_id で束ね、カスタムサービスはホスト名単位で束ねる。
+pub fn service_group_key(service_id: &str, url: &str, instance_id: &str) -> String {
+    let sid = service_id.trim();
+    if !sid.is_empty() && sid != "custom" {
+        return sid.to_string();
+    }
+    if let Ok(parsed) = Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            if !host.is_empty() {
+                return format!("custom:{}", host.to_ascii_lowercase());
+            }
+        }
+    }
+    format!("custom:{instance_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,12 +337,12 @@ mod tests {
     #[test]
     fn normalize_urls() {
         assert_eq!(
-            normalize_service_url("x.com/messages").as_deref(),
-            Some("https://x.com/messages")
+            normalize_service_url("bsky.app/messages").as_deref(),
+            Some("https://bsky.app/messages")
         );
         assert_eq!(
-            normalize_service_url("https://pairs.lv/").as_deref(),
-            Some("https://pairs.lv/")
+            normalize_service_url("https://tinder.com/").as_deref(),
+            Some("https://tinder.com/")
         );
         assert_eq!(normalize_service_url("javascript:alert(1)"), None);
         assert_eq!(normalize_service_url("file:///C:/Windows/System32"), None);
@@ -335,7 +351,7 @@ mod tests {
 
     #[test]
     fn parse_unread_titles() {
-        assert_eq!(parse_unread_count_from_title("(3) X / Messages"), 3);
+        assert_eq!(parse_unread_count_from_title("(3) Bluesky / Messages"), 3);
         assert_eq!(parse_unread_count_from_title("(99+) Instagram"), 99);
         assert_eq!(parse_unread_count_from_title("[12] Discord"), 12);
         assert_eq!(parse_unread_count_from_title("• Slack - general"), 1);
@@ -347,23 +363,23 @@ mod tests {
     fn popup_detection() {
         assert!(should_open_in_app_popup(
             "https://accounts.google.com/o/oauth2/auth",
-            "https://pairs.lv/"
-        ));
-        assert!(should_open_in_app_popup(
-            "https://access.line.me/oauth2/v2.1/authorize",
-            "https://with.is/"
-        ));
-        assert!(should_open_in_app_popup(
-            "https://appleid.apple.com/auth/authorize",
             "https://tinder.com/"
         ));
         assert!(should_open_in_app_popup(
-            "https://sub.pairs.lv/verify",
-            "https://pairs.lv/"
+            "https://access.line.me/oauth2/v2.1/authorize",
+            "https://mixi.social/"
+        ));
+        assert!(should_open_in_app_popup(
+            "https://appleid.apple.com/auth/authorize",
+            "https://bumble.com/app"
+        ));
+        assert!(should_open_in_app_popup(
+            "https://sub.instagram.com/verify",
+            "https://www.instagram.com/direct/inbox/"
         ));
         assert!(!should_open_in_app_popup(
             "https://news.yahoo.co.jp/articles/123",
-            "https://x.com/messages"
+            "https://bsky.app/messages"
         ));
     }
 
@@ -371,6 +387,26 @@ mod tests {
     fn badge_generation() {
         assert_eq!(make_badge_text("Bluesky"), "BL");
         assert_eq!(make_badge_text("Steam Chat"), "SC");
-        assert_eq!(make_badge_text("ハッピーメール"), "ハッ");
+        assert_eq!(make_badge_text("ミクシィ"), "ミク");
+    }
+
+    #[test]
+    fn service_group_key_groups_catalog_and_custom_hosts() {
+        assert_eq!(
+            service_group_key("instagram", "https://www.instagram.com/direct/inbox/", "svc-1"),
+            "instagram"
+        );
+        assert_eq!(
+            service_group_key("custom", "https://Chat.Example.com/room", "svc-1"),
+            "custom:chat.example.com"
+        );
+        assert_eq!(
+            service_group_key("custom", "https://chat.example.com/dm", "svc-2"),
+            "custom:chat.example.com"
+        );
+        assert_ne!(
+            service_group_key("custom", "https://other.example.org/", "svc-3"),
+            "custom:chat.example.com"
+        );
     }
 }

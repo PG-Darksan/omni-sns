@@ -17,6 +17,34 @@ class AppStore {
   static const _instancesKey = 'omnisns_instances_v1';
   static const _settingsKey = 'omnisns_settings_v1';
 
+  static const Set<String> _removedServiceIds = {
+    'x',
+    'pairs',
+    'with',
+    'tapple',
+    'omiai',
+    'marrish',
+    'ange',
+    'youbride',
+    'bridalnet',
+    'tokyo-calendar-date',
+    'match',
+    'grindr',
+    'happymail',
+    'wakuwaku',
+    'pcmax',
+    'ikukuru',
+    'meetup',
+  };
+
+  static bool _isRemovedService(ServiceInstance inst) {
+    if (_removedServiceIds.contains(inst.serviceId)) return true;
+    for (final id in _removedServiceIds) {
+      if (inst.instanceId == 'svc-$id-default') return true;
+    }
+    return false;
+  }
+
   Future<CatalogData> loadCatalog() async {
     final raw = await rootBundle.loadString('assets/catalog.json');
     final decoded = jsonDecode(raw) as Map<String, dynamic>;
@@ -40,6 +68,7 @@ class AppStore {
         instanceId: 'svc-${svc.id}-default',
         serviceId: svc.id,
         name: svc.name,
+        accountLabel: 'メイン',
         category: svc.category,
         url: svc.url,
         colorHex: svc.colorHex,
@@ -68,7 +97,7 @@ class AppStore {
             idx,
           ),
         )
-            .where((i) => i.serviceId != 'x' && i.instanceId != 'svc-x-default')
+            .where((i) => !_isRemovedService(i))
             .toList()
           ..sort((a, b) => a.order.compareTo(b.order));
       } catch (_) {

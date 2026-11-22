@@ -53,9 +53,14 @@ function main() {
   fs.copyFileSync(portableSrc, portableDst);
 
   const nsisDir = path.join(targetReleaseDir, 'bundle', 'nsis');
-  const nsisExe = fs
+  const nsisCandidates = fs
     .readdirSync(nsisDir)
-    .find((name) => name.toLowerCase().endsWith('.exe'));
+    .filter((name) => name.toLowerCase().endsWith('.exe'));
+  const nsisExe =
+    nsisCandidates.find((name) => name.includes(`_${version}_`) || name.includes(`-${version}-`)) ??
+    nsisCandidates
+      .map((name) => ({ name, mtime: fs.statSync(path.join(nsisDir, name)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime)[0]?.name;
   if (!nsisExe) {
     throw new Error(`Expected NSIS installer not found in: ${nsisDir}`);
   }

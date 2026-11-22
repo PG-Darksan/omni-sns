@@ -5,6 +5,7 @@ class NewInstanceRequest {
   const NewInstanceRequest({
     required this.serviceId,
     required this.name,
+    this.accountLabel,
     required this.category,
     required this.url,
     required this.colorHex,
@@ -14,6 +15,7 @@ class NewInstanceRequest {
 
   final String serviceId;
   final String name;
+  final String? accountLabel;
   final String category;
   final String url;
   final String colorHex;
@@ -57,10 +59,25 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return widget.existingInstances.where((i) => i.serviceId == serviceId).length;
   }
 
-  Future<void> _openDetailedAddDialog(CatalogService svc, int existingCount) async {
-    final nameCtrl = TextEditingController(
-      text: existingCount > 0 ? '${svc.name} (${existingCount + 1})' : svc.name,
+  String _nextAccountLabelFor(CatalogService svc) {
+    final existing = widget.existingInstances
+        .where((i) => i.serviceId == svc.id)
+        .toList();
+    final labels = List.generate(
+      existing.length,
+      (idx) => accountDisplayLabel(
+        existing[idx],
+        idx,
+        baseServiceName: svc.name,
+      ),
     );
+    return nextDefaultAccountLabel(labels);
+  }
+
+  Future<void> _openDetailedAddDialog(CatalogService svc, int existingCount) async {
+    final suggestedLabel = _nextAccountLabelFor(svc);
+    final accountCtrl = TextEditingController(text: suggestedLabel);
+    final nameCtrl = TextEditingController(text: svc.name);
     final urlCtrl = TextEditingController(text: svc.url);
     var uaMode = svc.recommendedAndroidUa;
 
@@ -76,9 +93,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     TextField(
+                      controller: accountCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'アカウント名（ヘッダー表示名）',
+                        hintText: '例: メイン / サブ / 仕事用',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
                       controller: nameCtrl,
                       decoration: const InputDecoration(
-                        labelText: '表示名',
+                        labelText: 'サービス表示名',
                         border: OutlineInputBorder(),
                       ),
                     ),
@@ -133,10 +159,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
                     }
                     final finalName =
                         nameCtrl.text.trim().isEmpty ? svc.name : nameCtrl.text.trim();
+                    final finalAcc = accountCtrl.text.trim().isEmpty
+                        ? suggestedLabel
+                        : accountCtrl.text.trim();
                     Navigator.of(ctx).pop(
                       NewInstanceRequest(
                         serviceId: svc.id,
                         name: finalName,
+                        accountLabel: finalAcc,
                         category: svc.category,
                         url: normalized,
                         colorHex: svc.colorHex,
@@ -154,6 +184,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       },
     );
 
+    accountCtrl.dispose();
     nameCtrl.dispose();
     urlCtrl.dispose();
 
@@ -180,6 +211,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       NewInstanceRequest(
         serviceId: 'custom',
         name: name,
+        accountLabel: 'メイン',
         category: _customCategory,
         url: normalized,
         colorHex: '#3B82F6',
@@ -216,7 +248,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
             child: TextField(
               decoration: InputDecoration(
-                hintText: 'サービス名・別名で検索 (例: Pairs, Tinder, mixi2, SMS...)',
+                hintText: 'サービス名・別名で検索 (例: Instagram, Discord, Tinder, mixi2, SMS...)',
                 prefixIcon: const Icon(Icons.search),
                 isDense: true,
                 border: OutlineInputBorder(
@@ -411,13 +443,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                               _openDetailedAddDialog(svc, count);
                                               return;
                                             }
-                                            final label = count > 0
-                                                ? '${svc.name} (${count + 1})'
-                                                : svc.name;
+                                            final accLabel = _nextAccountLabelFor(svc);
                                             Navigator.of(context).pop(
                                               NewInstanceRequest(
                                                 serviceId: svc.id,
-                                                name: label,
+                                                name: svc.name,
+                                                accountLabel: accLabel,
                                                 category: svc.category,
                                                 url: svc.url,
                                                 colorHex: svc.colorHex,
@@ -427,7 +458,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                             );
                                           },
                                           child: Text(
-                                            count > 0 ? '＋ 別枠で追加' : '＋ 追加して開く',
+                                            count > 0 ? '＋ 別アカウント追加' : '＋ 追加して開く',
                                           ),
                                         ),
                                       ),
@@ -494,9 +525,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
             DropdownMenuItem(value: 'custom', child: Text('カスタム追加')),
             DropdownMenuItem(value: 'major-sns', child: Text('メジャーSNS')),
             DropdownMenuItem(value: 'messaging', child: Text('チャット・メッセージ')),
-            DropdownMenuItem(value: 'matching-jp', child: Text('国内マッチング・婚活')),
-            DropdownMenuItem(value: 'matching-global', child: Text('海外マッチング')),
-            DropdownMenuItem(value: 'matching-dating', child: Text('国内メッセージ・出会い系')),
+            DropdownMenuItem(value: 'matching-global', child: Text('マッチング')),
             DropdownMenuItem(value: 'business-creative', child: Text('ビジネス・創作・趣味')),
           ],
           onChanged: (v) {

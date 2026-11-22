@@ -71,10 +71,12 @@ export const ACTION_SECTIONS: ActionSection[] = [
     ]
   },
   {
-    title: 'SNSサービス切替',
+    title: 'SNS・アカウント切替',
     items: [
       { id: 'previous-service', label: '前のSNSサービスへ', badge: '▲' },
       { id: 'next-service', label: '次のSNSサービスへ', badge: '▼' },
+      { id: 'previous-account', label: '前のアカウントへ（同一SNS）', badge: '◁' },
+      { id: 'next-account', label: '次のアカウントへ（同一SNS）', badge: '▷' },
       { id: 'open-catalog', label: 'SNSカタログを開く', badge: '⊞' },
       { id: 'sleep-tab', label: 'このSNSを休止（メモリ解放）', badge: '☾' }
     ]
@@ -88,7 +90,6 @@ export const ACTION_SECTIONS: ActionSection[] = [
       { id: 'zoom-out', label: '縮小', badge: '🔍-' },
       { id: 'zoom-reset', label: 'ズームリセット (100%)', badge: '100%' },
       { id: 'open-external', label: '既定のブラウザで開く', badge: '↗' },
-      { id: 'toggle-lock', label: 'プライバシーロック', badge: '🔒' },
       { id: 'gesture:settings', label: 'ジェスチャー設定を開く', badge: '⚙' }
     ]
   }

@@ -15,12 +15,13 @@ use crate::models::{BrowserTabInfo, ServiceInstance, TabRuntimeState, UpdateSett
 use crate::store::ConfigStore;
 use crate::url_utils::{
     build_user_agent, is_auth_popup_url, is_http_url, is_same_site_url, normalize_service_url,
-    parse_unread_count_from_title,
+    parse_unread_count_from_title, service_group_key,
 };
 
-pub const TOOLBAR_HEIGHT: f64 = 50.0;
-pub const TABBAR_HEIGHT: f64 = 36.0;
-pub const TOP_HEADER_HEIGHT: f64 = TOOLBAR_HEIGHT + TABBAR_HEIGHT;
+pub const ACCOUNTBAR_HEIGHT: f64 = 40.0;
+pub const TOOLBAR_HEIGHT: f64 = 44.0;
+pub const TABBAR_HEIGHT: f64 = 34.0;
+pub const TOP_HEADER_HEIGHT: f64 = ACCOUNTBAR_HEIGHT + TOOLBAR_HEIGHT + TABBAR_HEIGHT;
 const MAX_SUBTABS_PER_SERVICE: usize = 20;
 const MAX_CLOSED_HISTORY: usize = 25;
 
@@ -180,10 +181,10 @@ pub enum ClosedEntry {
 pub struct AppStateInner {
     pub store: ConfigStore,
     pub services: HashMap<String, ServiceTabs>,
+    pub last_active_by_group: HashMap<String, String>,
     pub closed_tabs: Vec<ClosedEntry>,
     pub active_instance_id: Option<String>,
     pub overlay_visible: bool,
-    pub is_locked: bool,
     pub is_quitting: bool,
     pub bootstrapped: bool,
     pub bounds: ContentBounds,
@@ -210,10 +211,10 @@ impl SharedState {
             inner: Arc::new(Mutex::new(AppStateInner {
                 store,
                 services,
+                last_active_by_group: HashMap::new(),
                 closed_tabs: Vec::new(),
                 active_instance_id: None,
                 overlay_visible: false,
-                is_locked: false,
                 is_quitting: false,
                 bootstrapped: false,
                 bounds: ContentBounds {
@@ -305,7 +306,6 @@ pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
                 .map(|t| t.is_sleeping || t.load_error.is_some() || t.webview_label.is_none())
                 .unwrap_or(true);
             let suspended = guard.overlay_visible
-                || guard.is_locked
                 || guard.active_instance_id.is_none()
                 || active_sleeping_or_err;
             (
@@ -343,25 +343,21 @@ pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
 pub fn update_window_title(app: &AppHandle, shared: &SharedState) {
     let title = {
         let guard = shared.inner.lock().unwrap();
-        if guard.is_locked {
-            "OmniSNS".to_string()
+        let mut total: u32 = 0;
+        for inst in guard.store.get_instances() {
+            if !inst.notifications_enabled {
+                continue;
+            }
+            if let Some(svc) = guard.services.get(&inst.instance_id) {
+                for tab in &svc.tabs {
+                    total = total.saturating_add(tab.unread_count);
+                }
+            }
+        }
+        if total > 0 {
+            format!("({total}) OmniSNS")
         } else {
-            let mut total: u32 = 0;
-            for inst in guard.store.get_instances() {
-                if !inst.notifications_enabled {
-                    continue;
-                }
-                if let Some(svc) = guard.services.get(&inst.instance_id) {
-                    for tab in &svc.tabs {
-                        total = total.saturating_add(tab.unread_count);
-                    }
-                }
-            }
-            if total > 0 {
-                format!("({total}) OmniSNS")
-            } else {
-                "OmniSNS".to_string()
-            }
+            "OmniSNS".to_string()
         }
     };
 
@@ -376,7 +372,6 @@ pub fn emit_state_updated(app: &AppHandle, shared: &SharedState) {
         crate::models::StateUpdatedPayload {
             config: guard.store.get_config(),
             runtime_states: SharedState::build_all_runtime_states(&guard),
-            is_locked: guard.is_locked,
             closed_tabs_count: guard.closed_tabs.len(),
         }
     };
@@ -540,7 +535,6 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
             .unwrap_or(false);
 
         let should_hide = guard.overlay_visible
-            || guard.is_locked
             || guard.active_instance_id.is_none()
             || active_has_error;
 
@@ -558,12 +552,7 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
                 }
             }
         }
-        (
-            target,
-            guard.bounds,
-            labels,
-            guard.overlay_visible || guard.is_locked,
-        )
+        (target, guard.bounds, labels, guard.overlay_visible)
     };
 
     for label in all_labels {
@@ -607,6 +596,8 @@ pub fn activate_tab(app: &AppHandle, shared: &SharedState, instance_id: Option<S
             None => None,
             Some(ref id) => {
                 if let Some(inst) = guard.store.get_instance(id) {
+                    let gkey = service_group_key(&inst.service_id, &inst.url, &inst.instance_id);
+                    guard.last_active_by_group.insert(gkey, inst.instance_id.clone());
                     let svc = guard
                         .services
                         .entry(id.clone())
@@ -647,6 +638,8 @@ pub fn activate_subtab(app: &AppHandle, shared: &SharedState, instance_id: &str,
         let Some(inst) = guard.store.get_instance(instance_id) else {
             return;
         };
+        let gkey = service_group_key(&inst.service_id, &inst.url, &inst.instance_id);
+        guard.last_active_by_group.insert(gkey, inst.instance_id.clone());
         guard.active_instance_id = Some(instance_id.to_string());
         guard.store.update_settings(UpdateSettingsPatch {
             active_instance_id: Some(Some(instance_id.to_string())),
@@ -981,16 +974,39 @@ pub fn step_active_service(app: &AppHandle, shared: &SharedState, delta: isize) 
         let mut guard = shared.inner.lock().unwrap();
         let settings = guard.store.get_settings();
         let instances = guard.store.get_instances();
-        if instances.len() <= 1 {
+        if instances.is_empty() {
             return Err("切り替えられるSNSが1つしかありません");
         }
-        let cur_idx = guard
+
+        // 同一SNSをグループ化してSNS単位で切り替える
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        for inst in &instances {
+            let gkey = service_group_key(&inst.service_id, &inst.url, &inst.instance_id);
+            if let Some((_, ids)) = groups.iter_mut().find(|(k, _)| k == &gkey) {
+                ids.push(inst.instance_id.clone());
+            } else {
+                groups.push((gkey, vec![inst.instance_id.clone()]));
+            }
+        }
+        if groups.len() <= 1 {
+            return Err("切り替えられるSNSが1つしかありません");
+        }
+
+        let cur_group_idx = guard
             .active_instance_id
             .as_deref()
-            .and_then(|id| instances.iter().position(|i| i.instance_id == id))
+            .and_then(|aid| groups.iter().position(|(_, ids)| ids.iter().any(|x| x == aid)))
             .unwrap_or(0);
-        let next_idx = step_tab_index(instances.len(), cur_idx, delta, settings.gesture.wrap_tabs)?;
-        let next_id = instances[next_idx].instance_id.clone();
+        let next_group_idx = step_tab_index(groups.len(), cur_group_idx, delta, settings.gesture.wrap_tabs)?;
+        let (next_gkey, next_ids) = &groups[next_group_idx];
+
+        let next_id = guard
+            .last_active_by_group
+            .get(next_gkey)
+            .filter(|saved| next_ids.iter().any(|x| x == *saved))
+            .cloned()
+            .unwrap_or_else(|| next_ids[0].clone());
+
         guard.store.update_settings(UpdateSettingsPatch {
             active_instance_id: Some(Some(next_id.clone())),
             ..Default::default()
@@ -1001,6 +1017,76 @@ pub fn step_active_service(app: &AppHandle, shared: &SharedState, delta: isize) 
     activate_tab(app, shared, Some(target_id));
     emit_state_updated(app, shared);
     Ok(())
+}
+
+/// 同一SNS内のアカウントを前後に瞬時切替する。
+pub fn step_active_account(app: &AppHandle, shared: &SharedState, delta: isize) -> Result<(), &'static str> {
+    let target_id = {
+        let mut guard = shared.inner.lock().unwrap();
+        let wrap = guard.store.get_settings().gesture.wrap_tabs;
+        let instances = guard.store.get_instances();
+        let Some(active_id) = guard.active_instance_id.clone() else {
+            return Err("選択中のSNSがありません");
+        };
+        let Some(active_inst) = instances.iter().find(|i| i.instance_id == active_id) else {
+            return Err("選択中のSNSがありません");
+        };
+        let gkey = service_group_key(&active_inst.service_id, &active_inst.url, &active_inst.instance_id);
+        let siblings: Vec<String> = instances
+            .iter()
+            .filter(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == gkey)
+            .map(|i| i.instance_id.clone())
+            .collect();
+        if siblings.len() <= 1 {
+            return Err("このSNSのアカウントは1つだけです");
+        }
+        let cur_idx = siblings.iter().position(|id| id == &active_id).unwrap_or(0);
+        let next_idx = step_tab_index(siblings.len(), cur_idx, delta, wrap)?;
+        let next_id = siblings[next_idx].clone();
+        guard.store.update_settings(UpdateSettingsPatch {
+            active_instance_id: Some(Some(next_id.clone())),
+            ..Default::default()
+        });
+        next_id
+    };
+
+    activate_tab(app, shared, Some(target_id));
+    emit_state_updated(app, shared);
+    Ok(())
+}
+
+/// 同一SNS内の指定番号（0始まり）アカウントへ瞬時切替する。
+pub fn activate_account_by_index(app: &AppHandle, shared: &SharedState, index: usize) {
+    let target_id = {
+        let mut guard = shared.inner.lock().unwrap();
+        let instances = guard.store.get_instances();
+        let Some(active_id) = guard.active_instance_id.clone() else {
+            return;
+        };
+        let Some(active_inst) = instances.iter().find(|i| i.instance_id == active_id) else {
+            return;
+        };
+        let gkey = service_group_key(&active_inst.service_id, &active_inst.url, &active_inst.instance_id);
+        let siblings: Vec<String> = instances
+            .iter()
+            .filter(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == gkey)
+            .map(|i| i.instance_id.clone())
+            .collect();
+        let Some(next_id) = siblings.get(index).cloned() else {
+            return;
+        };
+        if next_id == active_id {
+            return;
+        }
+        guard.store.update_settings(UpdateSettingsPatch {
+            active_instance_id: Some(Some(next_id.clone())),
+            ..Default::default()
+        });
+        next_id
+    };
+
+    activate_tab(app, shared, Some(target_id));
+    emit_state_updated(app, shared);
 }
 
 /// 前のタブ / 次のタブへ切替。
@@ -1058,7 +1144,7 @@ fn create_tab_webview(
                 .get(&instance.instance_id)
                 .map(|s| s.active_tab_id == tab_id)
                 .unwrap_or(false);
-        let visible = !guard.overlay_visible && !guard.is_locked && is_active_tab;
+        let visible = !guard.overlay_visible && is_active_tab;
         (
             guard.bounds,
             profile_dir_for(&guard.profiles_root, &instance.instance_id),
@@ -1413,31 +1499,18 @@ pub fn handle_shortcut_from_child(
     payload: Option<usize>,
 ) {
     match action {
-        "toggle-lock" => {
-            let (currently_locked, has_pin) = {
-                let guard = shared.inner.lock().unwrap();
-                (
-                    guard.is_locked,
-                    !guard.store.get_settings().lock_pin.is_empty(),
-                )
-            };
-            if !currently_locked {
-                set_locked_state(app, shared, true);
-            } else if !has_pin {
-                set_locked_state(app, shared, false);
-            } else if let Some(shell) = app.get_webview("shell") {
-                let _ = shell.emit(
-                    "app:shortcut",
-                    crate::models::ShortcutEventPayload {
-                        action: "focus-pin".to_string(),
-                        payload: None,
-                    },
-                );
-                let _ = shell.set_focus();
+        "switch-account" => {
+            if let Some(idx) = payload {
+                let app_bg = app.clone();
+                let shared_bg = shared.clone();
+                tauri::async_runtime::spawn(async move {
+                    activate_account_by_index(&app_bg, &shared_bg, idx);
+                });
             }
             return;
         }
-        "new-tab" | "close-tab" | "restore-closed" | "previous-tab" | "next-tab" => {
+        "previous-account" | "next-account" | "new-tab" | "close-tab" | "restore-closed"
+        | "previous-tab" | "next-tab" => {
             let app_bg = app.clone();
             let shared_bg = shared.clone();
             let act = action.to_string();
@@ -1461,15 +1534,6 @@ pub fn handle_shortcut_from_child(
             let _ = shell.set_focus();
         }
     }
-}
-
-pub fn set_locked_state(app: &AppHandle, shared: &SharedState, locked: bool) {
-    {
-        let mut guard = shared.inner.lock().unwrap();
-        guard.is_locked = locked;
-    }
-    refresh_attached_view(app, shared);
-    emit_state_updated(app, shared);
 }
 
 pub fn set_overlay_visible(app: &AppHandle, shared: &SharedState, visible: bool) {
@@ -1825,6 +1889,16 @@ pub fn execute_gesture_action(app: &AppHandle, shared: &SharedState, action: &st
                 show_overlay_notice(shared, reason, false);
             }
         }
+        "previous-account" => {
+            if let Err(reason) = step_active_account(app, shared, -1) {
+                show_overlay_notice(shared, reason, false);
+            }
+        }
+        "next-account" => {
+            if let Err(reason) = step_active_account(app, shared, 1) {
+                show_overlay_notice(shared, reason, false);
+            }
+        }
         "new-tab" => {
             if let Some((inst_id, _, _, _)) = active_pair {
                 if let Err(e) = create_subtab(app, shared, &inst_id, None) {
@@ -1891,9 +1965,6 @@ pub fn execute_gesture_action(app: &AppHandle, shared: &SharedState, action: &st
         }
         "open-catalog" => {
             handle_shortcut_from_child(app, shared, "open-catalog", None);
-        }
-        "toggle-lock" => {
-            handle_shortcut_from_child(app, shared, "toggle-lock", None);
         }
         "gesture:settings" => {
             handle_shortcut_from_child(app, shared, "open-gesture-settings", None);

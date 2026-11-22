@@ -12,10 +12,40 @@ use crate::models::{
     AddInstancePayload, AppConfig, AppSettings, ServiceInstance, UpdateInstancePatch,
     UpdateSettingsPatch, WindowBounds,
 };
-use crate::url_utils::{is_valid_hex_color, make_badge_text, normalize_service_url};
+use crate::url_utils::{
+    is_valid_hex_color, make_badge_text, normalize_service_url, service_group_key,
+};
 
 const CONFIG_VERSION: u32 = 1;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// アプリ内ログイン不可または無料プランでメッセージ送信不可のため除外されたサービスID
+const REMOVED_SERVICE_IDS: &[&str] = &[
+    "x",
+    "pairs",
+    "with",
+    "tapple",
+    "omiai",
+    "marrish",
+    "ange",
+    "youbride",
+    "bridalnet",
+    "tokyo-calendar-date",
+    "match",
+    "grindr",
+    "happymail",
+    "wakuwaku",
+    "pcmax",
+    "ikukuru",
+    "meetup",
+];
+
+fn is_removed_service(service_id: &str, instance_id: &str) -> bool {
+    REMOVED_SERVICE_IDS.contains(&service_id)
+        || REMOVED_SERVICE_IDS
+            .iter()
+            .any(|id| instance_id == format!("svc-{id}-default"))
+}
 
 fn next_short_hex_id() -> String {
     let nanos = SystemTime::now()
@@ -31,7 +61,6 @@ pub fn create_default_settings() -> AppSettings {
     AppSettings {
         theme: "dark".to_string(),
         minimize_to_tray: false,
-        lock_pin: String::new(),
         sidebar_width: 248,
         active_instance_id: None,
         gesture: GestureSettings::default(),
@@ -47,6 +76,7 @@ pub fn create_default_instances() -> Vec<ServiceInstance> {
             instance_id: format!("svc-{}-default", svc.id),
             service_id: svc.id.clone(),
             name: svc.name.clone(),
+            account_label: Some("メイン".to_string()),
             category: svc.category.clone(),
             url: svc.url.clone(),
             color: svc.color.clone(),
@@ -91,7 +121,6 @@ struct RawConfig {
 struct RawSettings {
     theme: Option<String>,
     minimize_to_tray: Option<bool>,
-    lock_pin: Option<String>,
     sidebar_width: Option<u32>,
     active_instance_id: Option<String>,
     gesture: Option<GestureSettings>,
@@ -103,6 +132,7 @@ struct RawInstance {
     instance_id: Option<String>,
     service_id: Option<String>,
     name: Option<String>,
+    account_label: Option<String>,
     category: Option<String>,
     url: Option<String>,
     color: Option<String>,
@@ -153,9 +183,6 @@ impl ConfigStore {
             if let Some(v) = rs.minimize_to_tray {
                 settings.minimize_to_tray = v;
             }
-            if let Some(v) = rs.lock_pin {
-                settings.lock_pin = v.chars().take(16).collect();
-            }
             if let Some(w) = rs.sidebar_width {
                 settings.sidebar_width = w.clamp(180, 360);
             }
@@ -180,8 +207,8 @@ impl ConfigStore {
                         .service_id
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "custom".to_string());
-                    // X (旧Twitter) はアプリ内ログイン不可のため旧設定からも自動除外する
-                    if service_id == "x" || instance_id == "svc-x-default" {
+                    // X・および無料プランでメッセージ送信不可のサービスは旧設定からも自動除外する
+                    if is_removed_service(&service_id, &instance_id) {
                         migrated = true;
                         return None;
                     }
@@ -189,6 +216,10 @@ impl ConfigStore {
                         .name
                         .filter(|n| !n.trim().is_empty())
                         .unwrap_or_else(|| "SNS".to_string());
+                    let account_label = item
+                        .account_label
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
                     let color = item
                         .color
                         .filter(|c| is_valid_hex_color(c))
@@ -216,6 +247,7 @@ impl ConfigStore {
                         instance_id,
                         service_id,
                         name,
+                        account_label,
                         category: item
                             .category
                             .filter(|c| !c.is_empty())
@@ -329,6 +361,11 @@ impl ConfigStore {
             payload.badge.trim().chars().take(2).collect()
         };
 
+        let account_label = payload
+            .account_label
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let instance = ServiceInstance {
             instance_id: format!("svc-{safe_prefix}-{}", next_short_hex_id()),
             service_id: if payload.service_id.is_empty() {
@@ -337,6 +374,7 @@ impl ConfigStore {
                 payload.service_id
             },
             name: trimmed_name,
+            account_label,
             category: if payload.category.is_empty() {
                 "custom".to_string()
             } else {
@@ -360,10 +398,27 @@ impl ConfigStore {
             order: self.config.instances.len(),
         };
 
+        let new_group_key = service_group_key(
+            &instance.service_id,
+            &instance.url,
+            &instance.instance_id,
+        );
+        let insert_pos = self
+            .config
+            .instances
+            .iter()
+            .rposition(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == new_group_key)
+            .map(|idx| idx + 1)
+            .unwrap_or(self.config.instances.len());
+
         self.config.settings.active_instance_id = Some(instance.instance_id.clone());
-        self.config.instances.push(instance.clone());
+        self.config.instances.insert(insert_pos, instance.clone());
+        for (idx, item) in self.config.instances.iter_mut().enumerate() {
+            item.order = idx;
+        }
+        let created = self.config.instances[insert_pos].clone();
         self.persist();
-        Ok(instance)
+        Ok(created)
     }
 
     pub fn restore_instance(&mut self, mut instance: ServiceInstance) -> ServiceInstance {
@@ -390,6 +445,13 @@ impl ConfigStore {
     }
 
     pub fn remove_instance(&mut self, instance_id: &str) -> bool {
+        let removed_group = self
+            .config
+            .instances
+            .iter()
+            .find(|item| item.instance_id == instance_id)
+            .map(|item| service_group_key(&item.service_id, &item.url, &item.instance_id));
+
         let prev_len = self.config.instances.len();
         self.config
             .instances
@@ -401,6 +463,44 @@ impl ConfigStore {
             item.order = idx;
         }
         if self.config.settings.active_instance_id.as_deref() == Some(instance_id) {
+            let same_group_fallback = removed_group.and_then(|grp| {
+                self.config
+                    .instances
+                    .iter()
+                    .find(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == grp)
+                    .map(|i| i.instance_id.clone())
+            });
+            self.config.settings.active_instance_id = same_group_fallback
+                .or_else(|| self.config.instances.first().map(|i| i.instance_id.clone()));
+        }
+        self.persist();
+        true
+    }
+
+    pub fn remove_instances(&mut self, instance_ids: &[String]) -> bool {
+        if instance_ids.is_empty() {
+            return false;
+        }
+        let id_set: std::collections::HashSet<&str> =
+            instance_ids.iter().map(|s| s.as_str()).collect();
+        let prev_len = self.config.instances.len();
+        self.config
+            .instances
+            .retain(|item| !id_set.contains(item.instance_id.as_str()));
+        if self.config.instances.len() == prev_len {
+            return false;
+        }
+        for (idx, item) in self.config.instances.iter_mut().enumerate() {
+            item.order = idx;
+        }
+        let active_removed = self
+            .config
+            .settings
+            .active_instance_id
+            .as_deref()
+            .map(|id| id_set.contains(id))
+            .unwrap_or(false);
+        if active_removed {
             self.config.settings.active_instance_id =
                 self.config.instances.first().map(|i| i.instance_id.clone());
         }
@@ -424,6 +524,14 @@ impl ConfigStore {
             if !trimmed.is_empty() {
                 target.name = trimmed.to_string();
             }
+        }
+        if let Some(label) = patch.account_label {
+            let trimmed = label.trim();
+            target.account_label = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
         }
         if let Some(url) = patch.url {
             if let Some(norm) = normalize_service_url(&url) {
@@ -500,9 +608,6 @@ impl ConfigStore {
         if let Some(tray) = patch.minimize_to_tray {
             self.config.settings.minimize_to_tray = tray;
         }
-        if let Some(pin) = patch.lock_pin {
-            self.config.settings.lock_pin = pin.chars().take(16).collect();
-        }
         if let Some(w) = patch.sidebar_width {
             self.config.settings.sidebar_width = w.clamp(180, 360);
         }
@@ -540,7 +645,8 @@ mod tests {
             let added = store1
                 .add_instance(AddInstancePayload {
                     service_id: "tinder".into(),
-                    name: "Tinder メイン".into(),
+                    name: "Tinder".into(),
+                    account_label: Some("メイン".into()),
                     category: "matching-global".into(),
                     url: "https://tinder.com/".into(),
                     color: "#FE3C72".into(),
@@ -548,7 +654,26 @@ mod tests {
                     ua_mode: "desktop".into(),
                 })
                 .unwrap();
-            assert_eq!(store1.get_instances().len(), initial_count + 1);
+            let added2 = store1
+                .add_instance(AddInstancePayload {
+                    service_id: "tinder".into(),
+                    name: "Tinder".into(),
+                    account_label: Some("サブ".into()),
+                    category: "matching-global".into(),
+                    url: "https://tinder.com/".into(),
+                    color: "#FE3C72".into(),
+                    badge: "TD".into(),
+                    ua_mode: "desktop".into(),
+                })
+                .unwrap();
+            assert_eq!(store1.get_instances().len(), initial_count + 2);
+            assert_eq!(
+                store1.get_settings().active_instance_id.as_deref(),
+                Some(added2.instance_id.as_str())
+            );
+
+            // 同一SNSのアカウント削除時は同じSNSの別アカウントを優先してアクティブにする
+            assert!(store1.remove_instance(&added2.instance_id));
             assert_eq!(
                 store1.get_settings().active_instance_id.as_deref(),
                 Some(added.instance_id.as_str())
@@ -557,7 +682,8 @@ mod tests {
             store1.update_instance(
                 &added.instance_id,
                 UpdateInstancePatch {
-                    name: Some("Tinder サブ".into()),
+                    name: Some("Tinder".into()),
+                    account_label: Some("仕事用".into()),
                     ua_mode: Some("mobile".into()),
                     zoom_factor: Some(1.2),
                     ..Default::default()
@@ -565,7 +691,6 @@ mod tests {
             );
             store1.update_settings(UpdateSettingsPatch {
                 theme: Some("light".into()),
-                lock_pin: Some("1234".into()),
                 ..Default::default()
             });
 
@@ -579,11 +704,10 @@ mod tests {
 
             let mut store2 = ConfigStore::new(config_path.clone());
             assert_eq!(store2.get_settings().theme, "light");
-            assert_eq!(store2.get_settings().lock_pin, "1234");
             assert_eq!(store2.get_instances()[0].instance_id, ids[0]);
 
             let restored = store2.get_instance(&added.instance_id).unwrap();
-            assert_eq!(restored.name, "Tinder サブ");
+            assert_eq!(restored.account_label.as_deref(), Some("仕事用"));
             assert_eq!(restored.ua_mode, "mobile");
             assert!((restored.zoom_factor - 1.2).abs() < 0.001);
 
@@ -595,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_strips_x_and_ignores_matching_flags() {
+    fn legacy_config_strips_x_and_paid_messaging_services() {
         let tmp_dir = std::env::temp_dir().join(format!("omnisns-rust-mig-{}", next_short_hex_id()));
         fs::create_dir_all(&tmp_dir).unwrap();
         let config_path = tmp_dir.join("config.json");
@@ -606,9 +730,9 @@ mod tests {
                 "theme": "dark",
                 "showMatchingServices": false,
                 "minimizeToTray": false,
-                "lockPin": "",
+                "lockPin": "1234",
                 "sidebarWidth": 248,
-                "activeInstanceId": "svc-x-default"
+                "activeInstanceId": "svc-pairs-default"
             },
             "instances": [
                 {
@@ -622,7 +746,6 @@ mod tests {
                     "uaMode": "desktop",
                     "muted": false,
                     "zoomFactor": 1.0,
-                    "isAdultOrMatching": false,
                     "notificationsEnabled": true,
                     "order": 0
                 },
@@ -637,7 +760,6 @@ mod tests {
                     "uaMode": "desktop",
                     "muted": false,
                     "zoomFactor": 1.0,
-                    "isAdultOrMatching": false,
                     "notificationsEnabled": true,
                     "order": 1
                 },
@@ -652,9 +774,22 @@ mod tests {
                     "uaMode": "desktop",
                     "muted": false,
                     "zoomFactor": 1.0,
-                    "isAdultOrMatching": true,
                     "notificationsEnabled": true,
                     "order": 2
+                },
+                {
+                    "instanceId": "svc-tinder-1",
+                    "serviceId": "tinder",
+                    "name": "Tinder",
+                    "category": "matching-global",
+                    "url": "https://tinder.com/",
+                    "color": "#FE3C72",
+                    "badge": "TD",
+                    "uaMode": "desktop",
+                    "muted": false,
+                    "zoomFactor": 1.0,
+                    "notificationsEnabled": true,
+                    "order": 3
                 }
             ]
         }"##;
@@ -665,7 +800,7 @@ mod tests {
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].service_id, "instagram");
         assert_eq!(instances[0].order, 0);
-        assert_eq!(instances[1].service_id, "pairs");
+        assert_eq!(instances[1].service_id, "tinder");
         assert_eq!(instances[1].order, 1);
         assert_eq!(
             store.get_settings().active_instance_id.as_deref(),
