@@ -13,12 +13,14 @@
   --accent: #3b82f6;
   --accent-hover: #2563eb;
   --accent-soft: rgba(59, 130, 246, 0.16);
-  --matching: #ec4899;
-  --matching-soft: rgba(236, 72, 153, 0.16);
   --danger: #ef4444;
   --success: #22c55e;
   --sidebar-width: 248px;
   --toolbar-height: 50px;
+  --tabbar-height: 36px;
+  --teal: #159cab;
+  --teal-soft: rgba(21, 156, 171, 0.18);
+  --gesture-amber: #ffb74d;
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 14px;
@@ -40,8 +42,6 @@ html[data-theme='light'] {
   --accent: #2563eb;
   --accent-hover: #1d4ed8;
   --accent-soft: rgba(37, 99, 235, 0.12);
-  --matching: #db2777;
-  --matching-soft: rgba(219, 39, 119, 0.12);
   --shadow-modal: 0 24px 64px rgba(15, 23, 42, 0.22);
 }
 
@@ -286,12 +286,6 @@ body {
   border: 1px solid var(--border-color);
 }
 
-.tag-mini.matching {
-  background: var(--matching-soft);
-  color: var(--matching);
-  border-color: transparent;
-}
-
 .service-right {
   display: flex;
   align-items: center;
@@ -428,14 +422,9 @@ body {
   padding: 0 8px;
 }
 
-.btn-icon-label.active {
-  background: var(--matching-soft);
-  color: var(--matching);
-  border-color: rgba(236, 72, 153, 0.35);
-}
-
 .btn-icon-label:hover {
-  filter: brightness(1.08);
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
 }
 
 /* ==================== Main Area & Toolbar ==================== */
@@ -756,10 +745,6 @@ body {
   border-color: transparent;
 }
 
-.cat-tab.matching-cat.active {
-  background: var(--matching);
-}
-
 .catalog-body {
   flex: 1;
   overflow-y: auto;
@@ -1020,4 +1005,558 @@ kbd {
   font-weight: 600;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
   z-index: 3000;
+}
+
+/* ==================== Gesture Toolbar Button ==================== */
+.gesture-tool-btn.gesture-on {
+  color: var(--gesture-amber);
+}
+
+/* ==================== Multi-Tab Bar (36px) ==================== */
+.tabbar {
+  height: var(--tabbar-height);
+  min-height: var(--tabbar-height);
+  max-height: var(--tabbar-height);
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border-color);
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.tab-strip {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.tab-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.browser-tab {
+  height: 28px;
+  min-width: 110px;
+  max-width: 210px;
+  padding: 0 6px 0 9px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+  font-size: 12px;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.browser-tab:hover {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.browser-tab.active {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+  font-weight: 600;
+}
+
+.browser-tab-icon {
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  font-weight: 700;
+  color: #fff;
+  overflow: hidden;
+}
+
+.browser-tab-icon img {
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+}
+
+.browser-tab.loading .browser-tab-icon {
+  animation: pulse 0.9s infinite;
+}
+
+.browser-tab-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.browser-tab-close {
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.browser-tab-close:hover {
+  background: rgba(239, 68, 68, 0.22);
+  color: var(--danger);
+}
+
+.tabbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.tabbar-btn {
+  height: 26px;
+  min-width: 26px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 13px;
+  flex-shrink: 0;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.tabbar-btn:hover:not(:disabled) {
+  background: var(--bg-surface-hover);
+  color: var(--text-primary);
+}
+
+.tabbar-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.tabbar-count {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ==================== Gesture Settings Modal (HisatorNotebook Board) ==================== */
+.modal-gesture {
+  width: min(1240px, 95vw);
+  height: min(820px, 92vh);
+}
+
+.gesture-modal-header {
+  align-items: center;
+  padding: 13px 18px;
+}
+
+.gesture-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.gesture-header-icon {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  border-radius: 9px;
+  background: var(--teal-soft);
+  border: 1px solid rgba(21, 156, 171, 0.35);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gesture-header-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+
+.gesture-inline-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.gesture-inline-switch.strong {
+  font-weight: 700;
+  font-size: 13.5px;
+}
+
+.switch-input {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--bg-surface-hover);
+  border: 1px solid var(--border-strong);
+  position: relative;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+  flex-shrink: 0;
+}
+
+.switch-input::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.16s ease;
+}
+
+.switch-input:checked {
+  background: var(--teal);
+  border-color: var(--teal);
+}
+
+.switch-input:checked::after {
+  transform: translateX(16px);
+}
+
+.gesture-board-layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(360px, 1.05fr) minmax(420px, 1.15fr);
+  overflow: hidden;
+}
+
+.gesture-candidates-pane {
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 12px 14px;
+  gap: 10px;
+}
+
+.gesture-cand-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gesture-target-chip {
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: var(--teal-soft);
+  border: 1px solid rgba(21, 156, 171, 0.45);
+  color: var(--teal);
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.gesture-candidates-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  align-content: start;
+  gap: 10px 12px;
+  padding-right: 4px;
+}
+
+.gesture-candidates-list::-webkit-scrollbar,
+.gesture-directions-pane::-webkit-scrollbar {
+  width: 6px;
+}
+
+.gesture-candidates-list::-webkit-scrollbar-thumb,
+.gesture-directions-pane::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+}
+
+.gesture-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.gesture-sec-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-muted);
+  padding: 2px 6px 4px;
+  letter-spacing: 0.02em;
+}
+
+.gesture-cand-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.1s ease, border-color 0.1s ease;
+}
+
+.gesture-cand-row:hover {
+  background: var(--bg-surface-hover);
+}
+
+.gesture-cand-row.is-current {
+  background: var(--teal-soft);
+  border-color: rgba(21, 156, 171, 0.55);
+  font-weight: 600;
+}
+
+.gesture-cand-row.is-used-elsewhere {
+  opacity: 0.72;
+}
+
+.gesture-cand-icon {
+  width: 18px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--teal);
+  flex-shrink: 0;
+}
+
+.gesture-cand-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gesture-cand-assigned {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.gesture-arrow-chip {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--bg-surface);
+  border: 1px solid rgba(21, 156, 171, 0.4);
+  color: var(--teal);
+}
+
+.gesture-cand-clear {
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.gesture-cand-clear:hover {
+  background: rgba(239, 68, 68, 0.2);
+  color: var(--danger);
+}
+
+.gesture-directions-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 14px;
+  gap: 10px;
+}
+
+.gesture-tools-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-xs {
+  padding: 5px 10px;
+  font-size: 11.5px;
+}
+
+.btn-xs.active {
+  background: var(--teal-soft);
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.btn-xs:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.gesture-group-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.gesture-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.gesture-cell {
+  background: var(--bg-surface);
+  border: 1.5px solid var(--border-color);
+  border-radius: 9px;
+  padding: 8px 9px;
+  text-align: left;
+  color: var(--text-primary);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: border-color 0.12s ease, background 0.12s ease, transform 0.1s ease;
+}
+
+.gesture-cell:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-strong);
+}
+
+.gesture-cell.selected {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+  box-shadow: 0 0 0 1px rgba(21, 156, 171, 0.35);
+}
+
+.gesture-cell.clear-selected {
+  border-color: var(--danger);
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.gesture-cell.dragging {
+  opacity: 0.45;
+}
+
+.gesture-cell.drag-over {
+  border-color: var(--gesture-amber);
+  transform: scale(1.02);
+}
+
+.gesture-cell.unassigned .gesture-cell-action {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.gesture-cell-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gesture-cell-svg {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.gesture-cell-dir {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.gesture-cell-action {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gesture-options-box {
+  margin-top: auto;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.gesture-options-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+}
+
+.gesture-tremor-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding-top: 4px;
+  border-top: 1px solid var(--border-color);
+}
+
+.gesture-tremor-row input[type='range'] {
+  width: 170px;
+}
+
+.gesture-hint-line {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.45;
 }

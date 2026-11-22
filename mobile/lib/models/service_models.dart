@@ -16,20 +16,17 @@ class CategoryMeta {
     required this.id,
     required this.label,
     required this.description,
-    this.isMatchingGroup = false,
   });
 
   final String id;
   final String label;
   final String description;
-  final bool isMatchingGroup;
 
   factory CategoryMeta.fromJson(Map<String, dynamic> json) {
     return CategoryMeta(
       id: json['id'] as String? ?? 'custom',
       label: json['label'] as String? ?? '',
       description: json['description'] as String? ?? '',
-      isMatchingGroup: json['isMatchingGroup'] as bool? ?? false,
     );
   }
 }
@@ -48,7 +45,6 @@ class CatalogService {
     required this.description,
     this.note,
     this.requiresCustomUrl = false,
-    this.isAdultOrMatching = false,
     this.defaultPinned = false,
   });
 
@@ -64,7 +60,6 @@ class CatalogService {
   final String description;
   final String? note;
   final bool requiresCustomUrl;
-  final bool isAdultOrMatching;
   final bool defaultPinned;
 
   /// Android向け推奨初期UA:
@@ -100,7 +95,6 @@ class CatalogService {
       description: json['description'] as String? ?? '',
       note: json['note'] as String?,
       requiresCustomUrl: json['requiresCustomUrl'] as bool? ?? false,
-      isAdultOrMatching: json['isAdultOrMatching'] as bool? ?? false,
       defaultPinned: json['defaultPinned'] as bool? ?? false,
     );
   }
@@ -116,7 +110,6 @@ class ServiceInstance {
     required this.colorHex,
     required this.badge,
     required this.uaMode,
-    required this.isAdultOrMatching,
     required this.notificationsEnabled,
     required this.order,
   });
@@ -129,7 +122,6 @@ class ServiceInstance {
   final String colorHex;
   final String badge;
   final UserAgentMode uaMode;
-  final bool isAdultOrMatching;
   final bool notificationsEnabled;
   final int order;
 
@@ -139,7 +131,6 @@ class ServiceInstance {
     String? colorHex,
     String? badge,
     UserAgentMode? uaMode,
-    bool? isAdultOrMatching,
     bool? notificationsEnabled,
     int? order,
   }) {
@@ -152,7 +143,6 @@ class ServiceInstance {
       colorHex: colorHex ?? this.colorHex,
       badge: badge ?? this.badge,
       uaMode: uaMode ?? this.uaMode,
-      isAdultOrMatching: isAdultOrMatching ?? this.isAdultOrMatching,
       notificationsEnabled: notificationsEnabled ?? this.notificationsEnabled,
       order: order ?? this.order,
     );
@@ -168,7 +158,6 @@ class ServiceInstance {
       'colorHex': colorHex,
       'badge': badge,
       'uaMode': uaMode.value,
-      'isAdultOrMatching': isAdultOrMatching,
       'notificationsEnabled': notificationsEnabled,
       'order': order,
     };
@@ -187,7 +176,6 @@ class ServiceInstance {
       colorHex: json['colorHex'] as String? ?? '#3B82F6',
       badge: (json['badge'] as String?) ?? makeBadgeText(safeName),
       uaMode: UserAgentMode.fromString(json['uaMode'] as String?),
-      isAdultOrMatching: json['isAdultOrMatching'] as bool? ?? false,
       notificationsEnabled: json['notificationsEnabled'] as bool? ?? true,
       order: json['order'] as int? ?? index,
     );
@@ -197,26 +185,22 @@ class ServiceInstance {
 class AppSettings {
   const AppSettings({
     this.isDarkMode = true,
-    this.showMatchingServices = true,
     this.lockPin = '',
     this.activeInstanceId,
   });
 
   final bool isDarkMode;
-  final bool showMatchingServices;
   final String lockPin;
   final String? activeInstanceId;
 
   AppSettings copyWith({
     bool? isDarkMode,
-    bool? showMatchingServices,
     String? lockPin,
     String? activeInstanceId,
     bool clearActive = false,
   }) {
     return AppSettings(
       isDarkMode: isDarkMode ?? this.isDarkMode,
-      showMatchingServices: showMatchingServices ?? this.showMatchingServices,
       lockPin: lockPin ?? this.lockPin,
       activeInstanceId:
           clearActive ? null : (activeInstanceId ?? this.activeInstanceId),
@@ -226,7 +210,6 @@ class AppSettings {
   Map<String, dynamic> toJson() {
     return {
       'isDarkMode': isDarkMode,
-      'showMatchingServices': showMatchingServices,
       'lockPin': lockPin,
       'activeInstanceId': activeInstanceId,
     };
@@ -235,7 +218,6 @@ class AppSettings {
   factory AppSettings.fromJson(Map<String, dynamic> json) {
     return AppSettings(
       isDarkMode: json['isDarkMode'] as bool? ?? true,
-      showMatchingServices: json['showMatchingServices'] as bool? ?? true,
       lockPin: json['lockPin'] as String? ?? '',
       activeInstanceId: json['activeInstanceId'] as String?,
     );

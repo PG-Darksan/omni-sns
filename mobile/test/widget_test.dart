@@ -5,14 +5,15 @@ import 'package:omni_sns_mobile/services/app_store.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  test('catalog.json loads all 61 services and 7 categories', () async {
+  test('catalog.json loads all 60 services without X and 7 categories', () async {
     final store = AppStore();
     final data = await store.loadCatalog();
 
     expect(data.categories.length, 7);
-    expect(data.services.length, 61);
+    expect(data.services.length, 60);
+    expect(data.services.any((s) => s.id == 'x'), isFalse);
     expect(
-      data.services.where((s) => s.isAdultOrMatching).length,
+      data.services.where((s) => s.category.startsWith('matching-')).length,
       greaterThanOrEqualTo(20),
     );
     for (final svc in data.services) {

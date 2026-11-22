@@ -10,7 +10,6 @@ class NewInstanceRequest {
     required this.colorHex,
     required this.badge,
     required this.uaMode,
-    required this.isAdultOrMatching,
   });
 
   final String serviceId;
@@ -20,7 +19,6 @@ class NewInstanceRequest {
   final String colorHex;
   final String badge;
   final UserAgentMode uaMode;
-  final bool isAdultOrMatching;
 }
 
 class CatalogScreen extends StatefulWidget {
@@ -29,13 +27,11 @@ class CatalogScreen extends StatefulWidget {
     required this.categories,
     required this.catalog,
     required this.existingInstances,
-    required this.initialShowMatching,
   });
 
   final List<CategoryMeta> categories;
   final List<CatalogService> catalog;
   final List<ServiceInstance> existingInstances;
-  final bool initialShowMatching;
 
   @override
   State<CatalogScreen> createState() => _CatalogScreenState();
@@ -44,19 +40,11 @@ class CatalogScreen extends StatefulWidget {
 class _CatalogScreenState extends State<CatalogScreen> {
   String _selectedCategory = 'all';
   String _searchQuery = '';
-  late bool _showMatching;
 
   final _customNameController = TextEditingController();
   final _customUrlController = TextEditingController();
   String _customCategory = 'custom';
   UserAgentMode _customUa = UserAgentMode.mobile;
-  bool _customIsMatching = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _showMatching = widget.initialShowMatching;
-  }
 
   @override
   void dispose() {
@@ -154,7 +142,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         colorHex: svc.colorHex,
                         badge: svc.badge,
                         uaMode: uaMode,
-                        isAdultOrMatching: svc.isAdultOrMatching,
                       ),
                     );
                   },
@@ -188,7 +175,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
     final rawName = _customNameController.text.trim();
     final name = rawName.isEmpty ? 'カスタムSNS' : rawName;
-    final isMatching = _customIsMatching || _customCategory.startsWith('matching-');
 
     Navigator.of(context).pop(
       NewInstanceRequest(
@@ -199,7 +185,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
         colorHex: '#3B82F6',
         badge: makeBadgeText(name),
         uaMode: _customUa,
-        isAdultOrMatching: isMatching,
       ),
     );
   }
@@ -208,7 +193,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
   Widget build(BuildContext context) {
     final q = _searchQuery.trim().toLowerCase();
     final filtered = widget.catalog.where((svc) {
-      if (!_showMatching && svc.isAdultOrMatching) return false;
       if (_selectedCategory != 'all' && svc.category != _selectedCategory) {
         return false;
       }
@@ -219,35 +203,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
           svc.aliases.any((a) => a.toLowerCase().contains(q));
     }).toList();
 
-    final visibleCategories = widget.categories
-        .where((c) => _showMatching || !c.isMatchingGroup)
-        .toList();
-
-    final totalAvailable = widget.catalog
-        .where((s) => _showMatching || !s.isAdultOrMatching)
-        .length;
+    final visibleCategories = widget.categories;
+    final totalAvailable = widget.catalog.length;
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('SNS・マッチング カタログ'),
-        actions: [
-          Row(
-            children: [
-              const Text('マッチング', style: TextStyle(fontSize: 12)),
-              Switch(
-                value: _showMatching,
-                onChanged: (v) {
-                  setState(() {
-                    _showMatching = v;
-                    if (!v && _selectedCategory.startsWith('matching-')) {
-                      _selectedCategory = 'all';
-                    }
-                  });
-                },
-              ),
-            ],
-          ),
-        ],
+        title: const Text('サービス カタログ'),
       ),
       body: Column(
         children: [
@@ -462,8 +423,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                                 colorHex: svc.colorHex,
                                                 badge: svc.badge,
                                                 uaMode: svc.recommendedAndroidUa,
-                                                isAdultOrMatching:
-                                                    svc.isAdultOrMatching,
                                               ),
                                             );
                                           },
@@ -565,14 +524,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
             if (v != null) setState(() => _customUa = v);
           },
         ),
-        const SizedBox(height: 8),
-        CheckboxListTile(
-          value: _customIsMatching,
-          onChanged: (v) => setState(() => _customIsMatching = v ?? false),
-          title: const Text('マッチング・18+フィルター対象にする'),
-          contentPadding: EdgeInsets.zero,
-        ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 16),
         FilledButton(
           onPressed: _submitCustomService,
           child: const Text('このサービスを追加して開く'),

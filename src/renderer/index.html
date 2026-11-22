@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta
     http-equiv="Content-Security-Policy"
-    content="default-src 'self'; img-src 'self' https: http: data:; style-src 'self' 'unsafe-inline'; script-src 'self';"
+    content="default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost; img-src 'self' https: http: data:; style-src 'self' 'unsafe-inline'; script-src 'self';"
   />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OmniSNS</title>
@@ -38,19 +38,17 @@
       <div id="service-list" class="service-list" role="tablist" aria-label="登録済みSNS一覧"></div>
 
       <div class="sidebar-footer">
-        <button id="btn-open-catalog" class="btn-primary btn-full" title="全61種＋カスタム追加 (Ctrl+K)">
-          ＋ SNS・マッチングを追加
+        <button id="btn-open-catalog" class="btn-primary btn-full" title="全60種＋カスタム追加 (Ctrl+K)">
+          ＋ サービスを追加
         </button>
         <div class="sidebar-footer-actions">
-          <button id="btn-toggle-matching" class="btn-icon-label" title="マッチング・出会い系の表示切替">
-            <span id="matching-toggle-icon">♥</span>
-            <span id="matching-toggle-text">マッチング表示</span>
+          <button id="btn-lock-app" class="btn-icon-label" title="プライバシーロック (Ctrl+Shift+L)" aria-label="プライバシーロック">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            <span>ロック</span>
           </button>
-          <button id="btn-lock-app" class="btn-icon" title="プライバシーロック (Ctrl+Shift+L)" aria-label="プライバシーロック">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          </button>
-          <button id="btn-open-settings" class="btn-icon" title="アプリ設定" aria-label="アプリ設定">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <button id="btn-open-settings" class="btn-icon-label" title="アプリ設定" aria-label="アプリ設定">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span>設定</span>
           </button>
         </div>
       </div>
@@ -90,17 +88,34 @@
           <button id="btn-clear-session" class="tool-btn" title="このサービスのログイン情報・Cookieを初期化" aria-label="セッション初期化">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
           </button>
+          <button id="btn-gesture-settings" class="tool-btn gesture-tool-btn" title="マウスジェスチャー設定（右ドラッグでタブ切替・削除・連続スクロール）" aria-label="マウスジェスチャー設定">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6v10h11"/><path d="M13.5 12.5L17 16l-3.5 3.5"/><circle cx="6" cy="6" r="2.6" fill="currentColor" stroke="none"/></svg>
+          </button>
           <button id="btn-devtools" class="tool-btn" title="開発者ツール (DevTools)" aria-label="開発者ツール">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
           </button>
         </div>
       </header>
 
+      <!-- マルチタブバー (高さ36px固定: 現在のSNS内で複数タブ切替・追加・複製・削除・復元) -->
+      <div id="tabbar" class="tabbar" role="tablist" aria-label="ブラウザタブ一覧">
+        <div id="tab-strip" class="tab-strip"></div>
+        <button id="btn-new-subtab" class="tabbar-btn" title="新しいタブを開く (Ctrl+T)">＋</button>
+        <div class="tabbar-actions">
+          <button id="btn-dup-subtab" class="tabbar-btn" title="現在のタブを複製">⧉</button>
+          <button id="btn-close-other-subtabs" class="tabbar-btn" title="このタブ以外を閉じる">⊘</button>
+          <button id="btn-restore-subtab" class="tabbar-btn tabbar-restore-btn" title="閉じたタブを復元 (Ctrl+Shift+T)" disabled>
+            <span>↶</span>
+            <span id="closed-tabs-count" class="tabbar-count hidden">0</span>
+          </button>
+        </div>
+      </div>
+
       <!-- WebContentsView 表示領域（未ロード・休止・エラー時のフォールバック表示） -->
       <main id="viewport" class="viewport">
         <div id="empty-state" class="viewport-placeholder hidden">
           <h2>サービスを追加して始めましょう</h2>
-          <p>X・Instagram・Threads・Bluesky・mixi2・Discord・主要マッチングアプリまで、すべて独立セッションでまとめて使えます。</p>
+          <p>Instagram・Threads・Bluesky・mixi2・Discord・Pairsなど全60種のサービスを、すべて独立セッションでまとめて使えます。</p>
           <button id="btn-empty-add" class="btn-primary">＋ カタログから追加 (Ctrl+K)</button>
         </div>
 
@@ -129,8 +144,8 @@
     <div class="modal-dialog modal-xl">
       <div class="modal-header">
         <div>
-          <h2 id="catalog-title">SNS・マッチングアプリ カタログ</h2>
-          <p class="modal-subtitle">WebブラウザからDM・メッセージ送信できる全サービスを収録。同じSNSの複数アカウント追加も可能です。</p>
+          <h2 id="catalog-title">サービス カタログ</h2>
+          <p class="modal-subtitle">WebブラウザからDM・メッセージ送信できる全サービスを収録。同じサービスの複数アカウント追加も可能です。</p>
         </div>
         <button id="btn-close-catalog" class="btn-icon" aria-label="閉じる">✕</button>
       </div>
@@ -143,10 +158,6 @@
           placeholder="サービス名・キーワードで検索（例: Pairs, Tinder, mixi2, Instagram, SMS...）"
           autocomplete="off"
         />
-        <label class="checkbox-inline">
-          <input id="catalog-show-matching" type="checkbox" checked />
-          <span>マッチング・出会い系を表示</span>
-        </label>
       </div>
 
       <div id="catalog-categories" class="category-tabs"></div>
@@ -189,10 +200,6 @@
             <label class="form-field">
               <span>アクセントカラー</span>
               <input id="custom-color" type="color" class="input-color" value="#3B82F6" />
-            </label>
-            <label class="form-field checkbox-field">
-              <input id="custom-is-matching" type="checkbox" />
-              <span>マッチング・18+フィルター対象にする</span>
             </label>
           </div>
           <div class="form-actions">
@@ -263,14 +270,6 @@
 
         <div class="setting-row">
           <div>
-            <div class="setting-label">マッチング・出会い系を表示</div>
-            <div class="setting-desc">OFFにするとサイドバーとカタログから一括非表示にします</div>
-          </div>
-          <input id="setting-show-matching" type="checkbox" class="toggle-check" />
-        </div>
-
-        <div class="setting-row">
-          <div>
             <div class="setting-label">閉じるときにタスクトレイへ最小化</div>
             <div class="setting-desc">バックグラウンドで未読チェックを維持したい場合に有効にします</div>
           </div>
@@ -294,9 +293,12 @@
         </div>
 
         <div class="shortcut-box">
-          <h3>キーボードショートカット</h3>
+          <h3>キーボードショートカット &amp; ジェスチャー</h3>
           <ul>
-            <li><kbd>Ctrl</kbd> + <kbd>K</kbd> : SNS・マッチングアプリ カタログを開く</li>
+            <li><kbd>右ドラッグ</kbd> : マウスジェスチャー（タブ切替・追加・削除・連続スクロール等）</li>
+            <li><kbd>Ctrl</kbd> + <kbd>T</kbd> / <kbd>W</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> : 新しいタブ / タブを閉じる / 閉じたタブを復元</li>
+            <li><kbd>Ctrl</kbd> + <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> : 次 / 前のタブへ切り替え</li>
+            <li><kbd>Ctrl</kbd> + <kbd>K</kbd> : サービス カタログを開く</li>
             <li><kbd>Ctrl</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> : 登録済みサービスを素早く切り替え</li>
             <li><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>L</kbd> : プライバシーロック（全画面即時隠蔽）</li>
           </ul>
@@ -308,12 +310,98 @@
     </div>
   </div>
 
+  <!-- マウスジェスチャー設定モーダル (HisatorNotebook 準拠 12方向ボード + リアルタイム連続スクロール) -->
+  <div id="gesture-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="gesture-title">
+    <div class="modal-dialog modal-gesture">
+      <div class="modal-header gesture-modal-header">
+        <div class="gesture-header-left">
+          <span class="gesture-header-icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#159CAB" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6v10h11"/><path d="M13.5 12.5L17 16l-3.5 3.5"/><circle cx="6" cy="6" r="2.8" fill="#159CAB" stroke="#ffffff" stroke-width="1.2"/></svg>
+          </span>
+          <div>
+            <h2 id="gesture-title">マウスジェスチャー設定</h2>
+            <p class="modal-subtitle">右ボタンを押したまま上下左右にドラッグして離すと操作を実行。スクロール割り当て時はドラッグ中リアルタイムに進行します。</p>
+          </div>
+        </div>
+        <div class="gesture-header-right">
+          <label class="gesture-inline-switch strong" title="右ドラッグによるマウスジェスチャーを有効化">
+            <span>有効</span>
+            <input id="gesture-enabled" type="checkbox" class="switch-input" checked />
+          </label>
+          <button id="btn-close-gesture" class="btn-icon" aria-label="閉じる">✕</button>
+        </div>
+      </div>
+
+      <div class="gesture-board-layout">
+        <!-- 左カラム: 割り当て候補一覧 -->
+        <div class="gesture-candidates-pane">
+          <div class="gesture-cand-toolbar">
+            <input
+              id="gesture-search"
+              type="search"
+              class="input-compact"
+              placeholder="割り当て操作を検索（例: タブ, スクロール, 戻る...）"
+              autocomplete="off"
+            />
+            <span id="gesture-target-indicator" class="gesture-target-chip">割当先: ← (左)</span>
+          </div>
+          <div id="gesture-candidates" class="gesture-candidates-list"></div>
+        </div>
+
+        <!-- 右カラム: 12方向ボード + 操作ボタン + オプション -->
+        <div class="gesture-directions-pane">
+          <div class="gesture-tools-bar">
+            <button id="btn-gesture-batch" type="button" class="btn-secondary btn-xs" title="割り当てるたびに自動で次の方向へ進みます">続けて割り当てる</button>
+            <button id="btn-gesture-select-clear" type="button" class="btn-secondary btn-xs">選んで外す</button>
+            <button id="btn-gesture-clear-all" type="button" class="btn-secondary btn-xs">全部外す</button>
+            <button id="btn-gesture-reset" type="button" class="btn-secondary btn-xs">初期値に戻す</button>
+            <button id="btn-gesture-undo" type="button" class="btn-secondary btn-xs" title="直前の変更を元に戻す (Ctrl+Z)" disabled>取り消す</button>
+          </div>
+
+          <div class="gesture-group-label">1方向（← → ↑ ↓）</div>
+          <div id="gesture-grid-single" class="gesture-grid"></div>
+
+          <div class="gesture-group-label">2方向（直角に1回曲げる 8通り · ドラッグで入替可能）</div>
+          <div id="gesture-grid-double" class="gesture-grid"></div>
+
+          <div class="gesture-options-box">
+            <div class="gesture-options-grid">
+              <label class="gesture-inline-switch" title="最初/最後のタブで端を跨いでループ切替します">
+                <span>タブの端でループ</span>
+                <input id="gesture-wrap-tabs" type="checkbox" class="switch-input" checked />
+              </label>
+              <label class="gesture-inline-switch" title="ドラッグ中の軌跡ラインを画面上に描画します">
+                <span>軌跡を表示</span>
+                <input id="gesture-show-trail" type="checkbox" class="switch-input" checked />
+              </label>
+              <label class="gesture-inline-switch" title="認識中の操作ガイドと実行結果の通知を表示します">
+                <span>ガイド・通知を表示</span>
+                <input id="gesture-show-feedback" type="checkbox" class="switch-input" checked />
+              </label>
+              <label class="gesture-inline-switch" title="同じ操作を複数の方向へ重複して割り当てられるようにします">
+                <span>同じ操作を複数方向へ許可</span>
+                <input id="gesture-allow-dup" type="checkbox" class="switch-input" />
+              </label>
+            </div>
+            <div class="gesture-tremor-row">
+              <span>手ぶれ補正（開始時の無視距離）: <strong><span id="gesture-tremor-val">4</span>px</strong></span>
+              <input id="gesture-tremor" type="range" min="1" max="30" step="1" value="4" />
+            </div>
+            <div class="gesture-hint-line">
+              ※ 動かさず普通に右クリックすると従来の右クリックメニューが開きます。ドラッグ中に <kbd>Esc</kbd> または左クリックで中止できます。
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- プライバシーロック画面 -->
   <div id="lock-overlay" class="lock-overlay hidden" role="dialog" aria-modal="true">
     <div class="lock-card">
       <div class="lock-icon">🔒</div>
       <h2>OmniSNS はロック中です</h2>
-      <p>すべてのSNS・マッチング画面を非表示にしています。</p>
+      <p>すべてのサービス画面を非表示にしています。</p>
       <form id="unlock-form" class="unlock-form">
         <input
           id="unlock-pin-input"

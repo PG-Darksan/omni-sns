@@ -45,7 +45,6 @@ class AppStore {
         colorHex: svc.colorHex,
         badge: svc.badge,
         uaMode: svc.recommendedAndroidUa,
-        isAdultOrMatching: svc.isAdultOrMatching,
         notificationsEnabled: true,
         order: idx,
       );
@@ -68,7 +67,10 @@ class AppStore {
             list[idx] as Map<String, dynamic>,
             idx,
           ),
-        )..sort((a, b) => a.order.compareTo(b.order));
+        )
+            .where((i) => i.serviceId != 'x' && i.instanceId != 'svc-x-default')
+            .toList()
+          ..sort((a, b) => a.order.compareTo(b.order));
       } catch (_) {
         instances = createDefaultInstances(catalog);
       }

@@ -2,6 +2,7 @@ import * as esbuild from 'esbuild';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { exportCatalogFiles } from './export-catalog.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -10,47 +11,24 @@ const distDir = path.join(rootDir, 'dist');
 
 async function build() {
   fs.rmSync(distDir, { recursive: true, force: true });
-  fs.mkdirSync(path.join(distDir, 'main'), { recursive: true });
-  fs.mkdirSync(path.join(distDir, 'preload'), { recursive: true });
   fs.mkdirSync(path.join(distDir, 'renderer'), { recursive: true });
   fs.mkdirSync(path.join(distDir, 'tests'), { recursive: true });
 
-  // 1. Main process bundle (CommonJS, Node target, electron external)
-  await esbuild.build({
-    entryPoints: [path.join(rootDir, 'src', 'main', 'main.ts')],
-    outfile: path.join(distDir, 'main', 'main.js'),
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    target: 'node20',
-    external: ['electron'],
-    sourcemap: true
-  });
+  // 1. Export shared 61-service catalog JSON for Tauri (embedded via include_str!)
+  await exportCatalogFiles({ includeMobile: false });
 
-  // 2. Preload script bundle (CommonJS, sandbox compatible)
-  await esbuild.build({
-    entryPoints: [path.join(rootDir, 'src', 'preload', 'preload.ts')],
-    outfile: path.join(distDir, 'preload', 'preload.js'),
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    target: 'node20',
-    external: ['electron'],
-    sourcemap: true
-  });
-
-  // 3. Renderer script bundle (Browser IIFE)
+  // 2. Renderer script bundle (Browser IIFE, minified for release size)
   await esbuild.build({
     entryPoints: [path.join(rootDir, 'src', 'renderer', 'renderer.ts')],
     outfile: path.join(distDir, 'renderer', 'renderer.js'),
     bundle: true,
+    minify: true,
     platform: 'browser',
     format: 'iife',
-    target: 'chrome130',
-    sourcemap: true
+    target: 'chrome120'
   });
 
-  // 4. Unit tests bundle
+  // 3. Unit tests bundle
   const testEntry = path.join(rootDir, 'tests', 'core.test.ts');
   if (fs.existsSync(testEntry)) {
     await esbuild.build({
@@ -60,12 +38,11 @@ async function build() {
       platform: 'node',
       format: 'cjs',
       target: 'node20',
-      external: ['electron'],
       sourcemap: true
     });
   }
 
-  // 5. Copy static renderer assets
+  // 4. Copy static renderer assets
   fs.copyFileSync(
     path.join(rootDir, 'src', 'renderer', 'index.html'),
     path.join(distDir, 'renderer', 'index.html')
@@ -75,7 +52,7 @@ async function build() {
     path.join(distDir, 'renderer', 'styles.css')
   );
 
-  console.log('[build] OmniSNS build completed successfully.');
+  console.log('[build] OmniSNS frontend & catalog build completed successfully.');
 }
 
 build().catch((err) => {

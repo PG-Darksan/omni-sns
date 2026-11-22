@@ -1,7 +1,7 @@
 import { UserAgentMode } from './types';
 
 /**
- * Electron / Chromium バージョンに基づき、GoogleログインやWhatsApp Web等に弾かれない
+ * WebView2 / Chromium バージョンに基づき、GoogleログインやWhatsApp Web等に弾かれない
  * クリーンなChrome互換User-Agentを生成する。
  */
 export function buildUserAgent(mode: UserAgentMode, chromeVersion = '136.0.0.0'): string {

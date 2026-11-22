@@ -1,4 +1,5 @@
-import type { OmniApi } from '../preload/preload';
+import { GestureBoardModal } from './gesture-ui';
+import { omniApi } from './omni-api';
 import {
   AddInstancePayload,
   AppConfig,
@@ -11,18 +12,13 @@ import {
 } from '../shared/types';
 import { makeBadgeText, normalizeServiceUrl } from '../shared/url-utils';
 
-declare global {
-  interface Window {
-    omniApi: OmniApi;
-  }
-}
-
 interface UiState {
   config: AppConfig | null;
   catalog: CatalogService[];
   categories: CategoryMeta[];
   runtimeMap: Map<string, TabRuntimeState>;
   isLocked: boolean;
+  closedTabsCount: number;
   selectedCatalogCategory: ServiceCategory | 'all';
   catalogSearchQuery: string;
   sidebarFilterQuery: string;
@@ -37,6 +33,7 @@ const state: UiState = {
   categories: [],
   runtimeMap: new Map(),
   isLocked: false,
+  closedTabsCount: 0,
   selectedCatalogCategory: 'all',
   catalogSearchQuery: '',
   sidebarFilterQuery: '',
@@ -47,6 +44,7 @@ const state: UiState = {
 
 let toastTimer: number | null = null;
 let dragSourceId: string | null = null;
+let gestureModal: GestureBoardModal | null = null;
 
 function el<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -72,21 +70,20 @@ function isAnyModalOpen(): boolean {
   return (
     !el('catalog-modal').classList.contains('hidden') ||
     !el('edit-modal').classList.contains('hidden') ||
-    !el('settings-modal').classList.contains('hidden')
+    !el('settings-modal').classList.contains('hidden') ||
+    !el('gesture-modal').classList.contains('hidden')
   );
 }
 
 async function syncOverlayToMain(): Promise<void> {
-  await window.omniApi.setOverlayVisible(isAnyModalOpen());
+  await omniApi.setOverlayVisible(isAnyModalOpen());
 }
 
 function getVisibleInstances(): ServiceInstance[] {
   if (!state.config) return [];
-  const { showMatchingServices } = state.config.settings;
   const query = state.sidebarFilterQuery.trim().toLowerCase();
 
   return state.config.instances.filter((inst) => {
-    if (!showMatchingServices && inst.isAdultOrMatching) return false;
     if (!query) return true;
     return (
       inst.name.toLowerCase().includes(query) ||
@@ -104,17 +101,16 @@ function getActiveInstance(): ServiceInstance | undefined {
 
 function applyThemeAndLayout(): void {
   if (!state.config) return;
-  const { theme, sidebarWidth, showMatchingServices } = state.config.settings;
+  const { theme, sidebarWidth } = state.config.settings;
   document.documentElement.setAttribute('data-theme', theme);
   document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
 
-  const toggleBtn = el<HTMLButtonElement>('btn-toggle-matching');
-  const toggleText = el<HTMLSpanElement>('matching-toggle-text');
-  toggleBtn.classList.toggle('active', showMatchingServices);
-  toggleText.textContent = showMatchingServices ? 'マッチング表示中' : 'マッチング非表示';
-
-  const catalogCheckbox = el<HTMLInputElement>('catalog-show-matching');
-  catalogCheckbox.checked = showMatchingServices;
+  const gestureBtn = el<HTMLButtonElement>('btn-gesture-settings');
+  const gestureOn = Boolean(state.config.settings.gesture?.enabled);
+  gestureBtn.classList.toggle('gesture-on', gestureOn);
+  gestureBtn.title = gestureOn
+    ? 'マウスジェスチャー設定（有効 · 右ドラッグで操作）'
+    : 'マウスジェスチャー設定（無効）';
 }
 
 function renderSidebar(): void {
@@ -125,7 +121,6 @@ function renderSidebar(): void {
 
   let totalUnread = 0;
   for (const inst of state.config.instances) {
-    if (!state.config.settings.showMatchingServices && inst.isAdultOrMatching) continue;
     if (!inst.notificationsEnabled) continue;
     totalUnread += state.runtimeMap.get(inst.instanceId)?.unreadCount ?? 0;
   }
@@ -196,11 +191,11 @@ function renderSidebar(): void {
 
       ids.splice(fromIndex, 1);
       ids.splice(toIndex, 0, dragSourceId);
-      await window.omniApi.reorderTabs(ids);
+      await omniApi.reorderTabs(ids);
     });
 
     item.addEventListener('click', async () => {
-      await window.omniApi.activateTab(inst.instanceId);
+      await omniApi.activateTab(inst.instanceId);
     });
 
     // Avatar
@@ -229,17 +224,17 @@ function renderSidebar(): void {
 
     const subEl = document.createElement('div');
     subEl.className = 'service-sub';
-    if (inst.isAdultOrMatching) {
-      const mTag = document.createElement('span');
-      mTag.className = 'tag-mini matching';
-      mTag.textContent = '恋活/婚活';
-      subEl.appendChild(mTag);
-    }
     if (inst.uaMode === 'mobile') {
       const uaTag = document.createElement('span');
       uaTag.className = 'tag-mini';
       uaTag.textContent = 'スマホUA';
       subEl.appendChild(uaTag);
+    }
+    if ((rt?.tabs?.length ?? 0) >= 2) {
+      const tabTag = document.createElement('span');
+      tabTag.className = 'tag-mini';
+      tabTag.textContent = `${rt!.tabs.length}タブ`;
+      subEl.appendChild(tabTag);
     }
     if (rt?.isSleeping) {
       const sleepTag = document.createElement('span');
@@ -288,7 +283,7 @@ function renderSidebar(): void {
       e.stopPropagation();
       const confirmed = window.confirm(`「${inst.name}」を一覧から削除しますか？`);
       if (!confirmed) return;
-      await window.omniApi.removeTab(inst.instanceId);
+      await omniApi.removeTab(inst.instanceId);
       showToast(`「${inst.name}」を削除しました`);
     });
 
@@ -386,7 +381,6 @@ function renderLockOverlay(): void {
 }
 
 function renderCatalog(): void {
-  const showMatching = el<HTMLInputElement>('catalog-show-matching').checked;
   const catTabs = el<HTMLDivElement>('catalog-categories');
   const grid = el<HTMLDivElement>('catalog-grid');
   const customForm = el<HTMLFormElement>('custom-service-form');
@@ -396,7 +390,7 @@ function renderCatalog(): void {
   const allTab = document.createElement('button');
   allTab.type = 'button';
   allTab.className = `cat-tab ${state.selectedCatalogCategory === 'all' ? 'active' : ''}`;
-  allTab.textContent = `すべて (${state.catalog.filter((s) => showMatching || !s.isAdultOrMatching).length})`;
+  allTab.textContent = `すべて (${state.catalog.length})`;
   allTab.addEventListener('click', () => {
     state.selectedCatalogCategory = 'all';
     renderCatalog();
@@ -404,7 +398,6 @@ function renderCatalog(): void {
   catTabs.appendChild(allTab);
 
   for (const cat of state.categories) {
-    if (!showMatching && cat.isMatchingGroup) continue;
     const count =
       cat.id === 'custom'
         ? null
@@ -413,7 +406,6 @@ function renderCatalog(): void {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'cat-tab';
-    if (cat.isMatchingGroup) btn.classList.add('matching-cat');
     if (state.selectedCatalogCategory === cat.id) btn.classList.add('active');
     btn.textContent = count !== null ? `${cat.label} (${count})` : cat.label;
     btn.addEventListener('click', () => {
@@ -434,7 +426,6 @@ function renderCatalog(): void {
 
   const q = state.catalogSearchQuery.trim().toLowerCase();
   const filtered = state.catalog.filter((svc) => {
-    if (!showMatching && svc.isAdultOrMatching) return false;
     if (state.selectedCatalogCategory !== 'all' && svc.category !== state.selectedCatalogCategory) {
       return false;
     }
@@ -537,8 +528,7 @@ function renderCatalog(): void {
         url: svc.url,
         color: svc.color,
         badge: svc.badge,
-        uaMode: svc.defaultUa,
-        isAdultOrMatching: Boolean(svc.isAdultOrMatching)
+        uaMode: svc.defaultUa
       });
     });
 
@@ -559,7 +549,7 @@ function renderCatalog(): void {
 }
 
 async function addServiceAndCloseCatalog(payload: AddInstancePayload): Promise<void> {
-  await window.omniApi.addTab(payload);
+  await omniApi.addTab(payload);
   el('catalog-modal').classList.add('hidden');
   el('edit-modal').classList.add('hidden');
   await syncOverlayToMain();
@@ -568,9 +558,6 @@ async function addServiceAndCloseCatalog(payload: AddInstancePayload): Promise<v
 
 async function openCatalogModal(): Promise<void> {
   if (state.isLocked) return;
-  if (state.config) {
-    el<HTMLInputElement>('catalog-show-matching').checked = state.config.settings.showMatchingServices;
-  }
   el('catalog-modal').classList.remove('hidden');
   await syncOverlayToMain();
   renderCatalog();
@@ -630,7 +617,6 @@ async function openSettingsModal(): Promise<void> {
   if (!state.config || state.isLocked) return;
   const s = state.config.settings;
   el<HTMLSelectElement>('setting-theme').value = s.theme;
-  el<HTMLInputElement>('setting-show-matching').checked = s.showMatchingServices;
   el<HTMLInputElement>('setting-minimize-tray').checked = s.minimizeToTray;
   el<HTMLInputElement>('setting-sidebar-width').value = String(s.sidebarWidth);
   el<HTMLSpanElement>('setting-sidebar-width-val').textContent = String(s.sidebarWidth);
@@ -645,11 +631,115 @@ async function closeSettingsModal(): Promise<void> {
   await syncOverlayToMain();
 }
 
+async function openGestureModal(): Promise<void> {
+  if (!state.config || state.isLocked || !gestureModal) return;
+  gestureModal.open(state.config.settings.gesture);
+  await syncOverlayToMain();
+}
+
+async function closeGestureModal(): Promise<void> {
+  gestureModal?.close();
+  await syncOverlayToMain();
+}
+
+function renderTabBar(): void {
+  const stripEl = el<HTMLDivElement>('tab-strip');
+  const newBtn = el<HTMLButtonElement>('btn-new-subtab');
+  const dupBtn = el<HTMLButtonElement>('btn-dup-subtab');
+  const closeOthersBtn = el<HTMLButtonElement>('btn-close-other-subtabs');
+  const restoreBtn = el<HTMLButtonElement>('btn-restore-subtab');
+  const closedCountEl = el<HTMLSpanElement>('closed-tabs-count');
+
+  const active = getActiveInstance();
+  const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+  const tabs = rt?.tabs ?? [];
+
+  newBtn.disabled = !active;
+  dupBtn.disabled = !active || tabs.length === 0;
+  closeOthersBtn.disabled = !active || tabs.length <= 1;
+  restoreBtn.disabled = state.closedTabsCount === 0;
+
+  if (state.closedTabsCount > 0) {
+    closedCountEl.textContent = String(state.closedTabsCount);
+    closedCountEl.classList.remove('hidden');
+  } else {
+    closedCountEl.classList.add('hidden');
+  }
+
+  stripEl.innerHTML = '';
+  if (!active || tabs.length === 0) return;
+
+  for (const tab of tabs) {
+    const isCurrent = tab.tabId === rt?.activeTabId;
+    const chip = document.createElement('div');
+    chip.className = 'browser-tab';
+    chip.setAttribute('role', 'tab');
+    chip.setAttribute('aria-selected', String(isCurrent));
+    if (isCurrent) chip.classList.add('active');
+    if (tab.isLoading) chip.classList.add('loading');
+    chip.title = `${tab.title || active.name}\n${tab.currentUrl}\n（中クリックで閉じる）`;
+
+    chip.addEventListener('click', () => {
+      if (!isCurrent) {
+        void omniApi.activateSubTab(active.instanceId, tab.tabId);
+      }
+    });
+    chip.addEventListener('auxclick', (e) => {
+      if (e.button === 1) {
+        e.preventDefault();
+        void omniApi.closeSubTab(active.instanceId, tab.tabId).then((msg) => {
+          if (msg) showToast(msg);
+        });
+      }
+    });
+
+    const icon = document.createElement('span');
+    icon.className = 'browser-tab-icon';
+    icon.style.background = active.color;
+    if (tab.faviconUrl) {
+      const img = document.createElement('img');
+      img.src = tab.faviconUrl;
+      img.alt = '';
+      img.onerror = () => {
+        icon.textContent = active.badge;
+      };
+      icon.appendChild(img);
+    } else {
+      icon.textContent = active.badge;
+    }
+
+    const title = document.createElement('span');
+    title.className = 'browser-tab-title';
+    title.textContent = tab.title || active.name;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'browser-tab-close';
+    closeBtn.textContent = '✕';
+    closeBtn.title = 'このタブを閉じる';
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      void omniApi.closeSubTab(active.instanceId, tab.tabId).then((msg) => {
+        if (msg) showToast(msg);
+      });
+    });
+
+    chip.appendChild(icon);
+    chip.appendChild(title);
+    chip.appendChild(closeBtn);
+    stripEl.appendChild(chip);
+  }
+}
+
 function renderAll(): void {
   applyThemeAndLayout();
   renderSidebar();
   renderToolbarAndViewport();
+  renderTabBar();
   renderLockOverlay();
+  if (state.config?.settings.gesture) {
+    gestureModal?.syncSettings(state.config.settings.gesture);
+  }
   if (!el('catalog-modal').classList.contains('hidden')) {
     renderCatalog();
   }
@@ -665,15 +755,8 @@ function bindEvents(): void {
   el<HTMLButtonElement>('btn-open-catalog').addEventListener('click', () => void openCatalogModal());
   el<HTMLButtonElement>('btn-empty-add').addEventListener('click', () => void openCatalogModal());
 
-  el<HTMLButtonElement>('btn-toggle-matching').addEventListener('click', async () => {
-    if (!state.config) return;
-    const next = !state.config.settings.showMatchingServices;
-    await window.omniApi.updateSettings({ showMatchingServices: next });
-    showToast(next ? 'マッチング・出会い系を表示しました' : 'マッチング・出会い系を非表示にしました');
-  });
-
   el<HTMLButtonElement>('btn-lock-app').addEventListener('click', async () => {
-    await window.omniApi.setLocked(true);
+    await omniApi.setLocked(true);
   });
 
   el<HTMLButtonElement>('btn-open-settings').addEventListener('click', () => void openSettingsModal());
@@ -682,7 +765,7 @@ function bindEvents(): void {
   const runActiveAction = async (action: string) => {
     const active = getActiveInstance();
     if (!active) return;
-    await window.omniApi.tabAction(active.instanceId, action);
+    await omniApi.tabAction(active.instanceId, action);
   };
 
   el<HTMLButtonElement>('btn-back').addEventListener('click', () => void runActiveAction('back'));
@@ -695,7 +778,7 @@ function bindEvents(): void {
   el<HTMLButtonElement>('btn-toggle-ua').addEventListener('click', async () => {
     const active = getActiveInstance();
     if (!active) return;
-    await window.omniApi.tabAction(active.instanceId, 'toggle-ua');
+    await omniApi.tabAction(active.instanceId, 'toggle-ua');
     showToast(active.uaMode === 'desktop' ? 'モバイル版UAへ切り替えました' : 'PC版UAへ切り替えました');
   });
   el<HTMLButtonElement>('btn-toggle-mute').addEventListener('click', () => void runActiveAction('toggle-mute'));
@@ -705,7 +788,7 @@ function bindEvents(): void {
   el<HTMLButtonElement>('btn-sleep-tab').addEventListener('click', async () => {
     const active = getActiveInstance();
     if (!active) return;
-    await window.omniApi.tabAction(active.instanceId, 'sleep');
+    await omniApi.tabAction(active.instanceId, 'sleep');
     showToast(`「${active.name}」を休止しました（メモリ解放）`);
   });
   el<HTMLButtonElement>('btn-clear-session').addEventListener('click', async () => {
@@ -715,15 +798,58 @@ function bindEvents(): void {
       `「${active.name}」のCookie・ログイン情報・キャッシュをすべて削除しますか？\n（他のサービスには影響しません）`
     );
     if (!ok) return;
-    await window.omniApi.tabAction(active.instanceId, 'clear-session');
+    await omniApi.tabAction(active.instanceId, 'clear-session');
     showToast(`「${active.name}」のセッションを初期化しました`);
   });
+  el<HTMLButtonElement>('btn-gesture-settings').addEventListener('click', () => void openGestureModal());
   el<HTMLButtonElement>('btn-devtools').addEventListener('click', () => void runActiveAction('devtools'));
+
+  // Multi-Tab Bar actions
+  el<HTMLButtonElement>('btn-new-subtab').addEventListener('click', async () => {
+    const active = getActiveInstance();
+    if (!active) return;
+    try {
+      await omniApi.createSubTab(active.instanceId);
+    } catch (err) {
+      showToast(String(err));
+    }
+  });
+  el<HTMLDivElement>('tab-strip').addEventListener('dblclick', (e) => {
+    if (e.target !== el('tab-strip')) return;
+    const active = getActiveInstance();
+    if (!active) return;
+    void omniApi.createSubTab(active.instanceId);
+  });
+  el<HTMLButtonElement>('btn-dup-subtab').addEventListener('click', async () => {
+    const active = getActiveInstance();
+    const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+    if (!active || !rt?.activeTabId) return;
+    try {
+      await omniApi.duplicateSubTab(active.instanceId, rt.activeTabId);
+    } catch (err) {
+      showToast(String(err));
+    }
+  });
+  el<HTMLButtonElement>('btn-close-other-subtabs').addEventListener('click', async () => {
+    const active = getActiveInstance();
+    const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+    if (!active || !rt?.activeTabId) return;
+    const closed = await omniApi.closeOtherSubTabs(active.instanceId, rt.activeTabId);
+    if (closed > 0) showToast(`他のタブ ${closed} 枚を閉じました`);
+  });
+  el<HTMLButtonElement>('btn-restore-subtab').addEventListener('click', async () => {
+    try {
+      const msg = await omniApi.restoreClosedTab();
+      showToast(msg);
+    } catch (err) {
+      showToast(String(err));
+    }
+  });
 
   el<HTMLButtonElement>('btn-copy-url').addEventListener('click', async () => {
     const urlText = el<HTMLSpanElement>('active-url-text').textContent || '';
     if (!urlText || urlText === '—') return;
-    await window.omniApi.copyText(urlText);
+    await omniApi.copyText(urlText);
     showToast('URLをクリップボードにコピーしました');
   });
 
@@ -741,15 +867,6 @@ function bindEvents(): void {
     }
     renderCatalog();
   });
-  el<HTMLInputElement>('catalog-show-matching').addEventListener('change', () => {
-    if (
-      !el<HTMLInputElement>('catalog-show-matching').checked &&
-      state.selectedCatalogCategory.startsWith('matching-')
-    ) {
-      state.selectedCatalogCategory = 'all';
-    }
-    renderCatalog();
-  });
 
   el<HTMLFormElement>('custom-service-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -763,8 +880,6 @@ function bindEvents(): void {
     const category = el<HTMLSelectElement>('custom-category').value as ServiceCategory;
     const uaMode = el<HTMLSelectElement>('custom-ua').value as UserAgentMode;
     const color = el<HTMLInputElement>('custom-color').value;
-    const isMatching =
-      el<HTMLInputElement>('custom-is-matching').checked || category.startsWith('matching-');
 
     await addServiceAndCloseCatalog({
       serviceId: 'custom',
@@ -773,8 +888,7 @@ function bindEvents(): void {
       url: normalized,
       color,
       badge: makeBadgeText(name || 'SN'),
-      uaMode,
-      isAdultOrMatching: isMatching
+      uaMode
     });
     el<HTMLFormElement>('custom-service-form').reset();
   });
@@ -803,20 +917,19 @@ function bindEvents(): void {
         url: normalized,
         color,
         badge: tpl.badge,
-        uaMode,
-        isAdultOrMatching: Boolean(tpl.isAdultOrMatching)
+        uaMode
       });
     } else if (state.editingMode === 'edit' && state.editingInstanceId) {
       const targetId = state.editingInstanceId;
       const existing = state.config?.instances.find((x) => x.instanceId === targetId);
-      await window.omniApi.updateTab(targetId, {
+      await omniApi.updateTab(targetId, {
         name: name || existing?.name || 'SNS',
         url: normalized,
         color,
         notificationsEnabled
       });
       if (existing && existing.uaMode !== uaMode) {
-        await window.omniApi.tabAction(targetId, 'toggle-ua');
+        await omniApi.tabAction(targetId, 'toggle-ua');
       }
       await closeEditModal();
       showToast('サービス設定を保存しました');
@@ -830,9 +943,8 @@ function bindEvents(): void {
     el<HTMLSpanElement>('setting-sidebar-width-val').textContent = val;
   });
   el<HTMLButtonElement>('btn-save-settings').addEventListener('click', async () => {
-    await window.omniApi.updateSettings({
+    await omniApi.updateSettings({
       theme: el<HTMLSelectElement>('setting-theme').value as 'dark' | 'light',
-      showMatchingServices: el<HTMLInputElement>('setting-show-matching').checked,
       minimizeToTray: el<HTMLInputElement>('setting-minimize-tray').checked,
       sidebarWidth: Number(el<HTMLInputElement>('setting-sidebar-width').value),
       lockPin: el<HTMLInputElement>('setting-lock-pin').value
@@ -845,7 +957,7 @@ function bindEvents(): void {
   el<HTMLFormElement>('unlock-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const pin = el<HTMLInputElement>('unlock-pin-input').value;
-    const res = await window.omniApi.setLocked(false, pin);
+    const res = await omniApi.setLocked(false, pin);
     if (!res.ok) {
       const errEl = el<HTMLDivElement>('unlock-error');
       errEl.textContent = res.error || '解除に失敗しました';
@@ -856,6 +968,10 @@ function bindEvents(): void {
 
   // Global keyboard shortcuts inside shell UI
   window.addEventListener('keydown', (e) => {
+    if (gestureModal?.handleKeyDown(e)) {
+      return;
+    }
+
     if (e.key === 'Escape') {
       if (!el('edit-modal').classList.contains('hidden')) {
         void closeEditModal();
@@ -874,11 +990,49 @@ function bindEvents(): void {
     if (e.shiftKey && key === 'l') {
       e.preventDefault();
       if (!state.isLocked) {
-        void window.omniApi.setLocked(true);
+        void omniApi.setLocked(true);
       } else if (!state.config?.settings.lockPin) {
-        void window.omniApi.setLocked(false);
+        void omniApi.setLocked(false);
       } else {
         el<HTMLInputElement>('unlock-pin-input').focus();
+      }
+      return;
+    }
+
+    if (e.shiftKey && !e.altKey && key === 't') {
+      e.preventDefault();
+      void omniApi.restoreClosedTab().then(showToast).catch((err) => showToast(String(err)));
+      return;
+    }
+
+    if (!e.shiftKey && !e.altKey && key === 't') {
+      e.preventDefault();
+      const active = getActiveInstance();
+      if (active) void omniApi.createSubTab(active.instanceId);
+      return;
+    }
+
+    if (!e.shiftKey && !e.altKey && key === 'w') {
+      e.preventDefault();
+      const active = getActiveInstance();
+      const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+      if (active && rt?.activeTabId) {
+        void omniApi.closeSubTab(active.instanceId, rt.activeTabId).then((msg) => {
+          if (msg) showToast(msg);
+        });
+      }
+      return;
+    }
+
+    if (!e.altKey && key === 'tab') {
+      e.preventDefault();
+      const active = getActiveInstance();
+      const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+      if (active && rt && rt.tabs.length >= 2) {
+        const curIdx = rt.tabs.findIndex((t) => t.tabId === rt.activeTabId);
+        const delta = e.shiftKey ? -1 : 1;
+        const nextIdx = (curIdx + delta + rt.tabs.length) % rt.tabs.length;
+        void omniApi.activateSubTab(active.instanceId, rt.tabs[nextIdx].tabId);
       }
       return;
     }
@@ -898,50 +1052,59 @@ function bindEvents(): void {
       const idx = Number(key) - 1;
       const visible = getVisibleInstances();
       if (visible[idx]) {
-        void window.omniApi.activateTab(visible[idx].instanceId);
+        void omniApi.activateTab(visible[idx].instanceId);
       }
     }
   });
 }
 
 async function bootstrap(): Promise<void> {
+  gestureModal = new GestureBoardModal({
+    onToast: showToast,
+    onCloseRequested: closeGestureModal
+  });
   bindEvents();
 
-  const data = await window.omniApi.getBootstrap();
-  state.config = data.config;
-  state.catalog = data.catalog;
-  state.categories = data.categories;
-  state.isLocked = data.isLocked;
-  state.runtimeMap = new Map(data.runtimeStates.map((rt) => [rt.instanceId, rt]));
-
-  el<HTMLSpanElement>('app-version').textContent = `v${data.appVersion} · Windows`;
-
-  window.omniApi.onStateUpdated((payload) => {
+  omniApi.onStateUpdated((payload) => {
     state.config = payload.config;
     state.isLocked = payload.isLocked;
+    state.closedTabsCount = payload.closedTabsCount ?? 0;
     state.runtimeMap = new Map(payload.runtimeStates.map((rt) => [rt.instanceId, rt]));
     renderAll();
   });
 
-  window.omniApi.onRuntimeUpdated((rt) => {
+  omniApi.onRuntimeUpdated((rt) => {
     state.runtimeMap.set(rt.instanceId, rt);
     renderSidebar();
     renderToolbarAndViewport();
+    renderTabBar();
   });
 
-  window.omniApi.onShortcut((payload) => {
+  omniApi.onShortcut((payload) => {
     if (payload.action === 'open-catalog') {
       void openCatalogModal();
+    } else if (payload.action === 'open-gesture-settings') {
+      void openGestureModal();
     } else if (payload.action === 'switch-tab' && typeof payload.payload === 'number') {
       const visible = getVisibleInstances();
       const target = visible[payload.payload];
       if (target) {
-        void window.omniApi.activateTab(target.instanceId);
+        void omniApi.activateTab(target.instanceId);
       }
     } else if (payload.action === 'focus-pin') {
       el<HTMLInputElement>('unlock-pin-input').focus();
     }
   });
+
+  const data = await omniApi.getBootstrap();
+  state.config = data.config;
+  state.catalog = data.catalog;
+  state.categories = data.categories;
+  state.isLocked = data.isLocked;
+  state.closedTabsCount = data.closedTabsCount ?? 0;
+  state.runtimeMap = new Map(data.runtimeStates.map((rt) => [rt.instanceId, rt]));
+
+  el<HTMLSpanElement>('app-version').textContent = `v${data.appVersion} · Windows`;
 
   renderAll();
 }

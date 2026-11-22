@@ -14,20 +14,17 @@ export const CATEGORIES: CategoryMeta[] = [
   {
     id: 'matching-jp',
     label: '国内マッチング・婚活',
-    description: 'ブラウザ版から検索・メッセージ送信に対応した国内恋活/婚活サービス',
-    isMatchingGroup: true
+    description: 'ブラウザ版から検索・メッセージ送信に対応した国内恋活/婚活サービス'
   },
   {
     id: 'matching-global',
     label: '海外マッチング',
-    description: 'グローバル対応のWeb版マッチングサービス',
-    isMatchingGroup: true
+    description: 'グローバル対応のWeb版マッチングサービス'
   },
   {
     id: 'matching-dating',
     label: '国内メッセージ・出会い系',
-    description: 'Webブラウザ版が主軸の国内メッセージ系出会いサービス',
-    isMatchingGroup: true
+    description: 'Webブラウザ版が主軸の国内メッセージ系出会いサービス'
   },
   {
     id: 'business-creative',
@@ -45,19 +42,6 @@ export const SERVICE_CATALOG: CatalogService[] = [
   // ========================
   // 1. メジャーSNS
   // ========================
-  {
-    id: 'x',
-    name: 'X (旧Twitter)',
-    aliases: ['twitter', 'ツイッター', 'エックス', 'dm'],
-    category: 'major-sns',
-    url: 'https://x.com/messages',
-    homeUrl: 'https://x.com/',
-    color: '#111827',
-    badge: 'X',
-    defaultUa: 'desktop',
-    description: 'リアルタイム投稿とDM・X Chatに対応。',
-    defaultPinned: true
-  },
   {
     id: 'instagram',
     name: 'Instagram',
@@ -425,7 +409,6 @@ export const SERVICE_CATALOG: CatalogService[] = [
     badge: 'PR',
     defaultUa: 'desktop',
     description: '国内最大級の恋活・婚活マッチング。ブラウザ版フル対応。',
-    isAdultOrMatching: true,
     defaultPinned: true
   },
   {
@@ -438,8 +421,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#EC4899',
     badge: 'WI',
     defaultUa: 'desktop',
-    description: '心理テスト・価値観重視のマッチング。ブラウザ版でメッセージ可。',
-    isAdultOrMatching: true
+    description: '心理テスト・価値観重視のマッチング。ブラウザ版でメッセージ可。'
   },
   {
     id: 'tapple',
@@ -451,8 +433,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#FF5A79',
     badge: 'TP',
     defaultUa: 'desktop',
-    description: '趣味タグ・おでかけ機能付き恋活アプリ。ブラウザ版対応。',
-    isAdultOrMatching: true
+    description: '趣味タグ・おでかけ機能付き恋活アプリ。ブラウザ版対応。'
   },
   {
     id: 'omiai',
@@ -464,8 +445,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#F97316',
     badge: 'OM',
     defaultUa: 'desktop',
-    description: '真剣な恋活・婚活向けマッチング。Web版からメッセージ送信可。',
-    isAdultOrMatching: true
+    description: '真剣な恋活・婚活向けマッチング。Web版からメッセージ送信可。'
   },
   {
     id: 'marrish',
@@ -477,8 +457,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#D946EF',
     badge: 'MR',
     defaultUa: 'desktop',
-    description: '婚活・再婚活向けマッチング。Web版フル対応。',
-    isAdultOrMatching: true
+    description: '婚活・再婚活向けマッチング。Web版フル対応。'
   },
   {
     id: 'ange',
@@ -490,8 +469,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#EF4444',
     badge: 'AG',
     defaultUa: 'desktop',
-    description: '30歳以上限定の大人向け恋活・婚活マッチング。Web版対応。',
-    isAdultOrMatching: true
+    description: '30歳以上限定の大人向け恋活・婚活マッチング。Web版対応。'
   },
   {
     id: 'youbride',
@@ -503,8 +481,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#FB7185',
     badge: 'YB',
     defaultUa: 'desktop',
-    description: '成婚実績豊富な真剣婚活サービス。PC/Web版フル対応。',
-    isAdultOrMatching: true
+    description: '成婚実績豊富な真剣婚活サービス。PC/Web版フル対応。'
   },
   {
     id: 'bridalnet',
@@ -516,8 +493,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#F43F5E',
     badge: 'BN',
     defaultUa: 'desktop',
-    description: 'IBJ運営の婚活サービス。日記・チャットまでブラウザ対応。',
-    isAdultOrMatching: true
+    description: 'IBJ運営の婚活サービス。日記・チャットまでブラウザ対応。'
   },
   {
     id: 'tokyo-calendar-date',
@@ -530,8 +506,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     badge: 'TK',
     defaultUa: 'desktop',
     description: '完全審査制マッチング。PCブラウザ版からメッセージ可能。',
-    note: 'PC用User-Agentでの利用を推奨します。',
-    isAdultOrMatching: true
+    note: 'PC用User-Agentでの利用を推奨します。'
   },
 
   // ========================
@@ -547,8 +522,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#FE3C72',
     badge: 'TD',
     defaultUa: 'desktop',
-    description: '世界最大級のスワイプ型マッチング。Tinder Webフル対応。',
-    isAdultOrMatching: true
+    description: '世界最大級のスワイプ型マッチング。Tinder Webフル対応。'
   },
   {
     id: 'bumble',
@@ -560,8 +534,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#FBBF24',
     badge: 'BM',
     defaultUa: 'desktop',
-    description: '恋活・友達作り（BFF）対応。Bumble Webで快適にチャット可能。',
-    isAdultOrMatching: true
+    description: '恋活・友達作り（BFF）対応。Bumble Webで快適にチャット可能。'
   },
   {
     id: 'okcupid',
@@ -573,8 +546,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#2563EB',
     badge: 'OK',
     defaultUa: 'desktop',
-    description: '価値観質問ベースのグローバルマッチング。Web版フル対応。',
-    isAdultOrMatching: true
+    description: '価値観質問ベースのグローバルマッチング。Web版フル対応。'
   },
   {
     id: 'match',
@@ -586,8 +558,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#1D4ED8',
     badge: 'MC',
     defaultUa: 'desktop',
-    description: '老舗グローバル婚活サービス。Web版機能が非常に充実。',
-    isAdultOrMatching: true
+    description: '老舗グローバル婚活サービス。Web版機能が非常に充実。'
   },
   {
     id: 'badoo',
@@ -599,8 +570,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#7C3AED',
     badge: 'BA',
     defaultUa: 'desktop',
-    description: '欧州・南米を中心に人気のマッチングSNS。Web版対応。',
-    isAdultOrMatching: true
+    description: '欧州・南米を中心に人気のマッチングSNS。Web版対応。'
   },
   {
     id: 'pof',
@@ -612,8 +582,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#0284C7',
     badge: 'PF',
     defaultUa: 'desktop',
-    description: '英語圏定番のマッチングサイト。Webからメッセージ送信可能。',
-    isAdultOrMatching: true
+    description: '英語圏定番のマッチングサイト。Webからメッセージ送信可能。'
   },
   {
     id: 'grindr',
@@ -625,8 +594,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#F59E0B',
     badge: 'GR',
     defaultUa: 'desktop',
-    description: 'Grindrの公式Web版クライアント。',
-    isAdultOrMatching: true
+    description: 'Grindrの公式Web版クライアント。'
   },
 
   // ========================
@@ -642,8 +610,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#EC4899',
     badge: 'HM',
     defaultUa: 'desktop',
-    description: '国内大手出会い系。Web版は検索・メッセージともフル機能。',
-    isAdultOrMatching: true
+    description: '国内大手出会い系。Web版は検索・メッセージともフル機能。'
   },
   {
     id: 'wakuwaku',
@@ -655,8 +622,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#10B981',
     badge: 'WK',
     defaultUa: 'desktop',
-    description: 'ブラウザ版フル機能で掲示板・メール送受信に対応。',
-    isAdultOrMatching: true
+    description: 'ブラウザ版フル機能で掲示板・メール送受信に対応。'
   },
   {
     id: 'pcmax',
@@ -668,8 +634,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#3B82F6',
     badge: 'PM',
     defaultUa: 'desktop',
-    description: 'Webブラウザ版がメインの老舗出会い系サービス。',
-    isAdultOrMatching: true
+    description: 'Webブラウザ版がメインの老舗出会い系サービス。'
   },
   {
     id: 'ikukuru',
@@ -681,8 +646,7 @@ export const SERVICE_CATALOG: CatalogService[] = [
     color: '#F97316',
     badge: 'IK',
     defaultUa: 'desktop',
-    description: 'Web版からプロフィール検索・メッセージ送受信が可能。',
-    isAdultOrMatching: true
+    description: 'Web版からプロフィール検索・メッセージ送受信が可能。'
   },
 
   // ========================

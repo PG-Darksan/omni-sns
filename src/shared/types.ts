@@ -34,8 +34,6 @@ export interface CatalogService {
   note?: string;
   /** ユーザーがインスタンスURLを指定する必要があるか（Mastodon/Misskey等） */
   requiresCustomUrl?: boolean;
-  /** 18+ / マッチング・出会い系フラグ（プライバシーフィルター対象） */
-  isAdultOrMatching?: boolean;
   /** 初期起動時に標準でサイドバーに並べるおすすめサービスか */
   defaultPinned?: boolean;
 }
@@ -61,12 +59,24 @@ export interface ServiceInstance {
   muted: boolean;
   /** ズーム倍率（例: 1.0） */
   zoomFactor: number;
-  /** 18+ / マッチング系フラグ */
-  isAdultOrMatching: boolean;
   /** 未読数監視を有効にするか */
   notificationsEnabled: boolean;
   /** 並び順 */
   order: number;
+}
+
+export interface BrowserTabInfo {
+  tabId: string;
+  instanceId: string;
+  currentUrl: string;
+  title: string;
+  faviconUrl: string | null;
+  unreadCount: number;
+  isLoading: boolean;
+  isSleeping: boolean;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  loadError: string | null;
 }
 
 export interface TabRuntimeState {
@@ -83,14 +93,38 @@ export interface TabRuntimeState {
   zoomFactor: number;
   uaMode: UserAgentMode;
   loadError: string | null;
+  activeTabId: string;
+  tabs: BrowserTabInfo[];
+}
+
+export type GestureShape =
+  | 'L'
+  | 'R'
+  | 'U'
+  | 'D'
+  | 'LU'
+  | 'LD'
+  | 'RU'
+  | 'RD'
+  | 'UL'
+  | 'UR'
+  | 'DL'
+  | 'DR';
+
+export interface GestureSettings {
+  enabled: boolean;
+  wrapTabs: boolean;
+  showTrail: boolean;
+  showFeedback: boolean;
+  allowDup: boolean;
+  tremor: number;
+  gestures: Record<string, string>;
 }
 
 export type ThemeMode = 'dark' | 'light';
 
 export interface AppSettings {
   theme: ThemeMode;
-  /** マッチング・出会い系サービスをUIに表示するか */
-  showMatchingServices: boolean;
   /** ウィンドウを閉じる際にトレイへ最小化するか */
   minimizeToTray: boolean;
   /** プライバシーロック用の任意PIN（空文字ならワンクリック解除） */
@@ -99,6 +133,8 @@ export interface AppSettings {
   sidebarWidth: number;
   /** 最後に開いていたサービスインスタンスID */
   activeInstanceId: string | null;
+  /** マウスジェスチャー設定 */
+  gesture: GestureSettings;
 }
 
 export interface AppConfig {
@@ -122,12 +158,10 @@ export interface AddInstancePayload {
   color: string;
   badge: string;
   uaMode: UserAgentMode;
-  isAdultOrMatching: boolean;
 }
 
 export interface CategoryMeta {
   id: ServiceCategory;
   label: string;
   description: string;
-  isMatchingGroup?: boolean;
 }

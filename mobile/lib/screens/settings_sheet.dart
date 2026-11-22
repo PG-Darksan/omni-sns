@@ -17,14 +17,12 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   late bool _isDarkMode;
-  late bool _showMatching;
   late final TextEditingController _pinController;
 
   @override
   void initState() {
     super.initState();
     _isDarkMode = widget.settings.isDarkMode;
-    _showMatching = widget.settings.showMatchingServices;
     _pinController = TextEditingController(text: widget.settings.lockPin);
   }
 
@@ -38,7 +36,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     Navigator.of(context).pop(
       widget.settings.copyWith(
         isDarkMode: _isDarkMode,
-        showMatchingServices: _showMatching,
         lockPin: _pinController.text.trim(),
       ),
     );
@@ -64,13 +61,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             subtitle: const Text('OFFにするとライトテーマに切り替えます'),
             value: _isDarkMode,
             onChanged: (v) => setState(() => _isDarkMode = v),
-          ),
-          const Divider(),
-          SwitchListTile(
-            title: const Text('マッチング・出会い系を表示'),
-            subtitle: const Text('OFFにするとタブバー・ドロワー・カタログから一括非表示にします'),
-            value: _showMatching,
-            onChanged: (v) => setState(() => _showMatching = v),
           ),
           const Divider(),
           const SizedBox(height: 8),
@@ -100,7 +90,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 builder: (ctx) => AlertDialog(
                   title: const Text('全Cookieを削除しますか？'),
                   content: const Text(
-                    'アプリ内WebViewのすべてのSNS・マッチングアプリからログアウトされます。',
+                    'アプリ内WebViewのすべてのサービスからログアウトされます。',
                   ),
                   actions: [
                     TextButton(

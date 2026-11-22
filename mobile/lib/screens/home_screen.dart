@@ -74,11 +74,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _ensureSafeActiveAndLoad();
   }
 
-  List<ServiceInstance> get _visibleInstances {
-    return _instances
-        .where((i) => _settings.showMatchingServices || !i.isAdultOrMatching)
-        .toList();
-  }
+  List<ServiceInstance> get _visibleInstances => _instances;
 
   ServiceInstance? get _activeInstance {
     final activeId = _settings.activeInstanceId;
@@ -296,7 +292,6 @@ class _HomeScreenState extends State<HomeScreen> {
           categories: _categories,
           catalog: _catalog,
           existingInstances: _instances,
-          initialShowMatching: _settings.showMatchingServices,
         ),
       ),
     );
@@ -317,7 +312,6 @@ class _HomeScreenState extends State<HomeScreen> {
       colorHex: req.colorHex,
       badge: req.badge,
       uaMode: req.uaMode,
-      isAdultOrMatching: req.isAdultOrMatching,
       notificationsEnabled: true,
       order: _instances.length,
     );
@@ -329,9 +323,6 @@ class _HomeScreenState extends State<HomeScreen> {
         title: newInstance.name,
         isSleeping: true,
       );
-      if (newInstance.isAdultOrMatching && !_settings.showMatchingServices) {
-        _settings = _settings.copyWith(showMatchingServices: true);
-      }
       _settings = _settings.copyWith(activeInstanceId: newInstance.instanceId);
     });
     _ensureController(newInstance);
@@ -643,7 +634,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             IconButton(
               icon: const Icon(Icons.add_circle_outline),
-              tooltip: 'SNS・マッチングを追加',
+              tooltip: 'サービスを追加',
               onPressed: _openCatalog,
             ),
             IconButton(
@@ -688,14 +679,6 @@ class _HomeScreenState extends State<HomeScreen> {
                             mode: LaunchMode.externalApplication);
                       }
                     }
-                  case 'toggle-matching':
-                    setState(() {
-                      _settings = _settings.copyWith(
-                        showMatchingServices: !_settings.showMatchingServices,
-                      );
-                    });
-                    _ensureSafeActiveAndLoad();
-                    await _persist();
                   case 'settings':
                     await _openSettings();
                 }
@@ -719,14 +702,6 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   const PopupMenuDivider(),
                 ],
-                PopupMenuItem(
-                  value: 'toggle-matching',
-                  child: Text(
-                    _settings.showMatchingServices
-                        ? '♥ マッチング系を非表示にする'
-                        : '♥ マッチング系を表示する',
-                  ),
-                ),
                 const PopupMenuItem(value: 'settings', child: Text('⚙ アプリ設定')),
               ],
             ),
@@ -768,12 +743,12 @@ class _HomeScreenState extends State<HomeScreen> {
               const Icon(Icons.forum_outlined, size: 52),
               const SizedBox(height: 12),
               const Text(
-                'SNS・マッチングを追加して始めましょう',
+                'サービスを追加して始めましょう',
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 8),
               const Text(
-                '全61種のDM送信対応SNS・マッチングアプリから選んでワンタップで切り替えられます。',
+                '全60種のDM送信対応サービスから選んでワンタップで切り替えられます。',
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 16),
@@ -1102,7 +1077,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ),
                         Text(
-                          'Android · v1.0.0',
+                          'Android · v1.1.0',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],
@@ -1180,7 +1155,6 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                     subtitle: Text(
                       [
-                        if (inst.isAdultOrMatching) '恋活/婚活',
                         inst.uaMode == UserAgentMode.desktop ? 'PC版UA' : 'スマホUA',
                         if (rt?.isSleeping == true) '休止中',
                       ].join(' · '),
@@ -1214,42 +1188,20 @@ class _HomeScreenState extends State<HomeScreen> {
                         _openCatalog();
                       },
                       icon: const Icon(Icons.add),
-                      label: const Text('SNS・マッチングを追加'),
+                      label: const Text('サービスを追加'),
                     ),
                   ),
                   const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: () async {
-                            setState(() {
-                              _settings = _settings.copyWith(
-                                showMatchingServices:
-                                    !_settings.showMatchingServices,
-                              );
-                            });
-                            _ensureSafeActiveAndLoad();
-                            await _persist();
-                          },
-                          icon: const Icon(Icons.favorite_outline, size: 16),
-                          label: Text(
-                            _settings.showMatchingServices
-                                ? 'マッチング表示'
-                                : 'マッチング非表示',
-                            style: const TextStyle(fontSize: 12),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      IconButton.outlined(
-                        icon: const Icon(Icons.settings_outlined),
-                        onPressed: () {
-                          Navigator.of(context).pop();
-                          _openSettings();
-                        },
-                      ),
-                    ],
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        Navigator.of(context).pop();
+                        _openSettings();
+                      },
+                      icon: const Icon(Icons.settings_outlined, size: 18),
+                      label: const Text('アプリ設定'),
+                    ),
                   ),
                 ],
               ),
@@ -1285,7 +1237,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                     const SizedBox(height: 6),
                     const Text(
-                      'すべてのSNS・マッチング画面を非表示にしています。',
+                      'すべてのサービス画面を非表示にしています。',
                       textAlign: TextAlign.center,
                       style: TextStyle(fontSize: 12.5),
                     ),
