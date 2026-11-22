@@ -3,7 +3,7 @@
 **OmniSNS** は、無料プランのままWebブラウザから **DM / メッセージ送信に対応した主要SNS・メッセンジャー・マッチングアプリ（全44種＋カスタムURL）** を、1つのアプリ内で切り替えて使える統合ブラウザアプリです。
 
 - **Windows 版**: Tauri v2 + WebView2 マルチWebView（アカウントごと独立プロファイルによる完全セッション分離 / ヘッダーでの同一SNSアカウント瞬時切替 / 軽量インストーラー＆単体ポータブル `.exe`）
-- **Android 版**: Flutter + Android WebView（ヘッダーアカウント切替 / 下部クイックタブ切替 / ドロワー並び替え / リリース `.apk`）
+- **Android 版**: Flutter + AndroidX WebKit Multi-Profile ネイティブWebView（アカウントごと独立プロファイルによる完全セッション分離 / スマホ版UA専用 / DM・チャット欄でのGoogleパスワードマネージャー誤起動抑止 / 下部タブ折り畳み対応 / リリース `.apk`）
 
 > ビルド済みバイナリ（Windows `.exe` / Android `.apk`）は **[GitHub Releases](https://github.com/PG-Darksan/omni-sns/releases)** からダウンロードできます。
 
@@ -16,10 +16,11 @@
   - Mastodon / Misskey の独自インスタンスや社内チャットも「カスタム追加」から自由に登録可能
 - **同一SNSのマルチアカウントをヘッダーで瞬時に切り替え**
   - サイドバーはSNS単位ですっきり整理し、上部ヘッダーのアカウントバーから **同一SNSの複数アカウントをワンクリック（または `Ctrl + Alt + 1〜9` / `←` `→`）で瞬時に切り替え** 可能
-  - ヘッダーの「＋ アカウント追加」から即座に別アカウント（Windows版は完全独立WebView2プロファイル `profiles/omnisns-<instanceId>`）を追加・名前変更・削除でき、アカウント別の未読バッジも一目で確認可能
-- **PC版 / モバイル版 User-Agent をアカウントごとにワンクリック切替**
-  - 標準でクリーンな最新 Chrome User-Agent を設定し、WhatsApp Web・Snapchat Web・mixi2 等に対応
-  - OAuthポップアップ認証にもシームレスに対応
+  - ヘッダーの「＋ アカウント追加」から即座に別アカウント（Windows版は完全独立WebView2プロファイル `profiles/omnisns-<instanceId>`、Android版は AndroidX WebKit `Multi-Profile` による完全独立プロファイル ※非対応WebView端末ではアカウント追加UIを自動非表示）を追加・名前変更・削除でき、アカウント別の未読バッジも一目で確認可能
+- **プラットフォーム最適化ブラウザ体験**
+  - **Windows 版**: PC版 / モバイル版 User-Agent をアカウントごとにワンクリック切替（WhatsApp Web・Snapchat Web・mixi2 等に対応）
+  - **Android 版**: スマホ版 Android Chrome UA 専用でシンプルに操作でき、下部タブバーのワンタップ折り畳み・展開、およびチャット欄・DM欄などパスワード入力欄以外での Google パスワードマネージャー誤起動抑止に対応
+  - OAuthポップアップ認証にもプロファイルを維持したままシームレスに対応
 - **マルチタブ & マウスジェスチャー（Windows版・HisatorNotebook 準拠）**
   - 各アカウント内でログインセッションを共有したまま **複数タブ** の作成・複製・切替・削除・閉じたタブ復元に対応
   - 右クリック＋ドラッグによる **12方向マウスジェスチャー**（1方向 4種 ＋ 直角2方向 8種）＋ 透明オーバーレイ軌跡＆ガイド表示（同一SNS内の前/次アカウント切替も割り当て可能）

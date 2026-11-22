@@ -64,16 +64,17 @@ class AppStore {
     final pinned = catalog.where((s) => s.defaultPinned).toList();
     return List.generate(pinned.length, (idx) {
       final svc = pinned[idx];
+      final instanceId = 'svc-${svc.id}-default';
       return ServiceInstance(
-        instanceId: 'svc-${svc.id}-default',
+        instanceId: instanceId,
         serviceId: svc.id,
         name: svc.name,
         accountLabel: 'メイン',
+        profileName: makeProfileNameForInstance(instanceId),
         category: svc.category,
         url: svc.url,
         colorHex: svc.colorHex,
         badge: svc.badge,
-        uaMode: svc.recommendedAndroidUa,
         notificationsEnabled: true,
         order: idx,
       );
@@ -87,10 +88,11 @@ class AppStore {
 
     final rawInstances = prefs.getString(_instancesKey);
     List<ServiceInstance> instances;
+    var needsMigrationPersist = false;
     if (rawInstances != null && rawInstances.isNotEmpty) {
       try {
         final list = jsonDecode(rawInstances) as List<dynamic>;
-        instances = List.generate(
+        final parsed = List.generate(
           list.length,
           (idx) => ServiceInstance.fromJson(
             list[idx] as Map<String, dynamic>,
@@ -100,8 +102,18 @@ class AppStore {
             .where((i) => !_isRemovedService(i))
             .toList()
           ..sort((a, b) => a.order.compareTo(b.order));
+
+        final migrated = assignProfilesForMigration(parsed);
+        for (var i = 0; i < migrated.length; i++) {
+          if (migrated[i].profileName != parsed[i].profileName) {
+            needsMigrationPersist = true;
+            break;
+          }
+        }
+        instances = migrated;
       } catch (_) {
         instances = createDefaultInstances(catalog);
+        needsMigrationPersist = true;
       }
     } else {
       instances = createDefaultInstances(catalog);
@@ -125,9 +137,14 @@ class AppStore {
         instances.any((i) => i.instanceId == settings.activeInstanceId);
     if (!hasValidActive) {
       settings = settings.copyWith(
-        activeInstanceId: instances.isNotEmpty ? instances.first.instanceId : null,
+        activeInstanceId:
+            instances.isNotEmpty ? instances.first.instanceId : null,
         clearActive: instances.isEmpty,
       );
+    }
+
+    if (needsMigrationPersist) {
+      await saveState(settings, instances);
     }
 
     return (settings, instances);

@@ -2,10 +2,9 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:webview_flutter/webview_flutter.dart';
-import 'package:webview_flutter_android/webview_flutter_android.dart';
 import '../models/service_models.dart';
 import '../services/app_store.dart';
+import '../services/omni_webview.dart';
 import 'catalog_sheet.dart';
 import 'settings_sheet.dart';
 
@@ -43,12 +42,13 @@ class _ServiceGroup {
 
 class _HomeScreenState extends State<HomeScreen> {
   bool _initialized = false;
+  bool _multiProfileSupported = false;
   List<CategoryMeta> _categories = const [];
   List<CatalogService> _catalog = const [];
   List<ServiceInstance> _instances = [];
   AppSettings _settings = const AppSettings();
 
-  final Map<String, WebViewController> _controllers = {};
+  final Map<String, OmniWebViewController> _controllers = {};
   final Map<String, TabRuntimeState> _runtimeMap = {};
   final Map<String, String> _lastActiveByGroup = {};
 
@@ -58,10 +58,20 @@ class _HomeScreenState extends State<HomeScreen> {
     _bootstrap();
   }
 
+  @override
+  void dispose() {
+    for (final ctrl in _controllers.values) {
+      ctrl.dispose();
+    }
+    _controllers.clear();
+    super.dispose();
+  }
+
   Future<void> _bootstrap() async {
     final catalogData = await widget.store.loadCatalog();
     final (settings, instances) =
         await widget.store.loadState(catalogData.services);
+    final multiProfile = await OmniWebViewManager.isMultiProfileSupported();
 
     for (final inst in instances) {
       _runtimeMap[inst.instanceId] = TabRuntimeState(
@@ -77,6 +87,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _catalog = catalogData.services;
       _settings = settings;
       _instances = instances;
+      _multiProfileSupported = multiProfile;
       _initialized = true;
     });
 
@@ -160,6 +171,17 @@ class _HomeScreenState extends State<HomeScreen> {
     return sum;
   }
 
+  int get _otherGroupsUnread {
+    final activeKey = _activeGroup?.key;
+    var sum = 0;
+    for (final inst in _visibleInstances) {
+      if (!inst.notificationsEnabled) continue;
+      if (activeKey != null && serviceGroupKey(inst) == activeKey) continue;
+      sum += _runtimeMap[inst.instanceId]?.unreadCount ?? 0;
+    }
+    return sum;
+  }
+
   void _ensureSafeActiveAndLoad() {
     final visible = _visibleInstances;
     var activeId = _settings.activeInstanceId;
@@ -183,100 +205,91 @@ class _HomeScreenState extends State<HomeScreen> {
     await widget.store.saveState(_settings, _instances);
   }
 
-  WebViewController _ensureController(ServiceInstance instance) {
+  OmniWebViewController _ensureController(ServiceInstance instance) {
     final existing = _controllers[instance.instanceId];
-    if (existing != null) return existing;
+    if (existing != null && !existing.isDisposed) return existing;
 
-    final PlatformWebViewControllerCreationParams params =
-        WebViewPlatform.instance is AndroidWebViewPlatform
-            ? AndroidWebViewControllerCreationParams()
-            : const PlatformWebViewControllerCreationParams();
-
-    final controller = WebViewController.fromPlatformCreationParams(
-      params,
-      onPermissionRequest: (request) => request.grant(),
+    final controller = OmniWebViewController(
+      initialUrl: instance.url,
+      profileName: _multiProfileSupported
+          ? instance.effectiveProfileName
+          : defaultWebViewProfileName,
+      userAgent: buildMobileUserAgent(),
+      onProgress: (progress) {
+        _updateRuntime(
+          instance.instanceId,
+          (cur) => cur.copyWith(
+            progress: progress,
+            isLoading: progress < 100,
+            isSleeping: false,
+          ),
+        );
+      },
+      onPageStarted: (url) {
+        _updateRuntime(
+          instance.instanceId,
+          (cur) => cur.copyWith(
+            currentUrl: url.isEmpty ? cur.currentUrl : url,
+            isLoading: true,
+            isSleeping: false,
+            clearError: true,
+          ),
+        );
+      },
+      onPageFinished: (url, title, canBack, canFwd) {
+        final safeTitle = title.trim().isEmpty ? instance.name : title;
+        final unread = parseUnreadCountFromTitle(safeTitle);
+        _updateRuntime(
+          instance.instanceId,
+          (cur) => cur.copyWith(
+            currentUrl: url.isEmpty ? cur.currentUrl : url,
+            title: safeTitle,
+            progress: 100,
+            unreadCount: unread,
+            isLoading: false,
+            isSleeping: false,
+            canGoBack: canBack,
+            canGoForward: canFwd,
+          ),
+        );
+      },
+      onTitleChanged: (title) {
+        final safeTitle = title.trim().isEmpty ? instance.name : title;
+        final unread = parseUnreadCountFromTitle(safeTitle);
+        _updateRuntime(
+          instance.instanceId,
+          (cur) => cur.copyWith(
+            title: safeTitle,
+            unreadCount: unread,
+          ),
+        );
+      },
+      onHistoryChanged: (url, canBack, canFwd) {
+        _updateRuntime(
+          instance.instanceId,
+          (cur) => cur.copyWith(
+            currentUrl: url.isEmpty ? cur.currentUrl : url,
+            canGoBack: canBack,
+            canGoForward: canFwd,
+          ),
+        );
+      },
+      onWebResourceError: (description, errorCode) {
+        _updateRuntime(
+          instance.instanceId,
+          (cur) => cur.copyWith(
+            isLoading: false,
+            loadError: '$description ($errorCode)',
+          ),
+        );
+      },
+      onExternalScheme: (url) {
+        final uri = Uri.tryParse(url);
+        if (uri != null) {
+          launchUrl(uri, mode: LaunchMode.externalApplication);
+        }
+      },
     );
-
-    if (controller.platform is AndroidWebViewController) {
-      final androidCtrl = controller.platform as AndroidWebViewController;
-      androidCtrl.setMediaPlaybackRequiresUserGesture(false);
-      androidCtrl.setGeolocationPermissionsPromptCallbacks(
-        onShowPrompt: (_) async => const GeolocationPermissionsResponse(
-          allow: true,
-          retain: true,
-        ),
-      );
-    }
-
-    controller
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setUserAgent(buildUserAgent(instance.uaMode))
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onProgress: (progress) {
-            _updateRuntime(
-              instance.instanceId,
-              (cur) => cur.copyWith(
-                progress: progress,
-                isLoading: progress < 100,
-                isSleeping: false,
-              ),
-            );
-          },
-          onPageStarted: (url) {
-            _updateRuntime(
-              instance.instanceId,
-              (cur) => cur.copyWith(
-                currentUrl: url,
-                isLoading: true,
-                isSleeping: false,
-                clearError: true,
-              ),
-            );
-          },
-          onPageFinished: (url) async {
-            final title = await controller.getTitle() ?? instance.name;
-            final canBack = await controller.canGoBack();
-            final canFwd = await controller.canGoForward();
-            final unread = parseUnreadCountFromTitle(title);
-            _updateRuntime(
-              instance.instanceId,
-              (cur) => cur.copyWith(
-                currentUrl: url,
-                title: title,
-                progress: 100,
-                unreadCount: unread,
-                isLoading: false,
-                isSleeping: false,
-                canGoBack: canBack,
-                canGoForward: canFwd,
-              ),
-            );
-          },
-          onWebResourceError: (error) {
-            if (error.isForMainFrame != true) return;
-            _updateRuntime(
-              instance.instanceId,
-              (cur) => cur.copyWith(
-                isLoading: false,
-                loadError: '${error.description} (${error.errorCode})',
-              ),
-            );
-          },
-          onNavigationRequest: (request) {
-            final uri = Uri.tryParse(request.url);
-            if (uri == null) return NavigationDecision.prevent;
-            if (uri.scheme == 'http' || uri.scheme == 'https') {
-              return NavigationDecision.navigate;
-            }
-            if (uri.scheme == 'mailto' || uri.scheme == 'tel') {
-              launchUrl(uri, mode: LaunchMode.externalApplication);
-            }
-            return NavigationDecision.prevent;
-          },
-        ),
-      )
-      ..loadRequest(Uri.parse(instance.url));
 
     _controllers[instance.instanceId] = controller;
     _updateRuntime(
@@ -313,7 +326,17 @@ class _HomeScreenState extends State<HomeScreen> {
     _activateInstance(_pickTargetAccountForGroup(group));
   }
 
+  Future<void> _toggleBottomTabsCollapsed() async {
+    setState(() {
+      _settings = _settings.copyWith(
+        isBottomTabsCollapsed: !_settings.isBottomTabsCollapsed,
+      );
+    });
+    await _persist();
+  }
+
   Future<void> _addAccountForActiveService() async {
+    if (!_multiProfileSupported) return;
     final active = _activeInstance;
     final group = _activeGroup;
     if (active == null || group == null) return;
@@ -335,16 +358,18 @@ class _HomeScreenState extends State<HomeScreen> {
         .padLeft(6, '0');
     final safePrefix =
         active.serviceId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
+    final newInstanceId =
+        'svc-${safePrefix.isEmpty ? 'custom' : safePrefix}-$randHex';
     final newInstance = ServiceInstance(
-      instanceId: 'svc-${safePrefix.isEmpty ? 'custom' : safePrefix}-$randHex',
+      instanceId: newInstanceId,
       serviceId: active.serviceId,
       name: group.displayName,
       accountLabel: nextLabel,
+      profileName: makeProfileNameForInstance(newInstanceId),
       category: active.category,
       url: catSvc?.url ?? active.url,
       colorHex: active.colorHex,
       badge: active.badge,
-      uaMode: active.uaMode,
       notificationsEnabled: true,
       order: _instances.length,
     );
@@ -354,7 +379,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final lastSiblingIdx = _instances.lastIndexWhere(
       (i) => serviceGroupKey(i) == newGroupKey,
     );
-    final insertAt = lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
+    final insertAt =
+        lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
     setState(() {
       _instances.insert(insertAt, newInstance);
       _runtimeMap[newInstance.instanceId] = TabRuntimeState(
@@ -366,11 +392,12 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     _ensureController(newInstance);
     await _persist();
-    _showSnack('「${group.displayName} / $nextLabel」を追加しました');
+    _showSnack('「${group.displayName} / $nextLabel」を追加しました（独立セッション）');
   }
 
   void _sleepInstance(String instanceId) {
-    _controllers.remove(instanceId);
+    final removed = _controllers.remove(instanceId);
+    removed?.dispose();
     _updateRuntime(
       instanceId,
       (cur) => cur.copyWith(
@@ -383,33 +410,39 @@ class _HomeScreenState extends State<HomeScreen> {
     _showSnack('タブを休止してメモリを解放しました');
   }
 
-  Future<void> _toggleUaForActive() async {
-    final active = _activeInstance;
-    if (active == null) return;
-    final nextUa = active.uaMode == UserAgentMode.desktop
-        ? UserAgentMode.mobile
-        : UserAgentMode.desktop;
-
-    final idx =
-        _instances.indexWhere((i) => i.instanceId == active.instanceId);
-    if (idx == -1) return;
-
-    final updated = active.copyWith(uaMode: nextUa);
-    setState(() {
-      _instances[idx] = updated;
-    });
-    await _persist();
-
-    final ctrl = _controllers[active.instanceId];
-    if (ctrl != null) {
-      await ctrl.setUserAgent(buildUserAgent(nextUa));
-      await ctrl.reload();
-    }
-    _showSnack(
-      nextUa == UserAgentMode.desktop
-          ? 'PC版 User-Agent に切り替えました'
-          : 'スマホ版 User-Agent に切り替えました',
+  Future<void> _clearSessionForInstance(ServiceInstance inst) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('ログイン情報を消去'),
+        content: Text(
+          _multiProfileSupported
+              ? 'このアカウントのCookieとログイン情報を消去してログアウトしますか？'
+              : 'Cookieとログイン情報を消去してログアウトしますか？',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('消去する'),
+          ),
+        ],
+      ),
     );
+    if (ok != true) return;
+
+    final profileName = _multiProfileSupported
+        ? inst.effectiveProfileName
+        : defaultWebViewProfileName;
+    await OmniWebViewManager.clearProfileData(profileName);
+    final ctrl = _controllers[inst.instanceId];
+    if (ctrl != null) {
+      await ctrl.loadUrl(inst.url);
+    }
+    _showSnack('ログイン情報を消去しました');
   }
 
   Future<void> _openCatalog() async {
@@ -419,10 +452,22 @@ class _HomeScreenState extends State<HomeScreen> {
           categories: _categories,
           catalog: _catalog,
           existingInstances: _instances,
+          multiProfileSupported: _multiProfileSupported,
         ),
       ),
     );
     if (req == null) return;
+
+    if (req.openExistingInstanceId != null) {
+      final existing = _instances.cast<ServiceInstance?>().firstWhere(
+            (i) => i?.instanceId == req.openExistingInstanceId,
+            orElse: () => null,
+          );
+      if (existing != null) {
+        _activateInstance(existing);
+        return;
+      }
+    }
 
     final randHex = Random()
         .nextInt(0xFFFFFF)
@@ -430,16 +475,18 @@ class _HomeScreenState extends State<HomeScreen> {
         .padLeft(6, '0');
     final safePrefix =
         req.serviceId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
+    final newInstanceId =
+        'svc-${safePrefix.isEmpty ? 'custom' : safePrefix}-$randHex';
     final newInstance = ServiceInstance(
-      instanceId: 'svc-${safePrefix.isEmpty ? 'custom' : safePrefix}-$randHex',
+      instanceId: newInstanceId,
       serviceId: req.serviceId,
       name: req.name,
       accountLabel: req.accountLabel,
+      profileName: makeProfileNameForInstance(newInstanceId),
       category: req.category,
       url: req.url,
       colorHex: req.colorHex,
       badge: req.badge,
-      uaMode: req.uaMode,
       notificationsEnabled: true,
       order: _instances.length,
     );
@@ -449,7 +496,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final lastSiblingIdx = _instances.lastIndexWhere(
       (i) => serviceGroupKey(i) == newGroupKey,
     );
-    final insertAt = lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
+    final insertAt =
+        lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
     setState(() {
       _instances.insert(insertAt, newInstance);
       _runtimeMap[newInstance.instanceId] = TabRuntimeState(
@@ -461,7 +509,8 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     _ensureController(newInstance);
     await _persist();
-    final suffix = (newInstance.accountLabel?.isNotEmpty ?? false)
+    final suffix = _multiProfileSupported &&
+            (newInstance.accountLabel?.isNotEmpty ?? false)
         ? ' / ${newInstance.accountLabel}'
         : '';
     _showSnack('「${newInstance.name}$suffix」を追加しました');
@@ -473,7 +522,7 @@ class _HomeScreenState extends State<HomeScreen> {
         builder: (_) => SettingsScreen(
           settings: _settings,
           onClearAllCookies: () async {
-            await WebViewCookieManager().clearCookies();
+            await OmniWebViewManager.clearAllCookies();
             for (final id in _controllers.keys.toList()) {
               await _controllers[id]?.reload();
             }
@@ -506,27 +555,32 @@ class _HomeScreenState extends State<HomeScreen> {
     final accCtrl = TextEditingController(text: curAccLabel);
     final nameCtrl = TextEditingController(text: inst.name);
     final urlCtrl = TextEditingController(text: inst.url);
-    var uaMode = inst.uaMode;
     var notify = inst.notificationsEnabled;
+
+    final dialogTitle = _multiProfileSupported
+        ? '「${grp?.displayName ?? inst.name} · $curAccLabel」を編集'
+        : '「${grp?.displayName ?? inst.name}」を編集';
 
     final updated = await showDialog<ServiceInstance>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
-          title: Text('「${grp?.displayName ?? inst.name} · $curAccLabel」を編集'),
+          title: Text(dialogTitle),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                TextField(
-                  controller: accCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'アカウント名（ヘッダー表示名）',
-                    hintText: '例: メイン / サブ / 仕事用',
-                    border: OutlineInputBorder(),
+                if (_multiProfileSupported) ...[
+                  TextField(
+                    controller: accCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'アカウント名（ヘッダー表示名）',
+                      hintText: '例: メイン / サブ / 仕事用',
+                      border: OutlineInputBorder(),
+                    ),
                   ),
-                ),
-                const SizedBox(height: 12),
+                  const SizedBox(height: 12),
+                ],
                 TextField(
                   controller: nameCtrl,
                   decoration: const InputDecoration(
@@ -542,27 +596,6 @@ class _HomeScreenState extends State<HomeScreen> {
                     labelText: 'ホーム / DM画面 URL',
                     border: OutlineInputBorder(),
                   ),
-                ),
-                const SizedBox(height: 12),
-                DropdownButtonFormField<UserAgentMode>(
-                  initialValue: uaMode,
-                  decoration: const InputDecoration(
-                    labelText: 'User-Agent',
-                    border: OutlineInputBorder(),
-                  ),
-                  items: const [
-                    DropdownMenuItem(
-                      value: UserAgentMode.mobile,
-                      child: Text('スマホ版 (Android Chrome)'),
-                    ),
-                    DropdownMenuItem(
-                      value: UserAgentMode.desktop,
-                      child: Text('PC版 (Windows Chrome)'),
-                    ),
-                  ],
-                  onChanged: (v) {
-                    if (v != null) setDialogState(() => uaMode = v);
-                  },
                 ),
                 const SizedBox(height: 8),
                 CheckboxListTile(
@@ -594,10 +627,12 @@ class _HomeScreenState extends State<HomeScreen> {
                     name: nameCtrl.text.trim().isEmpty
                         ? inst.name
                         : nameCtrl.text.trim(),
-                    accountLabel: trimmedAcc.isEmpty ? null : trimmedAcc,
-                    clearAccountLabel: trimmedAcc.isEmpty,
+                    accountLabel: _multiProfileSupported
+                        ? (trimmedAcc.isEmpty ? null : trimmedAcc)
+                        : inst.accountLabel,
+                    clearAccountLabel:
+                        _multiProfileSupported && trimmedAcc.isEmpty,
                     url: normalized,
-                    uaMode: uaMode,
                     notificationsEnabled: notify,
                   ),
                 );
@@ -618,17 +653,10 @@ class _HomeScreenState extends State<HomeScreen> {
         _instances.indexWhere((i) => i.instanceId == inst.instanceId);
     if (idx == -1) return;
 
-    final uaChanged = inst.uaMode != updated.uaMode;
     setState(() {
       _instances[idx] = updated;
     });
     await _persist();
-
-    final ctrl = _controllers[inst.instanceId];
-    if (ctrl != null && uaChanged) {
-      await ctrl.setUserAgent(buildUserAgent(updated.uaMode));
-      await ctrl.reload();
-    }
     _showSnack('設定を保存しました');
   }
 
@@ -646,14 +674,16 @@ class _HomeScreenState extends State<HomeScreen> {
       siblingIdx,
       baseServiceName: grp?.displayName,
     );
-    final displayTitle = grp != null && grp.accounts.length >= 2
+    final displayTitle = _multiProfileSupported &&
+            grp != null &&
+            grp.accounts.length >= 2
         ? '${grp.displayName} / $label'
         : (grp?.displayName ?? inst.name);
 
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('アカウントを削除'),
+        title: Text(_multiProfileSupported ? 'アカウントを削除' : 'サービスを削除'),
         content: Text('「$displayTitle」を削除しますか？'),
         actions: [
           TextButton(
@@ -670,7 +700,8 @@ class _HomeScreenState extends State<HomeScreen> {
     if (ok != true) return;
 
     final wasActive = _settings.activeInstanceId == inst.instanceId;
-    _controllers.remove(inst.instanceId);
+    final removedCtrl = _controllers.remove(inst.instanceId);
+    removedCtrl?.dispose();
     _runtimeMap.remove(inst.instanceId);
     setState(() {
       _instances.removeWhere((i) => i.instanceId == inst.instanceId);
@@ -680,12 +711,17 @@ class _HomeScreenState extends State<HomeScreen> {
             .firstWhere((i) => i != null && serviceGroupKey(i) == groupKey,
                 orElse: () => null);
         if (sameGroupNext != null) {
-          _settings = _settings.copyWith(activeInstanceId: sameGroupNext.instanceId);
+          _settings =
+              _settings.copyWith(activeInstanceId: sameGroupNext.instanceId);
         }
       }
     });
     _ensureSafeActiveAndLoad();
     await _persist();
+    if (_multiProfileSupported &&
+        inst.effectiveProfileName != defaultWebViewProfileName) {
+      await OmniWebViewManager.deleteProfile(inst.effectiveProfileName);
+    }
     _showSnack('「$displayTitle」を削除しました');
   }
 
@@ -715,16 +751,25 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     if (ok != true) return;
 
+    final profilesToDelete = <String>[];
     final ids = group.accounts.map((a) => a.instanceId).toSet();
-    for (final id in ids) {
-      _controllers.remove(id);
-      _runtimeMap.remove(id);
+    for (final acc in group.accounts) {
+      final ctrl = _controllers.remove(acc.instanceId);
+      ctrl?.dispose();
+      _runtimeMap.remove(acc.instanceId);
+      if (_multiProfileSupported &&
+          acc.effectiveProfileName != defaultWebViewProfileName) {
+        profilesToDelete.add(acc.effectiveProfileName);
+      }
     }
     setState(() {
       _instances.removeWhere((i) => ids.contains(i.instanceId));
     });
     _ensureSafeActiveAndLoad();
     await _persist();
+    for (final profile in profilesToDelete) {
+      await OmniWebViewManager.deleteProfile(profile);
+    }
     _showSnack('「${group.displayName}」を削除しました');
   }
 
@@ -754,6 +799,8 @@ class _HomeScreenState extends State<HomeScreen> {
         active != null ? _runtimeMap[active.instanceId] : null;
     final visible = _visibleInstances;
     final groups = _serviceGroups;
+    final tabsCollapsed = _settings.isBottomTabsCollapsed;
+    final otherUnread = _otherGroupsUnread;
 
     return PopScope(
       canPop: false,
@@ -832,18 +879,45 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
           actions: [
-            if (active != null)
+            if (tabsCollapsed)
               Padding(
                 padding: const EdgeInsets.only(right: 2),
                 child: ActionChip(
                   visualDensity: VisualDensity.compact,
                   labelPadding: const EdgeInsets.symmetric(horizontal: 4),
-                  label: Text(
-                    active.uaMode == UserAgentMode.desktop ? 'PC' : 'スマホ',
-                    style: const TextStyle(fontSize: 11),
+                  avatar: const Icon(
+                    Icons.keyboard_arrow_up_rounded,
+                    size: 16,
                   ),
-                  tooltip: 'PC版 / スマホ版 User-Agent 切替',
-                  onPressed: _toggleUaForActive,
+                  label: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('タブ', style: TextStyle(fontSize: 11)),
+                      if (otherUnread > 0) ...[
+                        const SizedBox(width: 4),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 4,
+                            vertical: 0.5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.redAccent,
+                            borderRadius: BorderRadius.circular(99),
+                          ),
+                          child: Text(
+                            otherUnread > 99 ? '99+' : '$otherUnread',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 9,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                  tooltip: '下部タブを展開',
+                  onPressed: _toggleBottomTabsCollapsed,
                 ),
               ),
             IconButton(
@@ -875,8 +949,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   case 'home':
                     if (active != null) {
                       final c = _ensureController(active);
-                      await c.loadRequest(Uri.parse(active.url));
+                      await c.loadUrl(active.url);
                     }
+                  case 'toggle-bottom-tabs':
+                    await _toggleBottomTabsCollapsed();
                   case 'sleep':
                     if (active != null) _sleepInstance(active.instanceId);
                   case 'external':
@@ -900,6 +976,12 @@ class _HomeScreenState extends State<HomeScreen> {
                   const PopupMenuItem(
                     value: 'home',
                     child: Text('⌂ DM/ホーム画面へ戻る'),
+                  ),
+                  PopupMenuItem(
+                    value: 'toggle-bottom-tabs',
+                    child: Text(
+                      tabsCollapsed ? '▲ 下部タブを展開' : '▼ 下部タブを折り畳む',
+                    ),
                   ),
                   const PopupMenuItem(
                     value: 'sleep',
@@ -929,10 +1011,23 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         body: Column(
           children: [
-            if (active != null && activeGroup != null)
+            if (active != null && activeGroup != null && _multiProfileSupported)
               _buildAccountSwitcherBar(activeGroup, active),
-            Expanded(child: _buildViewport(visible, active, activeRt)),
-            _buildBottomTabStrip(groups, activeGroup),
+            Expanded(
+              child: SafeArea(
+                top: false,
+                bottom: tabsCollapsed,
+                child: _buildViewport(visible, active, activeRt),
+              ),
+            ),
+            AnimatedSize(
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.bottomCenter,
+              child: tabsCollapsed
+                  ? const SizedBox(width: double.infinity, height: 0)
+                  : _buildBottomTabStrip(groups, activeGroup),
+            ),
           ],
         ),
       ),
@@ -1117,90 +1212,118 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    if (activeRt?.isSleeping == true || !_controllers.containsKey(active.instanceId)) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.bedtime_outlined, size: 48),
-              const SizedBox(height: 10),
-              Text(
-                '「${active.name}」は休止中です',
-                style:
-                    const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 8),
-              const Text('メモリ節約のため表示を一時停止しています。'),
-              const SizedBox(height: 14),
-              FilledButton(
-                onPressed: () {
-                  _ensureController(active);
-                  setState(() {});
-                },
-                child: const Text('再開する'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    if (activeRt?.loadError != null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.wifi_off, size: 48),
-              const SizedBox(height: 10),
-              const Text(
-                'ページの読み込みに失敗しました',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 6),
-              Text(activeRt!.loadError!, textAlign: TextAlign.center),
-              const SizedBox(height: 14),
-              Wrap(
-                spacing: 8,
-                children: [
-                  FilledButton(
-                    onPressed: () => _controllers[active.instanceId]?.reload(),
-                    child: const Text('再読み込み'),
-                  ),
-                  OutlinedButton(
-                    onPressed: () {
-                      final uri = Uri.tryParse(activeRt.currentUrl);
-                      if (uri != null) {
-                        launchUrl(uri, mode: LaunchMode.externalApplication);
-                      }
-                    },
-                    child: const Text('外部ブラウザで開く'),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
     final liveIds = visible
         .where((i) => _controllers.containsKey(i.instanceId))
         .map((i) => i.instanceId)
         .toList();
     final activeIndex = liveIds.indexOf(active.instanceId);
-    if (activeIndex < 0) return const SizedBox.shrink();
+    final isSleeping =
+        activeRt?.isSleeping == true || !_controllers.containsKey(active.instanceId);
+    final hasError = activeRt?.loadError != null;
+    final showWebView = !isSleeping && !hasError && activeIndex >= 0;
 
-    return IndexedStack(
-      index: activeIndex,
+    return Stack(
       children: [
-        for (final id in liveIds)
-          WebViewWidget(
-            key: ValueKey('wv-$id'),
-            controller: _controllers[id]!,
+        if (liveIds.isNotEmpty)
+          Positioned.fill(
+            child: Offstage(
+              offstage: !showWebView,
+              child: IndexedStack(
+                index: activeIndex >= 0 ? activeIndex : 0,
+                children: [
+                  for (final id in liveIds)
+                    OmniWebViewWidget(
+                      key: ValueKey('wv-$id'),
+                      controller: _controllers[id]!,
+                    ),
+                ],
+              ),
+            ),
+          ),
+        if (isSleeping)
+          Positioned.fill(
+            child: ColoredBox(
+              color: Theme.of(context).scaffoldBackgroundColor,
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.bedtime_outlined, size: 48),
+                      const SizedBox(height: 10),
+                      Text(
+                        '「${active.name}」は休止中です',
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text('メモリ節約のため表示を一時停止しています。'),
+                      const SizedBox(height: 14),
+                      FilledButton(
+                        onPressed: () {
+                          _ensureController(active);
+                          setState(() {});
+                        },
+                        child: const Text('再開する'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          )
+        else if (hasError)
+          Positioned.fill(
+            child: ColoredBox(
+              color: Theme.of(context).scaffoldBackgroundColor,
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.wifi_off, size: 48),
+                      const SizedBox(height: 10),
+                      const Text(
+                        'ページの読み込みに失敗しました',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(activeRt!.loadError!, textAlign: TextAlign.center),
+                      const SizedBox(height: 14),
+                      Wrap(
+                        spacing: 8,
+                        children: [
+                          FilledButton(
+                            onPressed: () =>
+                                _controllers[active.instanceId]?.reload(),
+                            child: const Text('再読み込み'),
+                          ),
+                          OutlinedButton(
+                            onPressed: () {
+                              final uri = Uri.tryParse(activeRt.currentUrl);
+                              if (uri != null) {
+                                launchUrl(
+                                  uri,
+                                  mode: LaunchMode.externalApplication,
+                                );
+                              }
+                            },
+                            child: const Text('外部ブラウザで開く'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           ),
       ],
     );
@@ -1303,14 +1426,16 @@ class _HomeScreenState extends State<HomeScreen> {
                                   ),
                                 ),
                               ),
-                              if (group.accounts.length >= 2) ...[
+                              if (_multiProfileSupported &&
+                                  group.accounts.length >= 2) ...[
                                 const SizedBox(width: 4),
                                 Text(
                                   '${group.accounts.length}垢',
                                   style: TextStyle(
                                     fontSize: 10,
                                     fontWeight: FontWeight.bold,
-                                    color: Theme.of(context).colorScheme.primary,
+                                    color:
+                                        Theme.of(context).colorScheme.primary,
                                   ),
                                 ),
                               ],
@@ -1344,9 +1469,16 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
               IconButton(
-                icon: const Icon(Icons.add),
+                icon: const Icon(Icons.add, size: 22),
+                visualDensity: VisualDensity.compact,
                 tooltip: 'サービス追加',
                 onPressed: _openCatalog,
+              ),
+              IconButton(
+                icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 24),
+                visualDensity: VisualDensity.compact,
+                tooltip: '下部タブを折り畳む',
+                onPressed: _toggleBottomTabsCollapsed,
               ),
             ],
           ),
@@ -1376,7 +1508,9 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             ListTile(
               title: Text(
-                '${grp?.displayName ?? inst.name} · $accLabel',
+                _multiProfileSupported
+                    ? '${grp?.displayName ?? inst.name} · $accLabel'
+                    : (grp?.displayName ?? inst.name),
                 style: const TextStyle(fontWeight: FontWeight.bold),
               ),
               subtitle: Text(inst.url),
@@ -1384,15 +1518,33 @@ class _HomeScreenState extends State<HomeScreen> {
             const Divider(height: 1),
             ListTile(
               leading: const Icon(Icons.edit_outlined),
-              title: const Text('アカウント名・URL・UA設定を編集'),
+              title: Text(
+                _multiProfileSupported ? 'アカウント名・URLを編集' : '表示名・URLを編集',
+              ),
               onTap: () {
                 Navigator.of(ctx).pop();
                 _editInstance(inst);
               },
             ),
             ListTile(
+              leading: const Icon(Icons.logout_outlined),
+              title: Text(
+                _multiProfileSupported
+                    ? 'このアカウントのログイン情報を消去'
+                    : 'ログイン情報を消去',
+              ),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _clearSessionForInstance(inst);
+              },
+            ),
+            ListTile(
               leading: const Icon(Icons.bedtime_outlined),
-              title: const Text('このアカウントを休止（メモリ解放）'),
+              title: Text(
+                _multiProfileSupported
+                    ? 'このアカウントを休止（メモリ解放）'
+                    : 'このタブを休止（メモリ解放）',
+              ),
               onTap: () {
                 Navigator.of(ctx).pop();
                 _sleepInstance(inst.instanceId);
@@ -1400,16 +1552,16 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             ListTile(
               leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-              title: const Text(
-                'このアカウントを削除',
-                style: TextStyle(color: Colors.redAccent),
+              title: Text(
+                _multiProfileSupported ? 'このアカウントを削除' : 'このサービスを削除',
+                style: const TextStyle(color: Colors.redAccent),
               ),
               onTap: () {
                 Navigator.of(ctx).pop();
                 _removeInstance(inst);
               },
             ),
-            if (grp != null && grp.accounts.length >= 2)
+            if (_multiProfileSupported && grp != null && grp.accounts.length >= 2)
               ListTile(
                 leading: const Icon(Icons.delete_sweep_outlined,
                     color: Colors.redAccent),
@@ -1476,7 +1628,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ),
                         Text(
-                          'Android · v1.2.0',
+                          'Android · v1.3.0',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],
@@ -1529,6 +1681,13 @@ class _HomeScreenState extends State<HomeScreen> {
                   final allSleeping = group.accounts.every(
                     (a) => _runtimeMap[a.instanceId]?.isSleeping != false,
                   );
+                  final host = Uri.tryParse(primary.url)?.host ?? '';
+                  final subtitleParts = <String>[
+                    if (_multiProfileSupported && group.accounts.length >= 2)
+                      '${group.accounts.length}アカウント',
+                    if (allSleeping) '休止中',
+                    if (host.isNotEmpty) host,
+                  ];
                   return ListTile(
                     key: ValueKey('drawer-${group.key}'),
                     selected: selected,
@@ -1554,17 +1713,14 @@ class _HomeScreenState extends State<HomeScreen> {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    subtitle: Text(
-                      [
-                        if (group.accounts.length >= 2)
-                          '${group.accounts.length}アカウント',
-                        primary.uaMode == UserAgentMode.desktop
-                            ? 'PC版UA'
-                            : 'スマホUA',
-                        if (allSleeping) '休止中',
-                      ].join(' · '),
-                      style: const TextStyle(fontSize: 11),
-                    ),
+                    subtitle: subtitleParts.isEmpty
+                        ? null
+                        : Text(
+                            subtitleParts.join(' · '),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 11),
+                          ),
                     trailing: IconButton(
                       icon: const Icon(Icons.more_vert, size: 18),
                       onPressed: () {
@@ -1604,7 +1760,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         Navigator.of(context).pop();
                         _openSettings();
                       },
-                      icon: const Icon(Icons.settings_outlined, size: 18),
+                      icon: const Icon(Icons.settings_outlined),
                       label: const Text('アプリ設定'),
                     ),
                   ),

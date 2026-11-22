@@ -10,7 +10,7 @@ class NewInstanceRequest {
     required this.url,
     required this.colorHex,
     required this.badge,
-    required this.uaMode,
+    this.openExistingInstanceId,
   });
 
   final String serviceId;
@@ -20,7 +20,7 @@ class NewInstanceRequest {
   final String url;
   final String colorHex;
   final String badge;
-  final UserAgentMode uaMode;
+  final String? openExistingInstanceId;
 }
 
 class CatalogScreen extends StatefulWidget {
@@ -29,11 +29,13 @@ class CatalogScreen extends StatefulWidget {
     required this.categories,
     required this.catalog,
     required this.existingInstances,
+    required this.multiProfileSupported,
   });
 
   final List<CategoryMeta> categories;
   final List<CatalogService> catalog;
   final List<ServiceInstance> existingInstances;
+  final bool multiProfileSupported;
 
   @override
   State<CatalogScreen> createState() => _CatalogScreenState();
@@ -46,7 +48,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
   final _customNameController = TextEditingController();
   final _customUrlController = TextEditingController();
   String _customCategory = 'custom';
-  UserAgentMode _customUa = UserAgentMode.mobile;
 
   @override
   void dispose() {
@@ -55,14 +56,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
     super.dispose();
   }
 
-  int _addedCountFor(String serviceId) {
-    return widget.existingInstances.where((i) => i.serviceId == serviceId).length;
+  List<ServiceInstance> _existingFor(String serviceId) {
+    return widget.existingInstances
+        .where((i) => i.serviceId == serviceId)
+        .toList();
   }
 
   String _nextAccountLabelFor(CatalogService svc) {
-    final existing = widget.existingInstances
-        .where((i) => i.serviceId == svc.id)
-        .toList();
+    final existing = _existingFor(svc.id);
     final labels = List.generate(
       existing.length,
       (idx) => accountDisplayLabel(
@@ -74,112 +75,101 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return nextDefaultAccountLabel(labels);
   }
 
-  Future<void> _openDetailedAddDialog(CatalogService svc, int existingCount) async {
+  String? _displayNoteForMobile(CatalogService svc) {
+    final note = svc.note?.trim();
+    if (note == null || note.isEmpty) return null;
+    if (note.contains('User-Agent') ||
+        note.contains('PCブラウザ') ||
+        note.contains('PC用')) {
+      return null;
+    }
+    return note;
+  }
+
+  Future<void> _openDetailedAddDialog(CatalogService svc) async {
     final suggestedLabel = _nextAccountLabelFor(svc);
     final accountCtrl = TextEditingController(text: suggestedLabel);
     final nameCtrl = TextEditingController(text: svc.name);
     final urlCtrl = TextEditingController(text: svc.url);
-    var uaMode = svc.recommendedAndroidUa;
 
     final result = await showDialog<NewInstanceRequest>(
       context: context,
       builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setDialogState) {
-            return AlertDialog(
-              title: Text('${svc.name} を詳細追加'),
-              content: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: accountCtrl,
-                      decoration: const InputDecoration(
-                        labelText: 'アカウント名（ヘッダー表示名）',
-                        hintText: '例: メイン / サブ / 仕事用',
-                        border: OutlineInputBorder(),
-                      ),
+        return AlertDialog(
+          title: Text('${svc.name} を詳細追加'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (widget.multiProfileSupported) ...[
+                  TextField(
+                    controller: accountCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'アカウント名（ヘッダー表示名）',
+                      hintText: '例: メイン / サブ / 仕事用',
+                      border: OutlineInputBorder(),
                     ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: nameCtrl,
-                      decoration: const InputDecoration(
-                        labelText: 'サービス表示名',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: urlCtrl,
-                      keyboardType: TextInputType.url,
-                      decoration: const InputDecoration(
-                        labelText: '初期URL (https://...)',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    DropdownButtonFormField<UserAgentMode>(
-                      initialValue: uaMode,
-                      decoration: const InputDecoration(
-                        labelText: 'User-Agent',
-                        border: OutlineInputBorder(),
-                      ),
-                      items: const [
-                        DropdownMenuItem(
-                          value: UserAgentMode.mobile,
-                          child: Text('スマホ版 (Android Chrome)'),
-                        ),
-                        DropdownMenuItem(
-                          value: UserAgentMode.desktop,
-                          child: Text('PC版 (Windows Chrome)'),
-                        ),
-                      ],
-                      onChanged: (v) {
-                        if (v != null) setDialogState(() => uaMode = v);
-                      },
-                    ),
-                  ],
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                TextField(
+                  controller: nameCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'サービス表示名',
+                    border: OutlineInputBorder(),
+                  ),
                 ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('キャンセル'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    final normalized = normalizeServiceUrl(urlCtrl.text);
-                    if (normalized == null) {
-                      ScaffoldMessenger.of(ctx).showSnackBar(
-                        const SnackBar(
-                          content: Text('有効な http:// または https:// URL を入力してください'),
-                        ),
-                      );
-                      return;
-                    }
-                    final finalName =
-                        nameCtrl.text.trim().isEmpty ? svc.name : nameCtrl.text.trim();
-                    final finalAcc = accountCtrl.text.trim().isEmpty
-                        ? suggestedLabel
-                        : accountCtrl.text.trim();
-                    Navigator.of(ctx).pop(
-                      NewInstanceRequest(
-                        serviceId: svc.id,
-                        name: finalName,
-                        accountLabel: finalAcc,
-                        category: svc.category,
-                        url: normalized,
-                        colorHex: svc.colorHex,
-                        badge: svc.badge,
-                        uaMode: uaMode,
-                      ),
-                    );
-                  },
-                  child: const Text('追加して開く'),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: urlCtrl,
+                  keyboardType: TextInputType.url,
+                  decoration: const InputDecoration(
+                    labelText: '初期URL (https://...)',
+                    border: OutlineInputBorder(),
+                  ),
                 ),
               ],
-            );
-          },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('キャンセル'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final normalized = normalizeServiceUrl(urlCtrl.text);
+                if (normalized == null) {
+                  ScaffoldMessenger.of(ctx).showSnackBar(
+                    const SnackBar(
+                      content: Text('有効な http:// または https:// URL を入力してください'),
+                    ),
+                  );
+                  return;
+                }
+                final finalName = nameCtrl.text.trim().isEmpty
+                    ? svc.name
+                    : nameCtrl.text.trim();
+                final finalAcc = widget.multiProfileSupported
+                    ? (accountCtrl.text.trim().isEmpty
+                        ? suggestedLabel
+                        : accountCtrl.text.trim())
+                    : 'メイン';
+                Navigator.of(ctx).pop(
+                  NewInstanceRequest(
+                    serviceId: svc.id,
+                    name: finalName,
+                    accountLabel: finalAcc,
+                    category: svc.category,
+                    url: normalized,
+                    colorHex: svc.colorHex,
+                    badge: svc.badge,
+                  ),
+                );
+              },
+              child: const Text('追加して開く'),
+            ),
+          ],
         );
       },
     );
@@ -216,7 +206,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
         url: normalized,
         colorHex: '#3B82F6',
         badge: makeBadgeText(name),
-        uaMode: _customUa,
       ),
     );
   }
@@ -248,7 +237,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
             child: TextField(
               decoration: InputDecoration(
-                hintText: 'サービス名・別名で検索 (例: Instagram, Discord, Tinder, mixi2, SMS...)',
+                hintText:
+                    'サービス名・別名で検索 (例: Instagram, Discord, Tinder, mixi2, SMS...)',
                 prefixIcon: const Icon(Icons.search),
                 isDense: true,
                 border: OutlineInputBorder(
@@ -258,7 +248,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
               onChanged: (value) {
                 setState(() {
                   _searchQuery = value;
-                  if (_selectedCategory == 'custom' && value.trim().isNotEmpty) {
+                  if (_selectedCategory == 'custom' &&
+                      value.trim().isNotEmpty) {
                     _selectedCategory = 'all';
                   }
                 });
@@ -276,7 +267,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
                   child: ChoiceChip(
                     label: Text('すべて ($totalAvailable)'),
                     selected: _selectedCategory == 'all',
-                    onSelected: (_) => setState(() => _selectedCategory = 'all'),
+                    onSelected: (_) =>
+                        setState(() => _selectedCategory = 'all'),
                   ),
                 ),
                 for (final cat in visibleCategories)
@@ -315,8 +307,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
                               ),
                               const SizedBox(height: 12),
                               FilledButton.tonal(
-                                onPressed: () =>
-                                    setState(() => _selectedCategory = 'custom'),
+                                onPressed: () => setState(
+                                    () => _selectedCategory = 'custom'),
                                 child: const Text('カスタムURLを追加する'),
                               ),
                             ],
@@ -329,8 +321,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         separatorBuilder: (_, _) => const SizedBox(height: 8),
                         itemBuilder: (context, index) {
                           final svc = filtered[index];
-                          final count = _addedCountFor(svc.id);
+                          final existing = _existingFor(svc.id);
+                          final count = existing.length;
                           final color = parseHexColor(svc.colorHex);
+                          final mobileNote = _displayNoteForMobile(svc);
+                          final canAddAnother =
+                              count == 0 || widget.multiProfileSupported;
 
                           return Card(
                             margin: EdgeInsets.zero,
@@ -346,7 +342,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                         height: 38,
                                         decoration: BoxDecoration(
                                           color: color,
-                                          borderRadius: BorderRadius.circular(10),
+                                          borderRadius:
+                                              BorderRadius.circular(10),
                                         ),
                                         alignment: Alignment.center,
                                         child: Text(
@@ -370,7 +367,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                                   child: Text(
                                                     svc.name,
                                                     style: const TextStyle(
-                                                      fontWeight: FontWeight.bold,
+                                                      fontWeight:
+                                                          FontWeight.bold,
                                                       fontSize: 15,
                                                     ),
                                                   ),
@@ -378,19 +376,23 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                                 if (count > 0) ...[
                                                   const SizedBox(width: 6),
                                                   Container(
-                                                    padding:
-                                                        const EdgeInsets.symmetric(
+                                                    padding: const EdgeInsets
+                                                        .symmetric(
                                                       horizontal: 6,
                                                       vertical: 2,
                                                     ),
                                                     decoration: BoxDecoration(
                                                       color: Colors.green
-                                                          .withValues(alpha: 0.2),
+                                                          .withValues(
+                                                              alpha: 0.2),
                                                       borderRadius:
-                                                          BorderRadius.circular(99),
+                                                          BorderRadius.circular(
+                                                              99),
                                                     ),
                                                     child: Text(
-                                                      count == 1
+                                                      count == 1 ||
+                                                              !widget
+                                                                  .multiProfileSupported
                                                           ? '追加済み'
                                                           : '$count個追加済み',
                                                       style: const TextStyle(
@@ -423,10 +425,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                     style:
                                         Theme.of(context).textTheme.bodySmall,
                                   ),
-                                  if (svc.note != null) ...[
+                                  if (mobileNote != null) ...[
                                     const SizedBox(height: 4),
                                     Text(
-                                      '※ ${svc.note!}',
+                                      '※ $mobileNote',
                                       style: const TextStyle(
                                         color: Colors.amber,
                                         fontSize: 11.5,
@@ -437,37 +439,60 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                   Row(
                                     children: [
                                       Expanded(
-                                        child: FilledButton(
-                                          onPressed: () {
-                                            if (svc.requiresCustomUrl) {
-                                              _openDetailedAddDialog(svc, count);
-                                              return;
-                                            }
-                                            final accLabel = _nextAccountLabelFor(svc);
-                                            Navigator.of(context).pop(
-                                              NewInstanceRequest(
-                                                serviceId: svc.id,
-                                                name: svc.name,
-                                                accountLabel: accLabel,
-                                                category: svc.category,
-                                                url: svc.url,
-                                                colorHex: svc.colorHex,
-                                                badge: svc.badge,
-                                                uaMode: svc.recommendedAndroidUa,
+                                        child: canAddAnother
+                                            ? FilledButton(
+                                                onPressed: () {
+                                                  if (svc.requiresCustomUrl) {
+                                                    _openDetailedAddDialog(svc);
+                                                    return;
+                                                  }
+                                                  final accLabel =
+                                                      _nextAccountLabelFor(svc);
+                                                  Navigator.of(context).pop(
+                                                    NewInstanceRequest(
+                                                      serviceId: svc.id,
+                                                      name: svc.name,
+                                                      accountLabel: accLabel,
+                                                      category: svc.category,
+                                                      url: svc.url,
+                                                      colorHex: svc.colorHex,
+                                                      badge: svc.badge,
+                                                    ),
+                                                  );
+                                                },
+                                                child: Text(
+                                                  count > 0
+                                                      ? '＋ 別アカウント追加'
+                                                      : '＋ 追加して開く',
+                                                ),
+                                              )
+                                            : FilledButton.tonal(
+                                                onPressed: () {
+                                                  Navigator.of(context).pop(
+                                                    NewInstanceRequest(
+                                                      serviceId: svc.id,
+                                                      name: svc.name,
+                                                      category: svc.category,
+                                                      url: svc.url,
+                                                      colorHex: svc.colorHex,
+                                                      badge: svc.badge,
+                                                      openExistingInstanceId:
+                                                          existing
+                                                              .first.instanceId,
+                                                    ),
+                                                  );
+                                                },
+                                                child: const Text('開く'),
                                               ),
-                                            );
-                                          },
-                                          child: Text(
-                                            count > 0 ? '＋ 別アカウント追加' : '＋ 追加して開く',
-                                          ),
+                                      ),
+                                      if (canAddAnother) ...[
+                                        const SizedBox(width: 8),
+                                        OutlinedButton(
+                                          onPressed: () =>
+                                              _openDetailedAddDialog(svc),
+                                          child: const Text('詳細'),
                                         ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      OutlinedButton(
-                                        onPressed: () =>
-                                            _openDetailedAddDialog(svc, count),
-                                        child: const Text('詳細'),
-                                      ),
+                                      ],
                                     ],
                                   ),
                                 ],
@@ -526,31 +551,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
             DropdownMenuItem(value: 'major-sns', child: Text('メジャーSNS')),
             DropdownMenuItem(value: 'messaging', child: Text('チャット・メッセージ')),
             DropdownMenuItem(value: 'matching-global', child: Text('マッチング')),
-            DropdownMenuItem(value: 'business-creative', child: Text('ビジネス・創作・趣味')),
+            DropdownMenuItem(
+              value: 'business-creative',
+              child: Text('ビジネス・創作・趣味'),
+            ),
           ],
           onChanged: (v) {
             if (v != null) setState(() => _customCategory = v);
-          },
-        ),
-        const SizedBox(height: 12),
-        DropdownButtonFormField<UserAgentMode>(
-          initialValue: _customUa,
-          decoration: const InputDecoration(
-            labelText: 'User-Agent',
-            border: OutlineInputBorder(),
-          ),
-          items: const [
-            DropdownMenuItem(
-              value: UserAgentMode.mobile,
-              child: Text('スマホ版 (Android Chrome)'),
-            ),
-            DropdownMenuItem(
-              value: UserAgentMode.desktop,
-              child: Text('PC版 (Windows Chrome)'),
-            ),
-          ],
-          onChanged: (v) {
-            if (v != null) setState(() => _customUa = v);
           },
         ),
         const SizedBox(height: 16),

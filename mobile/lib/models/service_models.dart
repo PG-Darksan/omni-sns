@@ -1,14 +1,15 @@
 import 'dart:ui';
 
-enum UserAgentMode {
-  desktop,
-  mobile;
+/// Android WebView の既定プロファイル名（AndroidX WebKit `Profile.DEFAULT_PROFILE_NAME` 準拠）
+const String defaultWebViewProfileName = 'Default';
 
-  String get value => name;
-
-  static UserAgentMode fromString(String? raw) {
-    return raw == 'desktop' ? UserAgentMode.desktop : UserAgentMode.mobile;
-  }
+/// インスタンスIDごとに独立した Android WebView プロファイル名を生成する。
+String makeProfileNameForInstance(String instanceId) {
+  final cleaned = instanceId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
+  final trimmed =
+      cleaned.length > 48 ? cleaned.substring(0, 48) : cleaned;
+  final body = trimmed.isEmpty ? 'account' : trimmed;
+  return 'omnisns_$body';
 }
 
 class CategoryMeta {
@@ -41,7 +42,6 @@ class CatalogService {
     required this.homeUrl,
     required this.colorHex,
     required this.badge,
-    required this.defaultUa,
     required this.description,
     this.note,
     this.requiresCustomUrl = false,
@@ -56,26 +56,10 @@ class CatalogService {
   final String homeUrl;
   final String colorHex;
   final String badge;
-  final UserAgentMode defaultUa;
   final String description;
   final String? note;
   final bool requiresCustomUrl;
   final bool defaultPinned;
-
-  /// Android向け推奨初期UA:
-  /// PC必須/推奨サービスはdesktop、それ以外はスマホ最適化のためmobileを既定にする。
-  UserAgentMode get recommendedAndroidUa {
-    const desktopRequiredIds = {
-      'whatsapp',
-      'snapchat',
-      'mixi2',
-      'google-messages',
-    };
-    if (desktopRequiredIds.contains(id)) {
-      return UserAgentMode.desktop;
-    }
-    return UserAgentMode.mobile;
-  }
 
   factory CatalogService.fromJson(Map<String, dynamic> json) {
     final rawAliases = json['aliases'];
@@ -90,7 +74,6 @@ class CatalogService {
       homeUrl: json['homeUrl'] as String? ?? 'https://example.com/',
       colorHex: json['color'] as String? ?? '#3B82F6',
       badge: json['badge'] as String? ?? 'SN',
-      defaultUa: UserAgentMode.fromString(json['defaultUa'] as String?),
       description: json['description'] as String? ?? '',
       note: json['note'] as String?,
       requiresCustomUrl: json['requiresCustomUrl'] as bool? ?? false,
@@ -105,11 +88,11 @@ class ServiceInstance {
     required this.serviceId,
     required this.name,
     this.accountLabel,
+    this.profileName,
     required this.category,
     required this.url,
     required this.colorHex,
     required this.badge,
-    required this.uaMode,
     required this.notificationsEnabled,
     required this.order,
   });
@@ -118,22 +101,29 @@ class ServiceInstance {
   final String serviceId;
   final String name;
   final String? accountLabel;
+  final String? profileName;
   final String category;
   final String url;
   final String colorHex;
   final String badge;
-  final UserAgentMode uaMode;
   final bool notificationsEnabled;
   final int order;
+
+  /// 実際に Android WebView に適用するプロファイル名を返す。
+  String get effectiveProfileName {
+    final p = profileName?.trim();
+    if (p != null && p.isNotEmpty) return p;
+    return makeProfileNameForInstance(instanceId);
+  }
 
   ServiceInstance copyWith({
     String? name,
     String? accountLabel,
     bool clearAccountLabel = false,
+    String? profileName,
     String? url,
     String? colorHex,
     String? badge,
-    UserAgentMode? uaMode,
     bool? notificationsEnabled,
     int? order,
   }) {
@@ -143,11 +133,11 @@ class ServiceInstance {
       name: name ?? this.name,
       accountLabel:
           clearAccountLabel ? null : (accountLabel ?? this.accountLabel),
+      profileName: profileName ?? this.profileName,
       category: category,
       url: url ?? this.url,
       colorHex: colorHex ?? this.colorHex,
       badge: badge ?? this.badge,
-      uaMode: uaMode ?? this.uaMode,
       notificationsEnabled: notificationsEnabled ?? this.notificationsEnabled,
       order: order ?? this.order,
     );
@@ -160,11 +150,11 @@ class ServiceInstance {
       'name': name,
       if (accountLabel != null && accountLabel!.trim().isNotEmpty)
         'accountLabel': accountLabel!.trim(),
+      'profileName': effectiveProfileName,
       'category': category,
       'url': url,
       'colorHex': colorHex,
       'badge': badge,
-      'uaMode': uaMode.value,
       'notificationsEnabled': notificationsEnabled,
       'order': order,
     };
@@ -174,17 +164,19 @@ class ServiceInstance {
     final name = (json['name'] as String?)?.trim();
     final safeName = (name == null || name.isEmpty) ? 'SNS' : name;
     final rawLabel = (json['accountLabel'] as String?)?.trim();
+    final rawProfile = (json['profileName'] as String?)?.trim();
     return ServiceInstance(
       instanceId: json['instanceId'] as String? ?? 'svc-$index',
       serviceId: json['serviceId'] as String? ?? 'custom',
       name: safeName,
       accountLabel: (rawLabel == null || rawLabel.isEmpty) ? null : rawLabel,
+      profileName:
+          (rawProfile == null || rawProfile.isEmpty) ? null : rawProfile,
       category: json['category'] as String? ?? 'custom',
       url: normalizeServiceUrl(json['url'] as String? ?? '') ??
           'https://example.com/',
       colorHex: json['colorHex'] as String? ?? '#3B82F6',
       badge: (json['badge'] as String?) ?? makeBadgeText(safeName),
-      uaMode: UserAgentMode.fromString(json['uaMode'] as String?),
       notificationsEnabled: json['notificationsEnabled'] as bool? ?? true,
       order: json['order'] as int? ?? index,
     );
@@ -195,20 +187,25 @@ class AppSettings {
   const AppSettings({
     this.isDarkMode = true,
     this.activeInstanceId,
+    this.isBottomTabsCollapsed = false,
   });
 
   final bool isDarkMode;
   final String? activeInstanceId;
+  final bool isBottomTabsCollapsed;
 
   AppSettings copyWith({
     bool? isDarkMode,
     String? activeInstanceId,
     bool clearActive = false,
+    bool? isBottomTabsCollapsed,
   }) {
     return AppSettings(
       isDarkMode: isDarkMode ?? this.isDarkMode,
       activeInstanceId:
           clearActive ? null : (activeInstanceId ?? this.activeInstanceId),
+      isBottomTabsCollapsed:
+          isBottomTabsCollapsed ?? this.isBottomTabsCollapsed,
     );
   }
 
@@ -216,6 +213,7 @@ class AppSettings {
     return {
       'isDarkMode': isDarkMode,
       'activeInstanceId': activeInstanceId,
+      'isBottomTabsCollapsed': isBottomTabsCollapsed,
     };
   }
 
@@ -223,6 +221,7 @@ class AppSettings {
     return AppSettings(
       isDarkMode: json['isDarkMode'] as bool? ?? true,
       activeInstanceId: json['activeInstanceId'] as String?,
+      isBottomTabsCollapsed: json['isBottomTabsCollapsed'] as bool? ?? false,
     );
   }
 }
@@ -276,13 +275,8 @@ class TabRuntimeState {
   }
 }
 
-/// WebViewの `; wv)` トークンを除いたクリーンなChrome互換UAを返す
-String buildUserAgent(UserAgentMode mode) {
-  if (mode == UserAgentMode.desktop) {
-    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/136.0.0.0 Safari/537.36';
-  }
+/// WebViewの `; wv)` トークンを除いたクリーンなスマホ版 Android Chrome UA を返す。
+String buildMobileUserAgent() {
   return 'Mozilla/5.0 (Linux; Android 14; Pixel 8) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
       'Chrome/136.0.0.0 Mobile Safari/537.36';
@@ -408,4 +402,36 @@ String nextDefaultAccountLabel(Iterable<String> existingLabels) {
     n += 1;
   }
   return 'アカウント $n';
+}
+
+/// レガシーデータ（profileName 未付与）のマイグレーション。
+/// 各SNSの1つ目の既存アカウントは `Default` プロファイルを引き継ぎ（ログイン維持）、
+/// 2つ目以降は独立プロファイル名を割り当てる。
+List<ServiceInstance> assignProfilesForMigration(
+  List<ServiceInstance> instances,
+) {
+  final seenDefaultGroups = <String>{};
+  return instances.map((inst) {
+    final gkey = serviceGroupKey(inst);
+    final existing = inst.profileName?.trim();
+    if (existing != null && existing.isNotEmpty) {
+      if (existing == defaultWebViewProfileName) {
+        if (seenDefaultGroups.add(gkey)) {
+          return inst;
+        }
+        // 同一サービス内で Default が重複していたら2つ目以降を分離
+        return inst.copyWith(
+          profileName: makeProfileNameForInstance(inst.instanceId),
+        );
+      }
+      return inst;
+    }
+
+    if (seenDefaultGroups.add(gkey)) {
+      return inst.copyWith(profileName: defaultWebViewProfileName);
+    }
+    return inst.copyWith(
+      profileName: makeProfileNameForInstance(inst.instanceId),
+    );
+  }).toList();
 }
