@@ -279,6 +279,26 @@ async fn gesture_update_settings(
 }
 
 #[tauri::command]
+async fn follow_adjust(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+    delta: i32,
+) -> Result<Option<ServiceInstance>, String> {
+    Ok(view_manager::adjust_follow_count(&app, &shared, &instance_id, delta))
+}
+
+#[tauri::command]
+async fn follow_reset(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+    reset_total: bool,
+) -> Result<Option<ServiceInstance>, String> {
+    Ok(view_manager::reset_follow_count(&app, &shared, &instance_id, reset_total))
+}
+
+#[tauri::command]
 async fn settings_update(
     app: AppHandle,
     shared: State<'_, SharedState>,
@@ -708,6 +728,8 @@ pub fn run() {
             subtab_duplicate,
             subtab_restore_closed,
             gesture_update_settings,
+            follow_adjust,
+            follow_reset,
             settings_update,
             ui_set_overlay,
             ui_copy_text,

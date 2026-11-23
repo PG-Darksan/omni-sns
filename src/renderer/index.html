@@ -15,13 +15,23 @@
     <!-- 左サイドバー -->
     <aside id="sidebar" class="sidebar">
       <div class="sidebar-header">
-        <div class="brand">
-          <div class="brand-logo" aria-hidden="true">O</div>
-          <div class="brand-text">
-            <span class="brand-name">OmniSNS</span>
-            <span id="app-version" class="brand-sub">Windows Desk</span>
-          </div>
-        </div>
+        <button
+          id="btn-hisator-ad"
+          type="button"
+          class="hisator-ad-card"
+          title="HisatorNotebook 公式サイトを開く (https://hisator-notebook.com/)"
+          aria-label="HisatorNotebook 公式サイトを開く"
+        >
+          <span class="hisator-ad-logo" aria-hidden="true">H</span>
+          <span class="hisator-ad-body">
+            <span class="hisator-ad-title-row">
+              <span class="hisator-ad-name">HisatorNotebook</span>
+              <span class="hisator-ad-badge">公式</span>
+            </span>
+            <span class="hisator-ad-sub">AI×マップ×ノート多機能アプリ</span>
+          </span>
+          <span class="hisator-ad-arrow" aria-hidden="true">↗</span>
+        </button>
         <span id="total-unread-badge" class="badge-pill hidden" title="合計未読数">0</span>
       </div>
 
@@ -51,7 +61,7 @@
     </aside>
 
     <!-- 右メインエリア -->
-    <div class="main-area">
+    <div id="main-area" class="main-area">
       <!-- 同一SNS アカウント即時切替ヘッダー (高さ40px固定) -->
       <div id="accountbar" class="accountbar" role="tablist" aria-label="同一SNSのアカウント切替">
         <div id="accountbar-service" class="accountbar-service">
@@ -60,15 +70,40 @@
         </div>
         <div class="accountbar-divider" aria-hidden="true"></div>
         <div id="account-strip" class="account-strip"></div>
-        <button
-          id="btn-add-account"
-          type="button"
-          class="account-add-btn"
-          title="このSNSに独立セッションの別アカウントを追加"
-          disabled
-        >
-          ＋ アカウント追加
-        </button>
+        <div class="accountbar-right">
+          <button
+            id="btn-collapsed-reload"
+            type="button"
+            class="tool-btn accountbar-collapsed-only"
+            title="再読み込み (Shift+クリックでスーパーリロード)"
+            aria-label="再読み込み"
+          >↻</button>
+          <button
+            id="btn-collapsed-follow"
+            type="button"
+            class="tool-pill follow-pill accountbar-collapsed-only"
+            title="フォロー回数カウンター（クリックで詳細・手動調整・リセット）"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+            <span id="collapsed-follow-count">0</span>
+          </button>
+          <button
+            id="btn-add-account"
+            type="button"
+            class="account-add-btn"
+            title="このSNSに独立セッションの別アカウントを追加"
+            disabled
+          >
+            ＋ アカウント追加
+          </button>
+          <button
+            id="btn-toggle-header"
+            type="button"
+            class="header-collapse-btn"
+            title="ヘッダー項目を折り畳む"
+            aria-label="ヘッダー項目を折り畳む"
+          >▲</button>
+        </div>
       </div>
 
       <!-- トップツールバー (高さ44px固定) -->
@@ -90,6 +125,16 @@
         </div>
 
         <div class="toolbar-controls">
+          <button
+            id="btn-follow-counter"
+            type="button"
+            class="tool-pill follow-pill"
+            title="フォロー回数カウンター（Threads・Instagram等のフォローを自動カウント / クリックで調整・リセット）"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+            <span>フォロー</span>
+            <strong id="follow-today-count">0</strong>
+          </button>
           <button id="btn-toggle-ua" class="tool-pill" title="PC版 / モバイル版 User-Agent を切り替え">PC版</button>
           <button id="btn-toggle-mute" class="tool-btn" title="ミュート切替" aria-label="ミュート切替">🔊</button>
           <div class="zoom-group">
@@ -313,7 +358,8 @@
           </ul>
         </div>
       </div>
-      <div class="modal-footer">
+      <div class="modal-footer modal-footer-between">
+        <span class="settings-version">OmniSNS <span id="app-version">Windows Desk</span></span>
         <button id="btn-save-settings" class="btn-primary">設定を保存して閉じる</button>
       </div>
     </div>
@@ -401,6 +447,66 @@
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- フォロー回数カウンターモーダル -->
+  <div id="follow-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="follow-modal-title">
+    <div class="modal-dialog modal-sm">
+      <div class="modal-header">
+        <div>
+          <h2 id="follow-modal-title">フォロー回数カウンター</h2>
+          <p id="follow-modal-account" class="modal-subtitle">—</p>
+        </div>
+        <button id="btn-close-follow" type="button" class="btn-icon" aria-label="閉じる">✕</button>
+      </div>
+      <div class="follow-modal-body">
+        <div class="follow-stats-grid">
+          <div class="follow-stat-card primary">
+            <span class="follow-stat-label">今日のフォロー数</span>
+            <strong id="follow-modal-today" class="follow-stat-value">0</strong>
+          </div>
+          <div class="follow-stat-card">
+            <span class="follow-stat-label">累計フォロー数</span>
+            <strong id="follow-modal-total" class="follow-stat-value">0</strong>
+          </div>
+        </div>
+        <div class="follow-adjust-row">
+          <button id="btn-follow-dec" type="button" class="btn-secondary">−1</button>
+          <button id="btn-follow-inc" type="button" class="btn-primary">＋1</button>
+        </div>
+        <div class="follow-reset-row">
+          <button id="btn-follow-reset-today" type="button" class="btn-secondary btn-xs">今日をリセット</button>
+          <button id="btn-follow-reset-all" type="button" class="btn-secondary btn-xs danger-text">累計もリセット</button>
+        </div>
+        <div id="follow-summary-box" class="follow-summary-box hidden">
+          <div class="follow-summary-header">
+            <span>全アカウントの本日の合計</span>
+            <strong id="follow-all-today">0 回</strong>
+          </div>
+          <div id="follow-summary-list" class="follow-summary-list"></div>
+        </div>
+        <p class="follow-hint">
+          Threads・Instagram・Bluesky 等でフォローを実行すると自動でカウントされます（日付が変わると「今日」は自動で0に戻ります）。
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 確認ダイアログモーダル（子WebView2を隠して確実に操作できるカスタムダイアログ） -->
+  <div id="confirm-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div class="modal-dialog modal-xs">
+      <div class="modal-header">
+        <h2 id="confirm-title">確認</h2>
+        <button id="btn-close-confirm" type="button" class="btn-icon" aria-label="閉じる">✕</button>
+      </div>
+      <div class="confirm-body">
+        <p id="confirm-message" class="confirm-message"></p>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-confirm-cancel" type="button" class="btn-secondary">キャンセル</button>
+        <button id="btn-confirm-ok" type="button" class="btn-danger">削除する</button>
       </div>
     </div>
   </div>

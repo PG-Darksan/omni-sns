@@ -22,6 +22,14 @@ pub const ACCOUNTBAR_HEIGHT: f64 = 40.0;
 pub const TOOLBAR_HEIGHT: f64 = 44.0;
 pub const TABBAR_HEIGHT: f64 = 34.0;
 pub const TOP_HEADER_HEIGHT: f64 = ACCOUNTBAR_HEIGHT + TOOLBAR_HEIGHT + TABBAR_HEIGHT;
+
+pub fn top_header_height(header_collapsed: bool) -> f64 {
+    if header_collapsed {
+        ACCOUNTBAR_HEIGHT
+    } else {
+        TOP_HEADER_HEIGHT
+    }
+}
 const MAX_SUBTABS_PER_SERVICE: usize = 20;
 const MAX_CLOSED_HISTORY: usize = 25;
 
@@ -206,7 +214,9 @@ impl SharedState {
         for inst in store.get_instances() {
             services.insert(inst.instance_id.clone(), ServiceTabs::new_initial(&inst));
         }
-        let sidebar_w = store.get_settings().sidebar_width as f64;
+        let settings_init = store.get_settings();
+        let sidebar_w = settings_init.sidebar_width as f64;
+        let top_h = top_header_height(settings_init.header_collapsed);
         Self {
             inner: Arc::new(Mutex::new(AppStateInner {
                 store,
@@ -219,7 +229,7 @@ impl SharedState {
                 bootstrapped: false,
                 bounds: ContentBounds {
                     x: sidebar_w,
-                    y: TOP_HEADER_HEIGHT,
+                    y: top_h,
                     width: 1000.0,
                     height: 760.0,
                 },
@@ -296,7 +306,7 @@ pub fn show_overlay_notice(shared: &SharedState, text: impl Into<String>, is_err
 pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
     #[cfg(windows)]
     {
-        let (host, main_hwnd, sidebar_w, suspended, settings) = {
+        let (host, main_hwnd, sidebar_w, top_h, suspended, settings) = {
             let guard = shared.inner.lock().unwrap();
             let active_sleeping_or_err = guard
                 .active_instance_id
@@ -308,12 +318,14 @@ pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
             let suspended = guard.overlay_visible
                 || guard.active_instance_id.is_none()
                 || active_sleeping_or_err;
+            let st = guard.store.get_settings();
             (
                 guard.gesture_host.clone(),
                 guard.main_hwnd,
-                guard.store.get_settings().sidebar_width as f64,
+                st.sidebar_width as f64,
+                top_header_height(st.header_collapsed),
                 suspended,
-                guard.store.get_settings().gesture,
+                st.gesture,
             )
         };
 
@@ -327,7 +339,7 @@ pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
             if let Some(vp) = crate::gesture_win::compute_viewport_screen_rect(
                 main_hwnd,
                 sidebar_w,
-                TOP_HEADER_HEIGHT,
+                top_h,
                 sf,
             ) {
                 host.update_viewport(vp);
@@ -508,12 +520,14 @@ pub fn update_bounds_from_window(app: &AppHandle, shared: &SharedState) {
 
     {
         let mut guard = shared.inner.lock().unwrap();
-        let sidebar_w = guard.store.get_settings().sidebar_width as f64;
+        let st = guard.store.get_settings();
+        let sidebar_w = st.sidebar_width as f64;
+        let top_h = top_header_height(st.header_collapsed);
         guard.bounds = ContentBounds {
             x: sidebar_w,
-            y: TOP_HEADER_HEIGHT,
+            y: top_h,
             width: (logical.width - sidebar_w).max(0.0),
-            height: (logical.height - TOP_HEADER_HEIGHT).max(0.0),
+            height: (logical.height - top_h).max(0.0),
         };
     }
 
@@ -1381,6 +1395,10 @@ fn attach_windows_handlers(
     let app_key = app.clone();
     let shared_key = shared.clone();
 
+    let app_follow = app.clone();
+    let shared_follow = shared.clone();
+    let id_follow = instance_id.clone();
+
     let callbacks = crate::platform_win::TabWebviewCallbacks {
         on_navigation_starting: Arc::new(move || {
             let (changed, was_error) = {
@@ -1480,6 +1498,9 @@ fn attach_windows_handlers(
         }),
         on_shortcut: Arc::new(move |action, payload| {
             handle_shortcut_from_child(&app_key, &shared_key, action, payload);
+        }),
+        on_follow_detected: Arc::new(move || {
+            adjust_follow_count(&app_follow, &shared_follow, &id_follow, 1);
         }),
     };
 
@@ -1988,5 +2009,37 @@ pub fn update_gesture_settings(
     };
     sync_gesture_host_state(app, shared);
     emit_state_updated(app, shared);
+    updated
+}
+
+pub fn adjust_follow_count(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    delta: i32,
+) -> Option<ServiceInstance> {
+    let updated = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.store.adjust_follow_count(instance_id, delta)
+    };
+    if updated.is_some() {
+        emit_state_updated(app, shared);
+    }
+    updated
+}
+
+pub fn reset_follow_count(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    reset_total: bool,
+) -> Option<ServiceInstance> {
+    let updated = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.store.reset_follow_count(instance_id, reset_total)
+    };
+    if updated.is_some() {
+        emit_state_updated(app, shared);
+    }
     updated
 }

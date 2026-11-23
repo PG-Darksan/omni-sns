@@ -63,6 +63,12 @@ export interface ServiceInstance {
   notificationsEnabled: boolean;
   /** 並び順 */
   order: number;
+  /** 本日のフォロー回数 */
+  followCountToday?: number;
+  /** 累計フォロー回数 */
+  followCountTotal?: number;
+  /** 本日カウントの日付 (YYYY-MM-DD) */
+  followCountDate?: string;
 }
 
 export interface BrowserTabInfo {
@@ -131,6 +137,8 @@ export interface AppSettings {
   sidebarWidth: number;
   /** 最後に開いていたサービスインスタンスID */
   activeInstanceId: string | null;
+  /** ツールバー・タブバー（ヘッダー下部）を折り畳んでいるか */
+  headerCollapsed?: boolean;
   /** マウスジェスチャー設定 */
   gesture: GestureSettings;
 }

@@ -28,10 +28,12 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_WEB_ERROR_STATUS_VALID_PROXY_AUTHENTICATION_REQUIRED,
 };
 use webview2_com::{
-    take_pwstr, AcceleratorKeyPressedEventHandler, CallDevToolsProtocolMethodCompletedHandler,
-    ClearBrowsingDataCompletedHandler, ExecuteScriptCompletedHandler, FaviconChangedEventHandler,
-    HistoryChangedEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler,
-    SourceChangedEventHandler,
+    take_pwstr, AcceleratorKeyPressedEventHandler,
+    AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+    CallDevToolsProtocolMethodCompletedHandler, ClearBrowsingDataCompletedHandler,
+    ExecuteScriptCompletedHandler, FaviconChangedEventHandler, HistoryChangedEventHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler, SourceChangedEventHandler,
+    WebMessageReceivedEventHandler,
 };
 use windows::Win32::Foundation::{FALSE, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
@@ -316,7 +318,278 @@ pub struct TabWebviewCallbacks {
     pub on_nav_flags_changed: Arc<dyn Fn(String, bool, bool) + Send + Sync>,
     pub on_favicon_changed: Arc<dyn Fn(String) + Send + Sync>,
     pub on_shortcut: Arc<dyn Fn(&'static str, Option<usize>) + Send + Sync>,
+    pub on_follow_detected: Arc<dyn Fn() + Send + Sync>,
 }
+
+/// Threads / Instagram / Bluesky / mixi2 等のフォロー操作を自動検知してホストへ通知するスクリプト。
+const FOLLOW_TRACKER_JS: &str = r#"(function() {
+  if (window.__omniFollowTrackerInstalled) return;
+  window.__omniFollowTrackerInstalled = true;
+
+  var NEGATIVE_RE = /(フォロー中|フォロー済|フォロー解除|フォロワー|リクエスト済|リクエスト中|承認待ち|解除|following|unfollow|followers|requested|pending|remove|cancel|block|mute)/i;
+  var EXACT_FOLLOW_TEXT_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォローを返す|follow|follow\s+back)$/i;
+  var ARIA_FOLLOW_RE = /^(?:(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|follow|follow\s+back)|.+?(?:をフォロー|をフォローする|をフォローバック)|follow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
+  var POST_FOLLOW_STATE_RE = /(フォロー中|フォロー済|フォロー解除|リクエスト済|リクエスト中|承認待ち|following|unfollow|requested|pending|チェック|check)/i;
+
+  var lastNetworkFollowAt = 0;
+  var lastNetworkEmitAt = 0;
+  var lastDomEmitAt = 0;
+
+  function emitFollow(source) {
+    var now = Date.now();
+    if (source === 'network') {
+      if (now - lastNetworkEmitAt < 120) return;
+      lastNetworkEmitAt = now;
+      lastNetworkFollowAt = now;
+    } else {
+      if (now - lastDomEmitAt < 350) return;
+      lastDomEmitAt = now;
+    }
+    try {
+      if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
+        window.chrome.webview.postMessage(JSON.stringify({ type: 'omnisns:follow', source: source || 'auto' }));
+      }
+    } catch (_) {}
+  }
+
+  function bodyToSearchString(body) {
+    if (!body) return '';
+    try {
+      if (typeof body === 'string') return body.slice(0, 8192);
+      if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+        return body.toString().slice(0, 8192);
+      }
+      if (typeof FormData !== 'undefined' && body instanceof FormData) {
+        var parts = [];
+        body.forEach(function(v, k) {
+          if (typeof v === 'string') parts.push(k + '=' + v.slice(0, 256));
+        });
+        return parts.join('&').slice(0, 8192);
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function isFollowApiRequest(rawUrl, method, rawBody) {
+    try {
+      var m = (method || 'GET').toUpperCase();
+      if (m !== 'POST') return false;
+      var url = String(rawUrl || '');
+      var lowerUrl = url.toLowerCase();
+      var body = bodyToSearchString(rawBody);
+      var decodedBody = body;
+      try {
+        if (body.indexOf('%') >= 0) decodedBody = decodeURIComponent(body.replace(/\+/g, ' '));
+      } catch (_) {}
+      var lowerBody = decodedBody.toLowerCase();
+
+      if (/\/friendships\/create(?:\/|\?|$)/i.test(lowerUrl) ||
+          /\/web\/friendships\/[^\/?#]+\/follow(?:\/|\?|$)/i.test(lowerUrl)) {
+        return !/unfollow|destroy/i.test(lowerUrl);
+      }
+
+      if (/\/(?:api\/)?graphql(?:\/|\?|$)/i.test(lowerUrl)) {
+        var fnameMatch = /(?:fb_api_req_friendly_name|friendlyname)["'=\s:]+([a-z0-9_]+)/i.exec(decodedBody);
+        var fname = fnameMatch ? fnameMatch[1] : '';
+        if (fname) {
+          if (/unfollow|destroy|remove|cancel|block|mute|follower|following|suggestion|recommend|list|count/i.test(fname)) {
+            return false;
+          }
+          if (/follow/i.test(fname) && /mutation|barcelona|polaris|friendship|profile|user|comet|textpost|ig/i.test(fname)) {
+            return true;
+          }
+        }
+        if (/usebarcelonafollowmutation|barcelonafollowmutation|polarisfriendshipsfollow|polarisfollowmutation|usepolarisfollowmutation|textpostappfollowmutation|friendingcometfollowmutation/i.test(lowerBody) &&
+            !/unfollow/i.test(lowerBody)) {
+          return true;
+        }
+        return false;
+      }
+
+      if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
+          lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
+        return true;
+      }
+
+      if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) return true;
+      if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) return true;
+      if (/\/api\/commit\/follow\/user/i.test(lowerUrl) &&
+          (/[?&]type=1(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=1(?:&|$)|"type"\s*:\s*1/i.test(lowerBody))) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  try {
+    var origFetch = window.fetch;
+    if (typeof origFetch === 'function') {
+      window.fetch = function(input, init) {
+        var reqUrl = '';
+        var reqMethod = 'GET';
+        var reqBody = null;
+        try {
+          if (typeof input === 'string') {
+            reqUrl = input;
+          } else if (input && typeof input === 'object') {
+            reqUrl = input.url || '';
+            if (input.method) reqMethod = input.method;
+          }
+          if (init && typeof init === 'object') {
+            if (init.method) reqMethod = init.method;
+            if (init.body !== undefined) reqBody = init.body;
+          }
+        } catch (_) {}
+        var isFollow = isFollowApiRequest(reqUrl, reqMethod, reqBody);
+        var promise = origFetch.apply(this, arguments);
+        if (isFollow && promise && typeof promise.then === 'function') {
+          promise.then(function(res) {
+            try {
+              if (res && res.ok) emitFollow('network');
+            } catch (_) {}
+          }, function() {});
+        }
+        return promise;
+      };
+    }
+  } catch (_) {}
+
+  try {
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+    if (typeof origOpen === 'function' && typeof origSend === 'function') {
+      XMLHttpRequest.prototype.open = function(method, url) {
+        try {
+          this.__omniMethod = method;
+          this.__omniUrl = url;
+        } catch (_) {}
+        return origOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        try {
+          if (isFollowApiRequest(this.__omniUrl, this.__omniMethod, body)) {
+            this.addEventListener('load', function() {
+              try {
+                if (this.status >= 200 && this.status < 300) {
+                  emitFollow('network');
+                }
+              } catch (_) {}
+            }, { once: true });
+          }
+        } catch (_) {}
+        return origSend.apply(this, arguments);
+      };
+    }
+  } catch (_) {}
+
+  function normalizeLabel(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function readElementLabels(el) {
+    var text = '';
+    var aria = '';
+    try {
+      text = normalizeLabel(el.innerText || el.textContent || '');
+      aria = normalizeLabel(el.getAttribute('aria-label') || '');
+      if (!aria) {
+        var svg = el.querySelector('svg[aria-label], [aria-label]');
+        if (svg) aria = normalizeLabel(svg.getAttribute('aria-label') || '');
+      }
+    } catch (_) {}
+    return { text: text, aria: aria };
+  }
+
+  function isFollowButtonElement(el) {
+    if (!el || el.disabled) return false;
+    try {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      if (el.closest('nav')) return false;
+      if (el.tagName && el.tagName.toUpperCase() === 'A') {
+        var href = (el.getAttribute('href') || '').toLowerCase();
+        if (/\/(following|followers)(?:\/|\?|$)/.test(href)) return false;
+      }
+      var labels = readElementLabels(el);
+      if (labels.text && NEGATIVE_RE.test(labels.text)) return false;
+      if (labels.aria && NEGATIVE_RE.test(labels.aria)) return false;
+      if (labels.text && labels.text.length <= 24 && EXACT_FOLLOW_TEXT_RE.test(labels.text)) {
+        return true;
+      }
+      if (!labels.text && labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
+        return true;
+      }
+      if (labels.text && labels.text.length <= 4 && /^[+＋]$/.test(labels.text) &&
+          labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function isElementHidden(el) {
+    try {
+      if (!el.isConnected) return true;
+      var style = window.getComputedStyle(el);
+      if (!style || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return true;
+      }
+      var rect = el.getBoundingClientRect();
+      return rect.width < 1 || rect.height < 1;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  document.addEventListener('click', function(e) {
+    try {
+      var target = e.target;
+      if (!target) return;
+      if (target.nodeType !== 1) target = target.parentElement;
+      if (!target || typeof target.closest !== 'function') return;
+      var btn = target.closest('button, [role="button"], a');
+      if (!btn || !isFollowButtonElement(btn)) return;
+
+      var clickedAt = Date.now();
+      var hadDialog = !!document.querySelector('[role="dialog"]');
+      var initialLabels = readElementLabels(btn);
+
+      setTimeout(function() {
+        try {
+          if (lastNetworkFollowAt >= clickedAt - 200) return;
+          if (!hadDialog) {
+            var dlg = document.querySelector('[role="dialog"]');
+            if (dlg) {
+              var dlgBtns = dlg.querySelectorAll('button, [role="button"]');
+              for (var i = 0; i < dlgBtns.length; i++) {
+                if (dlgBtns[i] !== btn && isFollowButtonElement(dlgBtns[i])) {
+                  return;
+                }
+              }
+            }
+          }
+          if (isElementHidden(btn)) {
+            emitFollow('dom');
+            return;
+          }
+          if (btn.getAttribute('aria-pressed') === 'true') {
+            emitFollow('dom');
+            return;
+          }
+          var after = readElementLabels(btn);
+          if ((after.text && POST_FOLLOW_STATE_RE.test(after.text)) ||
+              (after.aria && POST_FOLLOW_STATE_RE.test(after.aria))) {
+            emitFollow('dom');
+            return;
+          }
+          if ((after.text !== initialLabels.text || after.aria !== initialLabels.aria) &&
+              !isFollowButtonElement(btn)) {
+            emitFollow('dom');
+          }
+        } catch (_) {}
+      }, 650);
+    } catch (_) {}
+  }, true);
+})();"#;
 
 fn read_nav_snapshot(wv: &ICoreWebView2) -> (String, bool, bool) {
     unsafe {
@@ -387,10 +660,39 @@ pub fn attach_tab_handlers(
             let _ = settings.SetAreDefaultContextMenusEnabled(true);
             let _ = settings.SetAreDefaultScriptDialogsEnabled(true);
             let _ = settings.SetIsStatusBarEnabled(false);
+            let _ = settings.SetIsWebMessageEnabled(true);
             if let Ok(settings2) = settings.cast::<ICoreWebView2Settings2>() {
                 let ua_h = HSTRING::from(initial_ua);
                 let _ = settings2.SetUserAgent(&ua_h);
             }
+        }
+
+        // フォロー検知スクリプトをドキュメント生成前に注入し、WebMessage で受信する
+        {
+            let script_h = HSTRING::from(FOLLOW_TRACKER_JS);
+            let add_handler =
+                AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|_, _| Ok(())));
+            let _ = wv.AddScriptToExecuteOnDocumentCreated(&script_h, &add_handler);
+            let exec_handler = ExecuteScriptCompletedHandler::create(Box::new(|_, _| Ok(())));
+            let _ = wv.ExecuteScript(&script_h, &exec_handler);
+
+            let cb = callbacks.on_follow_detected.clone();
+            let mut token = Default::default();
+            let _ = wv.add_WebMessageReceived(
+                &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+                    if let Some(args) = args {
+                        let mut raw = PWSTR::null();
+                        if args.TryGetWebMessageAsString(&mut raw).is_ok() {
+                            let msg = take_pwstr(raw);
+                            if msg.contains("\"omnisns:follow\"") {
+                                cb();
+                            }
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
         }
 
         if let Ok(wv8) = wv.cast::<ICoreWebView2_8>() {

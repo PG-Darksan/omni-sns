@@ -82,17 +82,58 @@ function showToast(message: string): void {
   }, 2400);
 }
 
+let confirmResolver: ((accepted: boolean) => void) | null = null;
+
 function isAnyModalOpen(): boolean {
   return (
     !el('catalog-modal').classList.contains('hidden') ||
     !el('edit-modal').classList.contains('hidden') ||
     !el('settings-modal').classList.contains('hidden') ||
-    !el('gesture-modal').classList.contains('hidden')
+    !el('gesture-modal').classList.contains('hidden') ||
+    !el('follow-modal').classList.contains('hidden') ||
+    !el('confirm-modal').classList.contains('hidden')
   );
 }
 
 async function syncOverlayToMain(): Promise<void> {
   await omniApi.setOverlayVisible(isAnyModalOpen());
+}
+
+async function resolveConfirmDialog(accepted: boolean): Promise<void> {
+  el('confirm-modal').classList.add('hidden');
+  const resolver = confirmResolver;
+  confirmResolver = null;
+  await syncOverlayToMain();
+  resolver?.(accepted);
+}
+
+async function openConfirmDialog(options: {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  danger?: boolean;
+}): Promise<boolean> {
+  if (confirmResolver) {
+    const prev = confirmResolver;
+    confirmResolver = null;
+    prev(false);
+  }
+  el<HTMLHeadingElement>('confirm-title').textContent = options.title;
+  el<HTMLParagraphElement>('confirm-message').textContent = options.message;
+  const okBtn = el<HTMLButtonElement>('btn-confirm-ok');
+  okBtn.textContent = options.confirmLabel ?? 'OK';
+  okBtn.className = options.danger === false ? 'btn-primary' : 'btn-danger';
+  const cancelBtn = el<HTMLButtonElement>('btn-confirm-cancel');
+  cancelBtn.textContent = options.cancelLabel ?? 'キャンセル';
+
+  el('confirm-modal').classList.remove('hidden');
+  await syncOverlayToMain();
+  cancelBtn.focus();
+
+  return new Promise<boolean>((resolve) => {
+    confirmResolver = resolve;
+  });
 }
 
 function getCatalogService(serviceId: string): CatalogService | undefined {
@@ -180,8 +221,18 @@ async function activateGroup(group: ServiceGroup): Promise<void> {
 function applyThemeAndLayout(): void {
   if (!state.config) return;
   const { theme, sidebarWidth } = state.config.settings;
+  const headerCollapsed = Boolean(state.config.settings.headerCollapsed);
   document.documentElement.setAttribute('data-theme', theme);
   document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
+
+  el<HTMLDivElement>('main-area').classList.toggle('header-collapsed', headerCollapsed);
+  const toggleHeaderBtn = el<HTMLButtonElement>('btn-toggle-header');
+  toggleHeaderBtn.textContent = headerCollapsed ? '▼' : '▲';
+  toggleHeaderBtn.title = headerCollapsed ? 'ヘッダー項目を展開' : 'ヘッダー項目を折り畳む';
+  toggleHeaderBtn.setAttribute(
+    'aria-label',
+    headerCollapsed ? 'ヘッダー項目を展開' : 'ヘッダー項目を折り畳む'
+  );
 
   const gestureBtn = el<HTMLButtonElement>('btn-gesture-settings');
   const gestureOn = Boolean(state.config.settings.gesture?.enabled);
@@ -388,7 +439,13 @@ function renderSidebar(): void {
         group.accounts.length >= 2
           ? `「${group.displayName}」（全${group.accounts.length}アカウント）を一覧から削除しますか？\n※ 特定のアカウントだけ消す場合はヘッダーのアカウントタブから ✕ を押してください。`
           : `「${group.displayName}」を一覧から削除しますか？`;
-      if (!window.confirm(msg)) return;
+      const ok = await openConfirmDialog({
+        title: 'サービスを削除',
+        message: msg,
+        confirmLabel: '削除する',
+        danger: true
+      });
+      if (!ok) return;
       if (group.accounts.length === 1) {
         await omniApi.removeTab(group.accounts[0].instanceId);
       } else {
@@ -549,9 +606,12 @@ function renderAccountBar(): void {
       delBtn.textContent = '✕';
       delBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        const ok = window.confirm(
-          `「${group.displayName} / ${label}」を削除しますか？\n（このアカウントのログインセッションも削除されます）`
-        );
+        const ok = await openConfirmDialog({
+          title: 'アカウントを削除',
+          message: `「${group.displayName} / ${label}」を削除しますか？\n（このアカウントのログインセッションも削除されます）`,
+          confirmLabel: '削除する',
+          danger: true
+        });
         if (!ok) return;
         await omniApi.removeTab(inst.instanceId);
         showToast(`「${group.displayName} / ${label}」を削除しました`);
@@ -624,6 +684,12 @@ function renderToolbarAndViewport(): void {
   const muteBtn = el<HTMLButtonElement>('btn-toggle-mute');
   const zoomResetBtn = el<HTMLButtonElement>('btn-zoom-reset');
 
+  const followBtn = el<HTMLButtonElement>('btn-follow-counter');
+  const followTodayEl = el<HTMLElement>('follow-today-count');
+  const collapsedFollowBtn = el<HTMLButtonElement>('btn-collapsed-follow');
+  const collapsedFollowEl = el<HTMLSpanElement>('collapsed-follow-count');
+  const collapsedReloadBtn = el<HTMLButtonElement>('btn-collapsed-reload');
+
   const emptyEl = el<HTMLDivElement>('empty-state');
   const sleepingEl = el<HTMLDivElement>('sleeping-state');
   const errorEl = el<HTMLDivElement>('error-state');
@@ -635,6 +701,13 @@ function renderToolbarAndViewport(): void {
   if (!active) {
     backBtn.disabled = true;
     fwdBtn.disabled = true;
+    followBtn.disabled = true;
+    collapsedFollowBtn.disabled = true;
+    collapsedReloadBtn.disabled = true;
+    followTodayEl.textContent = '0';
+    collapsedFollowEl.textContent = '0';
+    followBtn.classList.remove('has-count');
+    collapsedFollowBtn.classList.remove('has-count');
     dotEl.className = 'status-dot';
     nameEl.textContent = 'サービス未選択';
     urlEl.textContent = '—';
@@ -647,6 +720,17 @@ function renderToolbarAndViewport(): void {
   }
 
   const displayTitle = getActiveDisplayTitle();
+  const todayFollow = active.followCountToday ?? 0;
+  followBtn.disabled = false;
+  collapsedFollowBtn.disabled = false;
+  collapsedReloadBtn.disabled = false;
+  followTodayEl.textContent = String(todayFollow);
+  collapsedFollowEl.textContent = String(todayFollow);
+  followBtn.classList.toggle('has-count', todayFollow > 0);
+  collapsedFollowBtn.classList.toggle('has-count', todayFollow > 0);
+  if (!el('follow-modal').classList.contains('hidden')) {
+    renderFollowModal();
+  }
   backBtn.disabled = !rt?.canGoBack;
   fwdBtn.disabled = !rt?.canGoForward;
   dotEl.className = `status-dot ${rt?.isLoading ? 'loading' : rt?.isSleeping ? '' : 'ready'}`;
@@ -947,6 +1031,69 @@ async function openSettingsModal(): Promise<void> {
   await syncOverlayToMain();
 }
 
+function renderFollowModal(): void {
+  const active = getActiveInstance();
+  if (!active || !state.config) return;
+  const todayCount = active.followCountToday ?? 0;
+  const totalCount = active.followCountTotal ?? 0;
+
+  el<HTMLParagraphElement>('follow-modal-account').textContent = getActiveDisplayTitle();
+  el<HTMLElement>('follow-modal-today').textContent = String(todayCount);
+  el<HTMLElement>('follow-modal-total').textContent = String(totalCount);
+  el<HTMLButtonElement>('btn-follow-dec').disabled = todayCount <= 0 && totalCount <= 0;
+  el<HTMLButtonElement>('btn-follow-reset-today').disabled = todayCount <= 0;
+  el<HTMLButtonElement>('btn-follow-reset-all').disabled = todayCount <= 0 && totalCount <= 0;
+
+  const summaryBox = el<HTMLDivElement>('follow-summary-box');
+  const summaryList = el<HTMLDivElement>('follow-summary-list');
+  const instances = state.config.instances;
+  if (instances.length >= 2) {
+    let allToday = 0;
+    summaryList.innerHTML = '';
+    const groups = getServiceGroups();
+    for (const grp of groups) {
+      grp.accounts.forEach((inst, idx) => {
+        const c = inst.followCountToday ?? 0;
+        allToday += c;
+        if (c > 0 || inst.instanceId === active.instanceId) {
+          const row = document.createElement('div');
+          row.className = 'follow-summary-row';
+          const lbl = getAccountDisplayLabel(inst, idx, grp.displayName);
+          const nameSpan = document.createElement('span');
+          nameSpan.textContent = `${grp.displayName} · ${lbl}`;
+          const cntSpan = document.createElement('strong');
+          cntSpan.textContent = `${c} 回`;
+          row.appendChild(nameSpan);
+          row.appendChild(cntSpan);
+          summaryList.appendChild(row);
+        }
+      });
+    }
+    el<HTMLElement>('follow-all-today').textContent = `${allToday} 回`;
+    summaryBox.classList.remove('hidden');
+  } else {
+    summaryBox.classList.add('hidden');
+  }
+}
+
+async function openFollowModal(): Promise<void> {
+  if (!getActiveInstance()) return;
+  renderFollowModal();
+  el('follow-modal').classList.remove('hidden');
+  await syncOverlayToMain();
+}
+
+async function closeFollowModal(): Promise<void> {
+  el('follow-modal').classList.add('hidden');
+  await syncOverlayToMain();
+}
+
+async function toggleHeaderCollapsed(): Promise<void> {
+  if (!state.config) return;
+  const next = !Boolean(state.config.settings.headerCollapsed);
+  await omniApi.updateSettings({ headerCollapsed: next });
+}
+
 async function closeSettingsModal(): Promise<void> {
   el('settings-modal').classList.add('hidden');
   await syncOverlayToMain();
@@ -1118,9 +1265,12 @@ function bindEvents(): void {
     const active = getActiveInstance();
     if (!active) return;
     const title = getActiveDisplayTitle();
-    const ok = window.confirm(
-      `「${title}」のCookie・ログイン情報・キャッシュをすべて削除しますか？\n（他のアカウント・サービスには影響しません）`
-    );
+    const ok = await openConfirmDialog({
+      title: 'ログイン情報を初期化',
+      message: `「${title}」のCookie・ログイン情報・キャッシュをすべて削除しますか？\n（他のアカウント・サービスには影響しません）`,
+      confirmLabel: '初期化する',
+      danger: true
+    });
     if (!ok) return;
     await omniApi.tabAction(active.instanceId, 'clear-session');
     showToast(`「${title}」のセッションを初期化しました`);
@@ -1168,6 +1318,10 @@ function bindEvents(): void {
     } catch (err) {
       showToast(String(err));
     }
+  });
+
+  el<HTMLButtonElement>('btn-hisator-ad').addEventListener('click', () => {
+    void omniApi.openExternalUrl('https://hisator-notebook.com/');
   });
 
   el<HTMLButtonElement>('btn-copy-url').addEventListener('click', async () => {
@@ -1264,6 +1418,52 @@ function bindEvents(): void {
     }
   });
 
+  // Follow counter & collapsible header
+  el<HTMLButtonElement>('btn-toggle-header').addEventListener('click', () => void toggleHeaderCollapsed());
+  el<HTMLButtonElement>('btn-collapsed-reload').addEventListener('click', (e) =>
+    void runActiveAction(e.shiftKey ? 'hard-reload' : 'reload')
+  );
+  el<HTMLButtonElement>('btn-follow-counter').addEventListener('click', () => void openFollowModal());
+  el<HTMLButtonElement>('btn-collapsed-follow').addEventListener('click', () => void openFollowModal());
+  el<HTMLButtonElement>('btn-close-follow').addEventListener('click', () => void closeFollowModal());
+  el<HTMLDivElement>('follow-modal').addEventListener('click', (e) => {
+    if (e.target === el('follow-modal')) {
+      void closeFollowModal();
+    }
+  });
+  el<HTMLButtonElement>('btn-follow-inc').addEventListener('click', async () => {
+    const active = getActiveInstance();
+    if (!active) return;
+    await omniApi.adjustFollowCount(active.instanceId, 1);
+  });
+  el<HTMLButtonElement>('btn-follow-dec').addEventListener('click', async () => {
+    const active = getActiveInstance();
+    if (!active) return;
+    await omniApi.adjustFollowCount(active.instanceId, -1);
+  });
+  el<HTMLButtonElement>('btn-follow-reset-today').addEventListener('click', async () => {
+    const active = getActiveInstance();
+    if (!active) return;
+    await omniApi.resetFollowCount(active.instanceId, false);
+    showToast('今日のフォロー回数をリセットしました');
+  });
+  el<HTMLButtonElement>('btn-follow-reset-all').addEventListener('click', async () => {
+    const active = getActiveInstance();
+    if (!active) return;
+    await omniApi.resetFollowCount(active.instanceId, true);
+    showToast('フォロー回数をすべてリセットしました');
+  });
+
+  // Confirm modal
+  el<HTMLButtonElement>('btn-confirm-ok').addEventListener('click', () => void resolveConfirmDialog(true));
+  el<HTMLButtonElement>('btn-confirm-cancel').addEventListener('click', () => void resolveConfirmDialog(false));
+  el<HTMLButtonElement>('btn-close-confirm').addEventListener('click', () => void resolveConfirmDialog(false));
+  el<HTMLDivElement>('confirm-modal').addEventListener('click', (e) => {
+    if (e.target === el('confirm-modal')) {
+      void resolveConfirmDialog(false);
+    }
+  });
+
   // Settings modal
   el<HTMLButtonElement>('btn-close-settings').addEventListener('click', () => void closeSettingsModal());
   el<HTMLInputElement>('setting-sidebar-width').addEventListener('input', (e) => {
@@ -1287,7 +1487,11 @@ function bindEvents(): void {
     }
 
     if (e.key === 'Escape') {
-      if (!el('edit-modal').classList.contains('hidden')) {
+      if (!el('confirm-modal').classList.contains('hidden')) {
+        void resolveConfirmDialog(false);
+      } else if (!el('follow-modal').classList.contains('hidden')) {
+        void closeFollowModal();
+      } else if (!el('edit-modal').classList.contains('hidden')) {
         void closeEditModal();
       } else if (!el('catalog-modal').classList.contains('hidden')) {
         void closeCatalogModal();

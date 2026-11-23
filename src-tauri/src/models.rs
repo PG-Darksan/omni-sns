@@ -47,6 +47,12 @@ pub struct ServiceInstance {
     pub zoom_factor: f64,
     pub notifications_enabled: bool,
     pub order: usize,
+    #[serde(default)]
+    pub follow_count_today: u32,
+    #[serde(default)]
+    pub follow_count_total: u32,
+    #[serde(default)]
+    pub follow_count_date: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +98,8 @@ pub struct AppSettings {
     pub minimize_to_tray: bool,
     pub sidebar_width: u32,
     pub active_instance_id: Option<String>,
+    #[serde(default)]
+    pub header_collapsed: bool,
     #[serde(default)]
     pub gesture: GestureSettings,
 }
@@ -155,6 +163,7 @@ pub struct UpdateSettingsPatch {
     pub sidebar_width: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub active_instance_id: Option<Option<String>>,
+    pub header_collapsed: Option<bool>,
     pub gesture: Option<GestureSettings>,
 }
 

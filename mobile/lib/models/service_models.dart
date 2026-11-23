@@ -82,6 +82,14 @@ class CatalogService {
   }
 }
 
+/// ローカル日付を `YYYY-MM-DD` 形式で返す（フォロー回数日次リセット判定用）。
+String formatLocalYmd(DateTime dt) {
+  final y = dt.year.toString().padLeft(4, '0');
+  final m = dt.month.toString().padLeft(2, '0');
+  final d = dt.day.toString().padLeft(2, '0');
+  return '$y-$m-$d';
+}
+
 class ServiceInstance {
   const ServiceInstance({
     required this.instanceId,
@@ -95,6 +103,9 @@ class ServiceInstance {
     required this.badge,
     required this.notificationsEnabled,
     required this.order,
+    this.followCountToday = 0,
+    this.followCountTotal = 0,
+    this.followCountDate,
   });
 
   final String instanceId;
@@ -108,12 +119,44 @@ class ServiceInstance {
   final String badge;
   final bool notificationsEnabled;
   final int order;
+  final int followCountToday;
+  final int followCountTotal;
+  final String? followCountDate;
 
   /// 実際に Android WebView に適用するプロファイル名を返す。
   String get effectiveProfileName {
     final p = profileName?.trim();
     if (p != null && p.isNotEmpty) return p;
     return makeProfileNameForInstance(instanceId);
+  }
+
+  /// 本日分の有効なフォロー回数（日付が変わっていれば自動で 0）。
+  int effectiveFollowCountToday([DateTime? now]) {
+    final today = formatLocalYmd(now ?? DateTime.now());
+    return followCountDate == today ? followCountToday : 0;
+  }
+
+  /// フォロー回数を delta (+1 / -1) 増減した新しいインスタンスを返す。
+  ServiceInstance withFollowDelta(int delta, [DateTime? now]) {
+    final today = formatLocalYmd(now ?? DateTime.now());
+    final baseToday = followCountDate == today ? followCountToday : 0;
+    final nextToday = (baseToday + delta).clamp(0, 999999);
+    final nextTotal = (followCountTotal + delta).clamp(0, 99999999);
+    return copyWith(
+      followCountToday: nextToday,
+      followCountTotal: nextTotal,
+      followCountDate: today,
+    );
+  }
+
+  /// フォロー回数をリセットした新しいインスタンスを返す。
+  ServiceInstance withFollowReset({required bool resetTotal, DateTime? now}) {
+    final today = formatLocalYmd(now ?? DateTime.now());
+    return copyWith(
+      followCountToday: 0,
+      followCountTotal: resetTotal ? 0 : followCountTotal,
+      followCountDate: today,
+    );
   }
 
   ServiceInstance copyWith({
@@ -126,6 +169,9 @@ class ServiceInstance {
     String? badge,
     bool? notificationsEnabled,
     int? order,
+    int? followCountToday,
+    int? followCountTotal,
+    String? followCountDate,
   }) {
     return ServiceInstance(
       instanceId: instanceId,
@@ -140,6 +186,9 @@ class ServiceInstance {
       badge: badge ?? this.badge,
       notificationsEnabled: notificationsEnabled ?? this.notificationsEnabled,
       order: order ?? this.order,
+      followCountToday: followCountToday ?? this.followCountToday,
+      followCountTotal: followCountTotal ?? this.followCountTotal,
+      followCountDate: followCountDate ?? this.followCountDate,
     );
   }
 
@@ -157,6 +206,10 @@ class ServiceInstance {
       'badge': badge,
       'notificationsEnabled': notificationsEnabled,
       'order': order,
+      'followCountToday': followCountToday,
+      'followCountTotal': followCountTotal,
+      if (followCountDate != null && followCountDate!.isNotEmpty)
+        'followCountDate': followCountDate,
     };
   }
 
@@ -165,6 +218,7 @@ class ServiceInstance {
     final safeName = (name == null || name.isEmpty) ? 'SNS' : name;
     final rawLabel = (json['accountLabel'] as String?)?.trim();
     final rawProfile = (json['profileName'] as String?)?.trim();
+    final rawFollowDate = (json['followCountDate'] as String?)?.trim();
     return ServiceInstance(
       instanceId: json['instanceId'] as String? ?? 'svc-$index',
       serviceId: json['serviceId'] as String? ?? 'custom',
@@ -179,6 +233,12 @@ class ServiceInstance {
       badge: (json['badge'] as String?) ?? makeBadgeText(safeName),
       notificationsEnabled: json['notificationsEnabled'] as bool? ?? true,
       order: json['order'] as int? ?? index,
+      followCountToday:
+          ((json['followCountToday'] as num?)?.toInt() ?? 0).clamp(0, 999999),
+      followCountTotal: ((json['followCountTotal'] as num?)?.toInt() ?? 0)
+          .clamp(0, 99999999),
+      followCountDate:
+          (rawFollowDate == null || rawFollowDate.isEmpty) ? null : rawFollowDate,
     );
   }
 }
@@ -188,17 +248,20 @@ class AppSettings {
     this.isDarkMode = true,
     this.activeInstanceId,
     this.isBottomTabsCollapsed = false,
+    this.isHeaderCollapsed = false,
   });
 
   final bool isDarkMode;
   final String? activeInstanceId;
   final bool isBottomTabsCollapsed;
+  final bool isHeaderCollapsed;
 
   AppSettings copyWith({
     bool? isDarkMode,
     String? activeInstanceId,
     bool clearActive = false,
     bool? isBottomTabsCollapsed,
+    bool? isHeaderCollapsed,
   }) {
     return AppSettings(
       isDarkMode: isDarkMode ?? this.isDarkMode,
@@ -206,6 +269,7 @@ class AppSettings {
           clearActive ? null : (activeInstanceId ?? this.activeInstanceId),
       isBottomTabsCollapsed:
           isBottomTabsCollapsed ?? this.isBottomTabsCollapsed,
+      isHeaderCollapsed: isHeaderCollapsed ?? this.isHeaderCollapsed,
     );
   }
 
@@ -214,6 +278,7 @@ class AppSettings {
       'isDarkMode': isDarkMode,
       'activeInstanceId': activeInstanceId,
       'isBottomTabsCollapsed': isBottomTabsCollapsed,
+      'isHeaderCollapsed': isHeaderCollapsed,
     };
   }
 
@@ -222,6 +287,7 @@ class AppSettings {
       isDarkMode: json['isDarkMode'] as bool? ?? true,
       activeInstanceId: json['activeInstanceId'] as String?,
       isBottomTabsCollapsed: json['isBottomTabsCollapsed'] as bool? ?? false,
+      isHeaderCollapsed: json['isHeaderCollapsed'] as bool? ?? false,
     );
   }
 }
@@ -280,6 +346,16 @@ String buildMobileUserAgent() {
   return 'Mozilla/5.0 (Linux; Android 14; Pixel 8) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
       'Chrome/136.0.0.0 Mobile Safari/537.36';
+}
+
+/// 安全な http / https URL（ホスト名あり）かを判定する。
+bool isHttpOrHttpsUrl(String? rawUrl) {
+  final trimmed = rawUrl?.trim();
+  if (trimmed == null || trimmed.isEmpty) return false;
+  final parsed = Uri.tryParse(trimmed);
+  if (parsed == null) return false;
+  return (parsed.scheme == 'http' || parsed.scheme == 'https') &&
+      parsed.host.isNotEmpty;
 }
 
 /// URL入力を検証し、安全な http/https URL に正規化する

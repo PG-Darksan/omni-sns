@@ -103,9 +103,23 @@ class AppStore {
             .toList()
           ..sort((a, b) => a.order.compareTo(b.order));
 
-        final migrated = assignProfilesForMigration(parsed);
+        final migratedProfiles = assignProfilesForMigration(parsed);
+        final migrated = migratedProfiles.map((inst) {
+          if (inst.serviceId == 'threads') {
+            final uri = Uri.tryParse(inst.url);
+            if (uri != null &&
+                (uri.host.toLowerCase() == 'www.threads.net' ||
+                    uri.host.toLowerCase() == 'threads.net')) {
+              return inst.copyWith(
+                url: uri.replace(host: 'www.threads.com').toString(),
+              );
+            }
+          }
+          return inst;
+        }).toList();
         for (var i = 0; i < migrated.length; i++) {
-          if (migrated[i].profileName != parsed[i].profileName) {
+          if (migrated[i].profileName != parsed[i].profileName ||
+              migrated[i].url != parsed[i].url) {
             needsMigrationPersist = true;
             break;
           }

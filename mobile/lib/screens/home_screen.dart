@@ -229,20 +229,21 @@ class _HomeScreenState extends State<HomeScreen> {
         _updateRuntime(
           instance.instanceId,
           (cur) => cur.copyWith(
-            currentUrl: url.isEmpty ? cur.currentUrl : url,
+            currentUrl: isHttpOrHttpsUrl(url) ? url : cur.currentUrl,
             isLoading: true,
             isSleeping: false,
             clearError: true,
           ),
         );
       },
-      onPageFinished: (url, title, canBack, canFwd) {
+      onPageFinished: (url, title, canBack, canFwd, hadError) {
         final safeTitle = title.trim().isEmpty ? instance.name : title;
         final unread = parseUnreadCountFromTitle(safeTitle);
+        final validUrl = isHttpOrHttpsUrl(url);
         _updateRuntime(
           instance.instanceId,
           (cur) => cur.copyWith(
-            currentUrl: url.isEmpty ? cur.currentUrl : url,
+            currentUrl: validUrl ? url : cur.currentUrl,
             title: safeTitle,
             progress: 100,
             unreadCount: unread,
@@ -250,6 +251,7 @@ class _HomeScreenState extends State<HomeScreen> {
             isSleeping: false,
             canGoBack: canBack,
             canGoForward: canFwd,
+            clearError: !hadError && validUrl,
           ),
         );
       },
@@ -268,7 +270,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _updateRuntime(
           instance.instanceId,
           (cur) => cur.copyWith(
-            currentUrl: url.isEmpty ? cur.currentUrl : url,
+            currentUrl: isHttpOrHttpsUrl(url) ? url : cur.currentUrl,
             canGoBack: canBack,
             canGoForward: canFwd,
           ),
@@ -284,10 +286,10 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       },
       onExternalScheme: (url) {
-        final uri = Uri.tryParse(url);
-        if (uri != null) {
-          launchUrl(uri, mode: LaunchMode.externalApplication);
-        }
+        _openExternalUrlSafely(url);
+      },
+      onFollowDetected: (_) {
+        _adjustFollowCount(instance.instanceId, 1);
       },
     );
 
@@ -326,10 +328,329 @@ class _HomeScreenState extends State<HomeScreen> {
     _activateInstance(_pickTargetAccountForGroup(group));
   }
 
+  Future<void> _reloadInstance(ServiceInstance instance) async {
+    final rt = _runtimeMap[instance.instanceId];
+    final fallbackUrl =
+        isHttpOrHttpsUrl(rt?.currentUrl) ? rt!.currentUrl : instance.url;
+
+    final ctrl = _controllers[instance.instanceId];
+    if (ctrl == null || ctrl.isDisposed) {
+      _ensureController(instance);
+      return;
+    }
+
+    _updateRuntime(
+      instance.instanceId,
+      (cur) => cur.copyWith(
+        isSleeping: false,
+        isLoading: true,
+        progress: 5,
+        clearError: true,
+      ),
+    );
+    await ctrl.reload(fallbackUrl: fallbackUrl);
+  }
+
+  Future<void> _reloadActiveTab() async {
+    final active = _activeInstance;
+    if (active == null) return;
+    await _reloadInstance(active);
+  }
+
+  Future<void> _openExternalUrlSafely(String rawUrl) async {
+    final uri = Uri.tryParse(rawUrl.trim());
+    if (uri == null) return;
+    try {
+      final launched = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      );
+      if (!launched) {
+        _showSnack('外部アプリで開けませんでした');
+      }
+    } catch (_) {
+      _showSnack('外部アプリで開けませんでした');
+    }
+  }
+
+  Future<void> _adjustFollowCount(String instanceId, int delta) async {
+    final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
+    if (idx == -1) return;
+    setState(() {
+      _instances[idx] = _instances[idx].withFollowDelta(delta);
+    });
+    await _persist();
+  }
+
+  Future<void> _resetFollowCount(
+    String instanceId, {
+    required bool resetTotal,
+  }) async {
+    final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
+    if (idx == -1) return;
+    setState(() {
+      _instances[idx] = _instances[idx].withFollowReset(resetTotal: resetTotal);
+    });
+    await _persist();
+  }
+
+  Future<void> _showFollowCounterSheet(ServiceInstance target) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) {
+          final current = _instances.cast<ServiceInstance?>().firstWhere(
+                (i) => i?.instanceId == target.instanceId,
+                orElse: () => null,
+              );
+          if (current == null) return const SizedBox.shrink();
+
+          final grp = _serviceGroups.cast<_ServiceGroup?>().firstWhere(
+                (g) => g?.key == serviceGroupKey(current),
+                orElse: () => null,
+              );
+          final siblingIdx = grp == null
+              ? 0
+              : max(
+                  0,
+                  grp.accounts
+                      .indexWhere((a) => a.instanceId == current.instanceId),
+                );
+          final accLabel = accountDisplayLabel(
+            current,
+            siblingIdx,
+            baseServiceName: grp?.displayName,
+          );
+          final title = _multiProfileSupported
+              ? '${grp?.displayName ?? current.name} · $accLabel'
+              : (grp?.displayName ?? current.name);
+
+          final now = DateTime.now();
+          final todayCount = current.effectiveFollowCountToday(now);
+          final totalCount = current.followCountTotal;
+          var allTodaySum = 0;
+          for (final inst in _instances) {
+            allTodaySum += inst.effectiveFollowCountToday(now);
+          }
+          final colorScheme = Theme.of(ctx).colorScheme;
+
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.person_add_alt_1_rounded,
+                        color: colorScheme.primary,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'フォロー回数カウンター',
+                              style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            Text(
+                              title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(ctx).textTheme.bodySmall,
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => Navigator.of(ctx).pop(),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: colorScheme.primaryContainer
+                                .withValues(alpha: 0.45),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: colorScheme.primary.withValues(alpha: 0.4),
+                            ),
+                          ),
+                          child: Column(
+                            children: [
+                              const Text(
+                                '今日のフォロー数',
+                                style: TextStyle(fontSize: 11.5),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '$todayCount',
+                                key: const ValueKey('follow-sheet-today'),
+                                style: TextStyle(
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.w800,
+                                  color: colorScheme.primary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: colorScheme.surfaceContainerHighest
+                                .withValues(alpha: 0.6),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: colorScheme.outlineVariant,
+                            ),
+                          ),
+                          child: Column(
+                            children: [
+                              const Text(
+                                '累計フォロー数',
+                                style: TextStyle(fontSize: 11.5),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '$totalCount',
+                                key: const ValueKey('follow-sheet-total'),
+                                style: const TextStyle(
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          key: const ValueKey('follow-sheet-dec'),
+                          onPressed: todayCount > 0 || totalCount > 0
+                              ? () async {
+                                  await _adjustFollowCount(
+                                    current.instanceId,
+                                    -1,
+                                  );
+                                  setSheetState(() {});
+                                }
+                              : null,
+                          icon: const Icon(Icons.remove, size: 18),
+                          label: const Text('−1'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: FilledButton.tonalIcon(
+                          key: const ValueKey('follow-sheet-inc'),
+                          onPressed: () async {
+                            await _adjustFollowCount(current.instanceId, 1);
+                            setSheetState(() {});
+                          },
+                          icon: const Icon(Icons.add, size: 18),
+                          label: const Text('＋1'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextButton(
+                          onPressed: todayCount > 0
+                              ? () async {
+                                  await _resetFollowCount(
+                                    current.instanceId,
+                                    resetTotal: false,
+                                  );
+                                  setSheetState(() {});
+                                }
+                              : null,
+                          child: const Text('今日をリセット'),
+                        ),
+                      ),
+                      Expanded(
+                        child: TextButton(
+                          onPressed: totalCount > 0 || todayCount > 0
+                              ? () async {
+                                  await _resetFollowCount(
+                                    current.instanceId,
+                                    resetTotal: true,
+                                  );
+                                  setSheetState(() {});
+                                }
+                              : null,
+                          style: TextButton.styleFrom(
+                            foregroundColor: Colors.redAccent,
+                          ),
+                          child: const Text('累計もリセット'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_instances.length >= 2) ...[
+                    const Divider(height: 16),
+                    Text(
+                      '全アカウント合計（今日）: $allTodaySum 回',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 6),
+                  Text(
+                    'Threads・Instagram・Bluesky 等でフォローを押すと自動でカウントされます（日付が変わると「今日」は自動で0に戻ります）。',
+                    style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                          fontSize: 11,
+                        ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Future<void> _toggleBottomTabsCollapsed() async {
     setState(() {
       _settings = _settings.copyWith(
         isBottomTabsCollapsed: !_settings.isBottomTabsCollapsed,
+      );
+    });
+    await _persist();
+  }
+
+  Future<void> _toggleHeaderCollapsed() async {
+    setState(() {
+      _settings = _settings.copyWith(
+        isHeaderCollapsed: !_settings.isHeaderCollapsed,
       );
     });
     await _persist();
@@ -524,7 +845,15 @@ class _HomeScreenState extends State<HomeScreen> {
           onClearAllCookies: () async {
             await OmniWebViewManager.clearAllCookies();
             for (final id in _controllers.keys.toList()) {
-              await _controllers[id]?.reload();
+              final inst = _instances.cast<ServiceInstance?>().firstWhere(
+                    (i) => i?.instanceId == id,
+                    orElse: () => null,
+                  );
+              if (inst != null) {
+                await _reloadInstance(inst);
+              } else {
+                await _controllers[id]?.reload();
+              }
             }
           },
         ),
@@ -800,6 +1129,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final visible = _visibleInstances;
     final groups = _serviceGroups;
     final tabsCollapsed = _settings.isBottomTabsCollapsed;
+    final headerCollapsed = _settings.isHeaderCollapsed;
     final otherUnread = _otherGroupsUnread;
 
     return PopScope(
@@ -817,201 +1147,255 @@ class _HomeScreenState extends State<HomeScreen> {
       },
       child: Scaffold(
         drawer: _buildDrawer(groups, activeGroup),
-        appBar: AppBar(
-          toolbarHeight: 50,
-          titleSpacing: 4,
-          title: active == null
-              ? const Text('OmniSNS')
-              : InkWell(
-                  borderRadius: BorderRadius.circular(8),
-                  onTap: () async {
-                    final url = activeRt?.currentUrl ?? active.url;
-                    await Clipboard.setData(ClipboardData(text: url));
-                    _showSnack('現在のURLをコピーしました');
-                  },
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 26,
-                        height: 26,
-                        decoration: BoxDecoration(
-                          color: parseHexColor(active.colorHex),
-                          borderRadius: BorderRadius.circular(7),
-                        ),
-                        alignment: Alignment.center,
-                        child: Text(
-                          active.badge,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
+        appBar: headerCollapsed
+            ? null
+            : AppBar(
+                toolbarHeight: 50,
+                titleSpacing: 4,
+                title: active == null
+                    ? const Text('OmniSNS')
+                    : InkWell(
+                        borderRadius: BorderRadius.circular(8),
+                        onTap: () async {
+                          final url = activeRt?.currentUrl ?? active.url;
+                          await Clipboard.setData(ClipboardData(text: url));
+                          _showSnack('現在のURLをコピーしました');
+                        },
+                        child: Row(
                           children: [
-                            Text(
-                              activeGroup?.displayName ?? active.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.bold,
+                            Container(
+                              width: 26,
+                              height: 26,
+                              decoration: BoxDecoration(
+                                color: parseHexColor(active.colorHex),
+                                borderRadius: BorderRadius.circular(7),
+                              ),
+                              alignment: Alignment.center,
+                              child: Text(
+                                active.badge,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                ),
                               ),
                             ),
-                            Text(
-                              activeRt?.currentUrl ?? active.url,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .labelSmall
-                                  ?.copyWith(fontSize: 10.5),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    activeGroup?.displayName ?? active.name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  Text(
+                                    activeRt?.currentUrl ?? active.url,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .labelSmall
+                                        ?.copyWith(fontSize: 10.5),
+                                  ),
+                                ],
+                              ),
                             ),
                           ],
                         ),
                       ),
-                    ],
+                actions: [
+                  if (tabsCollapsed)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 2),
+                      child: ActionChip(
+                        visualDensity: VisualDensity.compact,
+                        labelPadding: const EdgeInsets.symmetric(horizontal: 4),
+                        avatar: const Icon(
+                          Icons.keyboard_arrow_up_rounded,
+                          size: 16,
+                        ),
+                        label: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text('タブ', style: TextStyle(fontSize: 11)),
+                            if (otherUnread > 0) ...[
+                              const SizedBox(width: 4),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 4,
+                                  vertical: 0.5,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.redAccent,
+                                  borderRadius: BorderRadius.circular(99),
+                                ),
+                                child: Text(
+                                  otherUnread > 99 ? '99+' : '$otherUnread',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                        tooltip: '下部タブを展開',
+                        onPressed: _toggleBottomTabsCollapsed,
+                      ),
+                    ),
+                  if (active != null)
+                    IconButton(
+                      key: const ValueKey('header-reload-button'),
+                      icon: const Icon(Icons.refresh_rounded),
+                      visualDensity: VisualDensity.compact,
+                      tooltip: '再読み込み',
+                      onPressed: _reloadActiveTab,
+                    ),
+                  IconButton(
+                    key: const ValueKey('header-collapse-button'),
+                    icon: const Icon(Icons.keyboard_arrow_up_rounded),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: 'ヘッダーを折り畳む',
+                    onPressed: _toggleHeaderCollapsed,
                   ),
-                ),
-          actions: [
-            if (tabsCollapsed)
-              Padding(
-                padding: const EdgeInsets.only(right: 2),
-                child: ActionChip(
-                  visualDensity: VisualDensity.compact,
-                  labelPadding: const EdgeInsets.symmetric(horizontal: 4),
-                  avatar: const Icon(
-                    Icons.keyboard_arrow_up_rounded,
-                    size: 16,
+                  IconButton(
+                    icon: const Icon(Icons.add_circle_outline),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: 'サービスを追加',
+                    onPressed: _openCatalog,
                   ),
-                  label: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text('タブ', style: TextStyle(fontSize: 11)),
-                      if (otherUnread > 0) ...[
-                        const SizedBox(width: 4),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 4,
-                            vertical: 0.5,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.redAccent,
-                            borderRadius: BorderRadius.circular(99),
-                          ),
+                  PopupMenuButton<String>(
+                    onSelected: (value) async {
+                      final ctrl = active != null
+                          ? _controllers[active.instanceId]
+                          : null;
+                      switch (value) {
+                        case 'back':
+                          if (ctrl != null && await ctrl.canGoBack()) {
+                            await ctrl.goBack();
+                          }
+                        case 'forward':
+                          if (ctrl != null && await ctrl.canGoForward()) {
+                            await ctrl.goForward();
+                          }
+                        case 'reload':
+                          await _reloadActiveTab();
+                        case 'home':
+                          if (active != null) {
+                            final c = _ensureController(active);
+                            _updateRuntime(
+                              active.instanceId,
+                              (cur) => cur.copyWith(
+                                isSleeping: false,
+                                isLoading: true,
+                                progress: 5,
+                                clearError: true,
+                              ),
+                            );
+                            await c.loadUrl(active.url);
+                          }
+                        case 'toggle-header':
+                          await _toggleHeaderCollapsed();
+                        case 'toggle-bottom-tabs':
+                          await _toggleBottomTabsCollapsed();
+                        case 'follow-counter':
+                          if (active != null) {
+                            await _showFollowCounterSheet(active);
+                          }
+                        case 'sleep':
+                          if (active != null) _sleepInstance(active.instanceId);
+                        case 'external':
+                          if (active != null) {
+                            final url = isHttpOrHttpsUrl(activeRt?.currentUrl)
+                                ? activeRt!.currentUrl
+                                : active.url;
+                            await _openExternalUrlSafely(url);
+                          }
+                        case 'settings':
+                          await _openSettings();
+                      }
+                    },
+                    itemBuilder: (_) => [
+                      if (active != null) ...[
+                        const PopupMenuItem(value: 'back', child: Text('← 戻る')),
+                        const PopupMenuItem(
+                          value: 'forward',
+                          child: Text('→ 進む'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'reload',
+                          child: Text('↻ 再読み込み'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'home',
+                          child: Text('⌂ DM/ホーム画面へ戻る'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'toggle-header',
+                          child: Text('▲ ヘッダーを折り畳む'),
+                        ),
+                        PopupMenuItem(
+                          value: 'toggle-bottom-tabs',
                           child: Text(
-                            otherUnread > 99 ? '99+' : '$otherUnread',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 9,
-                              fontWeight: FontWeight.bold,
-                            ),
+                            tabsCollapsed ? '▲ 下部タブを展開' : '▼ 下部タブを折り畳む',
                           ),
                         ),
+                        PopupMenuItem(
+                          value: 'follow-counter',
+                          child: Text(
+                            '👤 フォロー回数 (今日 ${active.effectiveFollowCountToday()}回)',
+                          ),
+                        ),
+                        const PopupMenuItem(
+                          value: 'sleep',
+                          child: Text('☾ タブ休止（メモリ解放）'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'external',
+                          child: Text('↗ 外部ブラウザで開く'),
+                        ),
+                        const PopupMenuDivider(),
                       ],
+                      const PopupMenuItem(
+                        value: 'settings',
+                        child: Text('⚙ アプリ設定'),
+                      ),
                     ],
                   ),
-                  tooltip: '下部タブを展開',
-                  onPressed: _toggleBottomTabsCollapsed,
-                ),
-              ),
-            IconButton(
-              icon: const Icon(Icons.add_circle_outline),
-              tooltip: 'サービスを追加',
-              onPressed: _openCatalog,
-            ),
-            PopupMenuButton<String>(
-              onSelected: (value) async {
-                final ctrl =
-                    active != null ? _controllers[active.instanceId] : null;
-                switch (value) {
-                  case 'back':
-                    if (ctrl != null && await ctrl.canGoBack()) {
-                      await ctrl.goBack();
-                    }
-                  case 'forward':
-                    if (ctrl != null && await ctrl.canGoForward()) {
-                      await ctrl.goForward();
-                    }
-                  case 'reload':
-                    if (active != null) {
-                      if (ctrl != null) {
-                        await ctrl.reload();
-                      } else {
-                        _ensureController(active);
-                      }
-                    }
-                  case 'home':
-                    if (active != null) {
-                      final c = _ensureController(active);
-                      await c.loadUrl(active.url);
-                    }
-                  case 'toggle-bottom-tabs':
-                    await _toggleBottomTabsCollapsed();
-                  case 'sleep':
-                    if (active != null) _sleepInstance(active.instanceId);
-                  case 'external':
-                    if (active != null) {
-                      final uri =
-                          Uri.tryParse(activeRt?.currentUrl ?? active.url);
-                      if (uri != null) {
-                        await launchUrl(uri,
-                            mode: LaunchMode.externalApplication);
-                      }
-                    }
-                  case 'settings':
-                    await _openSettings();
-                }
-              },
-              itemBuilder: (_) => [
-                if (active != null) ...[
-                  const PopupMenuItem(value: 'back', child: Text('← 戻る')),
-                  const PopupMenuItem(value: 'forward', child: Text('→ 進む')),
-                  const PopupMenuItem(value: 'reload', child: Text('↻ 再読み込み')),
-                  const PopupMenuItem(
-                    value: 'home',
-                    child: Text('⌂ DM/ホーム画面へ戻る'),
-                  ),
-                  PopupMenuItem(
-                    value: 'toggle-bottom-tabs',
-                    child: Text(
-                      tabsCollapsed ? '▲ 下部タブを展開' : '▼ 下部タブを折り畳む',
-                    ),
-                  ),
-                  const PopupMenuItem(
-                    value: 'sleep',
-                    child: Text('☾ タブ休止（メモリ解放）'),
-                  ),
-                  const PopupMenuItem(
-                    value: 'external',
-                    child: Text('↗ 外部ブラウザで開く'),
-                  ),
-                  const PopupMenuDivider(),
                 ],
-                const PopupMenuItem(value: 'settings', child: Text('⚙ アプリ設定')),
-              ],
-            ),
-          ],
-          bottom: activeRt != null && activeRt.isLoading
-              ? PreferredSize(
-                  preferredSize: const Size.fromHeight(2.5),
-                  child: LinearProgressIndicator(
-                    minHeight: 2.5,
-                    value: activeRt.progress > 0 && activeRt.progress < 100
-                        ? activeRt.progress / 100
-                        : null,
-                  ),
-                )
-              : null,
-        ),
+                bottom: activeRt != null && activeRt.isLoading
+                    ? PreferredSize(
+                        preferredSize: const Size.fromHeight(2.5),
+                        child: LinearProgressIndicator(
+                          minHeight: 2.5,
+                          value: activeRt.progress > 0 &&
+                                  activeRt.progress < 100
+                              ? activeRt.progress / 100
+                              : null,
+                        ),
+                      )
+                    : null,
+              ),
         body: Column(
           children: [
-            if (active != null && activeGroup != null && _multiProfileSupported)
+            if (headerCollapsed)
+              _buildCollapsedHeaderBar(
+                active,
+                activeGroup,
+                activeRt,
+                tabsCollapsed,
+                otherUnread,
+              ),
+            if (!headerCollapsed && active != null && activeGroup != null)
               _buildAccountSwitcherBar(activeGroup, active),
             Expanded(
               child: SafeArea(
@@ -1034,11 +1418,219 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildCollapsedHeaderBar(
+    ServiceInstance? active,
+    _ServiceGroup? activeGroup,
+    TabRuntimeState? activeRt,
+    bool tabsCollapsed,
+    int otherUnread,
+  ) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final todayFollows = active?.effectiveFollowCountToday() ?? 0;
+    return Material(
+      key: const ValueKey('collapsed-header-bar'),
+      color: colorScheme.surfaceContainerLow,
+      child: SafeArea(
+        bottom: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              height: 36,
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              decoration: BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.5),
+                  ),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Builder(
+                    builder: (scaffoldCtx) => IconButton(
+                      icon: const Icon(Icons.menu, size: 19),
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints:
+                          const BoxConstraints(minWidth: 34, minHeight: 34),
+                      tooltip: 'メニュー',
+                      onPressed: () => Scaffold.of(scaffoldCtx).openDrawer(),
+                    ),
+                  ),
+                  if (active != null) ...[
+                    Container(
+                      width: 20,
+                      height: 20,
+                      decoration: BoxDecoration(
+                        color: parseHexColor(active.colorHex),
+                        borderRadius: BorderRadius.circular(5),
+                      ),
+                      alignment: Alignment.center,
+                      child: Text(
+                        active.badge,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 8.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        activeGroup?.displayName ?? active.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      key: const ValueKey('follow-counter-chip'),
+                      borderRadius: BorderRadius.circular(99),
+                      onTap: () => _showFollowCounterSheet(active),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: todayFollows > 0
+                              ? colorScheme.tertiaryContainer
+                              : colorScheme.surface,
+                          borderRadius: BorderRadius.circular(99),
+                          border: Border.all(
+                            color: todayFollows > 0
+                                ? colorScheme.tertiary
+                                : colorScheme.outlineVariant,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.person_add_alt_1_rounded,
+                              size: 12,
+                              color: todayFollows > 0
+                                  ? colorScheme.onTertiaryContainer
+                                  : colorScheme.onSurfaceVariant,
+                            ),
+                            const SizedBox(width: 3),
+                            Text(
+                              '$todayFollows',
+                              style: TextStyle(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w700,
+                                color: todayFollows > 0
+                                    ? colorScheme.onTertiaryContainer
+                                    : colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ] else
+                    const Expanded(
+                      child: Text(
+                        'OmniSNS',
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  if (tabsCollapsed) ...[
+                    const SizedBox(width: 4),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(99),
+                      onTap: _toggleBottomTabsCollapsed,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: colorScheme.surface,
+                          borderRadius: BorderRadius.circular(99),
+                          border: Border.all(color: colorScheme.outlineVariant),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text('タブ', style: TextStyle(fontSize: 10.5)),
+                            if (otherUnread > 0) ...[
+                              const SizedBox(width: 3),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 4,
+                                  vertical: 0.5,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.redAccent,
+                                  borderRadius: BorderRadius.circular(99),
+                                ),
+                                child: Text(
+                                  otherUnread > 99 ? '99+' : '$otherUnread',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 8.5,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                  if (active != null)
+                    IconButton(
+                      key: const ValueKey('header-reload-button'),
+                      icon: const Icon(Icons.refresh_rounded, size: 19),
+                      visualDensity: VisualDensity.compact,
+                      padding: EdgeInsets.zero,
+                      constraints:
+                          const BoxConstraints(minWidth: 34, minHeight: 34),
+                      tooltip: '再読み込み',
+                      onPressed: _reloadActiveTab,
+                    ),
+                  IconButton(
+                    key: const ValueKey('header-expand-button'),
+                    icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 22),
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints:
+                        const BoxConstraints(minWidth: 34, minHeight: 34),
+                    tooltip: 'ヘッダーを展開',
+                    onPressed: _toggleHeaderCollapsed,
+                  ),
+                ],
+              ),
+            ),
+            if (activeRt != null && activeRt.isLoading)
+              LinearProgressIndicator(
+                minHeight: 2,
+                value: activeRt.progress > 0 && activeRt.progress < 100
+                    ? activeRt.progress / 100
+                    : null,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildAccountSwitcherBar(
     _ServiceGroup group,
     ServiceInstance active,
   ) {
     final colorScheme = Theme.of(context).colorScheme;
+    final todayFollows = active.effectiveFollowCountToday();
     return Material(
       color: colorScheme.surfaceContainerLow,
       child: Container(
@@ -1050,124 +1642,201 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
         ),
-        child: ListView(
-          scrollDirection: Axis.horizontal,
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+        child: Row(
           children: [
-            for (var i = 0; i < group.accounts.length; i++)
-              Builder(
-                builder: (context) {
-                  final inst = group.accounts[i];
-                  final isCurrent = inst.instanceId == active.instanceId;
-                  final rt = _runtimeMap[inst.instanceId];
-                  final unread = inst.notificationsEnabled
-                      ? (rt?.unreadCount ?? 0)
-                      : 0;
-                  final label = accountDisplayLabel(
-                    inst,
-                    i,
-                    baseServiceName: group.displayName,
-                  );
-                  return Padding(
-                    padding: const EdgeInsets.only(right: 6),
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(99),
-                      onTap: () {
-                        if (!isCurrent) _activateInstance(inst);
-                      },
-                      onLongPress: () => _showInstanceActionSheet(inst),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10),
-                        decoration: BoxDecoration(
-                          color: isCurrent
-                              ? colorScheme.primaryContainer
-                              : colorScheme.surface,
-                          borderRadius: BorderRadius.circular(99),
-                          border: Border.all(
-                            color: isCurrent
-                                ? colorScheme.primary
-                                : colorScheme.outlineVariant,
-                            width: isCurrent ? 1.3 : 1,
-                          ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Container(
-                              width: 7,
-                              height: 7,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: rt?.isLoading == true
-                                    ? colorScheme.primary
-                                    : rt?.isSleeping == true
-                                        ? Colors.grey
-                                        : Colors.green,
-                              ),
-                            ),
-                            const SizedBox(width: 6),
-                            Text(
-                              label,
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: isCurrent
-                                    ? FontWeight.bold
-                                    : FontWeight.w500,
-                              ),
-                            ),
-                            if (unread > 0) ...[
-                              const SizedBox(width: 5),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 5,
-                                  vertical: 1,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Colors.redAccent,
+            Expanded(
+              child: _multiProfileSupported
+                  ? ListView(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.fromLTRB(8, 5, 4, 5),
+                      children: [
+                        for (var i = 0; i < group.accounts.length; i++)
+                          Builder(
+                            builder: (context) {
+                              final inst = group.accounts[i];
+                              final isCurrent =
+                                  inst.instanceId == active.instanceId;
+                              final rt = _runtimeMap[inst.instanceId];
+                              final unread = inst.notificationsEnabled
+                                  ? (rt?.unreadCount ?? 0)
+                                  : 0;
+                              final label = accountDisplayLabel(
+                                inst,
+                                i,
+                                baseServiceName: group.displayName,
+                              );
+                              return Padding(
+                                padding: const EdgeInsets.only(right: 6),
+                                child: InkWell(
                                   borderRadius: BorderRadius.circular(99),
-                                ),
-                                child: Text(
-                                  unread > 99 ? '99+' : '$unread',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 9.5,
-                                    fontWeight: FontWeight.bold,
+                                  onTap: () {
+                                    if (!isCurrent) _activateInstance(inst);
+                                  },
+                                  onLongPress: () =>
+                                      _showInstanceActionSheet(inst),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: isCurrent
+                                          ? colorScheme.primaryContainer
+                                          : colorScheme.surface,
+                                      borderRadius: BorderRadius.circular(99),
+                                      border: Border.all(
+                                        color: isCurrent
+                                            ? colorScheme.primary
+                                            : colorScheme.outlineVariant,
+                                        width: isCurrent ? 1.3 : 1,
+                                      ),
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Container(
+                                          width: 7,
+                                          height: 7,
+                                          decoration: BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            color: rt?.isLoading == true
+                                                ? colorScheme.primary
+                                                : rt?.isSleeping == true
+                                                    ? Colors.grey
+                                                    : Colors.green,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 6),
+                                        Text(
+                                          label,
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: isCurrent
+                                                ? FontWeight.bold
+                                                : FontWeight.w500,
+                                          ),
+                                        ),
+                                        if (unread > 0) ...[
+                                          const SizedBox(width: 5),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 5,
+                                              vertical: 1,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: Colors.redAccent,
+                                              borderRadius:
+                                                  BorderRadius.circular(99),
+                                            ),
+                                            child: Text(
+                                              unread > 99 ? '99+' : '$unread',
+                                              style: const TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 9.5,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ],
+                                    ),
                                   ),
                                 ),
+                              );
+                            },
+                          ),
+                        InkWell(
+                          borderRadius: BorderRadius.circular(99),
+                          onTap: _addAccountForActiveService,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(99),
+                              border: Border.all(
+                                color: colorScheme.outlineVariant,
                               ),
-                            ],
-                          ],
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.add,
+                                  size: 14,
+                                  color: colorScheme.primary,
+                                ),
+                                const SizedBox(width: 3),
+                                Text(
+                                  'アカウント追加',
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: colorScheme.primary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  : Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          group.displayName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
                       ),
                     ),
-                  );
-                },
-              ),
-            InkWell(
-              borderRadius: BorderRadius.circular(99),
-              onTap: _addAccountForActiveService,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(99),
-                  border: Border.all(
-                    color: colorScheme.outlineVariant,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.add, size: 14, color: colorScheme.primary),
-                    const SizedBox(width: 3),
-                    Text(
-                      'アカウント追加',
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w600,
-                        color: colorScheme.primary,
-                      ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(4, 5, 8, 5),
+              child: InkWell(
+                key: const ValueKey('follow-counter-chip'),
+                borderRadius: BorderRadius.circular(99),
+                onTap: () => _showFollowCounterSheet(active),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 9),
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: todayFollows > 0
+                        ? colorScheme.tertiaryContainer
+                        : colorScheme.surface,
+                    borderRadius: BorderRadius.circular(99),
+                    border: Border.all(
+                      color: todayFollows > 0
+                          ? colorScheme.tertiary
+                          : colorScheme.outlineVariant,
                     ),
-                  ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.person_add_alt_1_rounded,
+                        size: 13.5,
+                        color: todayFollows > 0
+                            ? colorScheme.onTertiaryContainer
+                            : colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        'フォロー $todayFollows',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: todayFollows > 0
+                              ? colorScheme.onTertiaryContainer
+                              : colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -1301,19 +1970,15 @@ class _HomeScreenState extends State<HomeScreen> {
                         spacing: 8,
                         children: [
                           FilledButton(
-                            onPressed: () =>
-                                _controllers[active.instanceId]?.reload(),
+                            onPressed: _reloadActiveTab,
                             child: const Text('再読み込み'),
                           ),
                           OutlinedButton(
                             onPressed: () {
-                              final uri = Uri.tryParse(activeRt.currentUrl);
-                              if (uri != null) {
-                                launchUrl(
-                                  uri,
-                                  mode: LaunchMode.externalApplication,
-                                );
-                              }
+                              final url = isHttpOrHttpsUrl(activeRt.currentUrl)
+                                  ? activeRt.currentUrl
+                                  : active.url;
+                              _openExternalUrlSafely(url);
                             },
                             child: const Text('外部ブラウザで開く'),
                           ),
@@ -1628,7 +2293,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ),
                         Text(
-                          'Android · v1.3.0',
+                          'Android · v1.4.0',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],

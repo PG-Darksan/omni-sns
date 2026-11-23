@@ -52,6 +52,8 @@ export interface OmniApi {
   duplicateSubTab: (instanceId: string, tabId: string) => Promise<string>;
   restoreClosedTab: () => Promise<string>;
   updateGestureSettings: (gesture: GestureSettings) => Promise<GestureSettings>;
+  adjustFollowCount: (instanceId: string, delta: number) => Promise<ServiceInstance | null>;
+  resetFollowCount: (instanceId: string, resetTotal: boolean) => Promise<ServiceInstance | null>;
   updateSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>;
   setOverlayVisible: (visible: boolean) => Promise<void>;
   copyText: (text: string) => Promise<void>;
@@ -107,6 +109,10 @@ export const omniApi: OmniApi = {
   restoreClosedTab: () => invoke<string>('subtab_restore_closed'),
   updateGestureSettings: (gesture) =>
     invoke<GestureSettings>('gesture_update_settings', { gesture }),
+  adjustFollowCount: (instanceId, delta) =>
+    invoke<ServiceInstance | null>('follow_adjust', { instanceId, delta }),
+  resetFollowCount: (instanceId, resetTotal) =>
+    invoke<ServiceInstance | null>('follow_reset', { instanceId, resetTotal }),
   updateSettings: (patch) => invoke<AppSettings>('settings_update', { patch }),
   setOverlayVisible: (visible) => invoke<void>('ui_set_overlay', { visible }),
   copyText: (text) => invoke<void>('ui_copy_text', { text }),

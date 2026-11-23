@@ -57,17 +57,52 @@ fn next_short_hex_id() -> String {
     format!("{:08x}", (mixed ^ (mixed >> 32)) as u32)
 }
 
+pub fn local_today_ymd() -> String {
+    #[cfg(windows)]
+    {
+        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
+    }
+    #[cfg(not(windows))]
+    {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let z = secs.div_euclid(86_400) + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = (yoe as i64) + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if m <= 2 { y + 1 } else { y };
+        format!("{year:04}-{m:02}-{d:02}")
+    }
+}
+
+fn normalize_follow_for_today(inst: &mut ServiceInstance, today: &str) {
+    if inst.follow_count_date != today {
+        inst.follow_count_today = 0;
+        inst.follow_count_date = today.to_string();
+    }
+}
+
 pub fn create_default_settings() -> AppSettings {
     AppSettings {
         theme: "dark".to_string(),
         minimize_to_tray: false,
         sidebar_width: 248,
         active_instance_id: None,
+        header_collapsed: false,
         gesture: GestureSettings::default(),
     }
 }
 
 pub fn create_default_instances() -> Vec<ServiceInstance> {
+    let today = local_today_ymd();
     catalog::services()
         .iter()
         .filter(|svc| svc.default_pinned.unwrap_or(false))
@@ -86,6 +121,9 @@ pub fn create_default_instances() -> Vec<ServiceInstance> {
             zoom_factor: 1.0,
             notifications_enabled: true,
             order: index,
+            follow_count_today: 0,
+            follow_count_total: 0,
+            follow_count_date: today.clone(),
         })
         .collect()
 }
@@ -123,6 +161,7 @@ struct RawSettings {
     minimize_to_tray: Option<bool>,
     sidebar_width: Option<u32>,
     active_instance_id: Option<String>,
+    header_collapsed: Option<bool>,
     gesture: Option<GestureSettings>,
 }
 
@@ -142,6 +181,9 @@ struct RawInstance {
     zoom_factor: Option<f64>,
     notifications_enabled: Option<bool>,
     order: Option<usize>,
+    follow_count_today: Option<u32>,
+    follow_count_total: Option<u32>,
+    follow_count_date: Option<String>,
 }
 
 pub struct ConfigStore {
@@ -186,12 +228,16 @@ impl ConfigStore {
             if let Some(w) = rs.sidebar_width {
                 settings.sidebar_width = w.clamp(180, 360);
             }
+            if let Some(hc) = rs.header_collapsed {
+                settings.header_collapsed = hc;
+            }
             if let Some(g) = rs.gesture {
                 settings.gesture = sanitize_gesture_settings(g);
             }
             settings.active_instance_id = rs.active_instance_id;
         }
 
+        let today = local_today_ymd();
         let mut migrated = false;
         let instances: Vec<ServiceInstance> = if let Some(raw_list) = raw.instances {
             let mut list: Vec<ServiceInstance> = raw_list
@@ -243,6 +289,29 @@ impl ConfigStore {
                         .unwrap_or(1.0)
                         .clamp(0.5, 2.0);
 
+                    let mut resolved_url = normalize_service_url(&raw_url)
+                        .unwrap_or_else(|| "https://example.com/".to_string());
+                    if service_id == "threads" {
+                        if let Ok(mut parsed) = url::Url::parse(&resolved_url) {
+                            if matches!(parsed.host_str(), Some("www.threads.net" | "threads.net")) {
+                                if parsed.set_host(Some("www.threads.com")).is_ok() {
+                                    resolved_url = parsed.to_string();
+                                    migrated = true;
+                                }
+                            }
+                        }
+                    }
+
+                    let raw_follow_date = item
+                        .follow_count_date
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    let follow_count_today = if raw_follow_date == today {
+                        item.follow_count_today.unwrap_or(0)
+                    } else {
+                        0
+                    };
+
                     Some(ServiceInstance {
                         instance_id,
                         service_id,
@@ -252,8 +321,7 @@ impl ConfigStore {
                             .category
                             .filter(|c| !c.is_empty())
                             .unwrap_or_else(|| "custom".to_string()),
-                        url: normalize_service_url(&raw_url)
-                            .unwrap_or_else(|| "https://example.com/".to_string()),
+                        url: resolved_url,
                         color,
                         badge,
                         ua_mode,
@@ -261,6 +329,9 @@ impl ConfigStore {
                         zoom_factor,
                         notifications_enabled: item.notifications_enabled.unwrap_or(true),
                         order: item.order.unwrap_or(idx),
+                        follow_count_today,
+                        follow_count_total: item.follow_count_total.unwrap_or(0),
+                        follow_count_date: today.clone(),
                     })
                 })
                 .collect();
@@ -315,19 +386,34 @@ impl ConfigStore {
     }
 
     pub fn get_config(&self) -> AppConfig {
-        self.config.clone()
+        let today = local_today_ymd();
+        let mut cfg = self.config.clone();
+        for inst in &mut cfg.instances {
+            normalize_follow_for_today(inst, &today);
+        }
+        cfg
     }
 
     pub fn get_instances(&self) -> Vec<ServiceInstance> {
-        self.config.instances.clone()
+        let today = local_today_ymd();
+        let mut list = self.config.instances.clone();
+        for inst in &mut list {
+            normalize_follow_for_today(inst, &today);
+        }
+        list
     }
 
     pub fn get_instance(&self, instance_id: &str) -> Option<ServiceInstance> {
+        let today = local_today_ymd();
         self.config
             .instances
             .iter()
             .find(|i| i.instance_id == instance_id)
             .cloned()
+            .map(|mut inst| {
+                normalize_follow_for_today(&mut inst, &today);
+                inst
+            })
     }
 
     pub fn get_settings(&self) -> AppSettings {
@@ -396,6 +482,9 @@ impl ConfigStore {
             zoom_factor: 1.0,
             notifications_enabled: true,
             order: self.config.instances.len(),
+            follow_count_today: 0,
+            follow_count_total: 0,
+            follow_count_date: local_today_ymd(),
         };
 
         let new_group_key = service_group_key(
@@ -614,11 +703,57 @@ impl ConfigStore {
         if let Some(active) = patch.active_instance_id {
             self.config.settings.active_instance_id = active;
         }
+        if let Some(hc) = patch.header_collapsed {
+            self.config.settings.header_collapsed = hc;
+        }
         if let Some(gesture) = patch.gesture {
             self.config.settings.gesture = sanitize_gesture_settings(gesture);
         }
         self.persist();
         self.config.settings.clone()
+    }
+
+    pub fn adjust_follow_count(&mut self, instance_id: &str, delta: i32) -> Option<ServiceInstance> {
+        let today = local_today_ymd();
+        let target = self
+            .config
+            .instances
+            .iter_mut()
+            .find(|i| i.instance_id == instance_id)?;
+        normalize_follow_for_today(target, &today);
+        if delta >= 0 {
+            let add = delta as u32;
+            target.follow_count_today = target.follow_count_today.saturating_add(add);
+            target.follow_count_total = target.follow_count_total.saturating_add(add);
+        } else {
+            let sub = delta.unsigned_abs();
+            target.follow_count_today = target.follow_count_today.saturating_sub(sub);
+            target.follow_count_total = target.follow_count_total.saturating_sub(sub);
+        }
+        let updated = target.clone();
+        self.persist();
+        Some(updated)
+    }
+
+    pub fn reset_follow_count(
+        &mut self,
+        instance_id: &str,
+        reset_total: bool,
+    ) -> Option<ServiceInstance> {
+        let today = local_today_ymd();
+        let target = self
+            .config
+            .instances
+            .iter_mut()
+            .find(|i| i.instance_id == instance_id)?;
+        target.follow_count_date = today;
+        target.follow_count_today = 0;
+        if reset_total {
+            target.follow_count_total = 0;
+        }
+        let updated = target.clone();
+        self.persist();
+        Some(updated)
     }
 
     pub fn update_window_bounds(&mut self, bounds: WindowBounds) {
@@ -806,6 +941,75 @@ mod tests {
             store.get_settings().active_instance_id.as_deref(),
             Some("svc-instagram-default")
         );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn follow_counter_header_collapsed_and_threads_migration() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-follow-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+
+        let legacy_json = r##"{
+            "version": 1,
+            "settings": {
+                "theme": "dark",
+                "minimizeToTray": false,
+                "sidebarWidth": 248,
+                "activeInstanceId": "svc-threads-default",
+                "headerCollapsed": true
+            },
+            "instances": [
+                {
+                    "instanceId": "svc-threads-default",
+                    "serviceId": "threads",
+                    "name": "Threads",
+                    "category": "major-sns",
+                    "url": "https://www.threads.net/",
+                    "color": "#18181B",
+                    "badge": "TH",
+                    "uaMode": "desktop",
+                    "muted": false,
+                    "zoomFactor": 1.0,
+                    "notificationsEnabled": true,
+                    "order": 0,
+                    "followCountToday": 9,
+                    "followCountTotal": 15,
+                    "followCountDate": "2020-01-01"
+                }
+            ]
+        }"##;
+        fs::write(&config_path, legacy_json).unwrap();
+
+        let mut store = ConfigStore::new(config_path.clone());
+        assert!(store.get_settings().header_collapsed);
+        let th = store.get_instance("svc-threads-default").unwrap();
+        assert_eq!(th.url, "https://www.threads.com/");
+        assert_eq!(th.follow_count_today, 0);
+        assert_eq!(th.follow_count_total, 15);
+
+        let inc = store.adjust_follow_count("svc-threads-default", 1).unwrap();
+        assert_eq!(inc.follow_count_today, 1);
+        assert_eq!(inc.follow_count_total, 16);
+
+        let dec = store.adjust_follow_count("svc-threads-default", -1).unwrap();
+        assert_eq!(dec.follow_count_today, 0);
+        assert_eq!(dec.follow_count_total, 15);
+
+        let _ = store.adjust_follow_count("svc-threads-default", 3).unwrap();
+        let rst_today = store
+            .reset_follow_count("svc-threads-default", false)
+            .unwrap();
+        assert_eq!(rst_today.follow_count_today, 0);
+        assert_eq!(rst_today.follow_count_total, 18);
+
+        let rst_all = store
+            .reset_follow_count("svc-threads-default", true)
+            .unwrap();
+        assert_eq!(rst_all.follow_count_today, 0);
+        assert_eq!(rst_all.follow_count_total, 0);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

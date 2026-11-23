@@ -11,6 +11,7 @@ typedef OmniWebViewPageFinishedCallback = void Function(
   String title,
   bool canGoBack,
   bool canGoForward,
+  bool hadError,
 );
 typedef OmniWebViewTitleChangedCallback = void Function(String title);
 typedef OmniWebViewHistoryChangedCallback = void Function(
@@ -23,6 +24,7 @@ typedef OmniWebViewErrorCallback = void Function(
   int errorCode,
 );
 typedef OmniWebViewExternalSchemeCallback = void Function(String url);
+typedef OmniWebViewFollowDetectedCallback = void Function(String source);
 
 /// Android ネイティブ WebView マルチプロファイル管理ブリッジ
 class OmniWebViewManager {
@@ -85,6 +87,7 @@ class OmniWebViewController {
     this.onHistoryChanged,
     this.onWebResourceError,
     this.onExternalScheme,
+    this.onFollowDetected,
   }) : _pendingUrl = initialUrl;
 
   final String initialUrl;
@@ -98,6 +101,7 @@ class OmniWebViewController {
   final OmniWebViewHistoryChangedCallback? onHistoryChanged;
   final OmniWebViewErrorCallback? onWebResourceError;
   final OmniWebViewExternalSchemeCallback? onExternalScheme;
+  final OmniWebViewFollowDetectedCallback? onFollowDetected;
 
   MethodChannel? _channel;
   String? _pendingUrl;
@@ -136,7 +140,8 @@ class OmniWebViewController {
         final title = map['title'] as String? ?? '';
         final canGoBack = map['canGoBack'] as bool? ?? false;
         final canGoForward = map['canGoForward'] as bool? ?? false;
-        onPageFinished?.call(url, title, canGoBack, canGoForward);
+        final hadError = map['hadError'] as bool? ?? false;
+        onPageFinished?.call(url, title, canGoBack, canGoForward, hadError);
       case 'onTitleChanged':
         final title = map['title'] as String? ?? '';
         onTitleChanged?.call(title);
@@ -154,6 +159,9 @@ class OmniWebViewController {
         if (url.isNotEmpty) {
           onExternalScheme?.call(url);
         }
+      case 'onFollowDetected':
+        final source = map['source'] as String? ?? 'auto';
+        onFollowDetected?.call(source);
     }
     return null;
   }
@@ -170,10 +178,22 @@ class OmniWebViewController {
     } catch (_) {}
   }
 
-  Future<void> reload() async {
+  Future<void> reload({String? fallbackUrl}) async {
     if (_disposed) return;
+    final effectiveFallback =
+        (fallbackUrl != null && fallbackUrl.trim().isNotEmpty)
+            ? fallbackUrl.trim()
+            : initialUrl;
+    final ch = _channel;
+    if (ch == null) {
+      _pendingUrl = effectiveFallback;
+      return;
+    }
     try {
-      await _channel?.invokeMethod<void>('reload');
+      await ch.invokeMethod<void>(
+        'reload',
+        <String, dynamic>{'fallbackUrl': effectiveFallback},
+      );
     } catch (_) {}
   }
 
