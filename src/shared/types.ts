@@ -69,6 +69,12 @@ export interface ServiceInstance {
   followCountTotal?: number;
   /** 本日カウントの日付 (YYYY-MM-DD) */
   followCountDate?: string;
+  /** 自動検出または手動設定されたログイン中アカウントID (@username) */
+  detectedHandle?: string;
+  /** SNS サーバー上の実フォロー中数（取得済みの場合） */
+  snsFollowingCount?: number;
+  /** SNS サーバー上の実フォロワー数（取得済みの場合） */
+  snsFollowersCount?: number;
   /** 同一アカウントで開いている複数タブの保存状態 */
   savedTabs?: { url: string; title: string }[];
   /** 保存時のアクティブタブ位置 */
@@ -133,6 +139,21 @@ export interface GestureSettings {
 
 export type ThemeMode = 'dark' | 'light';
 
+export interface FollowSyncSettings {
+  deviceId: string;
+  lanEnabled: boolean;
+  githubToken: string;
+  gistId: string;
+  lastSyncAt?: number;
+  lastSyncStatus?: string;
+}
+
+export interface UpdateFollowSyncPatch {
+  lanEnabled?: boolean;
+  githubToken?: string;
+  gistId?: string;
+}
+
 export interface AppSettings {
   theme: ThemeMode;
   /** ウィンドウを閉じる際にトレイへ最小化するか */
@@ -145,6 +166,8 @@ export interface AppSettings {
   headerCollapsed?: boolean;
   /** マウスジェスチャー設定 */
   gesture: GestureSettings;
+  /** フォロー数クロスデバイス同期設定 */
+  followSync?: FollowSyncSettings;
 }
 
 export interface AppConfig {

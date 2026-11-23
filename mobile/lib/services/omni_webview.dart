@@ -25,6 +25,12 @@ typedef OmniWebViewErrorCallback = void Function(
 );
 typedef OmniWebViewExternalSchemeCallback = void Function(String url);
 typedef OmniWebViewFollowDetectedCallback = void Function(String source);
+typedef OmniWebViewAccountIdentityCallback = void Function(
+  String service,
+  String handle,
+  int? following,
+  int? followers,
+);
 
 /// Android ネイティブ WebView マルチプロファイル管理ブリッジ
 class OmniWebViewManager {
@@ -88,6 +94,7 @@ class OmniWebViewController {
     this.onWebResourceError,
     this.onExternalScheme,
     this.onFollowDetected,
+    this.onAccountIdentity,
   }) : _pendingUrl = initialUrl;
 
   final String initialUrl;
@@ -102,6 +109,7 @@ class OmniWebViewController {
   final OmniWebViewErrorCallback? onWebResourceError;
   final OmniWebViewExternalSchemeCallback? onExternalScheme;
   final OmniWebViewFollowDetectedCallback? onFollowDetected;
+  final OmniWebViewAccountIdentityCallback? onAccountIdentity;
 
   MethodChannel? _channel;
   String? _pendingUrl;
@@ -162,6 +170,14 @@ class OmniWebViewController {
       case 'onFollowDetected':
         final source = map['source'] as String? ?? 'auto';
         onFollowDetected?.call(source);
+      case 'onAccountIdentity':
+        final service = map['service'] as String? ?? '';
+        final handle = map['handle'] as String? ?? '';
+        final following = (map['following'] as num?)?.toInt();
+        final followers = (map['followers'] as num?)?.toInt();
+        if (handle.isNotEmpty) {
+          onAccountIdentity?.call(service, handle, following, followers);
+        }
     }
     return null;
   }

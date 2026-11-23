@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/service_models.dart';
@@ -16,6 +17,17 @@ class CatalogData {
 class AppStore {
   static const _instancesKey = 'omnisns_instances_v1';
   static const _settingsKey = 'omnisns_settings_v1';
+  static const _followSyncSettingsKey = 'omnisns_follow_sync_settings_v1';
+  static const _followSyncLedgerKey = 'omnisns_follow_sync_ledger_v1';
+
+  static String _generateAndroidDeviceId() {
+    final r = Random();
+    final hex = List.generate(
+      8,
+      (_) => r.nextInt(16).toRadixString(16),
+    ).join();
+    return 'and-$hex';
+  }
 
   static const Set<String> _removedServiceIds = {
     'x',
@@ -175,5 +187,50 @@ class AppStore {
     );
     await prefs.setString(_instancesKey, jsonEncode(ordered));
     await prefs.setString(_settingsKey, jsonEncode(settings.toJson()));
+  }
+
+  Future<(FollowSyncSettings, FollowSyncLedger)> loadFollowSyncState() async {
+    final prefs = await SharedPreferences.getInstance();
+    FollowSyncSettings syncSettings = const FollowSyncSettings();
+    final rawSync = prefs.getString(_followSyncSettingsKey);
+    if (rawSync != null && rawSync.isNotEmpty) {
+      try {
+        syncSettings = FollowSyncSettings.fromJson(
+          jsonDecode(rawSync) as Map<String, dynamic>,
+        );
+      } catch (_) {}
+    }
+    var needsSave = false;
+    if (syncSettings.deviceId.trim().isEmpty) {
+      syncSettings = syncSettings.copyWith(deviceId: _generateAndroidDeviceId());
+      needsSave = true;
+    }
+
+    var ledger = FollowSyncLedger();
+    final rawLedger = prefs.getString(_followSyncLedgerKey);
+    if (rawLedger != null && rawLedger.isNotEmpty) {
+      try {
+        ledger = FollowSyncLedger.fromJson(
+          jsonDecode(rawLedger) as Map<String, dynamic>,
+        );
+      } catch (_) {}
+    }
+
+    if (needsSave) {
+      await saveFollowSyncState(syncSettings, ledger);
+    }
+    return (syncSettings, ledger);
+  }
+
+  Future<void> saveFollowSyncState(
+    FollowSyncSettings syncSettings,
+    FollowSyncLedger ledger,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _followSyncSettingsKey,
+      jsonEncode(syncSettings.toJson()),
+    );
+    await prefs.setString(_followSyncLedgerKey, jsonEncode(ledger.toJson()));
   }
 }

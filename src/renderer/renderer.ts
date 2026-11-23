@@ -100,7 +100,14 @@ async function syncOverlayToMain(): Promise<void> {
 }
 
 async function resolveConfirmDialog(accepted: boolean): Promise<void> {
-  el('confirm-modal').classList.add('hidden');
+  const modal = el<HTMLDivElement>('confirm-modal');
+  const dialog = modal.querySelector<HTMLDivElement>('.modal-dialog');
+  modal.classList.add('hidden');
+  modal.classList.remove('anchored');
+  if (dialog) {
+    dialog.style.left = '';
+    dialog.style.top = '';
+  }
   const resolver = confirmResolver;
   confirmResolver = null;
   await syncOverlayToMain();
@@ -113,6 +120,8 @@ async function openConfirmDialog(options: {
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;
+  anchorEl?: HTMLElement | null;
+  anchorPoint?: { x: number; y: number } | null;
 }): Promise<boolean> {
   if (confirmResolver) {
     const prev = confirmResolver;
@@ -127,7 +136,59 @@ async function openConfirmDialog(options: {
   const cancelBtn = el<HTMLButtonElement>('btn-confirm-cancel');
   cancelBtn.textContent = options.cancelLabel ?? 'キャンセル';
 
-  el('confirm-modal').classList.remove('hidden');
+  const modal = el<HTMLDivElement>('confirm-modal');
+  const dialog = modal.querySelector<HTMLDivElement>('.modal-dialog');
+  const anchorRect = options.anchorEl?.getBoundingClientRect() ?? null;
+  const hasAnchor = Boolean(
+    (anchorRect && (anchorRect.width > 0 || anchorRect.height > 0)) || options.anchorPoint
+  );
+
+  modal.classList.toggle('anchored', hasAnchor);
+  if (dialog) {
+    dialog.style.left = '';
+    dialog.style.top = '';
+  }
+
+  modal.classList.remove('hidden');
+
+  if (hasAnchor && dialog) {
+    const pad = 12;
+    const dlgRect = dialog.getBoundingClientRect();
+    const dlgW = dlgRect.width || 360;
+    const dlgH = dlgRect.height || 170;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    const refLeft = anchorRect ? anchorRect.left : options.anchorPoint!.x;
+    const refRight = anchorRect ? anchorRect.right : options.anchorPoint!.x;
+    const refTop = anchorRect ? anchorRect.top : options.anchorPoint!.y;
+    const refBottom = anchorRect ? anchorRect.bottom : options.anchorPoint!.y;
+
+    let left: number;
+    let top: number;
+    const isInSidebar = Boolean(options.anchorEl?.closest('#sidebar'));
+    if (isInSidebar) {
+      // 左サイドバーの削除ボタン -> ボタンのすぐ右側に配置
+      left = refRight + 10;
+      top = refTop - 18;
+    } else if (refTop < 140) {
+      // 上部ヘッダー／ツールバーのボタン -> ボタン直下に配置
+      left = refRight - dlgW;
+      top = refBottom + 8;
+    } else if (refLeft < vw * 0.5) {
+      left = refRight + 10;
+      top = refTop - 18;
+    } else {
+      left = refLeft - dlgW - 10;
+      top = refTop - 18;
+    }
+
+    left = Math.max(pad, Math.min(left, vw - dlgW - pad));
+    top = Math.max(pad, Math.min(top, vh - dlgH - pad));
+    dialog.style.left = `${Math.round(left)}px`;
+    dialog.style.top = `${Math.round(top)}px`;
+  }
+
   await syncOverlayToMain();
   cancelBtn.focus();
 
@@ -447,7 +508,9 @@ function renderSidebar(): void {
         title: 'サービスを削除',
         message: msg,
         confirmLabel: '削除する',
-        danger: true
+        danger: true,
+        anchorEl: delBtn,
+        anchorPoint: { x: e.clientX, y: e.clientY }
       });
       if (!ok) return;
       if (group.accounts.length === 1) {
@@ -623,7 +686,9 @@ function renderAccountBar(): void {
           title: 'アカウントを削除',
           message: `「${group.displayName} / ${label}」を削除しますか？\n（このアカウントのログインセッションも削除されます）`,
           confirmLabel: '削除する',
-          danger: true
+          danger: true,
+          anchorEl: delBtn,
+          anchorPoint: { x: e.clientX, y: e.clientY }
         });
         if (!ok) return;
         await omniApi.removeTab(inst.instanceId);
@@ -749,6 +814,20 @@ function renderToolbarAndViewport(): void {
   collapsedFollowEl.textContent = String(todayFollow);
   followBtn.classList.toggle('has-count', todayFollow > 0);
   collapsedFollowBtn.classList.toggle('has-count', todayFollow > 0);
+  const liveParts: string[] = [];
+  if (active.detectedHandle) liveParts.push(`@${active.detectedHandle}`);
+  if (typeof active.snsFollowingCount === 'number') {
+    liveParts.push(`SNS実フォロー中 ${active.snsFollowingCount.toLocaleString()}人`);
+  }
+  if (typeof active.snsFollowersCount === 'number') {
+    liveParts.push(`フォロワー ${active.snsFollowersCount.toLocaleString()}人`);
+  }
+  const followTip =
+    liveParts.length > 0
+      ? `フォロー回数カウンター（今日: ${todayFollow} / 累計: ${active.followCountTotal ?? 0}）\n${liveParts.join(' · ')}`
+      : `フォロー回数カウンター（今日: ${todayFollow} / 累計: ${active.followCountTotal ?? 0}）`;
+  followBtn.title = followTip;
+  collapsedFollowBtn.title = followTip;
   if (!el('follow-modal').classList.contains('hidden')) {
     renderFollowModal();
   }
@@ -855,16 +934,19 @@ function renderCatalog(): void {
     return;
   }
 
+  const ICON_CUSTOMIZE_SLIDERS =
+    '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>';
+
   for (const svc of filtered) {
     const count = addedCounts.get(svc.id) ?? 0;
     const card = document.createElement('div');
     card.className = 'catalog-card';
-
-    const top = document.createElement('div');
-    top.className = 'catalog-card-top';
+    card.title = svc.note
+      ? `${svc.name} (${svc.url})\n${svc.description}\n※ ${svc.note}`
+      : `${svc.name} (${svc.url})\n${svc.description}`;
 
     const avatar = document.createElement('div');
-    avatar.className = 'service-avatar';
+    avatar.className = 'catalog-card-avatar';
     avatar.style.background = svc.color;
     avatar.textContent = svc.badge;
 
@@ -873,45 +955,30 @@ function renderCatalog(): void {
 
     const title = document.createElement('div');
     title.className = 'catalog-card-title';
-    title.textContent = svc.name;
+
+    const nameText = document.createElement('span');
+    nameText.className = 'catalog-card-name';
+    nameText.textContent = svc.name;
+    title.appendChild(nameText);
 
     if (count > 0) {
       const chip = document.createElement('span');
       chip.className = 'added-chip';
-      chip.textContent = count === 1 ? '追加済み' : `${count}個追加済み`;
+      chip.textContent = count === 1 ? '済' : `${count}垢`;
+      chip.title = count === 1 ? '追加済み' : `${count}個追加済み`;
       title.appendChild(chip);
     }
 
-    const urlSub = document.createElement('div');
-    urlSub.className = 'catalog-card-url';
-    urlSub.textContent = svc.url;
-
     titleWrap.appendChild(title);
-    titleWrap.appendChild(urlSub);
-    top.appendChild(avatar);
-    top.appendChild(titleWrap);
-
-    const desc = document.createElement('div');
-    desc.className = 'catalog-card-desc';
-    desc.textContent = svc.description;
-
-    card.appendChild(top);
-    card.appendChild(desc);
-
-    if (svc.note) {
-      const note = document.createElement('div');
-      note.className = 'catalog-card-note';
-      note.textContent = `※ ${svc.note}`;
-      card.appendChild(note);
-    }
 
     const actions = document.createElement('div');
     actions.className = 'catalog-card-actions';
 
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
-    addBtn.className = 'btn-primary';
-    addBtn.textContent = count > 0 ? '＋ 別アカウント追加' : '＋ 追加して開く';
+    addBtn.className = 'btn-primary catalog-add-btn';
+    addBtn.textContent = count > 0 ? '＋別垢' : '＋追加';
+    addBtn.title = count > 0 ? `「${svc.name}」の別アカウントを追加して開く` : `「${svc.name}」を追加して開く`;
     addBtn.addEventListener('click', async () => {
       const existingForSvc = (state.config?.instances ?? []).filter((i) => i.serviceId === svc.id);
       const existingLabels = existingForSvc.map((acc, idx) =>
@@ -936,9 +1003,10 @@ function renderCatalog(): void {
 
     const customizeBtn = document.createElement('button');
     customizeBtn.type = 'button';
-    customizeBtn.className = 'btn-secondary';
-    customizeBtn.textContent = '詳細設定';
-    customizeBtn.title = 'アカウント名やURLを変更してから追加';
+    customizeBtn.className = 'btn-secondary catalog-custom-btn';
+    customizeBtn.innerHTML = ICON_CUSTOMIZE_SLIDERS;
+    customizeBtn.title = '詳細設定（アカウント名やURLを変更してから追加）';
+    customizeBtn.setAttribute('aria-label', `${svc.name} の詳細設定`);
     customizeBtn.addEventListener('click', () => {
       const existingForSvc = (state.config?.instances ?? []).filter((i) => i.serviceId === svc.id);
       const existingLabels = existingForSvc.map((acc, idx) =>
@@ -950,6 +1018,8 @@ function renderCatalog(): void {
 
     actions.appendChild(addBtn);
     actions.appendChild(customizeBtn);
+    card.appendChild(avatar);
+    card.appendChild(titleWrap);
     card.appendChild(actions);
     grid.appendChild(card);
   }
@@ -1063,18 +1133,108 @@ async function openSettingsModal(): Promise<void> {
   await syncOverlayToMain();
 }
 
+function formatSyncTime(unixSecs?: number): string {
+  if (!unixSecs) return '';
+  const d = new Date(unixSecs * 1000);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+function parseSharedSyncConfig(raw: string): { token: string; gistId: string } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const jsonPart = trimmed.startsWith('OMNISNS_SYNC_V1:')
+    ? trimmed.slice('OMNISNS_SYNC_V1:'.length).trim()
+    : trimmed;
+  if (!jsonPart.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(jsonPart) as { token?: unknown; gistId?: unknown };
+    const token = typeof parsed.token === 'string' ? parsed.token.trim() : '';
+    const gistId = typeof parsed.gistId === 'string' ? parsed.gistId.trim() : '';
+    if (!token && !gistId) return null;
+    return { token, gistId };
+  } catch {
+    return null;
+  }
+}
+
 function renderFollowModal(): void {
   const active = getActiveInstance();
   if (!active || !state.config) return;
   const todayCount = active.followCountToday ?? 0;
   const totalCount = active.followCountTotal ?? 0;
 
-  el<HTMLParagraphElement>('follow-modal-account').textContent = getActiveDisplayTitle();
+  const accountSubtitle = active.detectedHandle
+    ? `${getActiveDisplayTitle()} (@${active.detectedHandle})`
+    : getActiveDisplayTitle();
+  el<HTMLParagraphElement>('follow-modal-account').textContent = accountSubtitle;
   el<HTMLElement>('follow-modal-today').textContent = String(todayCount);
   el<HTMLElement>('follow-modal-total').textContent = String(totalCount);
   el<HTMLButtonElement>('btn-follow-dec').disabled = todayCount <= 0 && totalCount <= 0;
   el<HTMLButtonElement>('btn-follow-reset-today').disabled = todayCount <= 0;
   el<HTMLButtonElement>('btn-follow-reset-all').disabled = todayCount <= 0 && totalCount <= 0;
+
+  // SNS サーバー側の実フォロー中／フォロワー数
+  const snsLiveBar = el<HTMLDivElement>('follow-sns-live-bar');
+  const snsLiveText = el<HTMLSpanElement>('follow-sns-live-text');
+  const hasFlwng = typeof active.snsFollowingCount === 'number';
+  const hasFlwrs = typeof active.snsFollowersCount === 'number';
+  if (hasFlwng || hasFlwrs) {
+    const parts: string[] = [];
+    if (hasFlwng) parts.push(`フォロー中 ${active.snsFollowingCount!.toLocaleString()} 人`);
+    if (hasFlwrs) parts.push(`フォロワー ${active.snsFollowersCount!.toLocaleString()} 人`);
+    snsLiveText.textContent = parts.join(' · ');
+    snsLiveBar.classList.remove('hidden');
+  } else {
+    snsLiveBar.classList.add('hidden');
+  }
+
+  // 同期用ハンドル入力（入力中は上書きしない）
+  const handleInput = el<HTMLInputElement>('follow-handle-input');
+  if (document.activeElement !== handleInput) {
+    handleInput.value = active.detectedHandle ?? '';
+  }
+
+  // PC・スマホ同期設定
+  const fs = state.config.settings.followSync;
+  if (fs) {
+    const lanCheck = el<HTMLInputElement>('follow-sync-lan');
+    const tokenInput = el<HTMLInputElement>('follow-sync-token');
+    const gistInput = el<HTMLInputElement>('follow-sync-gist');
+    const badge = el<HTMLSpanElement>('follow-sync-badge');
+    const statusEl = el<HTMLDivElement>('follow-sync-status');
+
+    lanCheck.checked = fs.lanEnabled;
+    if (document.activeElement !== tokenInput) {
+      tokenInput.value = fs.githubToken ?? '';
+    }
+    if (document.activeElement !== gistInput) {
+      gistInput.value = fs.gistId ?? '';
+    }
+
+    const hasCloud = Boolean(fs.githubToken?.trim());
+    if (hasCloud && fs.lanEnabled) {
+      badge.textContent = 'LAN + クラウド';
+    } else if (hasCloud) {
+      badge.textContent = 'クラウド同期';
+    } else if (fs.lanEnabled) {
+      badge.textContent = 'LAN待機中';
+    } else {
+      badge.textContent = '同期OFF';
+    }
+
+    const timeStr = formatSyncTime(fs.lastSyncAt);
+    if (fs.lastSyncStatus) {
+      statusEl.textContent = timeStr
+        ? `${fs.lastSyncStatus}（最終: ${timeStr}）`
+        : fs.lastSyncStatus;
+    } else if (fs.lanEnabled) {
+      statusEl.textContent = '同一Wi-Fi内のPC・スマホと自動で合算共有されます';
+    } else {
+      statusEl.textContent = '同期は無効です（LAN または GitHub Gist を有効にしてください）';
+    }
+  }
 
   const summaryBox = el<HTMLDivElement>('follow-summary-box');
   const summaryList = el<HTMLDivElement>('follow-summary-list');
@@ -1092,7 +1252,9 @@ function renderFollowModal(): void {
           row.className = 'follow-summary-row';
           const lbl = getAccountDisplayLabel(inst, idx, grp.displayName);
           const nameSpan = document.createElement('span');
-          nameSpan.textContent = `${grp.displayName} · ${lbl}`;
+          nameSpan.textContent = inst.detectedHandle
+            ? `${grp.displayName} · ${lbl} (@${inst.detectedHandle})`
+            : `${grp.displayName} · ${lbl}`;
           const cntSpan = document.createElement('strong');
           cntSpan.textContent = `${c} 回`;
           row.appendChild(nameSpan);
@@ -1304,15 +1466,18 @@ function bindEvents(): void {
     await omniApi.tabAction(active.instanceId, 'sleep');
     showToast(`「${title}」を休止しました（メモリ解放）`);
   });
-  el<HTMLButtonElement>('btn-clear-session').addEventListener('click', async () => {
+  el<HTMLButtonElement>('btn-clear-session').addEventListener('click', async (e) => {
     const active = getActiveInstance();
     if (!active) return;
     const title = getActiveDisplayTitle();
+    const clearBtn = e.currentTarget as HTMLElement | null;
     const ok = await openConfirmDialog({
       title: 'ログイン情報を初期化',
       message: `「${title}」のCookie・ログイン情報・キャッシュをすべて削除しますか？\n（他のアカウント・サービスには影響しません）`,
       confirmLabel: '初期化する',
-      danger: true
+      danger: true,
+      anchorEl: clearBtn,
+      anchorPoint: { x: e.clientX, y: e.clientY }
     });
     if (!ok) return;
     await omniApi.tabAction(active.instanceId, 'clear-session');
@@ -1366,6 +1531,12 @@ function bindEvents(): void {
   el<HTMLButtonElement>('btn-hisator-ad').addEventListener('click', () => {
     void omniApi.openExternalUrl('https://hisator-notebook.com/');
   });
+
+  const openGmail = () => {
+    void omniApi.openExternalUrl('https://mail.google.com/');
+  };
+  el<HTMLButtonElement>('btn-open-gmail').addEventListener('click', openGmail);
+  el<HTMLButtonElement>('btn-collapsed-gmail').addEventListener('click', openGmail);
 
   el<HTMLButtonElement>('btn-copy-url').addEventListener('click', async () => {
     const active = getActiveInstance();
@@ -1549,6 +1720,105 @@ function bindEvents(): void {
     if (!active) return;
     await omniApi.resetFollowCount(active.instanceId, true);
     showToast('フォロー回数をすべてリセットしました');
+  });
+
+  const saveFollowHandle = async () => {
+    const active = getActiveInstance();
+    if (!active) return;
+    const raw = el<HTMLInputElement>('follow-handle-input').value.trim();
+    try {
+      const updated = await omniApi.setFollowHandle(active.instanceId, raw);
+      showToast(
+        updated.detectedHandle
+          ? `同期アカウントを @${updated.detectedHandle} に設定しました`
+          : '同期アカウントIDをクリアしました'
+      );
+    } catch (err) {
+      showToast(String(err));
+    }
+  };
+  el<HTMLButtonElement>('btn-follow-save-handle').addEventListener('click', () => void saveFollowHandle());
+  el<HTMLInputElement>('follow-handle-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void saveFollowHandle();
+    }
+  });
+
+  el<HTMLInputElement>('follow-sync-lan').addEventListener('change', async (e) => {
+    const lanEnabled = (e.target as HTMLInputElement).checked;
+    await omniApi.updateFollowSyncSettings({ lanEnabled });
+    showToast(lanEnabled ? '同一Wi-FiのLAN自動同期を有効にしました' : 'LAN自動同期を無効にしました');
+  });
+
+  el<HTMLButtonElement>('btn-follow-open-github-token').addEventListener('click', () => {
+    void omniApi.openExternalUrl(
+      'https://github.com/settings/tokens/new?scopes=gist&description=OmniSNS%20Follow%20Sync'
+    );
+  });
+
+  el<HTMLInputElement>('follow-sync-token').addEventListener('input', (e) => {
+    const inp = e.target as HTMLInputElement;
+    const parsed = parseSharedSyncConfig(inp.value);
+    if (parsed) {
+      inp.value = parsed.token;
+      el<HTMLInputElement>('follow-sync-gist').value = parsed.gistId;
+      showToast('コピーした同期設定を自動入力しました');
+    }
+  });
+
+  el<HTMLButtonElement>('btn-follow-sync-now').addEventListener('click', async () => {
+    const btn = el<HTMLButtonElement>('btn-follow-sync-now');
+    const lanEnabled = el<HTMLInputElement>('follow-sync-lan').checked;
+    const githubToken = el<HTMLInputElement>('follow-sync-token').value.trim();
+    const gistId = el<HTMLInputElement>('follow-sync-gist').value.trim();
+    btn.disabled = true;
+    btn.textContent = '同期中...';
+    try {
+      await omniApi.updateFollowSyncSettings({ lanEnabled, githubToken, gistId });
+      const res = await omniApi.syncFollowNow();
+      showToast(res.lastSyncStatus || '同期が完了しました');
+    } catch (err) {
+      showToast(String(err));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '保存して今すぐ同期';
+    }
+  });
+
+  el<HTMLButtonElement>('btn-follow-sync-copy').addEventListener('click', async () => {
+    const token = el<HTMLInputElement>('follow-sync-token').value.trim();
+    const gistId = el<HTMLInputElement>('follow-sync-gist').value.trim();
+    if (!token) {
+      showToast('先に GitHub Token を入力・同期してからコピーしてください');
+      return;
+    }
+    const payload = `OMNISNS_SYNC_V1:${JSON.stringify({ token, gistId })}`;
+    await omniApi.copyText(payload);
+    showToast('同期設定をコピーしました（スマホ側の「貼付して適用」で反映できます）');
+  });
+
+  el<HTMLButtonElement>('btn-follow-sync-paste').addEventListener('click', async () => {
+    try {
+      const clip = await navigator.clipboard.readText();
+      const parsed = parseSharedSyncConfig(clip);
+      if (!parsed) {
+        showToast('クリップボードに有効な同期設定がありません');
+        return;
+      }
+      el<HTMLInputElement>('follow-sync-token').value = parsed.token;
+      el<HTMLInputElement>('follow-sync-gist').value = parsed.gistId;
+      const lanEnabled = el<HTMLInputElement>('follow-sync-lan').checked;
+      await omniApi.updateFollowSyncSettings({
+        lanEnabled,
+        githubToken: parsed.token,
+        gistId: parsed.gistId
+      });
+      const res = await omniApi.syncFollowNow();
+      showToast(res.lastSyncStatus || '同期設定を適用しました');
+    } catch (err) {
+      showToast(`貼付に失敗しました: ${String(err)}`);
+    }
   });
 
   // Confirm modal

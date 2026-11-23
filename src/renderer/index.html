@@ -86,6 +86,16 @@
             aria-label="再読み込み"
           >↻</button>
           <button
+            id="btn-collapsed-gmail"
+            type="button"
+            class="tool-pill gmail-pill accountbar-collapsed-only"
+            title="既定ブラウザで Gmail を開く（SNS認証メール確認用）"
+            aria-label="Gmail を開く"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/></svg>
+            <span>Gmail</span>
+          </button>
+          <button
             id="btn-collapsed-follow"
             type="button"
             class="tool-pill follow-pill accountbar-collapsed-only"
@@ -142,6 +152,16 @@
         </div>
 
         <div class="toolbar-controls">
+          <button
+            id="btn-open-gmail"
+            type="button"
+            class="tool-pill gmail-pill"
+            title="既定ブラウザで Gmail を開く（SNS認証メール確認用）"
+            aria-label="Gmail を開く"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/></svg>
+            <span>Gmail</span>
+          </button>
           <button
             id="btn-follow-counter"
             type="button"
@@ -221,11 +241,8 @@
   <!-- サービスカタログモーダル -->
   <div id="catalog-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="catalog-title">
     <div class="modal-dialog modal-xl">
-      <div class="modal-header">
-        <div>
-          <h2 id="catalog-title">サービス カタログ</h2>
-          <p class="modal-subtitle">無料プランでWebブラウザからDM・メッセージ送信できる全サービスを収録。同一SNSの複数アカウントはヘッダーから瞬時に切り替えられます。</p>
-        </div>
+      <div class="modal-header catalog-modal-header">
+        <h2 id="catalog-title">サービス カタログ</h2>
         <button id="btn-close-catalog" class="btn-icon" aria-label="閉じる">✕</button>
       </div>
 
@@ -473,9 +490,9 @@
     </div>
   </div>
 
-  <!-- フォロー回数カウンターモーダル -->
+  <!-- フォロー回数カウンター & クロスデバイス同期モーダル -->
   <div id="follow-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="follow-modal-title">
-    <div class="modal-dialog modal-sm">
+    <div class="modal-dialog modal-md follow-modal-dialog">
       <div class="modal-header">
         <div>
           <h2 id="follow-modal-title">フォロー回数カウンター</h2>
@@ -494,6 +511,12 @@
             <strong id="follow-modal-total" class="follow-stat-value">0</strong>
           </div>
         </div>
+
+        <div id="follow-sns-live-bar" class="follow-sns-live-bar hidden">
+          <span class="follow-sns-live-badge">SNS実数</span>
+          <span id="follow-sns-live-text">フォロー中 — · フォロワー —</span>
+        </div>
+
         <div class="follow-adjust-row">
           <button id="btn-follow-dec" type="button" class="btn-secondary">−1</button>
           <button id="btn-follow-inc" type="button" class="btn-primary">＋1</button>
@@ -502,6 +525,61 @@
           <button id="btn-follow-reset-today" type="button" class="btn-secondary btn-xs">今日をリセット</button>
           <button id="btn-follow-reset-all" type="button" class="btn-secondary btn-xs danger-text">累計もリセット</button>
         </div>
+
+        <div class="follow-handle-row">
+          <span class="follow-handle-label">同期アカウントID</span>
+          <div class="follow-handle-input-wrap">
+            <span class="follow-handle-at">@</span>
+            <input
+              id="follow-handle-input"
+              type="text"
+              class="input-compact"
+              placeholder="自動検出（例: darksan560）"
+              autocomplete="off"
+            />
+            <button id="btn-follow-save-handle" type="button" class="btn-secondary btn-xs">設定</button>
+          </div>
+        </div>
+
+        <details id="follow-sync-details" class="follow-sync-box">
+          <summary class="follow-sync-summary">
+            <span>PC・スマホ同期設定（LAN自動 ＋ GitHub非公開Gist）</span>
+            <span id="follow-sync-badge" class="follow-sync-badge">LAN待機中</span>
+          </summary>
+          <div class="follow-sync-content">
+            <label class="follow-sync-toggle">
+              <span>同一Wi-Fi内で自動同期（設定不要・UDP LAN）</span>
+              <input id="follow-sync-lan" type="checkbox" class="switch-input" checked />
+            </label>
+            <div class="follow-sync-cloud-fields">
+              <div class="follow-sync-field-head">
+                <span>外出先(4G/5G)向け無料クラウド同期（GitHub非公開Gist）</span>
+                <button id="btn-follow-open-github-token" type="button" class="link-btn">Token作成を開く</button>
+              </div>
+              <input
+                id="follow-sync-token"
+                type="password"
+                class="input-compact"
+                placeholder="GitHub Personal Access Token（gist権限 / 設定文字列の貼付も可）"
+                autocomplete="off"
+              />
+              <input
+                id="follow-sync-gist"
+                type="text"
+                class="input-compact"
+                placeholder="Gist ID（初回は空欄のまま同期で自動作成）"
+                autocomplete="off"
+              />
+            </div>
+            <div class="follow-sync-actions">
+              <button id="btn-follow-sync-now" type="button" class="btn-primary btn-xs">保存して今すぐ同期</button>
+              <button id="btn-follow-sync-copy" type="button" class="btn-secondary btn-xs" title="TokenとGist IDをスマホ側へ一括貼り付けできる形式でコピー">設定をコピー</button>
+              <button id="btn-follow-sync-paste" type="button" class="btn-secondary btn-xs" title="別端末でコピーした同期設定を貼り付けて適用">貼付して適用</button>
+            </div>
+            <div id="follow-sync-status" class="follow-sync-status">同一Wi-Fi内なら自動で共有されます</div>
+          </div>
+        </details>
+
         <div id="follow-summary-box" class="follow-summary-box hidden">
           <div class="follow-summary-header">
             <span>全アカウントの本日の合計</span>
@@ -510,7 +588,7 @@
           <div id="follow-summary-list" class="follow-summary-list"></div>
         </div>
         <p class="follow-hint">
-          Threads・Instagram・Bluesky 等でフォローを実行すると自動でカウントされます（日付が変わると「今日」は自動で0に戻ります）。
+          Instagram・Threads・Bluesky 等でフォローを実行すると自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。
         </p>
       </div>
     </div>

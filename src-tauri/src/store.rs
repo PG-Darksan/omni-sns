@@ -7,6 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::catalog;
+use crate::follow_sync::{
+    make_account_sync_key, normalize_account_handle, now_unix_secs, AccountFollowLedger,
+    DeviceFollowEntry, FollowSyncLedger, FollowSyncSettings, UpdateFollowSyncPatch,
+};
 use crate::gesture::{sanitize_gesture_settings, GestureSettings};
 use crate::models::{
     AddInstancePayload, AppConfig, AppSettings, SavedSubTab, ServiceInstance, UpdateInstancePatch,
@@ -90,6 +94,48 @@ fn normalize_follow_for_today(inst: &mut ServiceInstance, today: &str) {
     }
 }
 
+fn project_ledger_to_instances_inner(
+    instances: &mut [ServiceInstance],
+    ledger: &FollowSyncLedger,
+    today: &str,
+) -> bool {
+    let mut changed = false;
+    for inst in instances.iter_mut() {
+        let Some(ref handle) = inst.detected_handle else {
+            continue;
+        };
+        let Some(key) = make_account_sync_key(&inst.service_id, handle) else {
+            continue;
+        };
+        let Some(acc) = ledger.accounts.get(&key) else {
+            continue;
+        };
+        let (sum_today, sum_total) = acc.effective_counts(today);
+        if inst.follow_count_today != sum_today
+            || inst.follow_count_total != sum_total
+            || inst.follow_count_date != today
+        {
+            inst.follow_count_today = sum_today;
+            inst.follow_count_total = sum_total;
+            inst.follow_count_date = today.to_string();
+            changed = true;
+        }
+        if let Some(flwng) = acc.sns_following {
+            if inst.sns_following_count != Some(flwng) {
+                inst.sns_following_count = Some(flwng);
+                changed = true;
+            }
+        }
+        if let Some(flwrs) = acc.sns_followers {
+            if inst.sns_followers_count != Some(flwrs) {
+                inst.sns_followers_count = Some(flwrs);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 pub fn create_default_settings() -> AppSettings {
     AppSettings {
         theme: "dark".to_string(),
@@ -98,6 +144,14 @@ pub fn create_default_settings() -> AppSettings {
         active_instance_id: None,
         header_collapsed: false,
         gesture: GestureSettings::default(),
+        follow_sync: FollowSyncSettings {
+            device_id: format!("win-{}", next_short_hex_id()),
+            lan_enabled: true,
+            github_token: String::new(),
+            gist_id: String::new(),
+            last_sync_at: None,
+            last_sync_status: None,
+        },
     }
 }
 
@@ -124,6 +178,9 @@ pub fn create_default_instances() -> Vec<ServiceInstance> {
             follow_count_today: 0,
             follow_count_total: 0,
             follow_count_date: today.clone(),
+            detected_handle: None,
+            sns_following_count: None,
+            sns_followers_count: None,
             saved_tabs: Vec::new(),
             saved_active_tab_index: None,
         })
@@ -145,6 +202,7 @@ pub fn create_default_config() -> AppConfig {
             height: 880,
             is_maximized: Some(false),
         }),
+        follow_ledger: FollowSyncLedger::default(),
     }
 }
 
@@ -154,6 +212,7 @@ struct RawConfig {
     settings: Option<RawSettings>,
     instances: Option<Vec<RawInstance>>,
     window_bounds: Option<WindowBounds>,
+    follow_ledger: Option<FollowSyncLedger>,
 }
 
 #[derive(Deserialize)]
@@ -165,6 +224,7 @@ struct RawSettings {
     active_instance_id: Option<String>,
     header_collapsed: Option<bool>,
     gesture: Option<GestureSettings>,
+    follow_sync: Option<FollowSyncSettings>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +246,9 @@ struct RawInstance {
     follow_count_today: Option<u32>,
     follow_count_total: Option<u32>,
     follow_count_date: Option<String>,
+    detected_handle: Option<String>,
+    sns_following_count: Option<u32>,
+    sns_followers_count: Option<u32>,
     saved_tabs: Option<Vec<SavedSubTab>>,
     saved_active_tab_index: Option<usize>,
 }
@@ -238,7 +301,16 @@ impl ConfigStore {
             if let Some(g) = rs.gesture {
                 settings.gesture = sanitize_gesture_settings(g);
             }
+            if let Some(mut fs) = rs.follow_sync {
+                if fs.device_id.trim().is_empty() {
+                    fs.device_id = format!("win-{}", next_short_hex_id());
+                }
+                settings.follow_sync = fs;
+            }
             settings.active_instance_id = rs.active_instance_id;
+        }
+        if settings.follow_sync.device_id.trim().is_empty() {
+            settings.follow_sync.device_id = format!("win-{}", next_short_hex_id());
         }
 
         let today = local_today_ymd();
@@ -361,6 +433,12 @@ impl ConfigStore {
                         follow_count_today,
                         follow_count_total: item.follow_count_total.unwrap_or(0),
                         follow_count_date: today.clone(),
+                        detected_handle: item
+                            .detected_handle
+                            .as_deref()
+                            .and_then(normalize_account_handle),
+                        sns_following_count: item.sns_following_count,
+                        sns_followers_count: item.sns_followers_count,
                         saved_tabs,
                         saved_active_tab_index,
                     })
@@ -384,12 +462,16 @@ impl ConfigStore {
             settings.active_instance_id = instances.first().map(|i| i.instance_id.clone());
         }
 
-        let loaded = AppConfig {
+        let mut loaded = AppConfig {
             version: CONFIG_VERSION,
             settings,
             instances,
             window_bounds: raw.window_bounds.or(defaults.window_bounds),
+            follow_ledger: raw.follow_ledger.unwrap_or_default(),
         };
+        if project_ledger_to_instances_inner(&mut loaded.instances, &loaded.follow_ledger, &today) {
+            migrated = true;
+        }
         if migrated {
             let _ = Self::save_atomic(file_path, &loaded);
         }
@@ -422,6 +504,7 @@ impl ConfigStore {
         for inst in &mut cfg.instances {
             normalize_follow_for_today(inst, &today);
         }
+        project_ledger_to_instances_inner(&mut cfg.instances, &cfg.follow_ledger, &today);
         cfg
     }
 
@@ -431,6 +514,7 @@ impl ConfigStore {
         for inst in &mut list {
             normalize_follow_for_today(inst, &today);
         }
+        project_ledger_to_instances_inner(&mut list, &self.config.follow_ledger, &today);
         list
     }
 
@@ -443,7 +527,9 @@ impl ConfigStore {
             .cloned()
             .map(|mut inst| {
                 normalize_follow_for_today(&mut inst, &today);
-                inst
+                let mut one = [inst];
+                project_ledger_to_instances_inner(&mut one, &self.config.follow_ledger, &today);
+                one.into_iter().next().unwrap()
             })
     }
 
@@ -516,6 +602,9 @@ impl ConfigStore {
             follow_count_today: 0,
             follow_count_total: 0,
             follow_count_date: local_today_ymd(),
+            detected_handle: None,
+            sns_following_count: None,
+            sns_followers_count: None,
             saved_tabs: Vec::new(),
             saved_active_tab_index: None,
         };
@@ -748,12 +837,88 @@ impl ConfigStore {
 
     pub fn adjust_follow_count(&mut self, instance_id: &str, delta: i32) -> Option<ServiceInstance> {
         let today = local_today_ymd();
-        let target = self
+        let idx = self
             .config
             .instances
-            .iter_mut()
-            .find(|i| i.instance_id == instance_id)?;
-        normalize_follow_for_today(target, &today);
+            .iter()
+            .position(|i| i.instance_id == instance_id)?;
+        normalize_follow_for_today(&mut self.config.instances[idx], &today);
+
+        let sync_key = self.config.instances[idx]
+            .detected_handle
+            .as_deref()
+            .and_then(|h| make_account_sync_key(&self.config.instances[idx].service_id, h));
+
+        if let Some(key) = sync_key {
+            let device_id = self.config.settings.follow_sync.device_id.clone();
+            let now = now_unix_secs();
+            let prev_today = self.config.instances[idx].follow_count_today;
+            let prev_total = self.config.instances[idx].follow_count_total;
+
+            let acc = self
+                .config
+                .follow_ledger
+                .accounts
+                .entry(key)
+                .or_insert_with(|| AccountFollowLedger {
+                    date: today.clone(),
+                    ..Default::default()
+                });
+            acc.roll_date(&today);
+
+            if !acc.devices.contains_key(&device_id) {
+                let (seed_today, seed_total) =
+                    if acc.devices.is_empty() && (prev_today > 0 || prev_total > 0) {
+                        (prev_today as i32, prev_total as i32)
+                    } else {
+                        (0, 0)
+                    };
+                acc.devices.insert(
+                    device_id.clone(),
+                    DeviceFollowEntry {
+                        today: seed_today,
+                        total: seed_total,
+                        today_epoch: acc.reset_epoch,
+                        total_epoch: acc.total_reset_epoch,
+                        updated_at: now,
+                    },
+                );
+            }
+
+            let (cur_sum_today, cur_sum_total) = acc.effective_counts(&today);
+            let reset_epoch = acc.reset_epoch;
+            let total_reset_epoch = acc.total_reset_epoch;
+            let entry = acc.devices.entry(device_id).or_default();
+            if entry.today_epoch < reset_epoch {
+                entry.today = 0;
+                entry.today_epoch = reset_epoch;
+            }
+            if entry.total_epoch < total_reset_epoch {
+                entry.total = 0;
+                entry.total_epoch = total_reset_epoch;
+            }
+            if delta >= 0 {
+                entry.today = entry.today.saturating_add(delta);
+                entry.total = entry.total.saturating_add(delta);
+            } else {
+                let dec_today = delta.unsigned_abs().min(cur_sum_today) as i32;
+                let dec_total = delta.unsigned_abs().min(cur_sum_total) as i32;
+                entry.today = entry.today.saturating_sub(dec_today);
+                entry.total = entry.total.saturating_sub(dec_total);
+            }
+            entry.updated_at = now.max(entry.updated_at.saturating_add(1));
+
+            project_ledger_to_instances_inner(
+                &mut self.config.instances,
+                &self.config.follow_ledger,
+                &today,
+            );
+            let updated = self.config.instances[idx].clone();
+            self.persist();
+            return Some(updated);
+        }
+
+        let target = &mut self.config.instances[idx];
         if delta >= 0 {
             let add = delta as u32;
             target.follow_count_today = target.follow_count_today.saturating_add(add);
@@ -774,11 +939,54 @@ impl ConfigStore {
         reset_total: bool,
     ) -> Option<ServiceInstance> {
         let today = local_today_ymd();
-        let target = self
+        let idx = self
             .config
             .instances
-            .iter_mut()
-            .find(|i| i.instance_id == instance_id)?;
+            .iter()
+            .position(|i| i.instance_id == instance_id)?;
+
+        let sync_key = self.config.instances[idx]
+            .detected_handle
+            .as_deref()
+            .and_then(|h| make_account_sync_key(&self.config.instances[idx].service_id, h));
+
+        if let Some(key) = sync_key {
+            let now = now_unix_secs();
+            let acc = self
+                .config
+                .follow_ledger
+                .accounts
+                .entry(key)
+                .or_insert_with(|| AccountFollowLedger {
+                    date: today.clone(),
+                    ..Default::default()
+                });
+            acc.roll_date(&today);
+            acc.reset_epoch = acc.reset_epoch.saturating_add(1);
+            for entry in acc.devices.values_mut() {
+                entry.today = 0;
+                entry.today_epoch = acc.reset_epoch;
+                entry.updated_at = now.max(entry.updated_at.saturating_add(1));
+            }
+            if reset_total {
+                acc.total_reset_epoch = acc.total_reset_epoch.saturating_add(1);
+                for entry in acc.devices.values_mut() {
+                    entry.total = 0;
+                    entry.total_epoch = acc.total_reset_epoch;
+                    entry.updated_at = now.max(entry.updated_at.saturating_add(1));
+                }
+            }
+            project_ledger_to_instances_inner(
+                &mut self.config.instances,
+                &self.config.follow_ledger,
+                &today,
+            );
+            let updated = self.config.instances[idx].clone();
+            self.persist();
+            return Some(updated);
+        }
+
+        let target = &mut self.config.instances[idx];
         target.follow_count_date = today;
         target.follow_count_today = 0;
         if reset_total {
@@ -787,6 +995,202 @@ impl ConfigStore {
         let updated = target.clone();
         self.persist();
         Some(updated)
+    }
+
+    /// ログイン中アカウントの `@handle` と SNS 実フォロー数／フォロワー数を記録する。
+    /// 戻り値: `(ui_changed, ledger_changed)`
+    pub fn record_account_identity(
+        &mut self,
+        instance_id: &str,
+        raw_handle: &str,
+        following: Option<u32>,
+        followers: Option<u32>,
+    ) -> (bool, bool) {
+        let Some(norm_handle) = normalize_account_handle(raw_handle) else {
+            return (false, false);
+        };
+        let Some(idx) = self
+            .config
+            .instances
+            .iter()
+            .position(|i| i.instance_id == instance_id)
+        else {
+            return (false, false);
+        };
+
+        let today = local_today_ymd();
+        normalize_follow_for_today(&mut self.config.instances[idx], &today);
+
+        let prev_handle = self.config.instances[idx].detected_handle.clone();
+        let prev_today = self.config.instances[idx].follow_count_today;
+        let prev_total = self.config.instances[idx].follow_count_total;
+        let service_id = self.config.instances[idx].service_id.clone();
+
+        let mut ui_changed = false;
+        let mut ledger_changed = false;
+
+        if prev_handle.as_deref() != Some(norm_handle.as_str()) {
+            self.config.instances[idx].detected_handle = Some(norm_handle.clone());
+            ui_changed = true;
+        }
+        if let Some(flwng) = following {
+            if self.config.instances[idx].sns_following_count != Some(flwng) {
+                self.config.instances[idx].sns_following_count = Some(flwng);
+                ui_changed = true;
+            }
+        }
+        if let Some(flwrs) = followers {
+            if self.config.instances[idx].sns_followers_count != Some(flwrs) {
+                self.config.instances[idx].sns_followers_count = Some(flwrs);
+                ui_changed = true;
+            }
+        }
+
+        if let Some(key) = make_account_sync_key(&service_id, &norm_handle) {
+            let device_id = self.config.settings.follow_sync.device_id.clone();
+            let now = now_unix_secs();
+            let existed = self.config.follow_ledger.accounts.contains_key(&key);
+            let acc = self
+                .config
+                .follow_ledger
+                .accounts
+                .entry(key)
+                .or_insert_with(|| AccountFollowLedger {
+                    date: today.clone(),
+                    ..Default::default()
+                });
+            acc.roll_date(&today);
+            if !existed {
+                ledger_changed = true;
+            }
+
+            if prev_handle.is_none()
+                && (prev_today > 0 || prev_total > 0)
+                && !acc.devices.contains_key(&device_id)
+            {
+                acc.devices.insert(
+                    device_id,
+                    DeviceFollowEntry {
+                        today: prev_today as i32,
+                        total: prev_total as i32,
+                        today_epoch: acc.reset_epoch,
+                        total_epoch: acc.total_reset_epoch,
+                        updated_at: now,
+                    },
+                );
+                ledger_changed = true;
+            }
+
+            let sns_diff = (following.is_some() && acc.sns_following != following)
+                || (followers.is_some() && acc.sns_followers != followers);
+            if sns_diff {
+                if let Some(flwng) = following {
+                    acc.sns_following = Some(flwng);
+                }
+                if let Some(flwrs) = followers {
+                    acc.sns_followers = Some(flwrs);
+                }
+                acc.sns_updated_at = now.max(acc.sns_updated_at.saturating_add(1));
+                ledger_changed = true;
+            }
+        }
+
+        let projected = project_ledger_to_instances_inner(
+            &mut self.config.instances,
+            &self.config.follow_ledger,
+            &today,
+        );
+        if ui_changed || projected || ledger_changed {
+            self.persist();
+        }
+        (ui_changed || projected, ledger_changed)
+    }
+
+    /// ユーザーが手動で同期用ハンドル名（`@username`）を指定／クリアする。
+    pub fn set_instance_handle(
+        &mut self,
+        instance_id: &str,
+        raw_handle: &str,
+    ) -> Result<(ServiceInstance, bool), String> {
+        let trimmed = raw_handle.trim();
+        if trimmed.is_empty() {
+            let idx = self
+                .config
+                .instances
+                .iter()
+                .position(|i| i.instance_id == instance_id)
+                .ok_or_else(|| "対象アカウントが見つかりません".to_string())?;
+            self.config.instances[idx].detected_handle = None;
+            let updated = self.config.instances[idx].clone();
+            self.persist();
+            return Ok((updated, false));
+        }
+        let norm = normalize_account_handle(trimmed)
+            .ok_or_else(|| "アカウントIDは半角英数字・.・_・- で入力してください".to_string())?;
+        let (_, ledger_changed) = self.record_account_identity(instance_id, &norm, None, None);
+        let updated = self
+            .get_instance(instance_id)
+            .ok_or_else(|| "対象アカウントが見つかりません".to_string())?;
+        Ok((updated, ledger_changed))
+    }
+
+    pub fn merge_follow_ledger(&mut self, remote: &FollowSyncLedger) -> bool {
+        let today = local_today_ymd();
+        let ledger_changed = self.config.follow_ledger.merge_from(remote, &today);
+        let ui_changed = project_ledger_to_instances_inner(
+            &mut self.config.instances,
+            &self.config.follow_ledger,
+            &today,
+        );
+        if ledger_changed || ui_changed {
+            self.persist();
+        }
+        ledger_changed || ui_changed
+    }
+
+    pub fn get_follow_sync_settings(&self) -> FollowSyncSettings {
+        self.config.settings.follow_sync.clone()
+    }
+
+    pub fn get_follow_ledger(&self) -> FollowSyncLedger {
+        self.config.follow_ledger.clone()
+    }
+
+    pub fn update_follow_sync_settings(
+        &mut self,
+        patch: UpdateFollowSyncPatch,
+    ) -> FollowSyncSettings {
+        if let Some(lan) = patch.lan_enabled {
+            self.config.settings.follow_sync.lan_enabled = lan;
+        }
+        if let Some(token) = patch.github_token {
+            self.config.settings.follow_sync.github_token = token.trim().to_string();
+        }
+        if let Some(gist_id) = patch.gist_id {
+            self.config.settings.follow_sync.gist_id = gist_id.trim().to_string();
+        }
+        self.persist();
+        self.config.settings.follow_sync.clone()
+    }
+
+    pub fn set_follow_sync_status(
+        &mut self,
+        gist_id: Option<String>,
+        status: String,
+        synced_at: Option<u64>,
+    ) -> FollowSyncSettings {
+        if let Some(id) = gist_id {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() {
+                self.config.settings.follow_sync.gist_id = trimmed.to_string();
+            }
+        }
+        if let Some(ts) = synced_at {
+            self.config.settings.follow_sync.last_sync_at = Some(ts);
+        }
+        self.config.settings.follow_sync.last_sync_status = Some(status);
+        self.persist();
+        self.config.settings.follow_sync.clone()
     }
 
     pub fn update_saved_tabs(
@@ -1109,6 +1513,86 @@ mod tests {
         let th3 = reloaded2.get_instance("svc-threads-default").unwrap();
         assert!(th3.saved_tabs.is_empty());
         assert_eq!(th3.saved_active_tab_index, None);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn follow_sync_migrates_local_counts_and_merges_remote_device() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-sync-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+
+        let mut store = ConfigStore::new(config_path.clone());
+        let ig = store
+            .get_instances()
+            .into_iter()
+            .find(|i| i.service_id == "instagram")
+            .unwrap();
+
+        // ハンドル検出前のローカルカウント 4 件
+        let _ = store.adjust_follow_count(&ig.instance_id, 4).unwrap();
+        // 自動検出で @darksan560 と SNS 実数(フォロー中 150 / フォロワー 280)を紐付け
+        let (ui_ch, led_ch) =
+            store.record_account_identity(&ig.instance_id, "@DarkSan560", Some(150), Some(280));
+        assert!(ui_ch && led_ch);
+
+        let after_id = store.get_instance(&ig.instance_id).unwrap();
+        assert_eq!(after_id.detected_handle.as_deref(), Some("darksan560"));
+        assert_eq!(after_id.follow_count_today, 4);
+        assert_eq!(after_id.follow_count_total, 4);
+        assert_eq!(after_id.sns_following_count, Some(150));
+        assert_eq!(after_id.sns_followers_count, Some(280));
+
+        // 同一アカウントのスマホ側レジャー（本日 6 件 / 累計 12 件 / 実フォロー 156）をマージ
+        let today = local_today_ymd();
+        let mut remote = FollowSyncLedger::default();
+        let mut remote_acc = AccountFollowLedger {
+            date: today.clone(),
+            sns_following: Some(156),
+            sns_followers: Some(290),
+            sns_updated_at: now_unix_secs() + 10,
+            ..Default::default()
+        };
+        remote_acc.devices.insert(
+            "and-phone01".to_string(),
+            DeviceFollowEntry {
+                today: 6,
+                total: 12,
+                today_epoch: 0,
+                total_epoch: 0,
+                updated_at: now_unix_secs() + 10,
+            },
+        );
+        remote
+            .accounts
+            .insert("instagram:darksan560".to_string(), remote_acc);
+
+        assert!(store.merge_follow_ledger(&remote));
+        let merged = store.get_instance(&ig.instance_id).unwrap();
+        assert_eq!(merged.follow_count_today, 10);
+        assert_eq!(merged.follow_count_total, 16);
+        assert_eq!(merged.sns_following_count, Some(156));
+        assert_eq!(merged.sns_followers_count, Some(290));
+
+        // PC 側から -1 調整しても合算値から正しく減算される
+        let dec = store.adjust_follow_count(&ig.instance_id, -1).unwrap();
+        assert_eq!(dec.follow_count_today, 9);
+        assert_eq!(dec.follow_count_total, 15);
+
+        // 本日リセットはエポックを進めて 0 にしつつ累計は維持
+        let rst = store.reset_follow_count(&ig.instance_id, false).unwrap();
+        assert_eq!(rst.follow_count_today, 0);
+        assert_eq!(rst.follow_count_total, 15);
+
+        // 再読み込みしてもレジャー・実数・ハンドルが維持される
+        let reloaded = ConfigStore::new(config_path.clone());
+        let persisted = reloaded.get_instance(&ig.instance_id).unwrap();
+        assert_eq!(persisted.detected_handle.as_deref(), Some("darksan560"));
+        assert_eq!(persisted.follow_count_today, 0);
+        assert_eq!(persisted.follow_count_total, 15);
+        assert_eq!(persisted.sns_following_count, Some(156));
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

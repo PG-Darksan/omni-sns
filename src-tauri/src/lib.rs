@@ -1,4 +1,5 @@
 mod catalog;
+mod follow_sync;
 mod gesture;
 #[cfg(windows)]
 mod gesture_win;
@@ -12,6 +13,7 @@ mod view_manager;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -19,6 +21,7 @@ use tauri::webview::WebviewBuilder;
 use tauri::window::{Color, WindowBuilder};
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, State, Theme, WebviewUrl, WindowEvent};
 
+use follow_sync::{FollowSyncSettings, UpdateFollowSyncPatch};
 use gesture::GestureSettings;
 use models::{
     AddInstancePayload, AddTabResponse, AppConfig, AppSettings, BootstrapPayload, ServiceInstance,
@@ -324,6 +327,33 @@ async fn follow_reset(
 }
 
 #[tauri::command]
+async fn follow_set_handle(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+    handle: String,
+) -> Result<ServiceInstance, String> {
+    view_manager::set_instance_handle(&app, &shared, &instance_id, &handle)
+}
+
+#[tauri::command]
+async fn follow_sync_update_settings(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    patch: UpdateFollowSyncPatch,
+) -> Result<FollowSyncSettings, String> {
+    Ok(view_manager::update_follow_sync_settings(&app, &shared, patch))
+}
+
+#[tauri::command]
+async fn follow_sync_now(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+) -> Result<FollowSyncSettings, String> {
+    view_manager::trigger_follow_sync_now(&app, &shared).await
+}
+
+#[tauri::command]
 async fn settings_update(
     app: AppHandle,
     shared: State<'_, SharedState>,
@@ -381,6 +411,7 @@ fn app_open_external_url(url: String) {
 }
 
 fn shutdown_gesture_host(shared: &SharedState) {
+    view_manager::shutdown_lan_sync(shared);
     #[cfg(windows)]
     {
         let host = {
@@ -709,6 +740,68 @@ pub fn run() {
 
             let _ = setup_tray(&app_handle, shared.clone());
 
+            // フォロー数クロスデバイス同期（同一Wi-Fi自動LAN同期 + GitHub非公開Gist定期同期）
+            if !smoke_test {
+                let shared_lan_cfg = shared.clone();
+                let app_lan_recv = app_handle.clone();
+                let shared_lan_recv = shared.clone();
+                let lan_handle = follow_sync::start_lan_sync_listener(
+                    move || {
+                        let guard = shared_lan_cfg.inner.lock().unwrap();
+                        let fs = guard.store.get_follow_sync_settings();
+                        (fs.lan_enabled, fs.device_id, guard.store.get_follow_ledger())
+                    },
+                    move |remote_ledger| {
+                        view_manager::apply_remote_follow_ledger(
+                            &app_lan_recv,
+                            &shared_lan_recv,
+                            remote_ledger,
+                        )
+                    },
+                );
+                {
+                    let mut guard = shared.inner.lock().unwrap();
+                    guard.lan_sync = Some(lan_handle);
+                }
+
+                let app_cloud = app_handle.clone();
+                let shared_cloud = shared.clone();
+                std::thread::Builder::new()
+                    .name("omnisns-cloud-sync".to_string())
+                    .spawn(move || {
+                        std::thread::sleep(Duration::from_secs(3));
+                        loop {
+                            let (quitting, has_token) = {
+                                let g = shared_cloud.inner.lock().unwrap();
+                                (
+                                    g.is_quitting,
+                                    !g.store
+                                        .get_follow_sync_settings()
+                                        .github_token
+                                        .trim()
+                                        .is_empty(),
+                                )
+                            };
+                            if quitting {
+                                break;
+                            }
+                            if has_token {
+                                let _ = view_manager::sync_cloud_gist_once_blocking(
+                                    &app_cloud,
+                                    &shared_cloud,
+                                );
+                            }
+                            for _ in 0..60 {
+                                std::thread::sleep(Duration::from_secs(1));
+                                if shared_cloud.inner.lock().unwrap().is_quitting {
+                                    return;
+                                }
+                            }
+                        }
+                    })
+                    .ok();
+            }
+
             if smoke_test {
                 let app_smoke = app_handle.clone();
                 let shared_smoke = shared.clone();
@@ -768,6 +861,9 @@ pub fn run() {
             gesture_update_settings,
             follow_adjust,
             follow_reset,
+            follow_set_handle,
+            follow_sync_update_settings,
+            follow_sync_now,
             settings_update,
             ui_set_overlay,
             ui_copy_text,

@@ -106,6 +106,9 @@ class ServiceInstance {
     this.followCountToday = 0,
     this.followCountTotal = 0,
     this.followCountDate,
+    this.detectedHandle,
+    this.snsFollowingCount,
+    this.snsFollowersCount,
   });
 
   final String instanceId;
@@ -122,6 +125,9 @@ class ServiceInstance {
   final int followCountToday;
   final int followCountTotal;
   final String? followCountDate;
+  final String? detectedHandle;
+  final int? snsFollowingCount;
+  final int? snsFollowersCount;
 
   /// 実際に Android WebView に適用するプロファイル名を返す。
   String get effectiveProfileName {
@@ -172,6 +178,10 @@ class ServiceInstance {
     int? followCountToday,
     int? followCountTotal,
     String? followCountDate,
+    String? detectedHandle,
+    bool clearDetectedHandle = false,
+    int? snsFollowingCount,
+    int? snsFollowersCount,
   }) {
     return ServiceInstance(
       instanceId: instanceId,
@@ -189,6 +199,11 @@ class ServiceInstance {
       followCountToday: followCountToday ?? this.followCountToday,
       followCountTotal: followCountTotal ?? this.followCountTotal,
       followCountDate: followCountDate ?? this.followCountDate,
+      detectedHandle: clearDetectedHandle
+          ? null
+          : (detectedHandle ?? this.detectedHandle),
+      snsFollowingCount: snsFollowingCount ?? this.snsFollowingCount,
+      snsFollowersCount: snsFollowersCount ?? this.snsFollowersCount,
     );
   }
 
@@ -210,6 +225,10 @@ class ServiceInstance {
       'followCountTotal': followCountTotal,
       if (followCountDate != null && followCountDate!.isNotEmpty)
         'followCountDate': followCountDate,
+      if (detectedHandle != null && detectedHandle!.trim().isNotEmpty)
+        'detectedHandle': detectedHandle!.trim(),
+      if (snsFollowingCount != null) 'snsFollowingCount': snsFollowingCount,
+      if (snsFollowersCount != null) 'snsFollowersCount': snsFollowersCount,
     };
   }
 
@@ -219,6 +238,7 @@ class ServiceInstance {
     final rawLabel = (json['accountLabel'] as String?)?.trim();
     final rawProfile = (json['profileName'] as String?)?.trim();
     final rawFollowDate = (json['followCountDate'] as String?)?.trim();
+    final rawHandle = normalizeAccountHandle(json['detectedHandle'] as String?);
     return ServiceInstance(
       instanceId: json['instanceId'] as String? ?? 'svc-$index',
       serviceId: json['serviceId'] as String? ?? 'custom',
@@ -239,6 +259,9 @@ class ServiceInstance {
           .clamp(0, 99999999),
       followCountDate:
           (rawFollowDate == null || rawFollowDate.isEmpty) ? null : rawFollowDate,
+      detectedHandle: rawHandle,
+      snsFollowingCount: (json['snsFollowingCount'] as num?)?.toInt(),
+      snsFollowersCount: (json['snsFollowersCount'] as num?)?.toInt(),
     );
   }
 }
@@ -510,4 +533,412 @@ List<ServiceInstance> assignProfilesForMigration(
       profileName: makeProfileNameForInstance(inst.instanceId),
     );
   }).toList();
+}
+
+/// 同期用アカウントハンドルを正規化する（Rust `normalize_account_handle` と同一仕様）。
+String? normalizeAccountHandle(String? raw) {
+  if (raw == null) return null;
+  var clean = raw.trim();
+  while (clean.startsWith('@')) {
+    clean = clean.substring(1);
+  }
+  clean = clean.trim().toLowerCase();
+  if (clean.isEmpty || clean.length > 64) return null;
+  if (!RegExp(r'^[a-z0-9._:-]+$').hasMatch(clean)) return null;
+  return clean;
+}
+
+/// PC・スマホ共通のアカウント同期キー (`<serviceId>:<handle>`) を生成する。
+String? makeAccountSyncKey(String serviceId, String? handle) {
+  final norm = normalizeAccountHandle(handle);
+  if (norm == null) return null;
+  final svc = serviceId.trim().toLowerCase();
+  if (svc.isEmpty) return null;
+  return '$svc:$norm';
+}
+
+int nowUnixSecs() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+/// 端末ごとのフォロー回数エントリ（Rust `DeviceFollowEntry` と完全互換 JSON）。
+class DeviceFollowEntry {
+  DeviceFollowEntry({
+    this.today = 0,
+    this.total = 0,
+    this.todayEpoch = 0,
+    this.totalEpoch = 0,
+    this.updatedAt = 0,
+  });
+
+  int today;
+  int total;
+  int todayEpoch;
+  int totalEpoch;
+  int updatedAt;
+
+  DeviceFollowEntry clone() => DeviceFollowEntry(
+        today: today,
+        total: total,
+        todayEpoch: todayEpoch,
+        totalEpoch: totalEpoch,
+        updatedAt: updatedAt,
+      );
+
+  bool equalsValue(DeviceFollowEntry other) =>
+      today == other.today &&
+      total == other.total &&
+      todayEpoch == other.todayEpoch &&
+      totalEpoch == other.totalEpoch &&
+      updatedAt == other.updatedAt;
+
+  Map<String, dynamic> toJson() => {
+        'today': today,
+        'total': total,
+        'todayEpoch': todayEpoch,
+        'totalEpoch': totalEpoch,
+        'updatedAt': updatedAt,
+      };
+
+  factory DeviceFollowEntry.fromJson(Map<String, dynamic> json) {
+    return DeviceFollowEntry(
+      today: (json['today'] as num?)?.toInt() ?? 0,
+      total: (json['total'] as num?)?.toInt() ?? 0,
+      todayEpoch: (json['todayEpoch'] as num?)?.toInt() ?? 0,
+      totalEpoch: (json['totalEpoch'] as num?)?.toInt() ?? 0,
+      updatedAt: (json['updatedAt'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+/// 同一 SNS アカウントの端末間合算レジャー（Rust `AccountFollowLedger` と完全互換）。
+class AccountFollowLedger {
+  AccountFollowLedger({
+    this.date = '',
+    this.resetEpoch = 0,
+    this.totalResetEpoch = 0,
+    Map<String, DeviceFollowEntry>? devices,
+    this.snsFollowing,
+    this.snsFollowers,
+    this.snsUpdatedAt = 0,
+  }) : devices = devices ?? {};
+
+  String date;
+  int resetEpoch;
+  int totalResetEpoch;
+  Map<String, DeviceFollowEntry> devices;
+  int? snsFollowing;
+  int? snsFollowers;
+  int snsUpdatedAt;
+
+  AccountFollowLedger clone() => AccountFollowLedger(
+        date: date,
+        resetEpoch: resetEpoch,
+        totalResetEpoch: totalResetEpoch,
+        devices: {for (final e in devices.entries) e.key: e.value.clone()},
+        snsFollowing: snsFollowing,
+        snsFollowers: snsFollowers,
+        snsUpdatedAt: snsUpdatedAt,
+      );
+
+  void rollDate(String today) {
+    if (date.isEmpty) {
+      date = today;
+    } else if (date.compareTo(today) < 0) {
+      date = today;
+      for (final entry in devices.values) {
+        entry.today = 0;
+        entry.todayEpoch = resetEpoch;
+      }
+    }
+  }
+
+  (int, int) effectiveCounts(String today) {
+    final sameDay = date == today;
+    var sumToday = 0;
+    var sumTotal = 0;
+    for (final entry in devices.values) {
+      if (sameDay && entry.todayEpoch >= resetEpoch) {
+        sumToday += entry.today;
+      }
+      if (entry.totalEpoch >= totalResetEpoch) {
+        sumTotal += entry.total;
+      }
+    }
+    return (
+      sumToday.clamp(0, 999999),
+      sumTotal.clamp(0, 99999999),
+    );
+  }
+
+  /// 相手側レジャーを CRDT マージする。ローカルに変化があれば true。
+  bool mergeFrom(AccountFollowLedger other, String today) {
+    var changed = false;
+
+    final candidates = [date, other.date, today]
+        .where((s) => s.isNotEmpty)
+        .toList()
+      ..sort();
+    final targetDate = candidates.isEmpty ? today : candidates.last;
+
+    if (date != targetDate) {
+      if (date.compareTo(targetDate) < 0) {
+        for (final entry in devices.values) {
+          entry.today = 0;
+        }
+      }
+      date = targetDate;
+      changed = true;
+    }
+
+    if (other.resetEpoch > resetEpoch) {
+      resetEpoch = other.resetEpoch;
+      for (final entry in devices.values) {
+        if (entry.todayEpoch < resetEpoch) {
+          entry.today = 0;
+          entry.todayEpoch = resetEpoch;
+        }
+      }
+      changed = true;
+    }
+
+    if (other.totalResetEpoch > totalResetEpoch) {
+      totalResetEpoch = other.totalResetEpoch;
+      for (final entry in devices.values) {
+        if (entry.totalEpoch < totalResetEpoch) {
+          entry.total = 0;
+          entry.totalEpoch = totalResetEpoch;
+        }
+      }
+      changed = true;
+    }
+
+    final otherSameDay = other.date == targetDate;
+    for (final item in other.devices.entries) {
+      final normalized = item.value.clone();
+      if (!otherSameDay || normalized.todayEpoch < resetEpoch) {
+        normalized.today = 0;
+        normalized.todayEpoch = resetEpoch;
+      }
+      if (normalized.totalEpoch < totalResetEpoch) {
+        normalized.total = 0;
+        normalized.totalEpoch = totalResetEpoch;
+      }
+      final local = devices[item.key];
+      if (local == null) {
+        devices[item.key] = normalized;
+        changed = true;
+      } else {
+        final remoteNewer = normalized.updatedAt > local.updatedAt ||
+            (normalized.updatedAt == local.updatedAt &&
+                (normalized.total > local.total ||
+                    normalized.today > local.today));
+        if (remoteNewer && !local.equalsValue(normalized)) {
+          devices[item.key] = normalized;
+          changed = true;
+        }
+      }
+    }
+
+    if (other.snsUpdatedAt > snsUpdatedAt ||
+        (other.snsUpdatedAt == snsUpdatedAt &&
+            ((snsFollowing == null && other.snsFollowing != null) ||
+                (snsFollowers == null && other.snsFollowers != null)))) {
+      final nextFlwng = other.snsFollowing ?? snsFollowing;
+      final nextFlwrs = other.snsFollowers ?? snsFollowers;
+      if (snsFollowing != nextFlwng ||
+          snsFollowers != nextFlwrs ||
+          snsUpdatedAt != other.snsUpdatedAt) {
+        snsFollowing = nextFlwng;
+        snsFollowers = nextFlwrs;
+        snsUpdatedAt = other.snsUpdatedAt;
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
+  Map<String, dynamic> toJson() => {
+        'date': date,
+        'resetEpoch': resetEpoch,
+        'totalResetEpoch': totalResetEpoch,
+        'devices': {for (final e in devices.entries) e.key: e.value.toJson()},
+        if (snsFollowing != null) 'snsFollowing': snsFollowing,
+        if (snsFollowers != null) 'snsFollowers': snsFollowers,
+        'snsUpdatedAt': snsUpdatedAt,
+      };
+
+  factory AccountFollowLedger.fromJson(Map<String, dynamic> json) {
+    final rawDevices = json['devices'];
+    final devices = <String, DeviceFollowEntry>{};
+    if (rawDevices is Map) {
+      for (final entry in rawDevices.entries) {
+        if (entry.value is Map) {
+          devices[entry.key.toString()] = DeviceFollowEntry.fromJson(
+            Map<String, dynamic>.from(entry.value as Map),
+          );
+        }
+      }
+    }
+    return AccountFollowLedger(
+      date: (json['date'] as String?) ?? '',
+      resetEpoch: (json['resetEpoch'] as num?)?.toInt() ?? 0,
+      totalResetEpoch: (json['totalResetEpoch'] as num?)?.toInt() ?? 0,
+      devices: devices,
+      snsFollowing: (json['snsFollowing'] as num?)?.toInt(),
+      snsFollowers: (json['snsFollowers'] as num?)?.toInt(),
+      snsUpdatedAt: (json['snsUpdatedAt'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+/// 全アカウント分のクロスデバイス同期レジャー（Rust `FollowSyncLedger` と完全互換）。
+class FollowSyncLedger {
+  FollowSyncLedger({
+    this.version = 1,
+    Map<String, AccountFollowLedger>? accounts,
+  }) : accounts = accounts ?? {};
+
+  int version;
+  Map<String, AccountFollowLedger> accounts;
+
+  FollowSyncLedger clone() => FollowSyncLedger(
+        version: version,
+        accounts: {for (final e in accounts.entries) e.key: e.value.clone()},
+      );
+
+  bool mergeFrom(FollowSyncLedger other, String today) {
+    var changed = false;
+    for (final entry in other.accounts.entries) {
+      final local = accounts[entry.key];
+      if (local == null) {
+        final cloned = entry.value.clone()..rollDate(today);
+        accounts[entry.key] = cloned;
+        changed = true;
+      } else {
+        if (local.mergeFrom(entry.value, today)) {
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  bool hasNewerDataThan(FollowSyncLedger other, String today) {
+    final probe = other.clone();
+    return probe.mergeFrom(this, today);
+  }
+
+  Map<String, dynamic> toJson() => {
+        'version': version,
+        'accounts': {for (final e in accounts.entries) e.key: e.value.toJson()},
+      };
+
+  factory FollowSyncLedger.fromJson(Map<String, dynamic> json) {
+    final rawAccounts = json['accounts'];
+    final accounts = <String, AccountFollowLedger>{};
+    if (rawAccounts is Map) {
+      for (final entry in rawAccounts.entries) {
+        if (entry.value is Map) {
+          accounts[entry.key.toString()] = AccountFollowLedger.fromJson(
+            Map<String, dynamic>.from(entry.value as Map),
+          );
+        }
+      }
+    }
+    return FollowSyncLedger(
+      version: (json['version'] as num?)?.toInt() ?? 1,
+      accounts: accounts,
+    );
+  }
+}
+
+/// クロスデバイス同期設定。
+class FollowSyncSettings {
+  const FollowSyncSettings({
+    this.deviceId = '',
+    this.lanEnabled = true,
+    this.githubToken = '',
+    this.gistId = '',
+    this.lastSyncAt,
+    this.lastSyncStatus,
+  });
+
+  final String deviceId;
+  final bool lanEnabled;
+  final String githubToken;
+  final String gistId;
+  final int? lastSyncAt;
+  final String? lastSyncStatus;
+
+  FollowSyncSettings copyWith({
+    String? deviceId,
+    bool? lanEnabled,
+    String? githubToken,
+    String? gistId,
+    int? lastSyncAt,
+    String? lastSyncStatus,
+  }) {
+    return FollowSyncSettings(
+      deviceId: deviceId ?? this.deviceId,
+      lanEnabled: lanEnabled ?? this.lanEnabled,
+      githubToken: githubToken ?? this.githubToken,
+      gistId: gistId ?? this.gistId,
+      lastSyncAt: lastSyncAt ?? this.lastSyncAt,
+      lastSyncStatus: lastSyncStatus ?? this.lastSyncStatus,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'deviceId': deviceId,
+        'lanEnabled': lanEnabled,
+        'githubToken': githubToken,
+        'gistId': gistId,
+        if (lastSyncAt != null) 'lastSyncAt': lastSyncAt,
+        if (lastSyncStatus != null) 'lastSyncStatus': lastSyncStatus,
+      };
+
+  factory FollowSyncSettings.fromJson(Map<String, dynamic> json) {
+    return FollowSyncSettings(
+      deviceId: (json['deviceId'] as String?)?.trim() ?? '',
+      lanEnabled: json['lanEnabled'] as bool? ?? true,
+      githubToken: (json['githubToken'] as String?)?.trim() ?? '',
+      gistId: (json['gistId'] as String?)?.trim() ?? '',
+      lastSyncAt: (json['lastSyncAt'] as num?)?.toInt(),
+      lastSyncStatus: json['lastSyncStatus'] as String?,
+    );
+  }
+}
+
+/// レジャーの合算値・SNS実数を全インスタンスへ投影する。
+(List<ServiceInstance>, bool) projectLedgerToInstances(
+  List<ServiceInstance> instances,
+  FollowSyncLedger ledger,
+  String today,
+) {
+  var changed = false;
+  final out = instances.map((inst) {
+    final key = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
+    if (key == null) return inst;
+    final acc = ledger.accounts[key];
+    if (acc == null) return inst;
+    final (sumToday, sumTotal) = acc.effectiveCounts(today);
+    final nextFlwng = acc.snsFollowing ?? inst.snsFollowingCount;
+    final nextFlwrs = acc.snsFollowers ?? inst.snsFollowersCount;
+    if (inst.followCountToday != sumToday ||
+        inst.followCountTotal != sumTotal ||
+        inst.followCountDate != today ||
+        inst.snsFollowingCount != nextFlwng ||
+        inst.snsFollowersCount != nextFlwrs) {
+      changed = true;
+      return inst.copyWith(
+        followCountToday: sumToday,
+        followCountTotal: sumTotal,
+        followCountDate: today,
+        snsFollowingCount: nextFlwng,
+        snsFollowersCount: nextFlwrs,
+      );
+    }
+    return inst;
+  }).toList();
+  return (out, changed);
 }

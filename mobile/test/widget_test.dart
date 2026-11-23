@@ -6,6 +6,7 @@ import 'package:omni_sns_mobile/models/service_models.dart';
 import 'package:omni_sns_mobile/screens/catalog_sheet.dart';
 import 'package:omni_sns_mobile/screens/home_screen.dart';
 import 'package:omni_sns_mobile/services/app_store.dart';
+import 'package:omni_sns_mobile/services/follow_sync_service.dart';
 import 'package:omni_sns_mobile/services/omni_webview.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -153,7 +154,8 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 50));
 
-    // ヘッダーに再読み込みボタンと折り畳みボタンが表示される
+    // ヘッダーに Gmail ボタン・再読み込みボタン・折り畳みボタンが表示される
+    expect(find.byKey(const ValueKey('header-gmail-button')), findsOneWidget);
     final reloadBtn = find.byKey(const ValueKey('header-reload-button'));
     expect(reloadBtn, findsOneWidget);
     expect(find.byTooltip('再読み込み'), findsOneWidget);
@@ -174,10 +176,11 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 250));
 
-    // ヘッダーを折り畳んでも再読み込みボタン・展開ボタンが押せる
+    // ヘッダーを折り畳んでも Gmail・再読み込みボタン・展開ボタンが押せる
     await tester.tap(find.byKey(const ValueKey('header-collapse-button')));
     await tester.pump();
     expect(find.byKey(const ValueKey('collapsed-header-bar')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-gmail-button')), findsOneWidget);
     expect(find.byKey(const ValueKey('header-reload-button')), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('header-expand-button')));
     await tester.pump();
@@ -330,7 +333,8 @@ void main() {
         ),
       ),
     );
-    expect(find.text('＋ 別アカウント追加'), findsNothing);
+    expect(find.text('＋別垢'), findsNothing);
+    expect(find.text('Instagram DM'), findsNothing);
     expect(find.text('開く'), findsOneWidget);
 
     await tester.pumpWidget(
@@ -349,6 +353,96 @@ void main() {
         ),
       ),
     );
-    expect(find.text('＋ 別アカウント追加'), findsOneWidget);
+    expect(find.text('＋別垢'), findsOneWidget);
+    expect(find.text('Instagram DM'), findsNothing);
+  });
+
+  test('FollowSyncLedger CRDT merges PC and Android JSON cleanly and supports shared sync copy/paste', () {
+    const today = '2026-11-23';
+    // Rust 側から届く JSON 形式そのままを読み込めることを検証
+    final pcJson = jsonDecode('''
+    {
+      "version": 1,
+      "accounts": {
+        "instagram:darksan560": {
+          "date": "2026-11-23",
+          "resetEpoch": 0,
+          "totalResetEpoch": 0,
+          "devices": {
+            "win-aaaa": {
+              "today": 11,
+              "total": 35,
+              "todayEpoch": 0,
+              "totalEpoch": 0,
+              "updatedAt": 100
+            }
+          },
+          "snsFollowing": 180,
+          "snsFollowers": 420,
+          "snsUpdatedAt": 100
+        }
+      }
+    }
+    ''') as Map<String, dynamic>;
+
+    final pcLedger = FollowSyncLedger.fromJson(pcJson);
+    final androidLedger = FollowSyncLedger(
+      accounts: {
+        'instagram:darksan560': AccountFollowLedger(
+          date: today,
+          devices: {
+            'and-bbbb': DeviceFollowEntry(
+              today: 7,
+              total: 19,
+              todayEpoch: 0,
+              totalEpoch: 0,
+              updatedAt: 200,
+            ),
+          },
+          snsFollowing: 187,
+          snsFollowers: 425,
+          snsUpdatedAt: 200,
+        ),
+      },
+    );
+
+    expect(androidLedger.mergeFrom(pcLedger, today), isTrue);
+    expect(androidLedger.mergeFrom(pcLedger, today), isFalse);
+
+    final acc = androidLedger.accounts['instagram:darksan560']!;
+    expect(acc.effectiveCounts(today), (18, 54));
+    expect(acc.snsFollowing, 187);
+    expect(acc.snsFollowers, 425);
+    // 翌日ロールオーバー
+    expect(acc.effectiveCounts('2026-11-24'), (0, 54));
+
+    // インスタンスへの投影
+    const ig = ServiceInstance(
+      instanceId: 'svc-ig',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      category: 'major-sns',
+      url: 'https://www.instagram.com/direct/inbox/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 0,
+      detectedHandle: 'darksan560',
+    );
+    final (projected, changed) =
+        projectLedgerToInstances([ig], androidLedger, today);
+    expect(changed, isTrue);
+    expect(projected.first.followCountToday, 18);
+    expect(projected.first.followCountTotal, 54);
+    expect(projected.first.snsFollowingCount, 187);
+    expect(projected.first.snsFollowersCount, 425);
+
+    // PC ⇄ スマホ 設定コピー文字列の往復
+    final encoded = encodeSharedSyncConfig('ghp_testToken123', 'gist_abc456');
+    final decoded = parseSharedSyncConfig(encoded);
+    expect(decoded, isNotNull);
+    expect(decoded!.token, 'ghp_testToken123');
+    expect(decoded.gistId, 'gist_abc456');
+    expect(parseSharedSyncConfig('invalid'), isNull);
   });
 }

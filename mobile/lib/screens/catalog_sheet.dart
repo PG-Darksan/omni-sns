@@ -75,17 +75,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return nextDefaultAccountLabel(labels);
   }
 
-  String? _displayNoteForMobile(CatalogService svc) {
-    final note = svc.note?.trim();
-    if (note == null || note.isEmpty) return null;
-    if (note.contains('User-Agent') ||
-        note.contains('PCブラウザ') ||
-        note.contains('PC用')) {
-      return null;
-    }
-    return note;
-  }
-
   Future<void> _openDetailedAddDialog(CatalogService svc) async {
     final suggestedLabel = _nextAccountLabelFor(svc);
     final accountCtrl = TextEditingController(text: suggestedLabel);
@@ -316,185 +305,177 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         ),
                       )
                     : ListView.separated(
-                        padding: const EdgeInsets.all(12),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
                         itemCount: filtered.length,
-                        separatorBuilder: (_, _) => const SizedBox(height: 8),
+                        separatorBuilder: (_, _) => const SizedBox(height: 6),
                         itemBuilder: (context, index) {
                           final svc = filtered[index];
                           final existing = _existingFor(svc.id);
                           final count = existing.length;
                           final color = parseHexColor(svc.colorHex);
-                          final mobileNote = _displayNoteForMobile(svc);
                           final canAddAnother =
                               count == 0 || widget.multiProfileSupported;
 
                           return Card(
                             margin: EdgeInsets.zero,
                             child: Padding(
-                              padding: const EdgeInsets.all(12),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              child: Row(
                                 children: [
-                                  Row(
-                                    children: [
-                                      Container(
-                                        width: 38,
-                                        height: 38,
-                                        decoration: BoxDecoration(
-                                          color: color,
-                                          borderRadius:
-                                              BorderRadius.circular(10),
-                                        ),
-                                        alignment: Alignment.center,
-                                        child: Text(
-                                          svc.badge,
-                                          style: const TextStyle(
-                                            color: Colors.white,
-                                            fontWeight: FontWeight.bold,
-                                            fontSize: 13,
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 10),
-                                      Expanded(
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Row(
-                                              children: [
-                                                Flexible(
-                                                  child: Text(
-                                                    svc.name,
-                                                    style: const TextStyle(
-                                                      fontWeight:
-                                                          FontWeight.bold,
-                                                      fontSize: 15,
-                                                    ),
-                                                  ),
-                                                ),
-                                                if (count > 0) ...[
-                                                  const SizedBox(width: 6),
-                                                  Container(
-                                                    padding: const EdgeInsets
-                                                        .symmetric(
-                                                      horizontal: 6,
-                                                      vertical: 2,
-                                                    ),
-                                                    decoration: BoxDecoration(
-                                                      color: Colors.green
-                                                          .withValues(
-                                                              alpha: 0.2),
-                                                      borderRadius:
-                                                          BorderRadius.circular(
-                                                              99),
-                                                    ),
-                                                    child: Text(
-                                                      count == 1 ||
-                                                              !widget
-                                                                  .multiProfileSupported
-                                                          ? '追加済み'
-                                                          : '$count個追加済み',
-                                                      style: const TextStyle(
-                                                        color: Colors.green,
-                                                        fontSize: 10,
-                                                        fontWeight:
-                                                            FontWeight.bold,
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ],
-                                              ],
-                                            ),
-                                            Text(
-                                              svc.url,
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                              style: Theme.of(context)
-                                                  .textTheme
-                                                  .bodySmall,
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    svc.description,
-                                    style:
-                                        Theme.of(context).textTheme.bodySmall,
-                                  ),
-                                  if (mobileNote != null) ...[
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      '※ $mobileNote',
+                                  Container(
+                                    width: 30,
+                                    height: 30,
+                                    decoration: BoxDecoration(
+                                      color: color,
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    alignment: Alignment.center,
+                                    child: Text(
+                                      svc.badge,
                                       style: const TextStyle(
-                                        color: Colors.amber,
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
                                         fontSize: 11.5,
                                       ),
                                     ),
-                                  ],
-                                  const SizedBox(height: 10),
-                                  Row(
-                                    children: [
-                                      Expanded(
-                                        child: canAddAnother
-                                            ? FilledButton(
-                                                onPressed: () {
-                                                  if (svc.requiresCustomUrl) {
-                                                    _openDetailedAddDialog(svc);
-                                                    return;
-                                                  }
-                                                  final accLabel =
-                                                      _nextAccountLabelFor(svc);
-                                                  Navigator.of(context).pop(
-                                                    NewInstanceRequest(
-                                                      serviceId: svc.id,
-                                                      name: svc.name,
-                                                      accountLabel: accLabel,
-                                                      category: svc.category,
-                                                      url: svc.url,
-                                                      colorHex: svc.colorHex,
-                                                      badge: svc.badge,
-                                                    ),
-                                                  );
-                                                },
-                                                child: Text(
-                                                  count > 0
-                                                      ? '＋ 別アカウント追加'
-                                                      : '＋ 追加して開く',
-                                                ),
-                                              )
-                                            : FilledButton.tonal(
-                                                onPressed: () {
-                                                  Navigator.of(context).pop(
-                                                    NewInstanceRequest(
-                                                      serviceId: svc.id,
-                                                      name: svc.name,
-                                                      category: svc.category,
-                                                      url: svc.url,
-                                                      colorHex: svc.colorHex,
-                                                      badge: svc.badge,
-                                                      openExistingInstanceId:
-                                                          existing
-                                                              .first.instanceId,
-                                                    ),
-                                                  );
-                                                },
-                                                child: const Text('開く'),
-                                              ),
-                                      ),
-                                      if (canAddAnother) ...[
-                                        const SizedBox(width: 8),
-                                        OutlinedButton(
-                                          onPressed: () =>
-                                              _openDetailedAddDialog(svc),
-                                          child: const Text('詳細'),
-                                        ),
-                                      ],
-                                    ],
                                   ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Row(
+                                      children: [
+                                        Flexible(
+                                          child: Text(
+                                            svc.name,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 14,
+                                            ),
+                                          ),
+                                        ),
+                                        if (count > 0) ...[
+                                          const SizedBox(width: 6),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 6,
+                                              vertical: 1.5,
+                                            ),
+                                            decoration: BoxDecoration(
+                                              color: Colors.green
+                                                  .withValues(alpha: 0.2),
+                                              borderRadius:
+                                                  BorderRadius.circular(99),
+                                            ),
+                                            child: Text(
+                                              count == 1 ||
+                                                      !widget
+                                                          .multiProfileSupported
+                                                  ? '済'
+                                                  : '$count垢',
+                                              style: const TextStyle(
+                                                color: Colors.green,
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  canAddAnother
+                                      ? FilledButton(
+                                          style: FilledButton.styleFrom(
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 10,
+                                              vertical: 6,
+                                            ),
+                                            minimumSize: const Size(0, 32),
+                                            tapTargetSize: MaterialTapTargetSize
+                                                .shrinkWrap,
+                                          ),
+                                          onPressed: () {
+                                            if (svc.requiresCustomUrl) {
+                                              _openDetailedAddDialog(svc);
+                                              return;
+                                            }
+                                            final accLabel =
+                                                _nextAccountLabelFor(svc);
+                                            Navigator.of(context).pop(
+                                              NewInstanceRequest(
+                                                serviceId: svc.id,
+                                                name: svc.name,
+                                                accountLabel: accLabel,
+                                                category: svc.category,
+                                                url: svc.url,
+                                                colorHex: svc.colorHex,
+                                                badge: svc.badge,
+                                              ),
+                                            );
+                                          },
+                                          child: Text(
+                                            count > 0 ? '＋別垢' : '＋追加',
+                                            style:
+                                                const TextStyle(fontSize: 12),
+                                          ),
+                                        )
+                                      : FilledButton.tonal(
+                                          style: FilledButton.styleFrom(
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 12,
+                                              vertical: 6,
+                                            ),
+                                            minimumSize: const Size(0, 32),
+                                            tapTargetSize: MaterialTapTargetSize
+                                                .shrinkWrap,
+                                          ),
+                                          onPressed: () {
+                                            Navigator.of(context).pop(
+                                              NewInstanceRequest(
+                                                serviceId: svc.id,
+                                                name: svc.name,
+                                                category: svc.category,
+                                                url: svc.url,
+                                                colorHex: svc.colorHex,
+                                                badge: svc.badge,
+                                                openExistingInstanceId: existing
+                                                    .first.instanceId,
+                                              ),
+                                            );
+                                          },
+                                          child: const Text(
+                                            '開く',
+                                            style: TextStyle(fontSize: 12),
+                                          ),
+                                        ),
+                                  if (canAddAnother)
+                                    IconButton(
+                                      icon: const Icon(
+                                        Icons.tune_rounded,
+                                        size: 18,
+                                      ),
+                                      visualDensity: VisualDensity.compact,
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(
+                                        minWidth: 32,
+                                        minHeight: 32,
+                                      ),
+                                      tooltip: '詳細設定',
+                                      onPressed: () =>
+                                          _openDetailedAddDialog(svc),
+                                    ),
                                 ],
                               ),
                             ),

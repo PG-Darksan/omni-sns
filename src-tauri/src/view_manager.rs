@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tauri::webview::{NewWindowResponse, PermissionKind, PermissionResponse, WebviewBuilder};
 use tauri::{
@@ -10,6 +11,9 @@ use tauri::{
     WebviewWindowBuilder,
 };
 
+use crate::follow_sync::{
+    FollowSyncLedger, FollowSyncSettings, LanSyncHandle, UpdateFollowSyncPatch,
+};
 use crate::gesture::{step_tab_index, GestureSettings};
 use crate::models::{
     BrowserTabInfo, SavedSubTab, ServiceInstance, TabRuntimeState, UpdateSettingsPatch,
@@ -19,6 +23,15 @@ use crate::url_utils::{
     build_user_agent, is_auth_popup_for_site, is_auth_popup_url, is_http_url, is_same_site_url,
     normalize_service_url, parse_unread_count_from_title, service_group_key,
 };
+
+/// 同一プロファイルを共有する全タブ WebView2 へ統一指定する高速起動フラグ。
+/// バックグラウンド・オフスクリーン生成時の Chromium スロットリングとウィンドウ遮蔽判定を抑止し、
+/// Instagram / Threads 等の重い SPA が別タブで瞬時にハイドレーション完了するようにする。
+#[cfg(windows)]
+const WEBVIEW2_FAST_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
+
+const BG_WARM_MAX_SECS: u64 = 8;
+const BG_WARM_POST_LOAD_MS: u64 = 2500;
 
 pub const ACCOUNTBAR_HEIGHT: f64 = 40.0;
 pub const TOOLBAR_HEIGHT: f64 = 44.0;
@@ -70,6 +83,7 @@ pub struct BrowserTabEntry {
     pub instance_id: String,
     pub webview_label: Option<String>,
     pub creation_epoch: u64,
+    pub warming_until: Option<Instant>,
     pub current_url: String,
     pub title: String,
     pub favicon_url: Option<String>,
@@ -88,6 +102,7 @@ impl BrowserTabEntry {
             instance_id: inst.instance_id.clone(),
             webview_label: None,
             creation_epoch: 0,
+            warming_until: None,
             current_url: url,
             title,
             favicon_url: None,
@@ -231,6 +246,8 @@ pub struct AppStateInner {
     pub profiles_root: PathBuf,
     pub chrome_version: String,
     pub main_hwnd: isize,
+    pub lan_sync: Option<LanSyncHandle>,
+    pub cloud_sync_gen: Arc<AtomicU64>,
     #[cfg(windows)]
     pub gesture_host: Option<crate::gesture_win::GestureWinHost>,
 }
@@ -275,6 +292,8 @@ impl SharedState {
                 profiles_root,
                 chrome_version,
                 main_hwnd: 0,
+                lan_sync: None,
+                cloud_sync_gen: Arc::new(AtomicU64::new(0)),
                 #[cfg(windows)]
                 gesture_host: None,
             })),
@@ -628,8 +647,9 @@ pub fn update_bounds_from_window(app: &AppHandle, shared: &SharedState) {
 }
 
 pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
-    let (target_label, bounds, tracked_labels, creating_labels, should_focus_shell) = {
-        let guard = shared.inner.lock().unwrap();
+    let (target_label, bounds, tracked_labels, creating_labels, warming_labels, should_focus_shell) = {
+        let mut guard = shared.inner.lock().unwrap();
+        let now = Instant::now();
         let active_tab = guard
             .active_instance_id
             .as_deref()
@@ -654,21 +674,42 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
             active_tab.and_then(|t| t.webview_label.clone())
         };
 
+        let allow_warming = !guard.overlay_visible;
         let mut tracked = HashSet::new();
-        for svc in guard.services.values() {
-            for tab in &svc.tabs {
+        let mut warming = HashSet::new();
+        for svc in guard.services.values_mut() {
+            for tab in &mut svc.tabs {
                 if let Some(ref l) = tab.webview_label {
                     tracked.insert(l.clone());
+                    if target.as_deref() == Some(l.as_str()) {
+                        tab.warming_until = None;
+                    } else if let Some(until) = tab.warming_until {
+                        if until > now {
+                            if allow_warming {
+                                warming.insert(l.clone());
+                            }
+                        } else {
+                            tab.warming_until = None;
+                        }
+                    }
                 }
             }
         }
         let creating: HashSet<String> = guard.creating_tabs.values().cloned().collect();
-        (target, guard.bounds, tracked, creating, guard.overlay_visible)
+        (
+            target,
+            guard.bounds,
+            tracked,
+            creating,
+            warming,
+            guard.overlay_visible,
+        )
     };
 
     // メインウィンドウ配下の全子WebViewを実体ベースで走査し、
     // 1) 未追跡かつ生成中でもない孤立した子WebView（ゾンビ）は即座に非表示＆破棄する
-    // 2) 表示対象以外の全SNS子WebViewを確実に非表示にする（モーダル重なり・残留を根絶）
+    // 2) ウォームアップ中のバックグラウンドタブは画面外(-10000,-10000)で描画継続させ、SPAを最速読込する
+    // 3) それ以外の非アクティブ／モーダル時の子WebViewは確実に非表示にする（重なり・残留を根絶）
     for (label, wv) in app.webviews() {
         if label == "shell" {
             continue;
@@ -681,7 +722,14 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
             continue;
         }
         if target_label.as_deref() != Some(label.as_str()) {
-            let _ = wv.hide();
+            if warming_labels.contains(&label) {
+                let _ = wv.set_bounds(Rect {
+                    position: LogicalPosition::new(-10000.0, -10000.0).into(),
+                    size: LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0)).into(),
+                });
+            } else {
+                let _ = wv.hide();
+            }
         }
     }
 
@@ -900,6 +948,8 @@ pub fn create_subtab_with_options(
         (inst, tid, target_url, total_tabs)
     };
 
+    // WebView2 生成開始前にタブ一覧を先行反映し、タブチップを 0ms で即座に表示する
+    emit_state_updated(app, shared);
     create_tab_webview(app, shared, inst, tab_id.clone(), target_url);
     update_bounds_from_window(app, shared);
     emit_state_updated(app, shared);
@@ -1508,13 +1558,24 @@ fn create_tab_webview(
     let name_for_popup = instance_name.clone();
     let fallback_url_for_popup = instance_url.clone();
 
-    let builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
+    #[allow(unused_mut)]
+    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
         .data_directory(profile_dir)
         .user_agent(&ua)
         .disable_drag_drop_handler()
         .enable_clipboard_access()
         .zoom_hotkeys_enabled(true)
-        .focused(false)
+        .focused(false);
+
+    #[cfg(windows)]
+    {
+        builder = builder
+            .additional_browser_args(WEBVIEW2_FAST_BROWSER_ARGS)
+            .initialization_script(crate::platform_win::FOLLOW_TRACKER_JS)
+            .initialization_script(crate::platform_win::PROFILE_STATS_JS);
+    }
+
+    let builder = builder
         .on_permission_request(|_wv, kind| match kind {
             PermissionKind::Notifications
             | PermissionKind::Camera
@@ -1708,14 +1769,18 @@ fn create_tab_webview(
         return;
     };
 
-    // 生成直後は一旦非表示にし、最新状態を再検証したうえで refresh_attached_view が一元的に表示制御する
-    let _ = webview.hide();
-
-    let committed = {
+    let (committed, started_warming, should_hide_immediately) = {
         let mut guard = shared.inner.lock().unwrap();
         guard.creating_tabs.remove(&tab_id);
+        let is_active_now = guard.active_instance_id.as_deref() == Some(instance_id.as_str())
+            && guard
+                .services
+                .get(&instance_id)
+                .map(|s| s.active_tab_id == tab_id)
+                .unwrap_or(false);
+        let overlay = guard.overlay_visible;
         if guard.is_quitting {
-            false
+            (false, false, true)
         } else if let Some(tab) = guard
             .services
             .get_mut(&instance_id)
@@ -1726,12 +1791,21 @@ fn create_tab_webview(
                 tab.is_sleeping = false;
                 tab.is_loading = true;
                 tab.load_error = None;
-                true
+                let warm = !overlay && !is_active_now;
+                tab.warming_until = if warm {
+                    Some(Instant::now() + Duration::from_secs(BG_WARM_MAX_SECS))
+                } else {
+                    None
+                };
+                // モーダル表示中のみ即座に非表示化。アクティブタブや画面外ウォーム中の
+                // バックグラウンドタブは hide() せず描画優先度を維持する。
+                let hide_now = overlay || (!is_active_now && !warm);
+                (true, warm, hide_now)
             } else {
-                false
+                (false, false, true)
             }
         } else {
-            false
+            (false, false, true)
         }
     };
 
@@ -1742,9 +1816,23 @@ fn create_tab_webview(
         return;
     }
 
+    if should_hide_immediately {
+        let _ = webview.hide();
+    }
+
     #[cfg(windows)]
     {
         attach_windows_handlers(app, shared, &webview, &instance, &tab_id, &label, &ua);
+    }
+
+    if started_warming {
+        // 最大ウォーム時間経過後に自動で非表示化してメモリ・GPUを節約
+        let app_warm = app.clone();
+        let shared_warm = shared.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(BG_WARM_MAX_SECS * 1000 + 300));
+            refresh_attached_view(&app_warm, &shared_warm);
+        });
     }
 
     emit_runtime_updated(app, shared, &instance_id);
@@ -1810,6 +1898,12 @@ fn attach_windows_handlers(
     let tid_follow = tid.clone();
     let label_follow = wv_label.clone();
 
+    let app_ident = app.clone();
+    let shared_ident = shared.clone();
+    let id_ident = instance_id.clone();
+    let tid_ident = tid.clone();
+    let label_ident = wv_label.clone();
+
     let callbacks = crate::platform_win::TabWebviewCallbacks {
         on_navigation_starting: Arc::new(move || {
             let (changed, was_error) = {
@@ -1840,9 +1934,10 @@ fn attach_windows_handlers(
             }
         }),
         on_navigation_completed: Arc::new(move |ok, err_msg, url, can_back, can_fwd| {
-            let changed = {
+            let (changed, schedule_warm_end) = {
                 let mut guard = shared_done.inner.lock().unwrap();
                 let mut multi = false;
+                let mut warm_shorten = false;
                 let updated = if let Some(svc) = guard.services.get_mut(&id_done) {
                     multi = svc.tabs.len() >= 2;
                     if let Some(tab) = svc.tab_mut(&tid_done) {
@@ -1857,6 +1952,12 @@ fn attach_windows_handlers(
                             tab.can_go_back = can_back;
                             tab.can_go_forward = can_fwd;
                             tab.load_error = if ok { None } else { err_msg };
+                            if tab.warming_until.is_some() {
+                                tab.warming_until = Some(
+                                    Instant::now() + Duration::from_millis(BG_WARM_POST_LOAD_MS),
+                                );
+                                warm_shorten = true;
+                            }
                             true
                         } else {
                             false
@@ -1870,8 +1971,16 @@ fn attach_windows_handlers(
                 if updated && multi {
                     persist_service_tabs(&mut guard, &id_done);
                 }
-                updated
+                (updated, warm_shorten)
             };
+            if schedule_warm_end {
+                let app_end = app_done.clone();
+                let shared_end = shared_done.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(BG_WARM_POST_LOAD_MS + 150));
+                    refresh_attached_view(&app_end, &shared_end);
+                });
+            }
             if changed && !ok {
                 refresh_attached_view(&app_done, &shared_done);
             }
@@ -2009,6 +2118,27 @@ fn attach_windows_handlers(
             };
             if alive {
                 adjust_follow_count(&app_follow, &shared_follow, &id_follow, 1);
+            }
+        }),
+        on_account_identity: Arc::new(move |handle, following, followers| {
+            let alive = {
+                let guard = shared_ident.inner.lock().unwrap();
+                guard
+                    .services
+                    .get(&id_ident)
+                    .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_ident))
+                    .map(|t| t.webview_label.as_deref() == Some(label_ident.as_str()))
+                    .unwrap_or(false)
+            };
+            if alive {
+                handle_account_identity(
+                    &app_ident,
+                    &shared_ident,
+                    &id_ident,
+                    &handle,
+                    following,
+                    followers,
+                );
             }
         }),
     };
@@ -2587,6 +2717,7 @@ pub fn adjust_follow_count(
     };
     if updated.is_some() {
         emit_state_updated(app, shared);
+        notify_follow_ledger_changed(app, shared);
     }
     updated
 }
@@ -2603,6 +2734,245 @@ pub fn reset_follow_count(
     };
     if updated.is_some() {
         emit_state_updated(app, shared);
+        notify_follow_ledger_changed(app, shared);
     }
     updated
+}
+
+pub fn handle_account_identity(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    handle: &str,
+    following: Option<u32>,
+    followers: Option<u32>,
+) {
+    let (ui_changed, ledger_changed) = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard
+            .store
+            .record_account_identity(instance_id, handle, following, followers)
+    };
+    if ui_changed {
+        emit_state_updated(app, shared);
+    }
+    if ledger_changed {
+        notify_follow_ledger_changed(app, shared);
+    }
+}
+
+pub fn set_instance_handle(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    raw_handle: &str,
+) -> Result<ServiceInstance, String> {
+    let (updated, ledger_changed) = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.store.set_instance_handle(instance_id, raw_handle)?
+    };
+    emit_state_updated(app, shared);
+    if ledger_changed {
+        notify_follow_ledger_changed(app, shared);
+    }
+    Ok(updated)
+}
+
+pub fn apply_remote_follow_ledger(
+    app: &AppHandle,
+    shared: &SharedState,
+    remote: FollowSyncLedger,
+) -> (String, FollowSyncLedger, bool) {
+    let today = crate::store::local_today_ymd();
+    let (device_id, current_ledger, changed, should_reply) = {
+        let mut guard = shared.inner.lock().unwrap();
+        let changed = guard.store.merge_follow_ledger(&remote);
+        let ledger = guard.store.get_follow_ledger();
+        let device_id = guard.store.get_follow_sync_settings().device_id;
+        let should_reply = ledger.has_newer_data_than(&remote, &today);
+        if changed {
+            let now = crate::follow_sync::now_unix_secs();
+            guard
+                .store
+                .set_follow_sync_status(None, "LAN同期完了".to_string(), Some(now));
+        }
+        (device_id, ledger, changed, should_reply)
+    };
+    if changed {
+        emit_state_updated(app, shared);
+    }
+    (device_id, current_ledger, should_reply)
+}
+
+pub fn notify_follow_ledger_changed(app: &AppHandle, shared: &SharedState) {
+    let (lan_enabled, device_id, token, ledger, gen_arc) = {
+        let guard = shared.inner.lock().unwrap();
+        let fs = guard.store.get_follow_sync_settings();
+        (
+            fs.lan_enabled,
+            fs.device_id,
+            fs.github_token,
+            guard.store.get_follow_ledger(),
+            guard.cloud_sync_gen.clone(),
+        )
+    };
+
+    if lan_enabled && !device_id.is_empty() && !ledger.accounts.is_empty() {
+        std::thread::spawn(move || {
+            crate::follow_sync::broadcast_lan_ledger(&device_id, &ledger);
+        });
+    }
+
+    if !token.trim().is_empty() {
+        let my_gen = gen_arc.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        let app_bg = app.clone();
+        let shared_bg = shared.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2000));
+            if gen_arc.load(Ordering::SeqCst) == my_gen {
+                let _ = sync_cloud_gist_once_blocking(&app_bg, &shared_bg);
+            }
+        });
+    }
+}
+
+pub fn sync_cloud_gist_once_blocking(
+    app: &AppHandle,
+    shared: &SharedState,
+) -> Result<FollowSyncSettings, String> {
+    let (token, gist_id, local_ledger, lan_enabled, device_id) = {
+        let guard = shared.inner.lock().unwrap();
+        let fs = guard.store.get_follow_sync_settings();
+        (
+            fs.github_token,
+            fs.gist_id,
+            guard.store.get_follow_ledger(),
+            fs.lan_enabled,
+            fs.device_id,
+        )
+    };
+
+    if token.trim().is_empty() {
+        return Err("GitHub Personal Access Token（gist権限）が未設定です".to_string());
+    }
+
+    let today = crate::store::local_today_ymd();
+    match crate::follow_sync::sync_with_github_gist(&token, &gist_id, &local_ledger, &today) {
+        Ok((resolved_gist_id, merged_ledger, _remote_changed)) => {
+            let now = crate::follow_sync::now_unix_secs();
+            let (updated_settings, final_ledger) = {
+                let mut guard = shared.inner.lock().unwrap();
+                let _ = guard.store.merge_follow_ledger(&merged_ledger);
+                let st = guard.store.set_follow_sync_status(
+                    Some(resolved_gist_id),
+                    "クラウド同期完了".to_string(),
+                    Some(now),
+                );
+                let ledger = guard.store.get_follow_ledger();
+                (st, ledger)
+            };
+            if lan_enabled && !device_id.is_empty() && !final_ledger.accounts.is_empty() {
+                crate::follow_sync::broadcast_lan_ledger(&device_id, &final_ledger);
+            }
+            emit_state_updated(app, shared);
+            Ok(updated_settings)
+        }
+        Err(err) => {
+            {
+                let mut guard = shared.inner.lock().unwrap();
+                guard
+                    .store
+                    .set_follow_sync_status(None, format!("同期エラー: {err}"), None);
+            }
+            emit_state_updated(app, shared);
+            Err(err)
+        }
+    }
+}
+
+pub fn update_follow_sync_settings(
+    app: &AppHandle,
+    shared: &SharedState,
+    patch: UpdateFollowSyncPatch,
+) -> FollowSyncSettings {
+    let updated = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.store.update_follow_sync_settings(patch)
+    };
+    emit_state_updated(app, shared);
+    if updated.lan_enabled {
+        let (dev_id, ledger) = {
+            let guard = shared.inner.lock().unwrap();
+            (
+                guard.store.get_follow_sync_settings().device_id,
+                guard.store.get_follow_ledger(),
+            )
+        };
+        if !dev_id.is_empty() && !ledger.accounts.is_empty() {
+            std::thread::spawn(move || {
+                crate::follow_sync::broadcast_lan_ledger(&dev_id, &ledger);
+            });
+        }
+    }
+    updated
+}
+
+pub async fn trigger_follow_sync_now(
+    app: &AppHandle,
+    shared: &SharedState,
+) -> Result<FollowSyncSettings, String> {
+    let (lan_enabled, device_id, token, ledger) = {
+        let guard = shared.inner.lock().unwrap();
+        let fs = guard.store.get_follow_sync_settings();
+        (
+            fs.lan_enabled,
+            fs.device_id,
+            fs.github_token,
+            guard.store.get_follow_ledger(),
+        )
+    };
+
+    if lan_enabled && !device_id.is_empty() && !ledger.accounts.is_empty() {
+        let dev_bg = device_id.clone();
+        let led_bg = ledger.clone();
+        std::thread::spawn(move || {
+            crate::follow_sync::broadcast_lan_ledger(&dev_bg, &led_bg);
+        });
+    }
+
+    if !token.trim().is_empty() {
+        let app_bg = app.clone();
+        let shared_bg = shared.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            sync_cloud_gist_once_blocking(&app_bg, &shared_bg)
+        })
+        .await
+        .map_err(|e| format!("同期タスクの実行に失敗しました: {e}"))?;
+    }
+
+    if lan_enabled {
+        let now = crate::follow_sync::now_unix_secs();
+        let updated = {
+            let mut guard = shared.inner.lock().unwrap();
+            guard.store.set_follow_sync_status(
+                None,
+                "同一Wi-Fi(LAN)へ送信しました".to_string(),
+                Some(now),
+            )
+        };
+        emit_state_updated(app, shared);
+        Ok(updated)
+    } else {
+        Err("LAN同期またはGitHub Gistクラウド同期を有効にしてください".to_string())
+    }
+}
+
+pub fn shutdown_lan_sync(shared: &SharedState) {
+    let handle = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.lan_sync.take()
+    };
+    if let Some(h) = handle {
+        h.shutdown();
+    }
 }

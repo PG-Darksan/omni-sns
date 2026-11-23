@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../models/service_models.dart';
 import '../services/app_store.dart';
+import '../services/follow_sync_service.dart';
 import '../services/omni_webview.dart';
 import 'catalog_sheet.dart';
 import 'settings_sheet.dart';
@@ -47,6 +49,11 @@ class _HomeScreenState extends State<HomeScreen> {
   List<CatalogService> _catalog = const [];
   List<ServiceInstance> _instances = [];
   AppSettings _settings = const AppSettings();
+  FollowSyncSettings _followSyncSettings = const FollowSyncSettings();
+  FollowSyncLedger _followLedger = FollowSyncLedger();
+  final FollowSyncService _followSyncService = FollowSyncService();
+  Timer? _cloudSyncDebounce;
+  Timer? _cloudSyncPeriodic;
 
   final Map<String, OmniWebViewController> _controllers = {};
   final Map<String, TabRuntimeState> _runtimeMap = {};
@@ -60,6 +67,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _cloudSyncDebounce?.cancel();
+    _cloudSyncPeriodic?.cancel();
+    _followSyncService.dispose();
     for (final ctrl in _controllers.values) {
       ctrl.dispose();
     }
@@ -69,8 +79,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _bootstrap() async {
     final catalogData = await widget.store.loadCatalog();
-    final (settings, instances) =
+    final (settings, loadedInstances) =
         await widget.store.loadState(catalogData.services);
+    final (followSyncSettings, followLedger) =
+        await widget.store.loadFollowSyncState();
+    final today = formatLocalYmd(DateTime.now());
+    final (instances, _) =
+        projectLedgerToInstances(loadedInstances, followLedger, today);
     final multiProfile = await OmniWebViewManager.isMultiProfileSupported();
 
     for (final inst in instances) {
@@ -87,12 +102,15 @@ class _HomeScreenState extends State<HomeScreen> {
       _catalog = catalogData.services;
       _settings = settings;
       _instances = instances;
+      _followSyncSettings = followSyncSettings;
+      _followLedger = followLedger;
       _multiProfileSupported = multiProfile;
       _initialized = true;
     });
 
     widget.onThemeChanged(settings.isDarkMode);
     _ensureSafeActiveAndLoad();
+    _startFollowSyncEngine();
   }
 
   List<ServiceInstance> get _visibleInstances => _instances;
@@ -291,6 +309,14 @@ class _HomeScreenState extends State<HomeScreen> {
       onFollowDetected: (_) {
         _adjustFollowCount(instance.instanceId, 1);
       },
+      onAccountIdentity: (_, handle, following, followers) {
+        _handleAccountIdentity(
+          instance.instanceId,
+          handle,
+          following: following,
+          followers: followers,
+        );
+      },
     );
 
     _controllers[instance.instanceId] = controller;
@@ -373,9 +399,321 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _startFollowSyncEngine() {
+    unawaited(
+      _followSyncService.startLanListener(
+        getState: () => (
+          enabled: _followSyncSettings.lanEnabled,
+          deviceId: _followSyncSettings.deviceId,
+          ledger: _followLedger.clone(),
+        ),
+        onRemoteLedger: (remote) {
+          final today = formatLocalYmd(DateTime.now());
+          final ledgerChanged = _followLedger.mergeFrom(remote, today);
+          final (projected, uiChanged) =
+              projectLedgerToInstances(_instances, _followLedger, today);
+          final shouldReply = _followLedger.hasNewerDataThan(remote, today);
+          if (ledgerChanged || uiChanged) {
+            if (mounted) {
+              setState(() {
+                _instances = projected;
+                _followSyncSettings = _followSyncSettings.copyWith(
+                  lastSyncAt: nowUnixSecs(),
+                  lastSyncStatus: 'LAN同期完了',
+                );
+              });
+            }
+            unawaited(_persistAllWithFollowSync());
+          }
+          return (
+            deviceId: _followSyncSettings.deviceId,
+            ledger: _followLedger.clone(),
+            shouldReply: shouldReply,
+          );
+        },
+      ),
+    );
+
+    _cloudSyncPeriodic?.cancel();
+    _cloudSyncPeriodic = Timer.periodic(const Duration(seconds: 60), (_) {
+      if (!mounted) return;
+      if (_followSyncSettings.githubToken.trim().isNotEmpty) {
+        unawaited(_syncFollowCloudOnce(silent: true));
+      }
+    });
+
+    if (_followSyncSettings.githubToken.trim().isNotEmpty) {
+      unawaited(_syncFollowCloudOnce(silent: true));
+    }
+  }
+
+  Future<void> _persistAllWithFollowSync() async {
+    await widget.store.saveState(_settings, _instances);
+    await widget.store.saveFollowSyncState(_followSyncSettings, _followLedger);
+  }
+
+  void _notifyFollowLedgerChanged() {
+    if (_followSyncSettings.lanEnabled &&
+        _followSyncSettings.deviceId.isNotEmpty &&
+        _followLedger.accounts.isNotEmpty) {
+      unawaited(
+        _followSyncService.broadcastLan(
+          _followSyncSettings.deviceId,
+          _followLedger.clone(),
+        ),
+      );
+    }
+    if (_followSyncSettings.githubToken.trim().isNotEmpty) {
+      _cloudSyncDebounce?.cancel();
+      _cloudSyncDebounce = Timer(const Duration(seconds: 2), () {
+        if (mounted) {
+          unawaited(_syncFollowCloudOnce(silent: true));
+        }
+      });
+    }
+  }
+
+  Future<String> _syncFollowCloudOnce({bool silent = false}) async {
+    final token = _followSyncSettings.githubToken.trim();
+    if (token.isEmpty) {
+      if (_followSyncSettings.lanEnabled) {
+        await _followSyncService.broadcastLan(
+          _followSyncSettings.deviceId,
+          _followLedger.clone(),
+        );
+        const msg = '同一Wi-Fi(LAN)へ送信しました';
+        if (mounted) {
+          setState(() {
+            _followSyncSettings = _followSyncSettings.copyWith(
+              lastSyncAt: nowUnixSecs(),
+              lastSyncStatus: msg,
+            );
+          });
+        }
+        await widget.store
+            .saveFollowSyncState(_followSyncSettings, _followLedger);
+        return msg;
+      }
+      throw Exception('LAN同期またはGitHub Gistクラウド同期を有効にしてください');
+    }
+
+    final today = formatLocalYmd(DateTime.now());
+    try {
+      final res = await FollowSyncService.syncWithGitHubGist(
+        token: token,
+        gistId: _followSyncSettings.gistId,
+        localLedger: _followLedger,
+        today: today,
+      );
+      _followLedger.mergeFrom(res.mergedLedger, today);
+      final (projected, _) =
+          projectLedgerToInstances(_instances, _followLedger, today);
+      if (mounted) {
+        setState(() {
+          _instances = projected;
+          _followSyncSettings = _followSyncSettings.copyWith(
+            gistId: res.gistId,
+            lastSyncAt: nowUnixSecs(),
+            lastSyncStatus: 'クラウド同期完了',
+          );
+        });
+      }
+      await _persistAllWithFollowSync();
+      if (_followSyncSettings.lanEnabled) {
+        unawaited(
+          _followSyncService.broadcastLan(
+            _followSyncSettings.deviceId,
+            _followLedger.clone(),
+          ),
+        );
+      }
+      return 'クラウド同期完了';
+    } catch (e) {
+      final errText = e.toString().replaceFirst('Exception: ', '');
+      if (mounted) {
+        setState(() {
+          _followSyncSettings = _followSyncSettings.copyWith(
+            lastSyncStatus: '同期エラー: $errText',
+          );
+        });
+      }
+      await widget.store
+          .saveFollowSyncState(_followSyncSettings, _followLedger);
+      if (!silent) rethrow;
+      return '同期エラー: $errText';
+    }
+  }
+
+  Future<void> _handleAccountIdentity(
+    String instanceId,
+    String rawHandle, {
+    int? following,
+    int? followers,
+  }) async {
+    final norm = normalizeAccountHandle(rawHandle);
+    if (norm == null) return;
+    final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
+    if (idx == -1) return;
+
+    final today = formatLocalYmd(DateTime.now());
+    final inst = _instances[idx];
+    final prevHandle = inst.detectedHandle;
+    final prevToday = inst.effectiveFollowCountToday();
+    final prevTotal = inst.followCountTotal;
+
+    var uiChanged = false;
+    var ledgerChanged = false;
+
+    var nextInst = inst;
+    if (prevHandle != norm) {
+      nextInst = nextInst.copyWith(detectedHandle: norm);
+      uiChanged = true;
+    }
+    if (following != null && nextInst.snsFollowingCount != following) {
+      nextInst = nextInst.copyWith(snsFollowingCount: following);
+      uiChanged = true;
+    }
+    if (followers != null && nextInst.snsFollowersCount != followers) {
+      nextInst = nextInst.copyWith(snsFollowersCount: followers);
+      uiChanged = true;
+    }
+
+    final key = makeAccountSyncKey(inst.serviceId, norm);
+    if (key != null) {
+      final now = nowUnixSecs();
+      final existed = _followLedger.accounts.containsKey(key);
+      final acc = _followLedger.accounts.putIfAbsent(
+        key,
+        () => AccountFollowLedger(date: today),
+      );
+      acc.rollDate(today);
+      if (!existed) ledgerChanged = true;
+
+      final devId = _followSyncSettings.deviceId;
+      if (prevHandle == null &&
+          (prevToday > 0 || prevTotal > 0) &&
+          devId.isNotEmpty &&
+          !acc.devices.containsKey(devId)) {
+        acc.devices[devId] = DeviceFollowEntry(
+          today: prevToday,
+          total: prevTotal,
+          todayEpoch: acc.resetEpoch,
+          totalEpoch: acc.totalResetEpoch,
+          updatedAt: now,
+        );
+        ledgerChanged = true;
+      }
+
+      final snsDiff = (following != null && acc.snsFollowing != following) ||
+          (followers != null && acc.snsFollowers != followers);
+      if (snsDiff) {
+        if (following != null) acc.snsFollowing = following;
+        if (followers != null) acc.snsFollowers = followers;
+        acc.snsUpdatedAt = max(now, acc.snsUpdatedAt + 1);
+        ledgerChanged = true;
+      }
+    }
+
+    final updatedList = List<ServiceInstance>.from(_instances);
+    updatedList[idx] = nextInst;
+    final (projected, projChanged) =
+        projectLedgerToInstances(updatedList, _followLedger, today);
+
+    if (uiChanged || projChanged || ledgerChanged) {
+      if (mounted) {
+        setState(() {
+          _instances = projected;
+        });
+      }
+      await _persistAllWithFollowSync();
+      if (ledgerChanged) {
+        _notifyFollowLedgerChanged();
+      }
+    }
+  }
+
+  Future<String?> _setInstanceHandleManual(
+    String instanceId,
+    String rawHandle,
+  ) async {
+    final trimmed = rawHandle.trim();
+    final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
+    if (idx == -1) return '対象アカウントが見つかりません';
+    if (trimmed.isEmpty) {
+      setState(() {
+        _instances[idx] = _instances[idx].copyWith(clearDetectedHandle: true);
+      });
+      await _persist();
+      return null;
+    }
+    final norm = normalizeAccountHandle(trimmed);
+    if (norm == null) {
+      return 'アカウントIDは半角英数字・.・_・- で入力してください';
+    }
+    await _handleAccountIdentity(instanceId, norm);
+    return null;
+  }
+
   Future<void> _adjustFollowCount(String instanceId, int delta) async {
     final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
     if (idx == -1) return;
+    final today = formatLocalYmd(DateTime.now());
+    final inst = _instances[idx];
+    final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
+
+    if (syncKey != null && _followSyncSettings.deviceId.isNotEmpty) {
+      final devId = _followSyncSettings.deviceId;
+      final now = nowUnixSecs();
+      final prevToday = inst.effectiveFollowCountToday();
+      final prevTotal = inst.followCountTotal;
+
+      final acc = _followLedger.accounts.putIfAbsent(
+        syncKey,
+        () => AccountFollowLedger(date: today),
+      );
+      acc.rollDate(today);
+
+      if (!acc.devices.containsKey(devId)) {
+        final seed = acc.devices.isEmpty && (prevToday > 0 || prevTotal > 0);
+        acc.devices[devId] = DeviceFollowEntry(
+          today: seed ? prevToday : 0,
+          total: seed ? prevTotal : 0,
+          todayEpoch: acc.resetEpoch,
+          totalEpoch: acc.totalResetEpoch,
+          updatedAt: now,
+        );
+      }
+
+      final (curToday, curTotal) = acc.effectiveCounts(today);
+      final entry = acc.devices[devId]!;
+      if (entry.todayEpoch < acc.resetEpoch) {
+        entry.today = 0;
+        entry.todayEpoch = acc.resetEpoch;
+      }
+      if (entry.totalEpoch < acc.totalResetEpoch) {
+        entry.total = 0;
+        entry.totalEpoch = acc.totalResetEpoch;
+      }
+      if (delta >= 0) {
+        entry.today += delta;
+        entry.total += delta;
+      } else {
+        final absDelta = -delta;
+        entry.today -= min(absDelta, curToday);
+        entry.total -= min(absDelta, curTotal);
+      }
+      entry.updatedAt = max(now, entry.updatedAt + 1);
+
+      final (projected, _) =
+          projectLedgerToInstances(_instances, _followLedger, today);
+      setState(() {
+        _instances = projected;
+      });
+      await _persistAllWithFollowSync();
+      _notifyFollowLedgerChanged();
+      return;
+    }
+
     setState(() {
       _instances[idx] = _instances[idx].withFollowDelta(delta);
     });
@@ -388,254 +726,703 @@ class _HomeScreenState extends State<HomeScreen> {
   }) async {
     final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
     if (idx == -1) return;
+    final today = formatLocalYmd(DateTime.now());
+    final inst = _instances[idx];
+    final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
+
+    if (syncKey != null) {
+      final now = nowUnixSecs();
+      final acc = _followLedger.accounts.putIfAbsent(
+        syncKey,
+        () => AccountFollowLedger(date: today),
+      );
+      acc.rollDate(today);
+      acc.resetEpoch += 1;
+      for (final entry in acc.devices.values) {
+        entry.today = 0;
+        entry.todayEpoch = acc.resetEpoch;
+        entry.updatedAt = max(now, entry.updatedAt + 1);
+      }
+      if (resetTotal) {
+        acc.totalResetEpoch += 1;
+        for (final entry in acc.devices.values) {
+          entry.total = 0;
+          entry.totalEpoch = acc.totalResetEpoch;
+          entry.updatedAt = max(now, entry.updatedAt + 1);
+        }
+      }
+      final (projected, _) =
+          projectLedgerToInstances(_instances, _followLedger, today);
+      setState(() {
+        _instances = projected;
+      });
+      await _persistAllWithFollowSync();
+      _notifyFollowLedgerChanged();
+      return;
+    }
+
     setState(() {
       _instances[idx] = _instances[idx].withFollowReset(resetTotal: resetTotal);
     });
     await _persist();
   }
 
+  String _formatSyncClock(int? unixSecs) {
+    if (unixSecs == null) return '';
+    final dt = DateTime.fromMillisecondsSinceEpoch(unixSecs * 1000);
+    final hh = dt.hour.toString().padLeft(2, '0');
+    final mm = dt.minute.toString().padLeft(2, '0');
+    return '$hh:$mm';
+  }
+
   Future<void> _showFollowCounterSheet(ServiceInstance target) async {
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setSheetState) {
-          final current = _instances.cast<ServiceInstance?>().firstWhere(
-                (i) => i?.instanceId == target.instanceId,
-                orElse: () => null,
-              );
-          if (current == null) return const SizedBox.shrink();
+    final handleCtrl = TextEditingController(text: target.detectedHandle ?? '');
+    final tokenCtrl =
+        TextEditingController(text: _followSyncSettings.githubToken);
+    final gistCtrl = TextEditingController(text: _followSyncSettings.gistId);
+    var isSyncing = false;
 
-          final grp = _serviceGroups.cast<_ServiceGroup?>().firstWhere(
-                (g) => g?.key == serviceGroupKey(current),
-                orElse: () => null,
-              );
-          final siblingIdx = grp == null
-              ? 0
-              : max(
-                  0,
-                  grp.accounts
-                      .indexWhere((a) => a.instanceId == current.instanceId),
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        builder: (ctx) => StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final current = _instances.cast<ServiceInstance?>().firstWhere(
+                  (i) => i?.instanceId == target.instanceId,
+                  orElse: () => null,
                 );
-          final accLabel = accountDisplayLabel(
-            current,
-            siblingIdx,
-            baseServiceName: grp?.displayName,
-          );
-          final title = _multiProfileSupported
-              ? '${grp?.displayName ?? current.name} · $accLabel'
-              : (grp?.displayName ?? current.name);
+            if (current == null) return const SizedBox.shrink();
 
-          final now = DateTime.now();
-          final todayCount = current.effectiveFollowCountToday(now);
-          final totalCount = current.followCountTotal;
-          var allTodaySum = 0;
-          for (final inst in _instances) {
-            allTodaySum += inst.effectiveFollowCountToday(now);
-          }
-          final colorScheme = Theme.of(ctx).colorScheme;
+            final grp = _serviceGroups.cast<_ServiceGroup?>().firstWhere(
+                  (g) => g?.key == serviceGroupKey(current),
+                  orElse: () => null,
+                );
+            final siblingIdx = grp == null
+                ? 0
+                : max(
+                    0,
+                    grp.accounts
+                        .indexWhere((a) => a.instanceId == current.instanceId),
+                  );
+            final accLabel = accountDisplayLabel(
+              current,
+              siblingIdx,
+              baseServiceName: grp?.displayName,
+            );
+            final baseTitle = _multiProfileSupported
+                ? '${grp?.displayName ?? current.name} · $accLabel'
+                : (grp?.displayName ?? current.name);
+            final title = current.detectedHandle != null
+                ? '$baseTitle (@${current.detectedHandle})'
+                : baseTitle;
 
-          return SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
+            final now = DateTime.now();
+            final todayCount = current.effectiveFollowCountToday(now);
+            final totalCount = current.followCountTotal;
+            var allTodaySum = 0;
+            for (final inst in _instances) {
+              allTodaySum += inst.effectiveFollowCountToday(now);
+            }
+            final colorScheme = Theme.of(ctx).colorScheme;
+            final fs = _followSyncSettings;
+            final hasCloud = fs.githubToken.trim().isNotEmpty;
+            final syncBadge = (hasCloud && fs.lanEnabled)
+                ? 'LAN + クラウド'
+                : hasCloud
+                    ? 'クラウド'
+                    : fs.lanEnabled
+                        ? 'LAN待機中'
+                        : 'OFF';
+            final syncClock = _formatSyncClock(fs.lastSyncAt);
+            final syncStatusLine = fs.lastSyncStatus != null
+                ? (syncClock.isNotEmpty
+                    ? '${fs.lastSyncStatus}（$syncClock）'
+                    : fs.lastSyncStatus!)
+                : (fs.lanEnabled
+                    ? '同一Wi-Fi内のPC・スマホと自動共有されます'
+                    : '同期は無効です');
+
+            final snsLiveParts = <String>[];
+            if (current.snsFollowingCount != null) {
+              snsLiveParts.add('フォロー中 ${current.snsFollowingCount}人');
+            }
+            if (current.snsFollowersCount != null) {
+              snsLiveParts.add('フォロワー ${current.snsFollowersCount}人');
+            }
+
+            return SafeArea(
+              child: Padding(
+                padding: EdgeInsets.only(
+                  bottom: MediaQuery.of(ctx).viewInsets.bottom,
+                ),
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Icon(
-                        Icons.person_add_alt_1_rounded,
-                        color: colorScheme.primary,
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.person_add_alt_1_rounded,
+                            color: colorScheme.primary,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text(
+                                  'フォロー回数カウンター',
+                                  style: TextStyle(
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                Text(
+                                  title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(ctx).textTheme.bodySmall,
+                                ),
+                              ],
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.close),
+                            onPressed: () => Navigator.of(ctx).pop(),
+                          ),
+                        ],
                       ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'フォロー回数カウンター',
-                              style: TextStyle(
-                                fontSize: 15,
-                                fontWeight: FontWeight.bold,
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: colorScheme.primaryContainer
+                                    .withValues(alpha: 0.45),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: colorScheme.primary
+                                      .withValues(alpha: 0.4),
+                                ),
+                              ),
+                              child: Column(
+                                children: [
+                                  const Text(
+                                    '今日のフォロー数',
+                                    style: TextStyle(fontSize: 11.5),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    '$todayCount',
+                                    key: const ValueKey('follow-sheet-today'),
+                                    style: TextStyle(
+                                      fontSize: 28,
+                                      fontWeight: FontWeight.w800,
+                                      color: colorScheme.primary,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                            Text(
-                              title,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: Theme.of(ctx).textTheme.bodySmall,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: colorScheme.surfaceContainerHighest
+                                    .withValues(alpha: 0.6),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: colorScheme.outlineVariant,
+                                ),
+                              ),
+                              child: Column(
+                                children: [
+                                  const Text(
+                                    '累計フォロー数',
+                                    style: TextStyle(fontSize: 11.5),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    '$totalCount',
+                                    key: const ValueKey('follow-sheet-total'),
+                                    style: const TextStyle(
+                                      fontSize: 28,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (snsLiveParts.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 7,
+                          ),
+                          decoration: BoxDecoration(
+                            color: colorScheme.primary.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color:
+                                  colorScheme.primary.withValues(alpha: 0.32),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: colorScheme.primary,
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  'SNS実数',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w700,
+                                    color: colorScheme.onPrimary,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  snsLiveParts.join(' · '),
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              key: const ValueKey('follow-sheet-dec'),
+                              onPressed: todayCount > 0 || totalCount > 0
+                                  ? () async {
+                                      await _adjustFollowCount(
+                                        current.instanceId,
+                                        -1,
+                                      );
+                                      setSheetState(() {});
+                                    }
+                                  : null,
+                              icon: const Icon(Icons.remove, size: 18),
+                              label: const Text('−1'),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: FilledButton.tonalIcon(
+                              key: const ValueKey('follow-sheet-inc'),
+                              onPressed: () async {
+                                await _adjustFollowCount(
+                                  current.instanceId,
+                                  1,
+                                );
+                                setSheetState(() {});
+                              },
+                              icon: const Icon(Icons.add, size: 18),
+                              label: const Text('＋1'),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextButton(
+                              onPressed: todayCount > 0
+                                  ? () async {
+                                      await _resetFollowCount(
+                                        current.instanceId,
+                                        resetTotal: false,
+                                      );
+                                      setSheetState(() {});
+                                    }
+                                  : null,
+                              child: const Text('今日をリセット'),
+                            ),
+                          ),
+                          Expanded(
+                            child: TextButton(
+                              onPressed: totalCount > 0 || todayCount > 0
+                                  ? () async {
+                                      await _resetFollowCount(
+                                        current.instanceId,
+                                        resetTotal: true,
+                                      );
+                                      setSheetState(() {});
+                                    }
+                                  : null,
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.redAccent,
+                              ),
+                              child: const Text('累計もリセット'),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: handleCtrl,
+                              decoration: const InputDecoration(
+                                isDense: true,
+                                prefixText: '@',
+                                labelText: '同期アカウントID（自動検出）',
+                                hintText: '例: darksan560',
+                                border: OutlineInputBorder(),
+                              ),
+                              style: const TextStyle(fontSize: 13),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton(
+                            onPressed: () async {
+                              final err = await _setInstanceHandleManual(
+                                current.instanceId,
+                                handleCtrl.text,
+                              );
+                              if (err != null) {
+                                _showSnack(err);
+                              } else {
+                                _showSnack('同期アカウントIDを更新しました');
+                              }
+                              setSheetState(() {});
+                            },
+                            child: const Text('設定'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(color: colorScheme.outlineVariant),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: ExpansionTile(
+                          tilePadding:
+                              const EdgeInsets.symmetric(horizontal: 12),
+                          childrenPadding:
+                              const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                          title: Row(
+                            children: [
+                              const Expanded(
+                                child: Text(
+                                  'PC・スマホ同期設定',
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: colorScheme.secondaryContainer,
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  syncBadge,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: colorScheme.onSecondaryContainer,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          children: [
+                            SwitchListTile(
+                              contentPadding: EdgeInsets.zero,
+                              dense: true,
+                              title: const Text(
+                                '同一Wi-Fiで自動同期（LAN）',
+                                style: TextStyle(fontSize: 12.5),
+                              ),
+                              value: fs.lanEnabled,
+                              onChanged: (val) async {
+                                setState(() {
+                                  _followSyncSettings = _followSyncSettings
+                                      .copyWith(lanEnabled: val);
+                                });
+                                await widget.store.saveFollowSyncState(
+                                  _followSyncSettings,
+                                  _followLedger,
+                                );
+                                if (val) {
+                                  _notifyFollowLedgerChanged();
+                                }
+                                setSheetState(() {});
+                              },
+                            ),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                const Text(
+                                  '外出先向けクラウド同期 (GitHub非公開Gist)',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                TextButton(
+                                  style: TextButton.styleFrom(
+                                    padding: EdgeInsets.zero,
+                                    minimumSize: const Size(0, 24),
+                                    tapTargetSize:
+                                        MaterialTapTargetSize.shrinkWrap,
+                                  ),
+                                  onPressed: () => _openExternalUrlSafely(
+                                    'https://github.com/settings/tokens/new?scopes=gist&description=OmniSNS%20Follow%20Sync',
+                                  ),
+                                  child: const Text(
+                                    'Token作成',
+                                    style: TextStyle(fontSize: 11),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            TextField(
+                              controller: tokenCtrl,
+                              obscureText: true,
+                              decoration: const InputDecoration(
+                                isDense: true,
+                                labelText: 'GitHub Token (gist権限)',
+                                border: OutlineInputBorder(),
+                              ),
+                              style: const TextStyle(fontSize: 12.5),
+                              onChanged: (val) {
+                                final parsed = parseSharedSyncConfig(val);
+                                if (parsed != null) {
+                                  tokenCtrl.text = parsed.token;
+                                  gistCtrl.text = parsed.gistId;
+                                  _showSnack('コピーした同期設定を自動入力しました');
+                                }
+                              },
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: gistCtrl,
+                              decoration: const InputDecoration(
+                                isDense: true,
+                                labelText: 'Gist ID（空欄で自動作成）',
+                                border: OutlineInputBorder(),
+                              ),
+                              style: const TextStyle(fontSize: 12.5),
+                            ),
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 6,
+                              runSpacing: 6,
+                              children: [
+                                FilledButton.tonal(
+                                  onPressed: isSyncing
+                                      ? null
+                                      : () async {
+                                          setSheetState(() => isSyncing = true);
+                                          setState(() {
+                                            _followSyncSettings =
+                                                _followSyncSettings.copyWith(
+                                              githubToken:
+                                                  tokenCtrl.text.trim(),
+                                              gistId: gistCtrl.text.trim(),
+                                            );
+                                          });
+                                          await widget.store
+                                              .saveFollowSyncState(
+                                            _followSyncSettings,
+                                            _followLedger,
+                                          );
+                                          try {
+                                            final msg =
+                                                await _syncFollowCloudOnce(
+                                              silent: false,
+                                            );
+                                            gistCtrl.text =
+                                                _followSyncSettings.gistId;
+                                            _showSnack(msg);
+                                          } catch (e) {
+                                            _showSnack(
+                                              e
+                                                  .toString()
+                                                  .replaceFirst(
+                                                    'Exception: ',
+                                                    '',
+                                                  ),
+                                            );
+                                          } finally {
+                                            if (ctx.mounted) {
+                                              setSheetState(
+                                                () => isSyncing = false,
+                                              );
+                                            }
+                                          }
+                                        },
+                                  child: Text(
+                                    isSyncing ? '同期中...' : '保存して今すぐ同期',
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                                OutlinedButton(
+                                  onPressed: () async {
+                                    final tk = tokenCtrl.text.trim();
+                                    if (tk.isEmpty) {
+                                      _showSnack('先にTokenを入力してください');
+                                      return;
+                                    }
+                                    await Clipboard.setData(
+                                      ClipboardData(
+                                        text: encodeSharedSyncConfig(
+                                          tk,
+                                          gistCtrl.text.trim(),
+                                        ),
+                                      ),
+                                    );
+                                    _showSnack('同期設定をコピーしました（PC側へ貼付可）');
+                                  },
+                                  child: const Text(
+                                    '設定コピー',
+                                    style: TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                                OutlinedButton(
+                                  onPressed: isSyncing
+                                      ? null
+                                      : () async {
+                                          final clip = await Clipboard.getData(
+                                            Clipboard.kTextPlain,
+                                          );
+                                          final parsed = parseSharedSyncConfig(
+                                            clip?.text ?? '',
+                                          );
+                                          if (parsed == null) {
+                                            _showSnack(
+                                              'クリップボードに有効な同期設定がありません',
+                                            );
+                                            return;
+                                          }
+                                          tokenCtrl.text = parsed.token;
+                                          gistCtrl.text = parsed.gistId;
+                                          setSheetState(() => isSyncing = true);
+                                          setState(() {
+                                            _followSyncSettings =
+                                                _followSyncSettings.copyWith(
+                                              githubToken: parsed.token,
+                                              gistId: parsed.gistId,
+                                            );
+                                          });
+                                          await widget.store
+                                              .saveFollowSyncState(
+                                            _followSyncSettings,
+                                            _followLedger,
+                                          );
+                                          try {
+                                            final msg =
+                                                await _syncFollowCloudOnce(
+                                              silent: false,
+                                            );
+                                            gistCtrl.text =
+                                                _followSyncSettings.gistId;
+                                            _showSnack(msg);
+                                          } catch (e) {
+                                            _showSnack(
+                                              e
+                                                  .toString()
+                                                  .replaceFirst(
+                                                    'Exception: ',
+                                                    '',
+                                                  ),
+                                            );
+                                          } finally {
+                                            if (ctx.mounted) {
+                                              setSheetState(
+                                                () => isSyncing = false,
+                                              );
+                                            }
+                                          }
+                                        },
+                                  child: const Text(
+                                    '貼付して適用',
+                                    style: TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                syncStatusLine,
+                                style: Theme.of(ctx)
+                                    .textTheme
+                                    .bodySmall
+                                    ?.copyWith(fontSize: 11),
+                              ),
                             ),
                           ],
                         ),
                       ),
-                      IconButton(
-                        icon: const Icon(Icons.close),
-                        onPressed: () => Navigator.of(ctx).pop(),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: colorScheme.primaryContainer
-                                .withValues(alpha: 0.45),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: colorScheme.primary.withValues(alpha: 0.4),
+                      if (_instances.length >= 2) ...[
+                        const Divider(height: 16),
+                        Text(
+                          '全アカウント合計（今日）: $allTodaySum 回',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 6),
+                      Text(
+                        'Threads・Instagram・Bluesky 等でフォローを押すと自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。',
+                        style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                              fontSize: 11,
                             ),
-                          ),
-                          child: Column(
-                            children: [
-                              const Text(
-                                '今日のフォロー数',
-                                style: TextStyle(fontSize: 11.5),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '$todayCount',
-                                key: const ValueKey('follow-sheet-today'),
-                                style: TextStyle(
-                                  fontSize: 28,
-                                  fontWeight: FontWeight.w800,
-                                  color: colorScheme.primary,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Container(
-                          padding: const EdgeInsets.all(12),
-                          decoration: BoxDecoration(
-                            color: colorScheme.surfaceContainerHighest
-                                .withValues(alpha: 0.6),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(
-                              color: colorScheme.outlineVariant,
-                            ),
-                          ),
-                          child: Column(
-                            children: [
-                              const Text(
-                                '累計フォロー数',
-                                style: TextStyle(fontSize: 11.5),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                '$totalCount',
-                                key: const ValueKey('follow-sheet-total'),
-                                style: const TextStyle(
-                                  fontSize: 28,
-                                  fontWeight: FontWeight.w800,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          key: const ValueKey('follow-sheet-dec'),
-                          onPressed: todayCount > 0 || totalCount > 0
-                              ? () async {
-                                  await _adjustFollowCount(
-                                    current.instanceId,
-                                    -1,
-                                  );
-                                  setSheetState(() {});
-                                }
-                              : null,
-                          icon: const Icon(Icons.remove, size: 18),
-                          label: const Text('−1'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: FilledButton.tonalIcon(
-                          key: const ValueKey('follow-sheet-inc'),
-                          onPressed: () async {
-                            await _adjustFollowCount(current.instanceId, 1);
-                            setSheetState(() {});
-                          },
-                          icon: const Icon(Icons.add, size: 18),
-                          label: const Text('＋1'),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextButton(
-                          onPressed: todayCount > 0
-                              ? () async {
-                                  await _resetFollowCount(
-                                    current.instanceId,
-                                    resetTotal: false,
-                                  );
-                                  setSheetState(() {});
-                                }
-                              : null,
-                          child: const Text('今日をリセット'),
-                        ),
-                      ),
-                      Expanded(
-                        child: TextButton(
-                          onPressed: totalCount > 0 || todayCount > 0
-                              ? () async {
-                                  await _resetFollowCount(
-                                    current.instanceId,
-                                    resetTotal: true,
-                                  );
-                                  setSheetState(() {});
-                                }
-                              : null,
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.redAccent,
-                          ),
-                          child: const Text('累計もリセット'),
-                        ),
-                      ),
-                    ],
-                  ),
-                  if (_instances.length >= 2) ...[
-                    const Divider(height: 16),
-                    Text(
-                      '全アカウント合計（今日）: $allTodaySum 回',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                  const SizedBox(height: 6),
-                  Text(
-                    'Threads・Instagram・Bluesky 等でフォローを押すと自動でカウントされます（日付が変わると「今日」は自動で0に戻ります）。',
-                    style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
-                          fontSize: 11,
-                        ),
-                  ),
-                ],
+                ),
               ),
-            ),
-          );
-        },
-      ),
-    );
+            );
+          },
+        ),
+      );
+    } finally {
+      handleCtrl.dispose();
+      tokenCtrl.dispose();
+      gistCtrl.dispose();
+    }
   }
 
   Future<void> _toggleBottomTabsCollapsed() async {
@@ -1252,6 +2039,14 @@ class _HomeScreenState extends State<HomeScreen> {
                         onPressed: _toggleBottomTabsCollapsed,
                       ),
                     ),
+                  IconButton(
+                    key: const ValueKey('header-gmail-button'),
+                    icon: const Icon(Icons.mail_outline_rounded),
+                    visualDensity: VisualDensity.compact,
+                    tooltip: 'Gmail を開く（SNS認証メール確認用）',
+                    onPressed: () =>
+                        _openExternalUrlSafely('https://mail.google.com/'),
+                  ),
                   if (active != null)
                     IconButton(
                       key: const ValueKey('header-reload-button'),
@@ -1588,6 +2383,17 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ),
                   ],
+                  IconButton(
+                    key: const ValueKey('header-gmail-button'),
+                    icon: const Icon(Icons.mail_outline_rounded, size: 18),
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints:
+                        const BoxConstraints(minWidth: 32, minHeight: 34),
+                    tooltip: 'Gmail を開く（SNS認証メール確認用）',
+                    onPressed: () =>
+                        _openExternalUrlSafely('https://mail.google.com/'),
+                  ),
                   if (active != null)
                     IconButton(
                       key: const ValueKey('header-reload-button'),

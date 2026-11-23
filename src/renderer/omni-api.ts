@@ -6,9 +6,11 @@ import {
   AppSettings,
   CatalogService,
   CategoryMeta,
+  FollowSyncSettings,
   GestureSettings,
   ServiceInstance,
-  TabRuntimeState
+  TabRuntimeState,
+  UpdateFollowSyncPatch
 } from '../shared/types';
 
 export interface BootstrapPayload {
@@ -55,6 +57,9 @@ export interface OmniApi {
   updateGestureSettings: (gesture: GestureSettings) => Promise<GestureSettings>;
   adjustFollowCount: (instanceId: string, delta: number) => Promise<ServiceInstance | null>;
   resetFollowCount: (instanceId: string, resetTotal: boolean) => Promise<ServiceInstance | null>;
+  setFollowHandle: (instanceId: string, handle: string) => Promise<ServiceInstance>;
+  updateFollowSyncSettings: (patch: UpdateFollowSyncPatch) => Promise<FollowSyncSettings>;
+  syncFollowNow: () => Promise<FollowSyncSettings>;
   updateSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>;
   setOverlayVisible: (visible: boolean) => Promise<void>;
   copyText: (text: string) => Promise<void>;
@@ -116,6 +121,11 @@ export const omniApi: OmniApi = {
     invoke<ServiceInstance | null>('follow_adjust', { instanceId, delta }),
   resetFollowCount: (instanceId, resetTotal) =>
     invoke<ServiceInstance | null>('follow_reset', { instanceId, resetTotal }),
+  setFollowHandle: (instanceId, handle) =>
+    invoke<ServiceInstance>('follow_set_handle', { instanceId, handle }),
+  updateFollowSyncSettings: (patch) =>
+    invoke<FollowSyncSettings>('follow_sync_update_settings', { patch }),
+  syncFollowNow: () => invoke<FollowSyncSettings>('follow_sync_now'),
   updateSettings: (patch) => invoke<AppSettings>('settings_update', { patch }),
   setOverlayVisible: (visible) => invoke<void>('ui_set_overlay', { visible }),
   copyText: (text) => invoke<void>('ui_copy_text', { text }),

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::follow_sync::{FollowSyncLedger, FollowSyncSettings};
 use crate::gesture::GestureSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,12 @@ pub struct ServiceInstance {
     pub follow_count_total: u32,
     #[serde(default)]
     pub follow_count_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sns_following_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sns_followers_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub saved_tabs: Vec<SavedSubTab>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +120,8 @@ pub struct AppSettings {
     pub header_collapsed: bool,
     #[serde(default)]
     pub gesture: GestureSettings,
+    #[serde(default)]
+    pub follow_sync: FollowSyncSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +145,8 @@ pub struct AppConfig {
     pub instances: Vec<ServiceInstance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_bounds: Option<WindowBounds>,
+    #[serde(default)]
+    pub follow_ledger: FollowSyncLedger,
 }
 
 #[derive(Debug, Clone, Deserialize)]
