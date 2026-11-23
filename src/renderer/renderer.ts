@@ -225,7 +225,11 @@ function applyThemeAndLayout(): void {
   document.documentElement.setAttribute('data-theme', theme);
   document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
 
-  el<HTMLDivElement>('main-area').classList.toggle('header-collapsed', headerCollapsed);
+  const mainArea = el<HTMLDivElement>('main-area');
+  const active = getActiveInstance();
+  const activeTabCount = active ? state.runtimeMap.get(active.instanceId)?.tabs?.length ?? 0 : 0;
+  mainArea.classList.toggle('header-collapsed', headerCollapsed);
+  mainArea.classList.toggle('has-multi-tabs', activeTabCount >= 2);
   const toggleHeaderBtn = el<HTMLButtonElement>('btn-toggle-header');
   toggleHeaderBtn.textContent = headerCollapsed ? '▼' : '▲';
   toggleHeaderBtn.title = headerCollapsed ? 'ヘッダー項目を展開' : 'ヘッダー項目を折り畳む';
@@ -518,7 +522,7 @@ function renderAccountBar(): void {
     }`;
 
     pill.addEventListener('click', () => {
-      if (!isCurrent) {
+      if (!isCurrent || rt?.isSleeping) {
         void omniApi.activateTab(inst.instanceId);
       }
     });
@@ -575,6 +579,15 @@ function renderAccountBar(): void {
 
     pill.appendChild(dot);
     pill.appendChild(labelSpan);
+
+    const subTabCount = rt?.tabs?.length ?? 0;
+    if (subTabCount >= 2) {
+      const tabBadge = document.createElement('span');
+      tabBadge.className = 'account-pill-tabs';
+      tabBadge.textContent = `${subTabCount}`;
+      tabBadge.title = `このアカウントで ${subTabCount} 枚のタブを開いています`;
+      pill.appendChild(tabBadge);
+    }
 
     const unread = inst.notificationsEnabled ? rt?.unreadCount ?? 0 : 0;
     if (unread > 0) {
@@ -679,13 +692,15 @@ function renderToolbarAndViewport(): void {
   const fwdBtn = el<HTMLButtonElement>('btn-forward');
   const dotEl = el<HTMLSpanElement>('active-service-dot');
   const nameEl = el<HTMLSpanElement>('active-service-name');
-  const urlEl = el<HTMLSpanElement>('active-url-text');
+  const urlInput = el<HTMLInputElement>('active-url-input');
+  const copyUrlBtn = el<HTMLButtonElement>('btn-copy-url');
   const uaBtn = el<HTMLButtonElement>('btn-toggle-ua');
   const muteBtn = el<HTMLButtonElement>('btn-toggle-mute');
   const zoomResetBtn = el<HTMLButtonElement>('btn-zoom-reset');
 
   const followBtn = el<HTMLButtonElement>('btn-follow-counter');
   const followTodayEl = el<HTMLElement>('follow-today-count');
+  const collapsedNewTabBtn = el<HTMLButtonElement>('btn-collapsed-new-subtab');
   const collapsedFollowBtn = el<HTMLButtonElement>('btn-collapsed-follow');
   const collapsedFollowEl = el<HTMLSpanElement>('collapsed-follow-count');
   const collapsedReloadBtn = el<HTMLButtonElement>('btn-collapsed-reload');
@@ -702,15 +717,18 @@ function renderToolbarAndViewport(): void {
     backBtn.disabled = true;
     fwdBtn.disabled = true;
     followBtn.disabled = true;
+    collapsedNewTabBtn.disabled = true;
     collapsedFollowBtn.disabled = true;
     collapsedReloadBtn.disabled = true;
+    copyUrlBtn.disabled = true;
+    urlInput.disabled = true;
+    urlInput.value = '';
     followTodayEl.textContent = '0';
     collapsedFollowEl.textContent = '0';
     followBtn.classList.remove('has-count');
     collapsedFollowBtn.classList.remove('has-count');
     dotEl.className = 'status-dot';
     nameEl.textContent = 'サービス未選択';
-    urlEl.textContent = '—';
     uaBtn.textContent = 'PC版';
     uaBtn.classList.remove('mobile-mode');
     muteBtn.innerHTML = ICON_VOLUME_ON;
@@ -722,8 +740,11 @@ function renderToolbarAndViewport(): void {
   const displayTitle = getActiveDisplayTitle();
   const todayFollow = active.followCountToday ?? 0;
   followBtn.disabled = false;
+  collapsedNewTabBtn.disabled = false;
   collapsedFollowBtn.disabled = false;
   collapsedReloadBtn.disabled = false;
+  copyUrlBtn.disabled = false;
+  urlInput.disabled = false;
   followTodayEl.textContent = String(todayFollow);
   collapsedFollowEl.textContent = String(todayFollow);
   followBtn.classList.toggle('has-count', todayFollow > 0);
@@ -735,7 +756,10 @@ function renderToolbarAndViewport(): void {
   fwdBtn.disabled = !rt?.canGoForward;
   dotEl.className = `status-dot ${rt?.isLoading ? 'loading' : rt?.isSleeping ? '' : 'ready'}`;
   nameEl.textContent = displayTitle;
-  urlEl.textContent = rt?.currentUrl || active.url;
+  const resolvedUrl = rt?.currentUrl || active.url;
+  if (document.activeElement !== urlInput) {
+    urlInput.value = resolvedUrl;
+  }
 
   const isMobile = active.uaMode === 'mobile';
   uaBtn.textContent = isMobile ? 'スマホ版' : 'PC版';
@@ -931,13 +955,21 @@ function renderCatalog(): void {
   }
 }
 
+let isAddingService = false;
+
 async function addServiceAndCloseCatalog(payload: AddInstancePayload): Promise<void> {
-  await omniApi.addTab(payload);
-  el('catalog-modal').classList.add('hidden');
-  el('edit-modal').classList.add('hidden');
-  await syncOverlayToMain();
-  const labelSuffix = payload.accountLabel ? ` / ${payload.accountLabel}` : '';
-  showToast(`「${payload.name}${labelSuffix}」を追加しました`);
+  if (isAddingService) return;
+  isAddingService = true;
+  try {
+    await omniApi.addTab(payload);
+    el('catalog-modal').classList.add('hidden');
+    el('edit-modal').classList.add('hidden');
+    await syncOverlayToMain();
+    const labelSuffix = payload.accountLabel ? ` / ${payload.accountLabel}` : '';
+    showToast(`「${payload.name}${labelSuffix}」を追加しました`);
+  } finally {
+    isAddingService = false;
+  }
 }
 
 async function openCatalogModal(): Promise<void> {
@@ -1094,6 +1126,16 @@ async function toggleHeaderCollapsed(): Promise<void> {
   await omniApi.updateSettings({ headerCollapsed: next });
 }
 
+async function focusAddressBar(): Promise<void> {
+  if (!state.config || !getActiveInstance()) return;
+  if (state.config.settings.headerCollapsed) {
+    await omniApi.updateSettings({ headerCollapsed: false });
+  }
+  const urlInput = el<HTMLInputElement>('active-url-input');
+  urlInput.focus();
+  urlInput.select();
+}
+
 async function closeSettingsModal(): Promise<void> {
   el('settings-modal').classList.add('hidden');
   await syncOverlayToMain();
@@ -1121,6 +1163,7 @@ function renderTabBar(): void {
   const active = getActiveInstance();
   const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
   const tabs = rt?.tabs ?? [];
+  el<HTMLDivElement>('main-area').classList.toggle('has-multi-tabs', tabs.length >= 2);
 
   newBtn.disabled = !active;
   dupBtn.disabled = !active || tabs.length === 0;
@@ -1148,7 +1191,7 @@ function renderTabBar(): void {
     chip.title = `${tab.title || active.name}\n${tab.currentUrl}\n（中クリックで閉じる）`;
 
     chip.addEventListener('click', () => {
-      if (!isCurrent) {
+      if (!isCurrent || tab.isSleeping) {
         void omniApi.activateSubTab(active.instanceId, tab.tabId);
       }
     });
@@ -1325,10 +1368,50 @@ function bindEvents(): void {
   });
 
   el<HTMLButtonElement>('btn-copy-url').addEventListener('click', async () => {
-    const urlText = el<HTMLSpanElement>('active-url-text').textContent || '';
-    if (!urlText || urlText === '—') return;
+    const active = getActiveInstance();
+    const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+    const urlText = rt?.currentUrl || active?.url || el<HTMLInputElement>('active-url-input').value.trim();
+    if (!urlText) return;
     await omniApi.copyText(urlText);
     showToast('URLをクリップボードにコピーしました');
+  });
+
+  const urlInput = el<HTMLInputElement>('active-url-input');
+  urlInput.addEventListener('focus', () => {
+    urlInput.select();
+  });
+  urlInput.addEventListener('keydown', async (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      const active = getActiveInstance();
+      const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+      urlInput.value = rt?.currentUrl || active?.url || '';
+      urlInput.blur();
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const active = getActiveInstance();
+      if (!active) return;
+      const normalized = normalizeServiceUrl(urlInput.value);
+      if (!normalized) {
+        showToast('有効な http:// または https:// URL を入力してください');
+        return;
+      }
+      const openInNewTab = e.altKey || e.ctrlKey || e.metaKey;
+      try {
+        if (openInNewTab) {
+          await omniApi.createSubTab(active.instanceId, normalized);
+          showToast('同じアカウントの新しいタブで開きました');
+        } else {
+          await omniApi.navigateSubTab(active.instanceId, normalized);
+        }
+        urlInput.blur();
+      } catch (err) {
+        showToast(String(err));
+      }
+    }
   });
 
   // Placeholder buttons
@@ -1338,6 +1421,11 @@ function bindEvents(): void {
 
   // Catalog modal
   el<HTMLButtonElement>('btn-close-catalog').addEventListener('click', () => void closeCatalogModal());
+  el<HTMLDivElement>('catalog-modal').addEventListener('click', (e) => {
+    if (e.target === el('catalog-modal')) {
+      void closeCatalogModal();
+    }
+  });
   el<HTMLInputElement>('catalog-search').addEventListener('input', (e) => {
     state.catalogSearchQuery = (e.target as HTMLInputElement).value;
     if (state.selectedCatalogCategory === 'custom' && state.catalogSearchQuery.trim()) {
@@ -1420,6 +1508,15 @@ function bindEvents(): void {
 
   // Follow counter & collapsible header
   el<HTMLButtonElement>('btn-toggle-header').addEventListener('click', () => void toggleHeaderCollapsed());
+  el<HTMLButtonElement>('btn-collapsed-new-subtab').addEventListener('click', async () => {
+    const active = getActiveInstance();
+    if (!active) return;
+    try {
+      await omniApi.createSubTab(active.instanceId);
+    } catch (err) {
+      showToast(String(err));
+    }
+  });
   el<HTMLButtonElement>('btn-collapsed-reload').addEventListener('click', (e) =>
     void runActiveAction(e.shiftKey ? 'hard-reload' : 'reload')
   );
@@ -1466,6 +1563,16 @@ function bindEvents(): void {
 
   // Settings modal
   el<HTMLButtonElement>('btn-close-settings').addEventListener('click', () => void closeSettingsModal());
+  el<HTMLDivElement>('settings-modal').addEventListener('click', (e) => {
+    if (e.target === el('settings-modal')) {
+      void closeSettingsModal();
+    }
+  });
+  el<HTMLDivElement>('gesture-modal').addEventListener('click', (e) => {
+    if (e.target === el('gesture-modal')) {
+      void closeGestureModal();
+    }
+  });
   el<HTMLInputElement>('setting-sidebar-width').addEventListener('input', (e) => {
     const val = (e.target as HTMLInputElement).value;
     el<HTMLSpanElement>('setting-sidebar-width-val').textContent = val;
@@ -1504,6 +1611,15 @@ function bindEvents(): void {
     const ctrl = e.ctrlKey || e.metaKey;
     if (!ctrl) return;
     const key = e.key.toLowerCase();
+
+    // モーダル表示中は Ctrl+K（カタログ開閉）以外のグローバルショートカットを抑止
+    if (isAnyModalOpen()) {
+      if (!e.shiftKey && !e.altKey && key === 'k' && !el('catalog-modal').classList.contains('hidden')) {
+        e.preventDefault();
+        void closeCatalogModal();
+      }
+      return;
+    }
 
     // Ctrl + Alt + 1..9 -> 同一SNS内のアカウント切替
     if (!e.shiftKey && e.altKey && /^[1-9]$/.test(key)) {
@@ -1569,6 +1685,36 @@ function bindEvents(): void {
       return;
     }
 
+    if (!e.shiftKey && !e.altKey && key === 'l') {
+      e.preventDefault();
+      void focusAddressBar();
+      return;
+    }
+
+    const activeEl = document.activeElement;
+    const isTypingInput =
+      activeEl instanceof HTMLInputElement ||
+      activeEl instanceof HTMLTextAreaElement ||
+      activeEl instanceof HTMLSelectElement;
+
+    if (!isTypingInput && !e.altKey) {
+      if (e.code === 'Minus' || e.code === 'NumpadSubtract' || key === '-' || key === '_') {
+        e.preventDefault();
+        void runActiveAction('zoom-out');
+        return;
+      }
+      if (key === '+' || key === '=' || key === ';' || e.code === 'Equal' || e.code === 'NumpadAdd') {
+        e.preventDefault();
+        void runActiveAction('zoom-in');
+        return;
+      }
+      if (!e.shiftKey && (key === '0' || e.code === 'Digit0' || e.code === 'Numpad0')) {
+        e.preventDefault();
+        void runActiveAction('zoom-reset');
+        return;
+      }
+    }
+
     if (!e.shiftKey && !e.altKey && key === 'k') {
       e.preventDefault();
       if (el('catalog-modal').classList.contains('hidden')) {
@@ -1617,6 +1763,8 @@ async function bootstrap(): Promise<void> {
       void openCatalogModal();
     } else if (payload.action === 'open-gesture-settings') {
       void openGestureModal();
+    } else if (payload.action === 'focus-address-bar') {
+      void focusAddressBar();
     } else if (payload.action === 'switch-tab' && typeof payload.payload === 'number') {
       const visibleGroups = getVisibleServiceGroups();
       const target = visibleGroups[payload.payload];

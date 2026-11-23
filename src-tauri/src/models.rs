@@ -30,6 +30,13 @@ pub struct CategoryMeta {
     pub description: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedSubTab {
+    pub url: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceInstance {
@@ -53,6 +60,10 @@ pub struct ServiceInstance {
     pub follow_count_total: u32,
     #[serde(default)]
     pub follow_count_date: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_tabs: Vec<SavedSubTab>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_active_tab_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -51,6 +51,7 @@ export interface OmniApi {
   closeOtherSubTabs: (instanceId: string, tabId: string) => Promise<number>;
   duplicateSubTab: (instanceId: string, tabId: string) => Promise<string>;
   restoreClosedTab: () => Promise<string>;
+  navigateSubTab: (instanceId: string, url: string) => Promise<string>;
   updateGestureSettings: (gesture: GestureSettings) => Promise<GestureSettings>;
   adjustFollowCount: (instanceId: string, delta: number) => Promise<ServiceInstance | null>;
   resetFollowCount: (instanceId: string, resetTotal: boolean) => Promise<ServiceInstance | null>;
@@ -107,6 +108,8 @@ export const omniApi: OmniApi = {
   duplicateSubTab: (instanceId, tabId) =>
     invoke<string>('subtab_duplicate', { instanceId, tabId }),
   restoreClosedTab: () => invoke<string>('subtab_restore_closed'),
+  navigateSubTab: (instanceId, url) =>
+    invoke<string>('subtab_navigate', { instanceId, url }),
   updateGestureSettings: (gesture) =>
     invoke<GestureSettings>('gesture_update_settings', { gesture }),
   adjustFollowCount: (instanceId, delta) =>

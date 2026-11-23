@@ -13,6 +13,7 @@ pub const GESTURE_ACTIONS: &[&str] = &[
     "previous-tab",
     "next-tab",
     "new-tab",
+    "ctrl-click",
     "duplicate-tab",
     "close-tab",
     "close-other-tabs",
@@ -208,6 +209,7 @@ pub fn action_label_ja(action: &str) -> &'static str {
         "previous-tab" => "前のタブへ",
         "next-tab" => "次のタブへ",
         "new-tab" => "新しいタブを開く",
+        "ctrl-click" => "Ctrl+クリック",
         "duplicate-tab" => "現在のタブを複製",
         "close-tab" => "現在のタブを閉じる",
         "close-other-tabs" => "このタブ以外を閉じる",
@@ -666,5 +668,17 @@ mod tests {
         assert_eq!(step_tab_index(3, 2, 1, true), Ok(0));
         assert!(step_tab_index(3, 0, -1, false).is_err());
         assert!(step_tab_index(1, 0, 1, true).is_err());
+    }
+
+    #[test]
+    fn ctrl_click_action_is_valid_and_preserved_by_sanitize() {
+        assert!(is_valid_action("ctrl-click"));
+        assert_eq!(action_label_ja("ctrl-click"), "Ctrl+クリック");
+        let mut settings = GestureSettings::default();
+        settings
+            .gestures
+            .insert("DR".to_string(), "ctrl-click".to_string());
+        let sanitized = sanitize_gesture_settings(settings);
+        assert_eq!(sanitized.action_for("DR"), "ctrl-click");
     }
 }

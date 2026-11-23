@@ -69,6 +69,10 @@ export interface ServiceInstance {
   followCountTotal?: number;
   /** 本日カウントの日付 (YYYY-MM-DD) */
   followCountDate?: string;
+  /** 同一アカウントで開いている複数タブの保存状態 */
+  savedTabs?: { url: string; title: string }[];
+  /** 保存時のアクティブタブ位置 */
+  savedActiveTabIndex?: number;
 }
 
 export interface BrowserTabInfo {

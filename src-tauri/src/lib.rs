@@ -132,14 +132,20 @@ async fn tab_remove(
     shared: State<'_, SharedState>,
     instance_id: String,
 ) -> Result<AppConfig, String> {
-    {
+    let prev_active = {
         let mut guard = shared.inner.lock().unwrap();
+        let prev = guard.active_instance_id.clone();
         guard.store.remove_instance(&instance_id);
-    }
+        prev
+    };
 
     view_manager::sync_instances(&app, &shared);
     let next_active = view_manager::ensure_safe_active_instance(&shared);
-    view_manager::activate_tab(&app, &shared, next_active);
+    if prev_active != next_active {
+        view_manager::activate_tab(&app, &shared, next_active);
+    } else {
+        view_manager::update_bounds_from_window(&app, &shared);
+    }
     view_manager::emit_state_updated(&app, &shared);
 
     let guard = shared.inner.lock().unwrap();
@@ -152,14 +158,20 @@ async fn tab_remove_many(
     shared: State<'_, SharedState>,
     instance_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
-    {
+    let prev_active = {
         let mut guard = shared.inner.lock().unwrap();
+        let prev = guard.active_instance_id.clone();
         guard.store.remove_instances(&instance_ids);
-    }
+        prev
+    };
 
     view_manager::sync_instances(&app, &shared);
     let next_active = view_manager::ensure_safe_active_instance(&shared);
-    view_manager::activate_tab(&app, &shared, next_active);
+    if prev_active != next_active {
+        view_manager::activate_tab(&app, &shared, next_active);
+    } else {
+        view_manager::update_bounds_from_window(&app, &shared);
+    }
     view_manager::emit_state_updated(&app, &shared);
 
     let guard = shared.inner.lock().unwrap();
@@ -177,6 +189,9 @@ async fn tab_update(
         let mut guard = shared.inner.lock().unwrap();
         guard.store.update_instance(&instance_id, patch)
     };
+    if let Some(ref inst) = updated {
+        view_manager::sync_sleeping_instance_metadata(&shared, inst);
+    }
     view_manager::sync_instances(&app, &shared);
     view_manager::emit_state_updated(&app, &shared);
     Ok(updated)
@@ -270,6 +285,16 @@ async fn subtab_restore_closed(
 }
 
 #[tauri::command]
+async fn subtab_navigate(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+    url: String,
+) -> Result<String, String> {
+    view_manager::navigate_subtab(&app, &shared, &instance_id, &url)
+}
+
+#[tauri::command]
 async fn gesture_update_settings(
     app: AppHandle,
     shared: State<'_, SharedState>,
@@ -304,9 +329,12 @@ async fn settings_update(
     shared: State<'_, SharedState>,
     patch: UpdateSettingsPatch,
 ) -> Result<AppSettings, String> {
-    let updated = {
+    let explicit_active_change = patch.active_instance_id.is_some();
+    let (prev_active, updated) = {
         let mut guard = shared.inner.lock().unwrap();
-        guard.store.update_settings(patch)
+        let prev = guard.active_instance_id.clone();
+        let updated = guard.store.update_settings(patch);
+        (prev, updated)
     };
 
     if let Some(win) = app.get_window("main") {
@@ -318,9 +346,12 @@ async fn settings_update(
         let _ = win.set_theme(Some(theme));
     }
 
-    view_manager::update_bounds_from_window(&app, &shared);
     let safe_active = view_manager::ensure_safe_active_instance(&shared);
-    view_manager::activate_tab(&app, &shared, safe_active);
+    if explicit_active_change || prev_active != safe_active {
+        view_manager::activate_tab(&app, &shared, safe_active);
+    } else {
+        view_manager::update_bounds_from_window(&app, &shared);
+    }
     view_manager::emit_state_updated(&app, &shared);
     Ok(updated)
 }
@@ -575,11 +606,17 @@ pub fn run() {
                     raw_hwnd,
                     initial_config.settings.gesture.clone(),
                     gesture_win::GestureHostCallbacks {
-                        on_action: Arc::new(move |action, _shape| {
+                        on_action: Arc::new(move |action, _shape, ctx| {
                             let app_bg = app_act.clone();
                             let shared_bg = shared_act.clone();
                             tauri::async_runtime::spawn(async move {
-                                view_manager::execute_gesture_action(&app_bg, &shared_bg, &action);
+                                view_manager::execute_gesture_action_with_origin(
+                                    &app_bg,
+                                    &shared_bg,
+                                    &action,
+                                    Some(ctx.origin_lx),
+                                    Some(ctx.origin_ly),
+                                );
                             });
                         }),
                         on_live_scroll: Arc::new(move |ox, oy, dx, dy| {
@@ -727,6 +764,7 @@ pub fn run() {
             subtab_close_others,
             subtab_duplicate,
             subtab_restore_closed,
+            subtab_navigate,
             gesture_update_settings,
             follow_adjust,
             follow_reset,

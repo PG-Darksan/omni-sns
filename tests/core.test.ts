@@ -5,6 +5,7 @@ import {
   buildUserAgent,
   getAccountDisplayLabel,
   getServiceGroupKey,
+  isSameSiteUrl,
   makeBadgeText,
   nextDefaultAccountLabel,
   normalizeServiceUrl,
@@ -110,6 +111,10 @@ test('shouldOpenInAppPopup allows OAuth and same-site popups while sending exter
   assert.equal(
     shouldOpenInAppPopup('https://news.yahoo.co.jp/articles/123', 'https://bsky.app/messages'),
     false
+  );
+  assert.equal(
+    isSameSiteUrl('https://www.threads.net/@alice', 'https://www.threads.com/'),
+    true
   );
 });
 

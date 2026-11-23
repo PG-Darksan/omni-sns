@@ -367,6 +367,7 @@ class OmniWebViewManager(
          */
         val FOLLOW_TRACKER_JS: String = """
             (function() {
+              if (window !== window.top) return;
               if (window.__omniFollowTrackerInstalled) return;
               window.__omniFollowTrackerInstalled = true;
 
@@ -375,19 +376,92 @@ class OmniWebViewManager(
               var ARIA_FOLLOW_RE = /^(?:(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|follow|follow\s+back)|.+?(?:をフォロー|をフォローする|をフォローバック)|follow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
               var POST_FOLLOW_STATE_RE = /(フォロー中|フォロー済|フォロー解除|リクエスト済|リクエスト中|承認待ち|following|unfollow|requested|pending|チェック|check)/i;
 
+              var lastNetworkFollowStartAt = 0;
               var lastNetworkFollowAt = 0;
-              var lastNetworkEmitAt = 0;
               var lastDomEmitAt = 0;
+              var lastAnyEmitAt = 0;
+              var inFlightFollows = 0;
+              var recentTargetKeys = Object.create(null);
+              var userInteractionSeq = 0;
+              var lastUserInteractionAt = 0;
+              var lastPointerDownAt = 0;
+              var emittedInteractions = Object.create(null);
 
-              function emitFollow(source) {
+              function bumpUserInteraction(fromPointerDown) {
                 var now = Date.now();
-                if (source === 'network') {
-                  if (now - lastNetworkEmitAt < 120) return;
-                  lastNetworkEmitAt = now;
-                  lastNetworkFollowAt = now;
+                if (fromPointerDown) {
+                  userInteractionSeq++;
+                  lastPointerDownAt = now;
+                  lastUserInteractionAt = now;
+                } else if (now - lastPointerDownAt > 500) {
+                  userInteractionSeq++;
+                  lastUserInteractionAt = now;
                 } else {
-                  if (now - lastDomEmitAt < 350) return;
+                  lastUserInteractionAt = now;
+                }
+              }
+
+              document.addEventListener('pointerdown', function(e) {
+                if (e && (e.isTrusted === false || (typeof e.button === 'number' && e.button !== 0))) return;
+                bumpUserInteraction(true);
+              }, true);
+
+              document.addEventListener('keydown', function(e) {
+                if (e && e.isTrusted !== false && (e.key === 'Enter' || e.key === ' ')) {
+                  bumpUserInteraction(true);
+                }
+              }, true);
+
+              function currentInteractionId() {
+                var now = Date.now();
+                if (userInteractionSeq > 0 && now - lastUserInteractionAt <= 3000) {
+                  return userInteractionSeq;
+                }
+                return 0;
+              }
+
+              function emitFollow(source, targetKey, interactionId) {
+                var now = Date.now();
+                if (interactionId && interactionId > 0) {
+                  for (var ik in emittedInteractions) {
+                    if (now - emittedInteractions[ik] > 15000) delete emittedInteractions[ik];
+                  }
+                  if (emittedInteractions[interactionId]) {
+                    if (source === 'network') {
+                      lastNetworkFollowAt = now;
+                      if (targetKey) recentTargetKeys[targetKey] = now;
+                    }
+                    return;
+                  }
+                }
+                if (targetKey) {
+                  for (var k in recentTargetKeys) {
+                    if (now - recentTargetKeys[k] > 15000) delete recentTargetKeys[k];
+                  }
+                  if (recentTargetKeys[targetKey] && now - recentTargetKeys[targetKey] < 5000) {
+                    return;
+                  }
+                }
+                if (source === 'network') {
+                  if (now - lastDomEmitAt < 2500) {
+                    lastNetworkFollowAt = now;
+                    if (targetKey) recentTargetKeys[targetKey] = now;
+                    if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
+                    return;
+                  }
+                  if (!targetKey && now - lastAnyEmitAt < 1200) {
+                    lastNetworkFollowAt = now;
+                    return;
+                  }
+                  lastNetworkFollowAt = now;
+                  lastAnyEmitAt = now;
+                  if (targetKey) recentTargetKeys[targetKey] = now;
+                  if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
+                } else {
+                  if (now - lastAnyEmitAt < 2500) return;
                   lastDomEmitAt = now;
+                  lastAnyEmitAt = now;
+                  if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
                 }
                 try {
                   if (window.OmniFollowBridge && typeof window.OmniFollowBridge.onFollowDetected === 'function') {
@@ -414,10 +488,29 @@ class OmniWebViewManager(
                 return '';
               }
 
-              function isFollowApiRequest(rawUrl, method, rawBody) {
+              function extractTargetKey(url, decodedBody) {
+                try {
+                  var m = /\/friendships\/create\/([^\/?#]+)/i.exec(url) ||
+                          /\/web\/friendships\/([^\/?#]+)\/follow/i.exec(url) ||
+                          /\/api\/v1\/accounts\/([^\/?#]+)\/follow/i.exec(url);
+                  if (m && m[1]) return String(m[1]).trim().toLowerCase();
+
+                  m = /"(?:target_user_id|targetUserId|to_user_id|subscribee_id|subject)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
+                      /(?:^|&)(?:target_user_id|to_user_id)=([a-z0-9._-]+)/i.exec(decodedBody);
+                  if (m && m[1]) return String(m[1]).trim().toLowerCase();
+
+                  m = /"(?:user_id|profile_id|userId)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
+                      /(?:^|&)user_id=([a-z0-9._-]+)/i.exec(decodedBody) ||
+                      /[?&]user_id=([a-z0-9._-]+)/i.exec(url);
+                  if (m && m[1]) return String(m[1]).trim().toLowerCase();
+                } catch (_) {}
+                return '';
+              }
+
+              function detectFollowApiRequest(rawUrl, method, rawBody) {
                 try {
                   var m = (method || 'GET').toUpperCase();
-                  if (m !== 'POST') return false;
+                  if (m !== 'POST') return null;
                   var url = String(rawUrl || '');
                   var lowerUrl = url.toLowerCase();
                   var body = bodyToSearchString(rawBody);
@@ -429,40 +522,48 @@ class OmniWebViewManager(
 
                   if (/\/friendships\/create(?:\/|\?|$)/i.test(lowerUrl) ||
                       /\/web\/friendships\/[^\/?#]+\/follow(?:\/|\?|$)/i.test(lowerUrl)) {
-                    return !/unfollow|destroy/i.test(lowerUrl);
+                    if (!/unfollow|destroy/i.test(lowerUrl)) {
+                      return { targetKey: extractTargetKey(url, decodedBody) };
+                    }
+                    return null;
                   }
 
                   if (/\/(?:api\/)?graphql(?:\/|\?|$)/i.test(lowerUrl)) {
                     var fnameMatch = /(?:fb_api_req_friendly_name|friendlyname)["'=\s:]+([a-z0-9_]+)/i.exec(decodedBody);
                     var fname = fnameMatch ? fnameMatch[1] : '';
                     if (fname) {
-                      if (/unfollow|destroy|remove|cancel|block|mute|follower|following|suggestion|recommend|list|count/i.test(fname)) {
-                        return false;
+                      if (/unfollow|destroy|remove|cancel|block|mute|follower|following|suggestion|recommend|list|count|query|fetch|load|get|status|info|chaining|similar|show|check|batch|many|bulk|sync|refresh|feed|timeline|modal|dialog|sheet/i.test(fname)) {
+                        return null;
                       }
-                      if (/follow/i.test(fname) && /mutation|barcelona|polaris|friendship|profile|user|comet|textpost|ig/i.test(fname)) {
-                        return true;
+                      if (/follow/i.test(fname) && /(?:mutation|create|add)/i.test(fname)) {
+                        return { targetKey: extractTargetKey(url, decodedBody) };
                       }
+                      return null;
                     }
-                    if (/usebarcelonafollowmutation|barcelonafollowmutation|polarisfriendshipsfollow|polarisfollowmutation|usepolarisfollowmutation|textpostappfollowmutation|friendingcometfollowmutation/i.test(lowerBody) &&
-                        !/unfollow/i.test(lowerBody)) {
-                      return true;
+                    if (/usebarcelonafollowmutation|barcelonafollowmutation|polarisfriendshipsfollow|polarisfollowmutation|usepolarisfollowmutation|polarisuserfollowmutation|igwebprofilefollowmutation|textpostappfollowmutation|friendingcometfollowmutation/i.test(lowerBody) &&
+                        !/unfollow|destroy/i.test(lowerBody)) {
+                      return { targetKey: extractTargetKey(url, decodedBody) };
                     }
-                    return false;
+                    return null;
                   }
 
                   if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
                       lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
-                    return true;
+                    return { targetKey: extractTargetKey(url, decodedBody) };
                   }
 
-                  if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) return true;
-                  if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) return true;
+                  if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) {
+                    return { targetKey: extractTargetKey(url, decodedBody) };
+                  }
+                  if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) {
+                    return { targetKey: extractTargetKey(url, decodedBody) };
+                  }
                   if (/\/api\/commit\/follow\/user/i.test(lowerUrl) &&
                       (/[?&]type=1(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=1(?:&|$)|"type"\s*:\s*1/i.test(lowerBody))) {
-                    return true;
+                    return { targetKey: extractTargetKey(url, decodedBody) };
                   }
                 } catch (_) {}
-                return false;
+                return null;
               }
 
               try {
@@ -484,14 +585,25 @@ class OmniWebViewManager(
                         if (init.body !== undefined) reqBody = init.body;
                       }
                     } catch (_) {}
-                    var isFollow = isFollowApiRequest(reqUrl, reqMethod, reqBody);
+                    var followReq = detectFollowApiRequest(reqUrl, reqMethod, reqBody);
+                    var reqInteractionId = 0;
+                    if (followReq) {
+                      lastNetworkFollowStartAt = Date.now();
+                      inFlightFollows++;
+                      reqInteractionId = currentInteractionId();
+                    }
                     var promise = origFetch.apply(this, arguments);
-                    if (isFollow && promise && typeof promise.then === 'function') {
+                    if (followReq && promise && typeof promise.then === 'function') {
                       promise.then(function(res) {
+                        inFlightFollows = Math.max(0, inFlightFollows - 1);
                         try {
-                          if (res && res.ok) emitFollow('network');
+                          if (res && res.ok) emitFollow('network', followReq.targetKey, reqInteractionId);
                         } catch (_) {}
-                      }, function() {});
+                      }, function() {
+                        inFlightFollows = Math.max(0, inFlightFollows - 1);
+                      });
+                    } else if (followReq) {
+                      inFlightFollows = Math.max(0, inFlightFollows - 1);
                     }
                     return promise;
                   };
@@ -511,14 +623,29 @@ class OmniWebViewManager(
                   };
                   XMLHttpRequest.prototype.send = function(body) {
                     try {
-                      if (isFollowApiRequest(this.__omniUrl, this.__omniMethod, body)) {
+                      var followReq = detectFollowApiRequest(this.__omniUrl, this.__omniMethod, body);
+                      if (followReq) {
+                        lastNetworkFollowStartAt = Date.now();
+                        inFlightFollows++;
+                        var reqInteractionId = currentInteractionId();
+                        var done = false;
+                        var finish = function() {
+                          if (!done) {
+                            done = true;
+                            inFlightFollows = Math.max(0, inFlightFollows - 1);
+                          }
+                        };
                         this.addEventListener('load', function() {
+                          finish();
                           try {
                             if (this.status >= 200 && this.status < 300) {
-                              emitFollow('network');
+                              emitFollow('network', followReq.targetKey, reqInteractionId);
                             }
                           } catch (_) {}
                         }, { once: true });
+                        this.addEventListener('error', finish, { once: true });
+                        this.addEventListener('abort', finish, { once: true });
+                        this.addEventListener('timeout', finish, { once: true });
                       }
                     } catch (_) {}
                     return origSend.apply(this, arguments);
@@ -586,6 +713,9 @@ class OmniWebViewManager(
 
               document.addEventListener('click', function(e) {
                 try {
+                  if (e && (e.isTrusted === false || e.button !== 0 || e.ctrlKey || e.metaKey)) return;
+                  bumpUserInteraction(false);
+                  var clickInteractionId = currentInteractionId();
                   var target = e.target;
                   if (!target) return;
                   if (target.nodeType !== 1) target = target.parentElement;
@@ -599,7 +729,12 @@ class OmniWebViewManager(
 
                   setTimeout(function() {
                     try {
-                      if (lastNetworkFollowAt >= clickedAt - 200) return;
+                      if (inFlightFollows > 0 ||
+                          lastNetworkFollowStartAt >= clickedAt - 300 ||
+                          lastNetworkFollowAt >= clickedAt - 300 ||
+                          lastAnyEmitAt >= clickedAt - 300) {
+                        return;
+                      }
                       if (!hadDialog) {
                         var dlg = document.querySelector('[role="dialog"]');
                         if (dlg) {
@@ -612,25 +747,25 @@ class OmniWebViewManager(
                         }
                       }
                       if (isElementHidden(btn)) {
-                        emitFollow('dom');
+                        emitFollow('dom', '', clickInteractionId);
                         return;
                       }
                       if (btn.getAttribute('aria-pressed') === 'true') {
-                        emitFollow('dom');
+                        emitFollow('dom', '', clickInteractionId);
                         return;
                       }
                       var after = readElementLabels(btn);
                       if ((after.text && POST_FOLLOW_STATE_RE.test(after.text)) ||
                           (after.aria && POST_FOLLOW_STATE_RE.test(after.aria))) {
-                        emitFollow('dom');
+                        emitFollow('dom', '', clickInteractionId);
                         return;
                       }
                       if ((after.text !== initialLabels.text || after.aria !== initialLabels.aria) &&
                           !isFollowButtonElement(btn)) {
-                        emitFollow('dom');
+                        emitFollow('dom', '', clickInteractionId);
                       }
                     } catch (_) {}
-                  }, 650);
+                  }, 1000);
                 } catch (_) {}
               }, true);
             })();

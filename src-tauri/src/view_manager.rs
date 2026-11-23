@@ -11,11 +11,13 @@ use tauri::{
 };
 
 use crate::gesture::{step_tab_index, GestureSettings};
-use crate::models::{BrowserTabInfo, ServiceInstance, TabRuntimeState, UpdateSettingsPatch};
+use crate::models::{
+    BrowserTabInfo, SavedSubTab, ServiceInstance, TabRuntimeState, UpdateSettingsPatch,
+};
 use crate::store::ConfigStore;
 use crate::url_utils::{
-    build_user_agent, is_auth_popup_url, is_http_url, is_same_site_url, normalize_service_url,
-    parse_unread_count_from_title, service_group_key,
+    build_user_agent, is_auth_popup_for_site, is_auth_popup_url, is_http_url, is_same_site_url,
+    normalize_service_url, parse_unread_count_from_title, service_group_key,
 };
 
 pub const ACCOUNTBAR_HEIGHT: f64 = 40.0;
@@ -23,11 +25,13 @@ pub const TOOLBAR_HEIGHT: f64 = 44.0;
 pub const TABBAR_HEIGHT: f64 = 34.0;
 pub const TOP_HEADER_HEIGHT: f64 = ACCOUNTBAR_HEIGHT + TOOLBAR_HEIGHT + TABBAR_HEIGHT;
 
-pub fn top_header_height(header_collapsed: bool) -> f64 {
-    if header_collapsed {
-        ACCOUNTBAR_HEIGHT
-    } else {
+pub fn top_header_height(header_collapsed: bool, active_tab_count: usize) -> f64 {
+    if !header_collapsed {
         TOP_HEADER_HEIGHT
+    } else if active_tab_count >= 2 {
+        ACCOUNTBAR_HEIGHT + TABBAR_HEIGHT
+    } else {
+        ACCOUNTBAR_HEIGHT
     }
 }
 const MAX_SUBTABS_PER_SERVICE: usize = 20;
@@ -65,6 +69,7 @@ pub struct BrowserTabEntry {
     pub tab_id: String,
     pub instance_id: String,
     pub webview_label: Option<String>,
+    pub creation_epoch: u64,
     pub current_url: String,
     pub title: String,
     pub favicon_url: Option<String>,
@@ -82,6 +87,7 @@ impl BrowserTabEntry {
             tab_id: next_tab_id(),
             instance_id: inst.instance_id.clone(),
             webview_label: None,
+            creation_epoch: 0,
             current_url: url,
             title,
             favicon_url: None,
@@ -119,6 +125,29 @@ pub struct ServiceTabs {
 
 impl ServiceTabs {
     fn new_initial(inst: &ServiceInstance) -> Self {
+        if inst.saved_tabs.len() >= 2 {
+            let tabs: Vec<BrowserTabEntry> = inst
+                .saved_tabs
+                .iter()
+                .map(|st| {
+                    let title = if st.title.trim().is_empty() {
+                        inst.name.clone()
+                    } else {
+                        st.title.clone()
+                    };
+                    BrowserTabEntry::new_for_service(inst, st.url.clone(), title)
+                })
+                .collect();
+            let active_idx = inst
+                .saved_active_tab_index
+                .unwrap_or(0)
+                .min(tabs.len() - 1);
+            let active_tab_id = tabs[active_idx].tab_id.clone();
+            return Self {
+                tabs,
+                active_tab_id,
+            };
+        }
         let first = BrowserTabEntry::new_for_service(inst, inst.url.clone(), inst.name.clone());
         let active_tab_id = first.tab_id.clone();
         Self {
@@ -179,6 +208,7 @@ pub enum ClosedEntry {
         url: String,
         title: String,
     },
+    #[allow(dead_code)]
     Service {
         instance: ServiceInstance,
         url: String,
@@ -189,6 +219,8 @@ pub enum ClosedEntry {
 pub struct AppStateInner {
     pub store: ConfigStore,
     pub services: HashMap<String, ServiceTabs>,
+    /// `tab_id -> pending_webview_label`（`win.add_child` 実行中の重複生成防止および孤立判定用）
+    pub creating_tabs: HashMap<String, String>,
     pub last_active_by_group: HashMap<String, String>,
     pub closed_tabs: Vec<ClosedEntry>,
     pub active_instance_id: Option<String>,
@@ -216,11 +248,18 @@ impl SharedState {
         }
         let settings_init = store.get_settings();
         let sidebar_w = settings_init.sidebar_width as f64;
-        let top_h = top_header_height(settings_init.header_collapsed);
+        let init_tab_count = settings_init
+            .active_instance_id
+            .as_deref()
+            .and_then(|id| services.get(id))
+            .map(|s| s.tabs.len())
+            .unwrap_or(0);
+        let top_h = top_header_height(settings_init.header_collapsed, init_tab_count);
         Self {
             inner: Arc::new(Mutex::new(AppStateInner {
                 store,
                 services,
+                creating_tabs: HashMap::new(),
                 last_active_by_group: HashMap::new(),
                 closed_tabs: Vec::new(),
                 active_instance_id: None,
@@ -278,6 +317,42 @@ fn profile_dir_for(profiles_root: &PathBuf, instance_id: &str) -> PathBuf {
     profiles_root.join(format!("omnisns-{}", sanitize_profile_segment(instance_id)))
 }
 
+fn active_tab_count(guard: &AppStateInner) -> usize {
+    guard
+        .active_instance_id
+        .as_deref()
+        .and_then(|id| guard.services.get(id))
+        .map(|s| s.tabs.len())
+        .unwrap_or(0)
+}
+
+fn persist_service_tabs(guard: &mut AppStateInner, instance_id: &str) {
+    let snapshot = guard.services.get(instance_id).map(|svc| {
+        let active_idx = svc
+            .tabs
+            .iter()
+            .position(|t| t.tab_id == svc.active_tab_id)
+            .unwrap_or(0);
+        let saved: Vec<SavedSubTab> = svc
+            .tabs
+            .iter()
+            .filter_map(|t| {
+                let url = normalize_service_url(&t.current_url)?;
+                Some(SavedSubTab {
+                    url,
+                    title: t.title.clone(),
+                })
+            })
+            .collect();
+        (saved, active_idx)
+    });
+    if let Some((saved, active_idx)) = snapshot {
+        guard
+            .store
+            .update_saved_tabs(instance_id, saved, active_idx);
+    }
+}
+
 fn push_closed_entry(guard: &mut AppStateInner, entry: ClosedEntry) {
     guard.closed_tabs.push(entry);
     if guard.closed_tabs.len() > MAX_CLOSED_HISTORY {
@@ -319,11 +394,12 @@ pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
                 || guard.active_instance_id.is_none()
                 || active_sleeping_or_err;
             let st = guard.store.get_settings();
+            let tab_count = active_tab_count(&guard);
             (
                 guard.gesture_host.clone(),
                 guard.main_hwnd,
                 st.sidebar_width as f64,
-                top_header_height(st.header_collapsed),
+                top_header_height(st.header_collapsed, tab_count),
                 suspended,
                 st.gesture,
             )
@@ -429,6 +505,22 @@ pub fn ensure_safe_active_instance(shared: &SharedState) -> Option<String> {
     fallback
 }
 
+fn close_webview_cleanly(wv: &Webview) {
+    let _ = wv.hide();
+    let _ = wv.close();
+}
+
+/// 休止中インスタンスのホームURL・表示名が編集された場合、休止タブ側の表示状態も同期する。
+pub fn sync_sleeping_instance_metadata(shared: &SharedState, inst: &ServiceInstance) {
+    let mut guard = shared.inner.lock().unwrap();
+    if let Some(svc) = guard.services.get_mut(&inst.instance_id) {
+        if svc.tabs.len() == 1 && svc.tabs[0].is_sleeping && svc.tabs[0].webview_label.is_none() {
+            svc.tabs[0].current_url = inst.url.clone();
+            svc.tabs[0].title = inst.name.clone();
+        }
+    }
+}
+
 /// ConfigStore のインスタンス一覧に合わせて ServiceTabs / 削除済みWebview を同期する。
 /// `purge_profile` が false の場合は閉じたタブ復元のためディスク上のプロファイルを保持する。
 pub fn sync_instances_ex(app: &AppHandle, shared: &SharedState, purge_profiles: bool) {
@@ -482,7 +574,7 @@ pub fn sync_instances_ex(app: &AppHandle, shared: &SharedState, purge_profiles: 
 
     for (label, maybe_profile_dir) in to_close {
         if let Some(wv) = app.get_webview(&label) {
-            let _ = wv.close();
+            close_webview_cleanly(&wv);
         }
         if let Some(profile_dir) = maybe_profile_dir {
             std::thread::spawn(move || {
@@ -522,7 +614,7 @@ pub fn update_bounds_from_window(app: &AppHandle, shared: &SharedState) {
         let mut guard = shared.inner.lock().unwrap();
         let st = guard.store.get_settings();
         let sidebar_w = st.sidebar_width as f64;
-        let top_h = top_header_height(st.header_collapsed);
+        let top_h = top_header_height(st.header_collapsed, active_tab_count(&guard));
         guard.bounds = ContentBounds {
             x: sidebar_w,
             y: top_h,
@@ -536,7 +628,7 @@ pub fn update_bounds_from_window(app: &AppHandle, shared: &SharedState) {
 }
 
 pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
-    let (target_label, bounds, all_labels, should_focus_shell) = {
+    let (target_label, bounds, tracked_labels, creating_labels, should_focus_shell) = {
         let guard = shared.inner.lock().unwrap();
         let active_tab = guard
             .active_instance_id
@@ -547,10 +639,14 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
         let active_has_error = active_tab
             .map(|t| t.load_error.is_some())
             .unwrap_or(false);
+        let active_is_sleeping = active_tab
+            .map(|t| t.is_sleeping)
+            .unwrap_or(true);
 
         let should_hide = guard.overlay_visible
             || guard.active_instance_id.is_none()
-            || active_has_error;
+            || active_has_error
+            || active_is_sleeping;
 
         let target = if should_hide {
             None
@@ -558,22 +654,33 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
             active_tab.and_then(|t| t.webview_label.clone())
         };
 
-        let mut labels = Vec::new();
+        let mut tracked = HashSet::new();
         for svc in guard.services.values() {
             for tab in &svc.tabs {
                 if let Some(ref l) = tab.webview_label {
-                    labels.push(l.clone());
+                    tracked.insert(l.clone());
                 }
             }
         }
-        (target, guard.bounds, labels, guard.overlay_visible)
+        let creating: HashSet<String> = guard.creating_tabs.values().cloned().collect();
+        (target, guard.bounds, tracked, creating, guard.overlay_visible)
     };
 
-    for label in all_labels {
-        if target_label.as_deref() == Some(label.as_str()) {
+    // メインウィンドウ配下の全子WebViewを実体ベースで走査し、
+    // 1) 未追跡かつ生成中でもない孤立した子WebView（ゾンビ）は即座に非表示＆破棄する
+    // 2) 表示対象以外の全SNS子WebViewを確実に非表示にする（モーダル重なり・残留を根絶）
+    for (label, wv) in app.webviews() {
+        if label == "shell" {
             continue;
         }
-        if let Some(wv) = app.get_webview(&label) {
+        if wv.window().label() != "main" {
+            continue;
+        }
+        if !tracked_labels.contains(&label) && !creating_labels.contains(&label) {
+            close_webview_cleanly(&wv);
+            continue;
+        }
+        if target_label.as_deref() != Some(label.as_str()) {
             let _ = wv.hide();
         }
     }
@@ -592,8 +699,14 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
                 });
             }
         }
-    } else if should_focus_shell {
-        if let Some(shell) = app.get_webview("shell") {
+    } else if let Some(shell) = app.get_webview("shell") {
+        #[cfg(windows)]
+        {
+            let _ = shell.with_webview(|platform_wv| {
+                crate::platform_win::bring_controller_to_top(&platform_wv.controller());
+            });
+        }
+        if should_focus_shell {
             let _ = shell.set_focus();
         }
     }
@@ -612,22 +725,29 @@ pub fn activate_tab(app: &AppHandle, shared: &SharedState, instance_id: Option<S
                 if let Some(inst) = guard.store.get_instance(id) {
                     let gkey = service_group_key(&inst.service_id, &inst.url, &inst.instance_id);
                     guard.last_active_by_group.insert(gkey, inst.instance_id.clone());
-                    let svc = guard
-                        .services
-                        .entry(id.clone())
-                        .or_insert_with(|| ServiceTabs::new_initial(&inst));
-                    if svc.tabs.is_empty() {
-                        let first = BrowserTabEntry::new_for_service(
-                            &inst,
-                            inst.url.clone(),
-                            inst.name.clone(),
-                        );
-                        svc.active_tab_id = first.tab_id.clone();
-                        svc.tabs.push(first);
-                    }
-                    let tab = svc.active_tab().unwrap();
-                    if tab.webview_label.is_none() {
-                        Some((inst, tab.tab_id.clone(), tab.current_url.clone()))
+                    let (tab_id, target_url, has_webview) = {
+                        let svc = guard
+                            .services
+                            .entry(id.clone())
+                            .or_insert_with(|| ServiceTabs::new_initial(&inst));
+                        if svc.tabs.is_empty() {
+                            let first = BrowserTabEntry::new_for_service(
+                                &inst,
+                                inst.url.clone(),
+                                inst.name.clone(),
+                            );
+                            svc.active_tab_id = first.tab_id.clone();
+                            svc.tabs.push(first);
+                        }
+                        let tab = svc.active_tab().unwrap();
+                        (
+                            tab.tab_id.clone(),
+                            tab.current_url.clone(),
+                            tab.webview_label.is_some(),
+                        )
+                    };
+                    if !has_webview && !guard.creating_tabs.contains_key(&tab_id) {
+                        Some((inst, tab_id, target_url))
                     } else {
                         None
                     }
@@ -643,7 +763,7 @@ pub fn activate_tab(app: &AppHandle, shared: &SharedState, instance_id: Option<S
         create_tab_webview(app, shared, inst, tab_id, target_url);
     }
 
-    refresh_attached_view(app, shared);
+    update_bounds_from_window(app, shared);
 }
 
 pub fn activate_subtab(app: &AppHandle, shared: &SharedState, instance_id: &str, tab_id: &str) {
@@ -659,26 +779,131 @@ pub fn activate_subtab(app: &AppHandle, shared: &SharedState, instance_id: &str,
             active_instance_id: Some(Some(instance_id.to_string())),
             ..Default::default()
         });
-        let Some(svc) = guard.services.get_mut(instance_id) else {
-            return;
+        let tab_info = {
+            let is_creating = guard.creating_tabs.contains_key(tab_id);
+            let Some(svc) = guard.services.get_mut(instance_id) else {
+                return;
+            };
+            let Some(tab) = svc.tabs.iter().find(|t| t.tab_id == tab_id) else {
+                return;
+            };
+            let res = if tab.webview_label.is_none() && !is_creating {
+                Some((inst, tab.tab_id.clone(), tab.current_url.clone()))
+            } else {
+                None
+            };
+            svc.active_tab_id = tab_id.to_string();
+            res
         };
-        let Some(tab) = svc.tabs.iter().find(|t| t.tab_id == tab_id) else {
-            return;
-        };
-        svc.active_tab_id = tab_id.to_string();
-        if tab.webview_label.is_none() {
-            Some((inst, tab.tab_id.clone(), tab.current_url.clone()))
-        } else {
-            None
-        }
+        persist_service_tabs(&mut guard, instance_id);
+        tab_info
     };
 
     if let Some((inst, tid, url)) = needs_create {
         create_tab_webview(app, shared, inst, tid, url);
     }
 
-    refresh_attached_view(app, shared);
+    update_bounds_from_window(app, shared);
     emit_state_updated(app, shared);
+}
+
+pub fn create_subtab_with_options(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    url_override: Option<String>,
+    insert_after_tab_id: Option<&str>,
+    activate: bool,
+) -> Result<(String, usize), String> {
+    let (inst, tab_id, target_url, total_tabs) = {
+        let mut guard = shared.inner.lock().unwrap();
+        let inst = guard
+            .store
+            .get_instance(instance_id)
+            .ok_or_else(|| "対象サービスが見つかりません".to_string())?;
+        let (tid, target_url, total_tabs) = {
+            let svc = guard
+                .services
+                .entry(instance_id.to_string())
+                .or_insert_with(|| ServiceTabs::new_initial(&inst));
+
+            let target_url = url_override
+                .as_deref()
+                .and_then(normalize_service_url)
+                .unwrap_or_else(|| inst.url.clone());
+
+            // 最後のタブを閉じて休止中のアカウントで新規タブ／復元した場合は、
+            // 休止中の1枚目をそのまま再利用して起こす（空の休止タブが増えないようにする）
+            let reuse_first = activate
+                && svc.tabs.len() == 1
+                && svc.tabs[0].is_sleeping
+                && svc.tabs[0].webview_label.is_none();
+            if reuse_first {
+                let initial_title = if url_override.is_some() {
+                    url::Url::parse(&target_url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_string()))
+                        .unwrap_or_else(|| inst.name.clone())
+                } else {
+                    inst.name.clone()
+                };
+                svc.tabs[0].current_url = target_url.clone();
+                svc.tabs[0].title = initial_title;
+                svc.tabs[0].load_error = None;
+                let tid = svc.tabs[0].tab_id.clone();
+                svc.active_tab_id = tid.clone();
+                (tid, target_url, 1)
+            } else {
+                if svc.tabs.len() >= MAX_SUBTABS_PER_SERVICE {
+                    return Err(format!(
+                        "1つのサービスで開けるタブは最大 {MAX_SUBTABS_PER_SERVICE} 枚です"
+                    ));
+                }
+
+                let initial_title = if url_override.is_some() {
+                    url::Url::parse(&target_url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_string()))
+                        .unwrap_or_else(|| inst.name.clone())
+                } else {
+                    inst.name.clone()
+                };
+                let entry =
+                    BrowserTabEntry::new_for_service(&inst, target_url.clone(), initial_title);
+                let tid = entry.tab_id.clone();
+
+                if let Some(after_id) = insert_after_tab_id {
+                    if let Some(pos) = svc.tabs.iter().position(|t| t.tab_id == after_id) {
+                        svc.tabs.insert(pos + 1, entry);
+                    } else {
+                        svc.tabs.push(entry);
+                    }
+                } else {
+                    svc.tabs.push(entry);
+                }
+
+                if activate {
+                    svc.active_tab_id = tid.clone();
+                }
+                (tid, target_url, svc.tabs.len())
+            }
+        };
+
+        if activate {
+            guard.active_instance_id = Some(instance_id.to_string());
+            guard.store.update_settings(UpdateSettingsPatch {
+                active_instance_id: Some(Some(instance_id.to_string())),
+                ..Default::default()
+            });
+        }
+        persist_service_tabs(&mut guard, instance_id);
+        (inst, tid, target_url, total_tabs)
+    };
+
+    create_tab_webview(app, shared, inst, tab_id.clone(), target_url);
+    update_bounds_from_window(app, shared);
+    emit_state_updated(app, shared);
+    Ok((tab_id, total_tabs))
 }
 
 pub fn create_subtab(
@@ -687,42 +912,70 @@ pub fn create_subtab(
     instance_id: &str,
     url_override: Option<String>,
 ) -> Result<String, String> {
-    let (inst, tab_id, target_url) = {
+    create_subtab_with_options(app, shared, instance_id, url_override, None, true)
+        .map(|(tab_id, _)| tab_id)
+}
+
+pub fn navigate_subtab(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    raw_url: &str,
+) -> Result<String, String> {
+    let target_url = normalize_service_url(raw_url)
+        .ok_or_else(|| "有効な http:// または https:// URL を入力してください".to_string())?;
+
+    let (existing_label, needs_create) = {
         let mut guard = shared.inner.lock().unwrap();
         let inst = guard
             .store
             .get_instance(instance_id)
             .ok_or_else(|| "対象サービスが見つかりません".to_string())?;
-        let svc = guard
-            .services
-            .entry(instance_id.to_string())
-            .or_insert_with(|| ServiceTabs::new_initial(&inst));
-        if svc.tabs.len() >= MAX_SUBTABS_PER_SERVICE {
-            return Err(format!(
-                "1つのサービスで開けるタブは最大 {MAX_SUBTABS_PER_SERVICE} 枚です"
-            ));
-        }
-
-        let target_url = url_override
-            .as_deref()
-            .and_then(normalize_service_url)
-            .unwrap_or_else(|| inst.url.clone());
-        let entry = BrowserTabEntry::new_for_service(&inst, target_url.clone(), inst.name.clone());
-        let tid = entry.tab_id.clone();
-        svc.tabs.push(entry);
-        svc.active_tab_id = tid.clone();
-        guard.active_instance_id = Some(instance_id.to_string());
-        guard.store.update_settings(UpdateSettingsPatch {
-            active_instance_id: Some(Some(instance_id.to_string())),
-            ..Default::default()
-        });
-        (inst, tid, target_url)
+        let res = {
+            let svc = guard
+                .services
+                .entry(instance_id.to_string())
+                .or_insert_with(|| ServiceTabs::new_initial(&inst));
+            if svc.tabs.is_empty() {
+                let first =
+                    BrowserTabEntry::new_for_service(&inst, target_url.clone(), inst.name.clone());
+                svc.active_tab_id = first.tab_id.clone();
+                svc.tabs.push(first);
+            }
+            let active_id = svc.active_tab_id.clone();
+            let active_idx = svc
+                .tabs
+                .iter()
+                .position(|t| t.tab_id == active_id)
+                .unwrap_or(0);
+            let tab = &mut svc.tabs[active_idx];
+            tab.current_url = target_url.clone();
+            tab.load_error = None;
+            if let Some(label) = tab.webview_label.clone() {
+                (Some(label), None)
+            } else {
+                (None, Some((inst, tab.tab_id.clone(), target_url.clone())))
+            }
+        };
+        persist_service_tabs(&mut guard, instance_id);
+        res
     };
 
-    create_tab_webview(app, shared, inst, tab_id.clone(), target_url);
+    if let Some(label) = existing_label {
+        if let Some(wv) = app.get_webview(&label) {
+            let url_owned = target_url.clone();
+            #[cfg(windows)]
+            let _ = wv.with_webview(move |pwv| {
+                crate::platform_win::navigate(&pwv.controller(), &url_owned);
+            });
+        }
+    } else if let Some((inst, tid, url)) = needs_create {
+        create_tab_webview(app, shared, inst, tid, url);
+    }
+
     refresh_attached_view(app, shared);
-    emit_state_updated(app, shared);
-    Ok(tab_id)
+    emit_runtime_updated(app, shared, instance_id);
+    Ok(target_url)
 }
 
 pub fn duplicate_subtab(
@@ -753,10 +1006,11 @@ pub fn close_subtab(
             closed_label: Option<String>,
             activate_next: Option<(ServiceInstance, String, String)>,
         },
-        ClosedService {
+        LastTabSlept {
+            closed_label: Option<String>,
             service_name: String,
         },
-        LastServiceSlept {
+        AlreadySleeping {
             service_name: String,
         },
     }
@@ -773,25 +1027,34 @@ pub fn close_subtab(
             .unwrap_or(0);
 
         if sub_count >= 2 {
-            let svc = guard.services.get_mut(instance_id).unwrap();
-            let Some(pos) = svc.tabs.iter().position(|t| t.tab_id == tab_id) else {
-                return None;
+            let (removed, needs_create) = {
+                let is_creating_map = guard.creating_tabs.clone();
+                let svc = guard.services.get_mut(instance_id).unwrap();
+                let Some(pos) = svc.tabs.iter().position(|t| t.tab_id == tab_id) else {
+                    return None;
+                };
+                let was_active = svc.active_tab_id == tab_id;
+                let removed = svc.tabs.remove(pos);
+                let next_idx = pos.min(svc.tabs.len() - 1);
+                let next_tab_id = svc.tabs[next_idx].tab_id.clone();
+                let needs_create = if was_active
+                    && svc.tabs[next_idx].webview_label.is_none()
+                    && !is_creating_map.contains_key(&next_tab_id)
+                {
+                    Some((
+                        inst.clone(),
+                        next_tab_id.clone(),
+                        svc.tabs[next_idx].current_url.clone(),
+                    ))
+                } else {
+                    None
+                };
+                if was_active {
+                    svc.active_tab_id = next_tab_id;
+                }
+                (removed, needs_create)
             };
-            let removed = svc.tabs.remove(pos);
-            let next_idx = pos.min(svc.tabs.len() - 1);
-            let next_tab_id = svc.tabs[next_idx].tab_id.clone();
-            let needs_create = if svc.tabs[next_idx].webview_label.is_none() {
-                Some((
-                    inst.clone(),
-                    next_tab_id.clone(),
-                    svc.tabs[next_idx].current_url.clone(),
-                ))
-            } else {
-                None
-            };
-            if svc.active_tab_id == tab_id {
-                svc.active_tab_id = next_tab_id;
-            }
+            persist_service_tabs(&mut guard, instance_id);
             push_closed_entry(
                 &mut guard,
                 ClosedEntry::SubTab {
@@ -805,29 +1068,49 @@ pub fn close_subtab(
                 activate_next: needs_create,
             }
         } else {
-            // 最後のサブタブ -> 他にサービスがあればこのサービスを閉じて履歴へ積む（プロファイルは保持！）
-            let total_count = guard.store.get_instances().len();
-            if total_count >= 2 {
-                let (cur_url, cur_title) = guard
-                    .services
-                    .get(instance_id)
-                    .and_then(|s| s.active_tab())
-                    .map(|t| (t.current_url.clone(), t.title.clone()))
-                    .unwrap_or_else(|| (inst.url.clone(), inst.name.clone()));
+            // 最後のタブを閉じてもサイドバー／アカウント一覧からは絶対に削除せず、
+            // WebView2 のみ閉じて休止状態にし、閉じたページは復元履歴へ積む。
+            let creating_first = guard
+                .services
+                .get(instance_id)
+                .and_then(|s| s.tabs.first())
+                .map(|t| guard.creating_tabs.contains_key(&t.tab_id))
+                .unwrap_or(false);
+            let closed_info = guard.services.get_mut(instance_id).and_then(|svc| {
+                let tab = svc.tabs.first_mut()?;
+                if tab.is_sleeping && tab.webview_label.is_none() && !creating_first {
+                    return None;
+                }
+                let label = tab.webview_label.take();
+                let prev_url = tab.current_url.clone();
+                let prev_title = tab.title.clone();
+                tab.creation_epoch = tab.creation_epoch.wrapping_add(1);
+                tab.is_sleeping = true;
+                tab.is_loading = false;
+                tab.unread_count = 0;
+                tab.can_go_back = false;
+                tab.can_go_forward = false;
+                tab.load_error = None;
+                tab.current_url = inst.url.clone();
+                tab.title = inst.name.clone();
+                Some((label, prev_url, prev_title))
+            });
+            if let Some((closed_label, prev_url, prev_title)) = closed_info {
+                persist_service_tabs(&mut guard, instance_id);
                 push_closed_entry(
                     &mut guard,
-                    ClosedEntry::Service {
-                        instance: inst.clone(),
-                        url: cur_url,
-                        title: cur_title,
+                    ClosedEntry::SubTab {
+                        instance_id: instance_id.to_string(),
+                        url: prev_url,
+                        title: prev_title,
                     },
                 );
-                guard.store.remove_instance(instance_id);
-                CloseOutcome::ClosedService {
+                CloseOutcome::LastTabSlept {
+                    closed_label,
                     service_name: inst.name,
                 }
             } else {
-                CloseOutcome::LastServiceSlept {
+                CloseOutcome::AlreadySleeping {
                     service_name: inst.name,
                 }
             }
@@ -841,30 +1124,33 @@ pub fn close_subtab(
         } => {
             if let Some(label) = closed_label {
                 if let Some(wv) = app.get_webview(&label) {
-                    let _ = wv.close();
+                    close_webview_cleanly(&wv);
                 }
             }
             if let Some((inst, tid, url)) = activate_next {
                 create_tab_webview(app, shared, inst, tid, url);
             }
-            refresh_attached_view(app, shared);
+            update_bounds_from_window(app, shared);
             emit_state_updated(app, shared);
             None
         }
-        CloseOutcome::ClosedService { service_name } => {
-            sync_instances_ex(app, shared, false);
-            let next_active = ensure_safe_active_instance(shared);
-            activate_tab(app, shared, next_active);
+        CloseOutcome::LastTabSlept {
+            closed_label,
+            service_name,
+        } => {
+            if let Some(label) = closed_label {
+                if let Some(wv) = app.get_webview(&label) {
+                    close_webview_cleanly(&wv);
+                }
+            }
+            update_bounds_from_window(app, shared);
             emit_state_updated(app, shared);
             Some(format!(
-                "「{service_name}」を閉じました（閉じたタブを復元で戻せます）"
+                "「{service_name}」のタブを閉じました（休止状態 · サイドバーに残ります）"
             ))
         }
-        CloseOutcome::LastServiceSlept { service_name } => {
-            sleep_tab(app, shared, instance_id);
-            Some(format!(
-                "最後のサービス「{service_name}」を休止しました"
-            ))
+        CloseOutcome::AlreadySleeping { service_name } => {
+            Some(format!("「{service_name}」のタブはすでに閉じています"))
         }
     }
 }
@@ -880,7 +1166,7 @@ pub fn close_other_subtabs(
         let mut labels = Vec::new();
         let mut closed_entries = Vec::new();
         if let Some(svc) = guard.services.get_mut(instance_id) {
-            if svc.tabs.len() <= 1 {
+            if svc.tabs.len() <= 1 || !svc.tabs.iter().any(|t| t.tab_id == keep_tab_id) {
                 return 0;
             }
             let mut kept = Vec::new();
@@ -898,9 +1184,6 @@ pub fn close_other_subtabs(
                     });
                 }
             }
-            if kept.is_empty() {
-                return 0;
-            }
             svc.tabs = kept;
             svc.active_tab_id = svc.tabs[0].tab_id.clone();
         }
@@ -911,16 +1194,17 @@ pub fn close_other_subtabs(
         if closed_count == 0 {
             return 0;
         }
+        persist_service_tabs(&mut guard, instance_id);
         labels
     };
 
     let closed_num = closed_labels.len();
     for label in closed_labels {
         if let Some(wv) = app.get_webview(&label) {
-            let _ = wv.close();
+            close_webview_cleanly(&wv);
         }
     }
-    refresh_attached_view(app, shared);
+    update_bounds_from_window(app, shared);
     emit_state_updated(app, shared);
     closed_num.max(1)
 }
@@ -1149,26 +1433,6 @@ fn create_tab_webview(
         return;
     };
 
-    let (bounds, profile_dir, chrome_ver, initial_visible) = {
-        let guard = shared.inner.lock().unwrap();
-        let is_active_tab = guard.active_instance_id.as_deref()
-            == Some(instance.instance_id.as_str())
-            && guard
-                .services
-                .get(&instance.instance_id)
-                .map(|s| s.active_tab_id == tab_id)
-                .unwrap_or(false);
-        let visible = !guard.overlay_visible && is_active_tab;
-        (
-            guard.bounds,
-            profile_dir_for(&guard.profiles_root, &instance.instance_id),
-            guard.chrome_version.clone(),
-            visible,
-        )
-    };
-
-    let _ = fs::create_dir_all(&profile_dir);
-
     let Ok(parsed_url) = url::Url::parse(&target_url) else {
         return;
     };
@@ -1179,6 +1443,50 @@ fn create_tab_webview(
         sanitize_profile_segment(&instance.instance_id),
         gen
     );
+
+    // ロック下で重複生成ガード（creating_tabs）と現在エポックを確保
+    let Some((bounds, profile_dir, chrome_ver, start_offscreen, my_epoch)) = ({
+        let mut guard = shared.inner.lock().unwrap();
+        if guard.is_quitting || guard.creating_tabs.contains_key(&tab_id) {
+            None
+        } else {
+            let tab_meta = guard
+                .services
+                .get(&instance.instance_id)
+                .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tab_id))
+                .and_then(|t| {
+                    if t.webview_label.is_some() {
+                        None
+                    } else {
+                        Some(t.creation_epoch)
+                    }
+                });
+            if let Some(epoch) = tab_meta {
+                let is_active_tab = guard.active_instance_id.as_deref()
+                    == Some(instance.instance_id.as_str())
+                    && guard
+                        .services
+                        .get(&instance.instance_id)
+                        .map(|s| s.active_tab_id == tab_id)
+                        .unwrap_or(false);
+                let start_offscreen = guard.overlay_visible || !is_active_tab;
+                guard.creating_tabs.insert(tab_id.clone(), label.clone());
+                Some((
+                    guard.bounds,
+                    profile_dir_for(&guard.profiles_root, &instance.instance_id),
+                    guard.chrome_version.clone(),
+                    start_offscreen,
+                    epoch,
+                ))
+            } else {
+                None
+            }
+        }
+    }) else {
+        return;
+    };
+
+    let _ = fs::create_dir_all(&profile_dir);
     let ua = build_user_agent(&instance.ua_mode, &chrome_ver);
 
     let instance_id = instance.instance_id.clone();
@@ -1189,12 +1497,14 @@ fn create_tab_webview(
     let shared_for_title = shared.clone();
     let id_for_title = instance_id.clone();
     let tid_for_title = tab_id.clone();
+    let label_for_title = label.clone();
     let fallback_name = instance_name.clone();
 
     let app_for_popup = app.clone();
     let shared_for_popup = shared.clone();
     let id_for_popup = instance_id.clone();
     let tid_for_popup = tab_id.clone();
+    let label_for_popup = label.clone();
     let name_for_popup = instance_name.clone();
     let fallback_url_for_popup = instance_url.clone();
 
@@ -1226,29 +1536,43 @@ fn create_tab_webview(
             let unread = parse_unread_count_from_title(&clean_title);
             let changed = {
                 let mut guard = shared_for_title.inner.lock().unwrap();
-                if let Some(tab) = guard
-                    .services
-                    .get_mut(&id_for_title)
-                    .and_then(|s| s.tab_mut(&tid_for_title))
-                {
-                    tab.title = clean_title;
-                    tab.unread_count = unread;
-                    true
+                let mut multi = false;
+                let updated = if let Some(svc) = guard.services.get_mut(&id_for_title) {
+                    multi = svc.tabs.len() >= 2;
+                    if let Some(tab) = svc.tab_mut(&tid_for_title) {
+                        if tab.webview_label.as_deref() == Some(label_for_title.as_str()) {
+                            tab.title = clean_title;
+                            tab.unread_count = unread;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 } else {
                     false
+                };
+                if updated && multi {
+                    persist_service_tabs(&mut guard, &id_for_title);
                 }
+                updated
             };
             if changed {
                 emit_runtime_updated(&app_for_title, &shared_for_title, &id_for_title);
             }
         })
         .on_new_window(move |target_url, features| {
-            let (current_url, latest_ua) = {
+            let (is_alive, current_url, latest_ua) = {
                 let guard = shared_for_popup.inner.lock().unwrap();
-                let cur = guard
+                let tab_opt = guard
                     .services
                     .get(&id_for_popup)
-                    .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_for_popup))
+                    .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_for_popup));
+                let alive = tab_opt
+                    .map(|t| t.webview_label.as_deref() == Some(label_for_popup.as_str()))
+                    .unwrap_or(false);
+                let cur = tab_opt
                     .map(|t| t.current_url.clone())
                     .filter(|u| !u.is_empty())
                     .unwrap_or_else(|| fallback_url_for_popup.clone());
@@ -1257,11 +1581,24 @@ fn create_tab_webview(
                     .get_instance(&id_for_popup)
                     .map(|i| i.ua_mode)
                     .unwrap_or_else(|| "desktop".to_string());
-                (cur, build_user_agent(&ua_mode, &guard.chrome_version))
+                (alive, cur, build_user_agent(&ua_mode, &guard.chrome_version))
             };
+            if !is_alive {
+                return NewWindowResponse::Deny;
+            }
 
             let target_str = target_url.as_str();
-            if is_auth_popup_url(target_str) {
+            let has_popup_features = features.size().is_some() || features.position().is_some();
+            #[cfg(windows)]
+            let (is_user_new_tab, force_foreground) = crate::gesture_win::consume_new_tab_click_intent();
+            #[cfg(not(windows))]
+            let (is_user_new_tab, force_foreground) = (false, false);
+
+            let should_open_auth_popup = (!is_user_new_tab
+                && is_auth_popup_for_site(target_str, &current_url))
+                || (has_popup_features && is_auth_popup_url(target_str));
+
+            if should_open_auth_popup {
                 // OAuth / SSO は window.opener を保つネイティブ子ウィンドウで開く
                 let popup_id = POPUP_GEN.fetch_add(1, Ordering::Relaxed);
                 let popup_label = format!("popup-{popup_id}");
@@ -1296,14 +1633,55 @@ fn create_tab_webview(
                     Ok(window) => NewWindowResponse::Create { window },
                     Err(_) => NewWindowResponse::Allow,
                 }
-            } else if is_same_site_url(target_str, &current_url) {
-                // 同一サービスの別ページリンクは同サービス内の新しいサブタブで開く！
+            } else if is_user_new_tab && is_http_url(target_str) {
+                // Ctrl+クリック / 中クリック / Ctrl+クリックジェスチャー時は、
+                // 同一アカウントのセッションを保ったまま別ページを新しいタブで開く！
                 let app_bg = app_for_popup.clone();
                 let shared_bg = shared_for_popup.clone();
                 let inst_bg = id_for_popup.clone();
+                let after_tid = tid_for_popup.clone();
+                let url_bg = target_str.to_string();
+                let activate = force_foreground;
+                tauri::async_runtime::spawn(async move {
+                    match create_subtab_with_options(
+                        &app_bg,
+                        &shared_bg,
+                        &inst_bg,
+                        Some(url_bg),
+                        Some(&after_tid),
+                        activate,
+                    ) {
+                        Ok((_, total)) => {
+                            if !activate {
+                                show_overlay_notice(
+                                    &shared_bg,
+                                    format!("別タブで開きました（全{total}タブ）"),
+                                    false,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            show_overlay_notice(&shared_bg, err, true);
+                        }
+                    }
+                });
+                NewWindowResponse::Deny
+            } else if is_same_site_url(target_str, &current_url) {
+                // 同一サービスの target="_blank" リンクは同アカウント内の新しいタブで開く
+                let app_bg = app_for_popup.clone();
+                let shared_bg = shared_for_popup.clone();
+                let inst_bg = id_for_popup.clone();
+                let after_tid = tid_for_popup.clone();
                 let url_bg = target_str.to_string();
                 tauri::async_runtime::spawn(async move {
-                    let _ = create_subtab(&app_bg, &shared_bg, &inst_bg, Some(url_bg));
+                    let _ = create_subtab_with_options(
+                        &app_bg,
+                        &shared_bg,
+                        &inst_bg,
+                        Some(url_bg),
+                        Some(&after_tid),
+                        true,
+                    );
                 });
                 NewWindowResponse::Deny
             } else {
@@ -1315,42 +1693,62 @@ fn create_tab_webview(
             }
         });
 
-    let Ok(webview) = win.add_child(
-        builder,
-        LogicalPosition::new(bounds.x, bounds.y),
-        LogicalSize::new(bounds.width, bounds.height),
-    ) else {
+    // 非アクティブ・モーダル表示中に生成されるタブは画面外へ配置してから即非表示にし、
+    // 一瞬でもモーダルや他タブの上に重ならないようにする
+    let init_pos = if start_offscreen {
+        LogicalPosition::new(-10000.0, -10000.0)
+    } else {
+        LogicalPosition::new(bounds.x, bounds.y)
+    };
+    let init_size = LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0));
+
+    let Ok(webview) = win.add_child(builder, init_pos, init_size) else {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.creating_tabs.remove(&tab_id);
         return;
     };
 
-    if !initial_visible {
-        let _ = webview.hide();
-    }
+    // 生成直後は一旦非表示にし、最新状態を再検証したうえで refresh_attached_view が一元的に表示制御する
+    let _ = webview.hide();
 
-    let updated = {
+    let committed = {
         let mut guard = shared.inner.lock().unwrap();
-        if let Some(tab) = guard
+        guard.creating_tabs.remove(&tab_id);
+        if guard.is_quitting {
+            false
+        } else if let Some(tab) = guard
             .services
             .get_mut(&instance_id)
             .and_then(|s| s.tab_mut(&tab_id))
         {
-            tab.webview_label = Some(label.clone());
-            tab.is_sleeping = false;
-            tab.is_loading = true;
-            tab.load_error = None;
-            true
+            if tab.creation_epoch == my_epoch && tab.webview_label.is_none() {
+                tab.webview_label = Some(label.clone());
+                tab.is_sleeping = false;
+                tab.is_loading = true;
+                tab.load_error = None;
+                true
+            } else {
+                false
+            }
         } else {
             false
         }
     };
-    if updated {
-        emit_runtime_updated(app, shared, &instance_id);
+
+    if !committed {
+        // 生成中にタブが削除・休止・置換されていた場合は即座に破棄してゾンビWebViewを防ぐ
+        close_webview_cleanly(&webview);
+        refresh_attached_view(app, shared);
+        return;
     }
 
     #[cfg(windows)]
     {
-        attach_windows_handlers(app, shared, &webview, &instance, &tab_id, &ua, initial_visible);
+        attach_windows_handlers(app, shared, &webview, &instance, &tab_id, &label, &ua);
     }
+
+    emit_runtime_updated(app, shared, &instance_id);
+    refresh_attached_view(app, shared);
 }
 
 #[cfg(windows)]
@@ -1360,11 +1758,12 @@ fn attach_windows_handlers(
     webview: &Webview,
     instance: &ServiceInstance,
     tab_id: &str,
+    webview_label: &str,
     ua: &str,
-    initial_visible: bool,
 ) {
     let instance_id = instance.instance_id.clone();
     let tid = tab_id.to_string();
+    let wv_label = webview_label.to_string();
     let fallback_url = instance.url.clone();
     let muted = instance.muted;
     let zoom = instance.zoom_factor;
@@ -1374,23 +1773,33 @@ fn attach_windows_handlers(
     let shared_start = shared.clone();
     let id_start = instance_id.clone();
     let tid_start = tid.clone();
+    let label_start = wv_label.clone();
 
     let app_done = app.clone();
     let shared_done = shared.clone();
     let id_done = instance_id.clone();
     let tid_done = tid.clone();
+    let label_done = wv_label.clone();
     let fallback_done = fallback_url.clone();
 
     let app_nav = app.clone();
     let shared_nav = shared.clone();
     let id_nav = instance_id.clone();
     let tid_nav = tid.clone();
+    let label_nav = wv_label.clone();
     let fallback_nav = fallback_url.clone();
 
     let app_fav = app.clone();
     let shared_fav = shared.clone();
     let id_fav = instance_id.clone();
     let tid_fav = tid.clone();
+    let label_fav = wv_label.clone();
+
+    let app_zoom = app.clone();
+    let shared_zoom = shared.clone();
+    let id_zoom = instance_id.clone();
+    let tid_zoom = tid.clone();
+    let label_zoom = wv_label.clone();
 
     let app_key = app.clone();
     let shared_key = shared.clone();
@@ -1398,6 +1807,8 @@ fn attach_windows_handlers(
     let app_follow = app.clone();
     let shared_follow = shared.clone();
     let id_follow = instance_id.clone();
+    let tid_follow = tid.clone();
+    let label_follow = wv_label.clone();
 
     let callbacks = crate::platform_win::TabWebviewCallbacks {
         on_navigation_starting: Arc::new(move || {
@@ -1408,11 +1819,15 @@ fn attach_windows_handlers(
                     .get_mut(&id_start)
                     .and_then(|s| s.tab_mut(&tid_start))
                 {
-                    let had_err = tab.load_error.is_some();
-                    tab.is_loading = true;
-                    tab.is_sleeping = false;
-                    tab.load_error = None;
-                    (true, had_err)
+                    if tab.webview_label.as_deref() == Some(label_start.as_str()) {
+                        let had_err = tab.load_error.is_some();
+                        tab.is_loading = true;
+                        tab.is_sleeping = false;
+                        tab.load_error = None;
+                        (true, had_err)
+                    } else {
+                        (false, false)
+                    }
                 } else {
                     (false, false)
                 }
@@ -1427,27 +1842,37 @@ fn attach_windows_handlers(
         on_navigation_completed: Arc::new(move |ok, err_msg, url, can_back, can_fwd| {
             let changed = {
                 let mut guard = shared_done.inner.lock().unwrap();
-                if let Some(tab) = guard
-                    .services
-                    .get_mut(&id_done)
-                    .and_then(|s| s.tab_mut(&tid_done))
-                {
-                    tab.is_loading = false;
-                    tab.is_sleeping = false;
-                    if !url.is_empty() {
-                        tab.current_url = url;
-                    } else if tab.current_url.is_empty() {
-                        tab.current_url = fallback_done.clone();
+                let mut multi = false;
+                let updated = if let Some(svc) = guard.services.get_mut(&id_done) {
+                    multi = svc.tabs.len() >= 2;
+                    if let Some(tab) = svc.tab_mut(&tid_done) {
+                        if tab.webview_label.as_deref() == Some(label_done.as_str()) {
+                            tab.is_loading = false;
+                            tab.is_sleeping = false;
+                            if !url.is_empty() {
+                                tab.current_url = url;
+                            } else if tab.current_url.is_empty() {
+                                tab.current_url = fallback_done.clone();
+                            }
+                            tab.can_go_back = can_back;
+                            tab.can_go_forward = can_fwd;
+                            tab.load_error = if ok { None } else { err_msg };
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
-                    tab.can_go_back = can_back;
-                    tab.can_go_forward = can_fwd;
-                    tab.load_error = if ok { None } else { err_msg };
-                    true
                 } else {
                     false
+                };
+                if updated && multi {
+                    persist_service_tabs(&mut guard, &id_done);
                 }
+                updated
             };
-            if !ok {
+            if changed && !ok {
                 refresh_attached_view(&app_done, &shared_done);
             }
             if changed {
@@ -1457,22 +1882,32 @@ fn attach_windows_handlers(
         on_nav_flags_changed: Arc::new(move |url, can_back, can_fwd| {
             let changed = {
                 let mut guard = shared_nav.inner.lock().unwrap();
-                if let Some(tab) = guard
-                    .services
-                    .get_mut(&id_nav)
-                    .and_then(|s| s.tab_mut(&tid_nav))
-                {
-                    if !url.is_empty() {
-                        tab.current_url = url;
-                    } else if tab.current_url.is_empty() {
-                        tab.current_url = fallback_nav.clone();
+                let mut multi = false;
+                let updated = if let Some(svc) = guard.services.get_mut(&id_nav) {
+                    multi = svc.tabs.len() >= 2;
+                    if let Some(tab) = svc.tab_mut(&tid_nav) {
+                        if tab.webview_label.as_deref() == Some(label_nav.as_str()) {
+                            if !url.is_empty() {
+                                tab.current_url = url;
+                            } else if tab.current_url.is_empty() {
+                                tab.current_url = fallback_nav.clone();
+                            }
+                            tab.can_go_back = can_back;
+                            tab.can_go_forward = can_fwd;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
-                    tab.can_go_back = can_back;
-                    tab.can_go_forward = can_fwd;
-                    true
                 } else {
                     false
+                };
+                if updated && multi {
+                    persist_service_tabs(&mut guard, &id_nav);
                 }
+                updated
             };
             if changed {
                 emit_runtime_updated(&app_nav, &shared_nav, &id_nav);
@@ -1486,8 +1921,12 @@ fn attach_windows_handlers(
                     .get_mut(&id_fav)
                     .and_then(|s| s.tab_mut(&tid_fav))
                 {
-                    tab.favicon_url = Some(favicon);
-                    true
+                    if tab.webview_label.as_deref() == Some(label_fav.as_str()) {
+                        tab.favicon_url = Some(favicon);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -1496,20 +1935,87 @@ fn attach_windows_handlers(
                 emit_runtime_updated(&app_fav, &shared_fav, &id_fav);
             }
         }),
+        on_zoom_factor_changed: Arc::new(move |raw_zoom| {
+            let next_zoom = ((raw_zoom * 100.0).round() / 100.0).clamp(0.3, 3.0);
+            let sibling_labels: Option<Vec<String>> = {
+                let mut guard = shared_zoom.inner.lock().unwrap();
+                let alive = guard
+                    .services
+                    .get(&id_zoom)
+                    .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_zoom))
+                    .map(|t| t.webview_label.as_deref() == Some(label_zoom.as_str()))
+                    .unwrap_or(false);
+                if !alive {
+                    None
+                } else {
+                    let cur_zoom = guard
+                        .store
+                        .get_instance(&id_zoom)
+                        .map(|i| i.zoom_factor)
+                        .unwrap_or(1.0);
+                    if (cur_zoom - next_zoom).abs() < 0.005 {
+                        None
+                    } else {
+                        guard.store.update_instance(
+                            &id_zoom,
+                            crate::models::UpdateInstancePatch {
+                                zoom_factor: Some(next_zoom),
+                                ..Default::default()
+                            },
+                        );
+                        let siblings = guard
+                            .services
+                            .get(&id_zoom)
+                            .map(|s| {
+                                s.tabs
+                                    .iter()
+                                    .filter_map(|t| t.webview_label.clone())
+                                    .filter(|l| l != &label_zoom)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Some(siblings)
+                    }
+                }
+            };
+            if let Some(siblings) = sibling_labels {
+                for l in siblings {
+                    if let Some(wv) = app_zoom.get_webview(&l) {
+                        let _ = wv.with_webview(move |pwv| {
+                            crate::platform_win::set_zoom_factor(&pwv.controller(), next_zoom);
+                        });
+                    }
+                }
+                show_overlay_notice(
+                    &shared_zoom,
+                    format!("拡大率: {}%", (next_zoom * 100.0).round() as i32),
+                    false,
+                );
+                emit_state_updated(&app_zoom, &shared_zoom);
+            }
+        }),
         on_shortcut: Arc::new(move |action, payload| {
             handle_shortcut_from_child(&app_key, &shared_key, action, payload);
         }),
         on_follow_detected: Arc::new(move || {
-            adjust_follow_count(&app_follow, &shared_follow, &id_follow, 1);
+            let alive = {
+                let guard = shared_follow.inner.lock().unwrap();
+                guard
+                    .services
+                    .get(&id_follow)
+                    .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_follow))
+                    .map(|t| t.webview_label.as_deref() == Some(label_follow.as_str()))
+                    .unwrap_or(false)
+            };
+            if alive {
+                adjust_follow_count(&app_follow, &shared_follow, &id_follow, 1);
+            }
         }),
     };
 
     let _ = webview.with_webview(move |platform_wv| {
         let controller = platform_wv.controller();
         crate::platform_win::attach_tab_handlers(&controller, muted, zoom, &ua_owned, callbacks);
-        if initial_visible {
-            crate::platform_win::bring_controller_to_top(&controller);
-        }
     });
 }
 
@@ -1531,7 +2037,7 @@ pub fn handle_shortcut_from_child(
             return;
         }
         "previous-account" | "next-account" | "new-tab" | "close-tab" | "restore-closed"
-        | "previous-tab" | "next-tab" => {
+        | "previous-tab" | "next-tab" | "zoom-in" | "zoom-out" | "zoom-reset" => {
             let app_bg = app.clone();
             let shared_bg = shared.clone();
             let act = action.to_string();
@@ -1551,21 +2057,25 @@ pub fn handle_shortcut_from_child(
                 payload,
             },
         );
-        if action == "open-catalog" || action == "open-gesture-settings" {
+        if action == "open-catalog"
+            || action == "open-gesture-settings"
+            || action == "focus-address-bar"
+        {
             let _ = shell.set_focus();
         }
     }
 }
 
 pub fn set_overlay_visible(app: &AppHandle, shared: &SharedState, visible: bool) {
-    {
+    let changed = {
         let mut guard = shared.inner.lock().unwrap();
-        if guard.overlay_visible == visible {
-            return;
-        }
+        let prev = guard.overlay_visible;
         guard.overlay_visible = visible;
+        prev != visible
+    };
+    if changed || visible {
+        refresh_attached_view(app, shared);
     }
-    refresh_attached_view(app, shared);
 }
 
 pub fn sleep_tab(app: &AppHandle, shared: &SharedState, instance_id: &str) {
@@ -1574,6 +2084,7 @@ pub fn sleep_tab(app: &AppHandle, shared: &SharedState, instance_id: &str) {
         let mut out = Vec::new();
         if let Some(svc) = guard.services.get_mut(instance_id) {
             for tab in &mut svc.tabs {
+                tab.creation_epoch = tab.creation_epoch.wrapping_add(1);
                 if let Some(l) = tab.webview_label.take() {
                     out.push(l);
                 }
@@ -1588,7 +2099,7 @@ pub fn sleep_tab(app: &AppHandle, shared: &SharedState, instance_id: &str) {
 
     for label in labels {
         if let Some(wv) = app.get_webview(&label) {
-            let _ = wv.close();
+            close_webview_cleanly(&wv);
         }
     }
     refresh_attached_view(app, shared);
@@ -1599,9 +2110,11 @@ pub fn destroy_all_views(app: &AppHandle, shared: &SharedState) {
     let labels: Vec<String> = {
         let mut guard = shared.inner.lock().unwrap();
         guard.active_instance_id = None;
+        guard.creating_tabs.clear();
         let mut out = Vec::new();
         for svc in guard.services.values_mut() {
             for tab in &mut svc.tabs {
+                tab.creation_epoch = tab.creation_epoch.wrapping_add(1);
                 if let Some(l) = tab.webview_label.take() {
                     out.push(l);
                 }
@@ -1611,7 +2124,12 @@ pub fn destroy_all_views(app: &AppHandle, shared: &SharedState) {
     };
     for label in labels {
         if let Some(wv) = app.get_webview(&label) {
-            let _ = wv.close();
+            close_webview_cleanly(&wv);
+        }
+    }
+    for (label, wv) in app.webviews() {
+        if label != "shell" && wv.window().label() == "main" {
+            close_webview_cleanly(&wv);
         }
     }
 }
@@ -1773,7 +2291,7 @@ pub fn perform_tab_action(app: &AppHandle, shared: &SharedState, instance_id: &s
                 "zoom-out" => ((instance.zoom_factor - 0.1) * 100.0).round() / 100.0,
                 _ => 1.0,
             }
-            .clamp(0.5, 2.0);
+            .clamp(0.3, 3.0);
 
             {
                 let mut guard = shared.inner.lock().unwrap();
@@ -1791,6 +2309,11 @@ pub fn perform_tab_action(app: &AppHandle, shared: &SharedState, instance_id: &s
                     crate::platform_win::set_zoom_factor(&pwv.controller(), next_zoom)
                 });
             }
+            show_overlay_notice(
+                shared,
+                format!("拡大率: {}%", (next_zoom * 100.0).round() as i32),
+                false,
+            );
             emit_state_updated(app, shared);
         }
         "toggle-ua" => {
@@ -1871,8 +2394,43 @@ pub fn perform_tab_action(app: &AppHandle, shared: &SharedState, instance_id: &s
     }
 }
 
+/// ジェスチャー開始位置へ Ctrl+クリック を送信する。
+pub fn dispatch_ctrl_click(
+    app: &AppHandle,
+    shared: &SharedState,
+    origin_css_x: f64,
+    origin_css_y: f64,
+) {
+    #[cfg(windows)]
+    if let Some(wv) = get_current_active_webview(app, shared) {
+        crate::gesture_win::mark_gesture_ctrl_click();
+        let _ = wv.with_webview(move |pwv| {
+            crate::platform_win::dispatch_ctrl_click(
+                &pwv.controller(),
+                origin_css_x,
+                origin_css_y,
+            );
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, shared, origin_css_x, origin_css_y);
+    }
+}
+
 /// ジェスチャーまたはショートカットから渡された操作を実行する。
 pub fn execute_gesture_action(app: &AppHandle, shared: &SharedState, action: &str) {
+    execute_gesture_action_with_origin(app, shared, action, None, None);
+}
+
+/// 開始座標つきでジェスチャー操作を実行する（Ctrl+クリック等）。
+pub fn execute_gesture_action_with_origin(
+    app: &AppHandle,
+    shared: &SharedState,
+    action: &str,
+    origin_lx: Option<f64>,
+    origin_ly: Option<f64>,
+) {
     let active_pair: Option<(String, String, bool, bool)> = {
         let guard = shared.inner.lock().unwrap();
         guard.active_instance_id.as_ref().and_then(|inst_id| {
@@ -1925,6 +2483,11 @@ pub fn execute_gesture_action(app: &AppHandle, shared: &SharedState, action: &st
                 if let Err(e) = create_subtab(app, shared, &inst_id, None) {
                     show_overlay_notice(shared, e, true);
                 }
+            }
+        }
+        "ctrl-click" => {
+            if let (Some(ox), Some(oy)) = (origin_lx, origin_ly) {
+                dispatch_ctrl_click(app, shared, ox, oy);
             }
         }
         "duplicate-tab" => {

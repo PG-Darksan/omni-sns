@@ -224,7 +224,14 @@ pub fn is_auth_popup_url(target_url: &str) -> bool {
     AUTH_PATH_KEYWORDS.iter().any(|kw| lower_path.contains(kw))
 }
 
-/// 同一ルートドメイン（サブドメイン含む）のURLかを判定する。
+/// 同一ルートドメイン（サブドメイン・同一サービス別ドメイン含む）のURLかを判定する。
+fn canonical_site_group(domain: &str) -> &str {
+    match domain {
+        "threads.net" | "threads.com" => "threads.com",
+        other => other,
+    }
+}
+
 pub fn is_same_site_url(target_url: &str, current_service_url: &str) -> bool {
     let Ok(target) = Url::parse(target_url) else {
         return false;
@@ -237,11 +244,38 @@ pub fn is_same_site_url(target_url: &str, current_service_url: &str) -> bool {
     };
     if let Ok(current) = Url::parse(current_service_url) {
         if let Some(current_host) = current.host_str() {
-            return get_registrable_domain_hint(target_host)
-                == get_registrable_domain_hint(current_host);
+            let td = get_registrable_domain_hint(target_host);
+            let cd = get_registrable_domain_hint(current_host);
+            return canonical_site_group(&td) == canonical_site_group(&cd);
         }
     }
     false
+}
+
+/// 現在のサイト文脈を考慮し、認証用ポップアップとして別ウィンドウで開くべきか判定する。
+/// Facebook や Discord 等の同一サイト内の通常ページ遷移を OAuth ポップアップと誤判定しない。
+pub fn is_auth_popup_for_site(target_url: &str, current_service_url: &str) -> bool {
+    let Ok(target) = Url::parse(target_url) else {
+        return false;
+    };
+    if target.scheme() != "https" && target.scheme() != "http" {
+        return false;
+    }
+    let Some(target_host) = target.host_str() else {
+        return false;
+    };
+    if is_same_site_url(target_url, current_service_url) {
+        let lower_host = target_host.to_ascii_lowercase();
+        let has_auth_label = lower_host
+            .split('.')
+            .any(|label| AUTH_HOST_LABELS.contains(&label) || matches!(label, "accounts" | "id"));
+        if has_auth_label {
+            return true;
+        }
+        let lower_path = target.path().to_ascii_lowercase();
+        return AUTH_PATH_KEYWORDS.iter().any(|kw| lower_path.contains(kw));
+    }
+    is_auth_popup_url(target_url)
 }
 
 /// ポップアップURLが認証（OAuth / SSO / 本人確認）や同一サービスのサブウィンドウかを判定する。
@@ -380,6 +414,30 @@ mod tests {
         assert!(!should_open_in_app_popup(
             "https://news.yahoo.co.jp/articles/123",
             "https://bsky.app/messages"
+        ));
+
+        // Threads .net / .com は同一サービス扱い
+        assert!(is_same_site_url(
+            "https://www.threads.net/@alice",
+            "https://www.threads.com/"
+        ));
+        // Facebook / Discord 上の通常ページは OAuth ポップアップ扱いせず同アカウントの別タブへ
+        assert!(!is_auth_popup_for_site(
+            "https://www.facebook.com/someone/posts/123",
+            "https://www.facebook.com/"
+        ));
+        assert!(!is_auth_popup_for_site(
+            "https://discord.com/channels/123/456",
+            "https://discord.com/channels/@me"
+        ));
+        // 他サイトからの Facebook OAuth や同一サイト内の /oauth は引き続き認証ポップアップ扱い
+        assert!(is_auth_popup_for_site(
+            "https://www.facebook.com/v18.0/dialog/oauth",
+            "https://tinder.com/"
+        ));
+        assert!(is_auth_popup_for_site(
+            "https://discord.com/oauth2/authorize?client_id=1",
+            "https://discord.com/channels/@me"
         ));
     }
 

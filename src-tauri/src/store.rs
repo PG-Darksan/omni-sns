@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::catalog;
 use crate::gesture::{sanitize_gesture_settings, GestureSettings};
 use crate::models::{
-    AddInstancePayload, AppConfig, AppSettings, ServiceInstance, UpdateInstancePatch,
+    AddInstancePayload, AppConfig, AppSettings, SavedSubTab, ServiceInstance, UpdateInstancePatch,
     UpdateSettingsPatch, WindowBounds,
 };
 use crate::url_utils::{
@@ -124,6 +124,8 @@ pub fn create_default_instances() -> Vec<ServiceInstance> {
             follow_count_today: 0,
             follow_count_total: 0,
             follow_count_date: today.clone(),
+            saved_tabs: Vec::new(),
+            saved_active_tab_index: None,
         })
         .collect()
 }
@@ -184,6 +186,8 @@ struct RawInstance {
     follow_count_today: Option<u32>,
     follow_count_total: Option<u32>,
     follow_count_date: Option<String>,
+    saved_tabs: Option<Vec<SavedSubTab>>,
+    saved_active_tab_index: Option<usize>,
 }
 
 pub struct ConfigStore {
@@ -287,7 +291,7 @@ impl ConfigStore {
                         .filter(|z| z.is_finite())
                         .map(|z| (z * 100.0).round() / 100.0)
                         .unwrap_or(1.0)
-                        .clamp(0.5, 2.0);
+                        .clamp(0.3, 3.0);
 
                     let mut resolved_url = normalize_service_url(&raw_url)
                         .unwrap_or_else(|| "https://example.com/".to_string());
@@ -312,6 +316,31 @@ impl ConfigStore {
                         0
                     };
 
+                    let saved_tabs: Vec<SavedSubTab> = item
+                        .saved_tabs
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|t| {
+                            let url = normalize_service_url(&t.url)?;
+                            let title = if t.title.trim().is_empty() {
+                                name.clone()
+                            } else {
+                                t.title.trim().to_string()
+                            };
+                            Some(SavedSubTab { url, title })
+                        })
+                        .take(20)
+                        .collect();
+                    let (saved_tabs, saved_active_tab_index) = if saved_tabs.len() >= 2 {
+                        let idx = item
+                            .saved_active_tab_index
+                            .unwrap_or(0)
+                            .min(saved_tabs.len() - 1);
+                        (saved_tabs, Some(idx))
+                    } else {
+                        (Vec::new(), None)
+                    };
+
                     Some(ServiceInstance {
                         instance_id,
                         service_id,
@@ -332,6 +361,8 @@ impl ConfigStore {
                         follow_count_today,
                         follow_count_total: item.follow_count_total.unwrap_or(0),
                         follow_count_date: today.clone(),
+                        saved_tabs,
+                        saved_active_tab_index,
                     })
                 })
                 .collect();
@@ -485,6 +516,8 @@ impl ConfigStore {
             follow_count_today: 0,
             follow_count_total: 0,
             follow_count_date: local_today_ymd(),
+            saved_tabs: Vec::new(),
+            saved_active_tab_index: None,
         };
 
         let new_group_key = service_group_key(
@@ -637,7 +670,7 @@ impl ConfigStore {
         }
         if let Some(zoom) = patch.zoom_factor {
             if zoom.is_finite() {
-                target.zoom_factor = ((zoom * 100.0).round() / 100.0).clamp(0.5, 2.0);
+                target.zoom_factor = ((zoom * 100.0).round() / 100.0).clamp(0.3, 3.0);
             }
         }
         if let Some(notif) = patch.notifications_enabled {
@@ -754,6 +787,37 @@ impl ConfigStore {
         let updated = target.clone();
         self.persist();
         Some(updated)
+    }
+
+    pub fn update_saved_tabs(
+        &mut self,
+        instance_id: &str,
+        tabs: Vec<SavedSubTab>,
+        active_index: usize,
+    ) {
+        let Some(target) = self
+            .config
+            .instances
+            .iter_mut()
+            .find(|i| i.instance_id == instance_id)
+        else {
+            return;
+        };
+
+        let (next_tabs, next_active) = if tabs.len() >= 2 {
+            let trimmed: Vec<SavedSubTab> = tabs.into_iter().take(20).collect();
+            let idx = active_index.min(trimmed.len() - 1);
+            (trimmed, Some(idx))
+        } else {
+            (Vec::new(), None)
+        };
+
+        if target.saved_tabs == next_tabs && target.saved_active_tab_index == next_active {
+            return;
+        }
+        target.saved_tabs = next_tabs;
+        target.saved_active_tab_index = next_active;
+        self.persist();
     }
 
     pub fn update_window_bounds(&mut self, bounds: WindowBounds) {
@@ -1010,6 +1074,41 @@ mod tests {
             .unwrap();
         assert_eq!(rst_all.follow_count_today, 0);
         assert_eq!(rst_all.follow_count_total, 0);
+
+        // 同一アカウントの複数サブタブ永続化
+        store.update_saved_tabs(
+            "svc-threads-default",
+            vec![
+                SavedSubTab {
+                    url: "https://www.threads.com/".into(),
+                    title: "Threads".into(),
+                },
+                SavedSubTab {
+                    url: "https://www.threads.com/@alice".into(),
+                    title: "Alice".into(),
+                },
+            ],
+            1,
+        );
+        let reloaded = ConfigStore::new(config_path.clone());
+        let th2 = reloaded.get_instance("svc-threads-default").unwrap();
+        assert_eq!(th2.saved_tabs.len(), 2);
+        assert_eq!(th2.saved_tabs[1].url, "https://www.threads.com/@alice");
+        assert_eq!(th2.saved_active_tab_index, Some(1));
+
+        // 1タブに戻ったら saved_tabs は自動クリア
+        store.update_saved_tabs(
+            "svc-threads-default",
+            vec![SavedSubTab {
+                url: "https://www.threads.com/".into(),
+                title: "Threads".into(),
+            }],
+            0,
+        );
+        let reloaded2 = ConfigStore::new(config_path.clone());
+        let th3 = reloaded2.get_instance("svc-threads-default").unwrap();
+        assert!(th3.saved_tabs.is_empty());
+        assert_eq!(th3.saved_active_tab_index, None);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

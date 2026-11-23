@@ -23,18 +23,39 @@ export const DEFAULT_GESTURES: Record<GestureShape, string> = {
 interface ActionItem {
   id: string;
   label: string;
-  badge: string;
+  badge?: string;
+  svg?: string;
   hint?: string;
+  keywords?: string;
 }
 
 interface ActionSection {
   title: string;
+  compactFullWidth?: boolean;
   items: ActionItem[];
 }
+
+const ICON_CTRL_CLICK =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4l7.07 17 2.51-7.39L21 11.07z"/><line x1="16" y1="16" x2="21" y2="21"/></svg>';
+const ICON_TOGGLE_UA =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 15H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v2"/><line x1="6" y1="19" x2="11" y2="19"/><line x1="8.5" y1="15" x2="8.5" y2="19"/><rect x="15" y="10" width="7" height="10" rx="1.5"/><line x1="18.5" y1="17.5" x2="18.51" y2="17.5"/></svg>';
+const ICON_MUTE =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="22" y1="9" x2="16" y2="15"/><line x1="16" y1="9" x2="22" y2="15"/></svg>';
+const ICON_ZOOM_IN =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>';
+const ICON_ZOOM_OUT =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>';
+const ICON_ZOOM_RESET =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V6a2 2 0 0 1 2-2h3"/><path d="M15 4h3a2 2 0 0 1 2 2v3"/><path d="M20 15v3a2 2 0 0 1-2 2h-3"/><path d="M9 20H6a2 2 0 0 1-2-2v-3"/><circle cx="12" cy="12" r="2.2"/></svg>';
+const ICON_OPEN_EXTERNAL =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
+const ICON_GESTURE_SETTINGS =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>';
 
 export const ACTION_SECTIONS: ActionSection[] = [
   {
     title: '未割り当て',
+    compactFullWidth: true,
     items: [{ id: 'none', label: '何もしない', badge: '—' }]
   },
   {
@@ -43,8 +64,15 @@ export const ACTION_SECTIONS: ActionSection[] = [
       { id: 'previous-tab', label: '前のタブへ', badge: '◀', hint: 'サブタブ1枚時は前のSNSへ' },
       { id: 'next-tab', label: '次のタブへ', badge: '▶', hint: 'サブタブ1枚時は次のSNSへ' },
       { id: 'new-tab', label: '新しいタブを開く', badge: '＋' },
+      {
+        id: 'ctrl-click',
+        label: 'Ctrl+クリック',
+        svg: ICON_CTRL_CLICK,
+        hint: 'ジェスチャー開始位置を Ctrl+クリック（リンクを同一アカウントの別タブで開く）',
+        keywords: 'ctrl click クリック リンク 新しいタブ 別タブ バックグラウンド'
+      },
       { id: 'duplicate-tab', label: '現在のタブを複製', badge: '⧉' },
-      { id: 'close-tab', label: '現在のタブを閉じる（削除）', badge: '✕' },
+      { id: 'close-tab', label: '現在のタブを閉じる', badge: '✕', hint: '最後の1枚を閉じてもサイドバーからは消えず休止します' },
       { id: 'close-other-tabs', label: 'このタブ以外を閉じる', badge: '⊘' },
       { id: 'restore-closed', label: '閉じたタブを復元', badge: '↶' }
     ]
@@ -71,6 +99,18 @@ export const ACTION_SECTIONS: ActionSection[] = [
     ]
   },
   {
+    title: '表示・アプリ操作',
+    items: [
+      { id: 'toggle-ua', label: 'PC版 / スマホ版 UA切替', svg: ICON_TOGGLE_UA },
+      { id: 'toggle-mute', label: 'ミュート切替', svg: ICON_MUTE },
+      { id: 'zoom-in', label: '拡大', svg: ICON_ZOOM_IN },
+      { id: 'zoom-out', label: '縮小', svg: ICON_ZOOM_OUT },
+      { id: 'zoom-reset', label: 'ズームリセット (100%)', svg: ICON_ZOOM_RESET },
+      { id: 'open-external', label: '既定のブラウザで開く', svg: ICON_OPEN_EXTERNAL },
+      { id: 'gesture:settings', label: 'ジェスチャー設定を開く', svg: ICON_GESTURE_SETTINGS }
+    ]
+  },
+  {
     title: 'SNS・アカウント切替',
     items: [
       { id: 'previous-service', label: '前のSNSサービスへ', badge: '▲' },
@@ -79,18 +119,6 @@ export const ACTION_SECTIONS: ActionSection[] = [
       { id: 'next-account', label: '次のアカウントへ（同一SNS）', badge: '▷' },
       { id: 'open-catalog', label: 'SNSカタログを開く', badge: '⊞' },
       { id: 'sleep-tab', label: 'このSNSを休止（メモリ解放）', badge: '☾' }
-    ]
-  },
-  {
-    title: '表示・アプリ操作',
-    items: [
-      { id: 'toggle-ua', label: 'PC版 / スマホ版 UA切替', badge: '📱' },
-      { id: 'toggle-mute', label: 'ミュート切替', badge: '🔇' },
-      { id: 'zoom-in', label: '拡大', badge: '🔍+' },
-      { id: 'zoom-out', label: '縮小', badge: '🔍-' },
-      { id: 'zoom-reset', label: 'ズームリセット (100%)', badge: '100%' },
-      { id: 'open-external', label: '既定のブラウザで開く', badge: '↗' },
-      { id: 'gesture:settings', label: 'ジェスチャー設定を開く', badge: '⚙' }
     ]
   }
 ];
@@ -561,19 +589,9 @@ export class GestureBoardModal {
     }
     const currentAssigned = this.settings.gestures[this.selectedShape] ?? 'none';
 
-    for (const sec of ACTION_SECTIONS) {
-      const filtered = sec.items.filter((item) => {
-        if (!q) return true;
-        return (
-          item.label.toLowerCase().includes(q) ||
-          item.id.toLowerCase().includes(q) ||
-          sec.title.toLowerCase().includes(q)
-        );
-      });
-      if (filtered.length === 0) continue;
-
+    const buildSectionEl = (sec: ActionSection, filtered: ActionItem[]): HTMLDivElement => {
       const secEl = document.createElement('div');
-      secEl.className = 'gesture-sec';
+      secEl.className = sec.compactFullWidth ? 'gesture-sec gesture-sec-compact' : 'gesture-sec';
 
       const heading = document.createElement('div');
       heading.className = 'gesture-sec-title';
@@ -585,7 +603,7 @@ export class GestureBoardModal {
         const row = document.createElement('div');
         row.className = 'gesture-cand-row';
         if (currentAssigned === item.id) row.classList.add('is-current');
-        if (!this.settings.allowDup && shapes.length > 0 && currentAssigned !== item.id) {
+        if (!this.settings!.allowDup && shapes.length > 0 && currentAssigned !== item.id) {
           row.classList.add('is-used-elsewhere');
         }
         if (item.hint) row.title = item.hint;
@@ -602,7 +620,11 @@ export class GestureBoardModal {
 
         const iconSpan = document.createElement('span');
         iconSpan.className = 'gesture-cand-icon';
-        iconSpan.textContent = item.badge;
+        if (item.svg) {
+          iconSpan.innerHTML = item.svg;
+        } else {
+          iconSpan.textContent = item.badge ?? '';
+        }
 
         const labelSpan = document.createElement('span');
         labelSpan.className = 'gesture-cand-label';
@@ -636,7 +658,58 @@ export class GestureBoardModal {
         secEl.appendChild(row);
       }
 
-      listEl.appendChild(secEl);
+      return secEl;
+    };
+
+    const columnSections: { sec: ActionSection; items: ActionItem[] }[] = [];
+
+    for (const sec of ACTION_SECTIONS) {
+      const filtered = sec.items.filter((item) => {
+        if (!q) return true;
+        return (
+          item.label.toLowerCase().includes(q) ||
+          item.id.toLowerCase().includes(q) ||
+          sec.title.toLowerCase().includes(q) ||
+          (item.hint?.toLowerCase().includes(q) ?? false) ||
+          (item.keywords?.toLowerCase().includes(q) ?? false)
+        );
+      });
+      if (filtered.length === 0) continue;
+
+      if (sec.compactFullWidth) {
+        listEl.appendChild(buildSectionEl(sec, filtered));
+      } else {
+        columnSections.push({ sec, items: filtered });
+      }
+    }
+
+    if (columnSections.length > 0) {
+      const colsWrap = document.createElement('div');
+      colsWrap.className = 'gesture-sec-columns';
+      const colLeft = document.createElement('div');
+      colLeft.className = 'gesture-sec-col';
+      const colRight = document.createElement('div');
+      colRight.className = 'gesture-sec-col';
+
+      let leftWeight = 0;
+      let rightWeight = 0;
+      for (const entry of columnSections) {
+        const weight = entry.items.length + 1.5;
+        const secEl = buildSectionEl(entry.sec, entry.items);
+        if (leftWeight <= rightWeight) {
+          colLeft.appendChild(secEl);
+          leftWeight += weight;
+        } else {
+          colRight.appendChild(secEl);
+          rightWeight += weight;
+        }
+      }
+
+      colsWrap.appendChild(colLeft);
+      if (colRight.childNodes.length > 0) {
+        colsWrap.appendChild(colRight);
+      }
+      listEl.appendChild(colsWrap);
     }
   }
 }

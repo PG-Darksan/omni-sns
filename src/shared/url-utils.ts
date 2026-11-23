@@ -110,6 +110,26 @@ const AUTH_PATH_KEYWORDS = [
   '/challenge'
 ];
 
+function canonicalSiteGroup(domain: string): string {
+  return domain === 'threads.net' ? 'threads.com' : domain;
+}
+
+export function isSameSiteUrl(targetUrl: string, currentServiceUrl: string): boolean {
+  try {
+    const target = new URL(targetUrl);
+    if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+      return false;
+    }
+    const current = new URL(currentServiceUrl);
+    return (
+      canonicalSiteGroup(getRegistrableDomainHint(target.hostname)) ===
+      canonicalSiteGroup(getRegistrableDomainHint(current.hostname))
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * ポップアップURLが認証（OAuth / SSO / 本人確認）や同一サービスのサブウィンドウかを判定する。
  * true なら同じセッションパーティションを共有するアプリ内子ウィンドウで開く。
@@ -130,9 +150,8 @@ export function shouldOpenInAppPopup(targetUrl: string, currentServiceUrl: strin
       return true;
     }
 
-    // 同一ルートドメイン（サブドメイン含む）のウィンドウ（例: 認証やメディアビューア）はアプリ内で許可
-    const current = new URL(currentServiceUrl);
-    if (getRegistrableDomainHint(target.hostname) === getRegistrableDomainHint(current.hostname)) {
+    // 同一ルートドメイン（サブドメイン・threads.net/threads.com 含む）はアプリ内で許可
+    if (isSameSiteUrl(targetUrl, currentServiceUrl)) {
       return true;
     }
 

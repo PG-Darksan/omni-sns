@@ -1,9 +1,9 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -28,8 +28,8 @@ use windows::Win32::Graphics::GdiPlus::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT, VK_ESCAPE,
-    VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT, VK_CONTROL,
+    VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
@@ -38,9 +38,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, UnhookWindowsHookEx, UpdateLayeredWindow, WindowFromPoint, CS_HREDRAW,
     CS_VREDRAW, GA_ROOT, HCURSOR, HHOOK, HICON, HWND_TOPMOST, MSG, MSLLHOOKSTRUCT, SM_SWAPBUTTON,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WH_MOUSE_LL,
-    WM_APP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    WM_APP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows_core::{HSTRING, PCWSTR};
 
@@ -89,9 +89,51 @@ impl ViewportRect {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GestureActionContext {
+    pub origin_lx: f64,
+    pub origin_ly: f64,
+}
+
 pub struct GestureHostCallbacks {
-    pub on_action: Arc<dyn Fn(String, String) + Send + Sync>,
+    pub on_action: Arc<dyn Fn(String, String, GestureActionContext) + Send + Sync>,
     pub on_live_scroll: Arc<dyn Fn(f64, f64, f64, f64) + Send + Sync>,
+}
+
+static LAST_USER_NEW_TAB_CLICK_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_USER_NEW_TAB_FOREGROUND: AtomicBool = AtomicBool::new(false);
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// ジェスチャー経由の Ctrl+クリック 実行直前に呼び出し、直後の NewWindowRequested を
+/// 同一アカウントの新しいバックグラウンドタブとして開く意図を記録する。
+pub fn mark_gesture_ctrl_click() {
+    LAST_USER_NEW_TAB_FOREGROUND.store(false, Ordering::SeqCst);
+    LAST_USER_NEW_TAB_CLICK_MS.store(now_epoch_ms(), Ordering::SeqCst);
+}
+
+/// NewWindowRequested がユーザーによる Ctrl+クリック / 中クリック / Ctrl+クリックジェスチャー
+/// 起因かを判定して消費する。戻り値は `(is_user_new_tab, force_foreground)`。
+pub fn consume_new_tab_click_intent() -> (bool, bool) {
+    let now = now_epoch_ms();
+    let recorded = LAST_USER_NEW_TAB_CLICK_MS.load(Ordering::SeqCst);
+    if recorded != 0 && now.saturating_sub(recorded) <= 1500 {
+        LAST_USER_NEW_TAB_CLICK_MS.store(0, Ordering::SeqCst);
+        let fg = LAST_USER_NEW_TAB_FOREGROUND.load(Ordering::SeqCst);
+        return (true, fg);
+    }
+    let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+    let mid_down = unsafe { GetAsyncKeyState(VK_MBUTTON.0 as i32) } < 0;
+    if ctrl_down || mid_down {
+        let shift_down = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+        return (true, shift_down);
+    }
+    (false, false)
 }
 
 enum HookMsg {
@@ -147,10 +189,10 @@ unsafe extern "system" fn low_level_mouse_proc(
         if info.dwExtraInfo != SYNTHETIC_MAGIC {
             let msg = wparam.0 as u32;
             let swapped = is_swapped_buttons();
-            let (sec_down, sec_up, other_down) = if swapped {
-                (WM_LBUTTONDOWN, windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP, WM_RBUTTONDOWN)
+            let (sec_down, sec_up, primary_down, primary_up) = if swapped {
+                (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP)
             } else {
-                (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_LBUTTONDOWN)
+                (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_LBUTTONDOWN, WM_LBUTTONUP)
             };
 
             if msg == sec_down {
@@ -167,9 +209,9 @@ unsafe extern "system" fn low_level_mouse_proc(
                         if in_vp {
                             // 他ボタン（左・中）が押されていないこと & カーソル下が自ウィンドウ配下であること
                             let primary_vk = if swapped { VK_RBUTTON } else { VK_LBUTTON };
-                            let primary_down = unsafe { GetAsyncKeyState(primary_vk.0 as i32) } < 0;
+                            let is_primary_down = unsafe { GetAsyncKeyState(primary_vk.0 as i32) } < 0;
                             let middle_down = unsafe { GetAsyncKeyState(VK_MBUTTON.0 as i32) } < 0;
-                            if !primary_down && !middle_down {
+                            if !is_primary_down && !middle_down {
                                 let under = unsafe { WindowFromPoint(pt) };
                                 let root = unsafe { GetAncestor(under, GA_ROOT) };
                                 if root == main_hwnd {
@@ -212,7 +254,7 @@ unsafe extern "system" fn low_level_mouse_proc(
                         };
                     }
                     // 注意: WH_MOUSE_LL で WM_MOUSEMOVE を飲み込むとカーソルが動かないため必ず通す
-                } else if msg == other_down || msg == WM_MBUTTONDOWN {
+                } else if msg == primary_down || msg == WM_MBUTTONDOWN {
                     if let Ok(mut q) = st.queue.lock() {
                         q.push(HookMsg::Abort);
                     }
@@ -245,6 +287,39 @@ unsafe extern "system" fn low_level_mouse_proc(
                         };
                     }
                     return LRESULT(1);
+                }
+            } else if (msg == primary_down
+                || msg == primary_up
+                || msg == WM_MBUTTONDOWN
+                || msg == WM_MBUTTONUP)
+                && !st.suspended.load(Ordering::Relaxed)
+            {
+                // 物理 Ctrl+クリック / 中クリック を記録し、NewWindowRequested が
+                // 非同期ディスパッチされた後でも確実に同一アカウントの新規タブとして開けるようにする
+                let is_middle = msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP;
+                let ctrl_down = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+                if is_middle || ctrl_down {
+                    let main_raw = st.main_hwnd.load(Ordering::Relaxed);
+                    if main_raw != 0 {
+                        let pt = info.pt;
+                        let in_vp = st
+                            .viewport
+                            .lock()
+                            .map(|vp| vp.contains(pt.x, pt.y))
+                            .unwrap_or(false);
+                        if in_vp {
+                            let under = unsafe { WindowFromPoint(pt) };
+                            let root = unsafe { GetAncestor(under, GA_ROOT) };
+                            if root == HWND(main_raw as *mut c_void) {
+                                let shift_down =
+                                    unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+                                LAST_USER_NEW_TAB_FOREGROUND
+                                    .store(shift_down, Ordering::SeqCst);
+                                LAST_USER_NEW_TAB_CLICK_MS
+                                    .store(now_epoch_ms(), Ordering::SeqCst);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -458,7 +533,12 @@ impl OverlayRuntime {
             return;
         }
 
-        (self.callbacks.on_action)(action, shape);
+        let origin = stroke.path.origin();
+        let ctx = GestureActionContext {
+            origin_lx: origin.x,
+            origin_ly: origin.y,
+        };
+        (self.callbacks.on_action)(action, shape, ctx);
     }
 
     fn on_tick(&mut self) {
@@ -687,6 +767,8 @@ impl OverlayRuntime {
                                 "ジェスチャー設定から操作を割り当てできます"
                             } else if is_scroll {
                                 "ドラッグ中リアルタイムスクロール · 離すと停止"
+                            } else if action == "ctrl-click" {
+                                "右ボタンを離すと開始位置を Ctrl+クリック · Esc で中止"
                             } else {
                                 "右ボタンを離すと実行 · Esc で中止"
                             };

@@ -33,7 +33,7 @@ use webview2_com::{
     CallDevToolsProtocolMethodCompletedHandler, ClearBrowsingDataCompletedHandler,
     ExecuteScriptCompletedHandler, FaviconChangedEventHandler, HistoryChangedEventHandler,
     NavigationCompletedEventHandler, NavigationStartingEventHandler, SourceChangedEventHandler,
-    WebMessageReceivedEventHandler,
+    WebMessageReceivedEventHandler, ZoomFactorChangedEventHandler,
 };
 use windows::Win32::Foundation::{FALSE, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
@@ -44,8 +44,8 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowPos, HWND_TOP, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SW_SHOWNORMAL,
+    SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SW_SHOWNORMAL,
 };
 use windows_core::{BOOL, Interface, HSTRING, PCWSTR, PWSTR};
 
@@ -125,7 +125,7 @@ pub fn bring_controller_to_top(controller: &ICoreWebView2Controller) {
                 0,
                 0,
                 0,
-                SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOSIZE,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOSIZE,
             );
         }
     }
@@ -251,24 +251,98 @@ pub fn clear_browsing_data_and_navigate(controller: &ICoreWebView2Controller, ho
     }
 }
 
-/// CDP `Input.dispatchMouseEvent` (mouseWheel) で指定CSS座標下の要素を滑らかにスクロールする。
+/// CDP `Input.dispatchMouseEvent` で指定 DIP 座標（ZoomFactor 補正済み CSS 座標）に
+/// Ctrl+左クリック（modifiers: 2）を送信する。
+/// カーソル移動や OS の Ctrl キー状態を汚さずに、ジェスチャー開始位置のリンクを別タブで開ける。
+pub fn dispatch_ctrl_click(
+    controller: &ICoreWebView2Controller,
+    dip_x: f64,
+    dip_y: f64,
+) {
+    if !dip_x.is_finite() || !dip_y.is_finite() {
+        return;
+    }
+    unsafe {
+        let mut zoom = 1.0_f64;
+        let _ = controller.ZoomFactor(&mut zoom);
+        let z = if zoom.is_finite() && zoom > 0.05 {
+            zoom
+        } else {
+            1.0
+        };
+        let x = (dip_x / z).max(0.0);
+        let y = (dip_y / z).max(0.0);
+        let Ok(wv) = controller.CoreWebView2() else {
+            return;
+        };
+        let method = HSTRING::from("Input.dispatchMouseEvent");
+        let move_params = HSTRING::from(format!(
+            "{{\"type\":\"mouseMoved\",\"x\":{x:.1},\"y\":{y:.1},\"modifiers\":2,\"pointerType\":\"mouse\"}}"
+        ));
+        let down_params = HSTRING::from(format!(
+            "{{\"type\":\"mousePressed\",\"x\":{x:.1},\"y\":{y:.1},\"button\":\"left\",\"buttons\":1,\"clickCount\":1,\"modifiers\":2,\"pointerType\":\"mouse\"}}"
+        ));
+        let up_params = HSTRING::from(format!(
+            "{{\"type\":\"mouseReleased\",\"x\":{x:.1},\"y\":{y:.1},\"button\":\"left\",\"buttons\":0,\"clickCount\":1,\"modifiers\":2,\"pointerType\":\"mouse\"}}"
+        ));
+
+        let wv_for_down = wv.clone();
+        let method_down = method.clone();
+        let move_handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+            move |_, _| {
+                let wv_for_up = wv_for_down.clone();
+                let method_up = method_down.clone();
+                let up_params_c = up_params.clone();
+                let down_handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                    move |_, _| {
+                        let up_handler = CallDevToolsProtocolMethodCompletedHandler::create(
+                            Box::new(|_, _| Ok(())),
+                        );
+                        let _ = wv_for_up.CallDevToolsProtocolMethod(
+                            &method_up,
+                            &up_params_c,
+                            &up_handler,
+                        );
+                        Ok(())
+                    },
+                ));
+                let _ = wv_for_down.CallDevToolsProtocolMethod(
+                    &method_down,
+                    &down_params,
+                    &down_handler,
+                );
+                Ok(())
+            },
+        ));
+        let _ = wv.CallDevToolsProtocolMethod(&method, &move_params, &move_handler);
+    }
+}
+
+/// CDP `Input.dispatchMouseEvent` (mouseWheel) で指定 DIP 座標（ZoomFactor 補正済み CSS 座標）下の要素を滑らかにスクロールする。
 /// メインページだけでなく X / Discord / Instagram 等の内側スクロール領域にも自然に効く。
 pub fn dispatch_wheel_scroll(
     controller: &ICoreWebView2Controller,
-    css_x: f64,
-    css_y: f64,
+    dip_x: f64,
+    dip_y: f64,
     delta_x: f64,
     delta_y: f64,
 ) {
     if !delta_x.is_finite() || !delta_y.is_finite() {
         return;
     }
-    let x = css_x.max(0.0);
-    let y = css_y.max(0.0);
-    let params = format!(
-        "{{\"type\":\"mouseWheel\",\"x\":{x:.1},\"y\":{y:.1},\"deltaX\":{delta_x:.2},\"deltaY\":{delta_y:.2}}}"
-    );
     unsafe {
+        let mut zoom = 1.0_f64;
+        let _ = controller.ZoomFactor(&mut zoom);
+        let z = if zoom.is_finite() && zoom > 0.05 {
+            zoom
+        } else {
+            1.0
+        };
+        let x = (dip_x / z).max(0.0);
+        let y = (dip_y / z).max(0.0);
+        let params = format!(
+            "{{\"type\":\"mouseWheel\",\"x\":{x:.1},\"y\":{y:.1},\"deltaX\":{delta_x:.2},\"deltaY\":{delta_y:.2}}}"
+        );
         if let Ok(wv) = controller.CoreWebView2() {
             let method = HSTRING::from("Input.dispatchMouseEvent");
             let params_h = HSTRING::from(params.as_str());
@@ -317,12 +391,14 @@ pub struct TabWebviewCallbacks {
     pub on_navigation_completed: Arc<dyn Fn(bool, Option<String>, String, bool, bool) + Send + Sync>,
     pub on_nav_flags_changed: Arc<dyn Fn(String, bool, bool) + Send + Sync>,
     pub on_favicon_changed: Arc<dyn Fn(String) + Send + Sync>,
+    pub on_zoom_factor_changed: Arc<dyn Fn(f64) + Send + Sync>,
     pub on_shortcut: Arc<dyn Fn(&'static str, Option<usize>) + Send + Sync>,
     pub on_follow_detected: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Threads / Instagram / Bluesky / mixi2 等のフォロー操作を自動検知してホストへ通知するスクリプト。
 const FOLLOW_TRACKER_JS: &str = r#"(function() {
+  if (window !== window.top) return;
   if (window.__omniFollowTrackerInstalled) return;
   window.__omniFollowTrackerInstalled = true;
 
@@ -331,19 +407,92 @@ const FOLLOW_TRACKER_JS: &str = r#"(function() {
   var ARIA_FOLLOW_RE = /^(?:(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|follow|follow\s+back)|.+?(?:をフォロー|をフォローする|をフォローバック)|follow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
   var POST_FOLLOW_STATE_RE = /(フォロー中|フォロー済|フォロー解除|リクエスト済|リクエスト中|承認待ち|following|unfollow|requested|pending|チェック|check)/i;
 
+  var lastNetworkFollowStartAt = 0;
   var lastNetworkFollowAt = 0;
-  var lastNetworkEmitAt = 0;
   var lastDomEmitAt = 0;
+  var lastAnyEmitAt = 0;
+  var inFlightFollows = 0;
+  var recentTargetKeys = Object.create(null);
+  var userInteractionSeq = 0;
+  var lastUserInteractionAt = 0;
+  var lastPointerDownAt = 0;
+  var emittedInteractions = Object.create(null);
 
-  function emitFollow(source) {
+  function bumpUserInteraction(fromPointerDown) {
     var now = Date.now();
-    if (source === 'network') {
-      if (now - lastNetworkEmitAt < 120) return;
-      lastNetworkEmitAt = now;
-      lastNetworkFollowAt = now;
+    if (fromPointerDown) {
+      userInteractionSeq++;
+      lastPointerDownAt = now;
+      lastUserInteractionAt = now;
+    } else if (now - lastPointerDownAt > 500) {
+      userInteractionSeq++;
+      lastUserInteractionAt = now;
     } else {
-      if (now - lastDomEmitAt < 350) return;
+      lastUserInteractionAt = now;
+    }
+  }
+
+  document.addEventListener('pointerdown', function(e) {
+    if (e && (e.isTrusted === false || (typeof e.button === 'number' && e.button !== 0))) return;
+    bumpUserInteraction(true);
+  }, true);
+
+  document.addEventListener('keydown', function(e) {
+    if (e && e.isTrusted !== false && (e.key === 'Enter' || e.key === ' ')) {
+      bumpUserInteraction(true);
+    }
+  }, true);
+
+  function currentInteractionId() {
+    var now = Date.now();
+    if (userInteractionSeq > 0 && now - lastUserInteractionAt <= 3000) {
+      return userInteractionSeq;
+    }
+    return 0;
+  }
+
+  function emitFollow(source, targetKey, interactionId) {
+    var now = Date.now();
+    if (interactionId && interactionId > 0) {
+      for (var ik in emittedInteractions) {
+        if (now - emittedInteractions[ik] > 15000) delete emittedInteractions[ik];
+      }
+      if (emittedInteractions[interactionId]) {
+        if (source === 'network') {
+          lastNetworkFollowAt = now;
+          if (targetKey) recentTargetKeys[targetKey] = now;
+        }
+        return;
+      }
+    }
+    if (targetKey) {
+      for (var k in recentTargetKeys) {
+        if (now - recentTargetKeys[k] > 15000) delete recentTargetKeys[k];
+      }
+      if (recentTargetKeys[targetKey] && now - recentTargetKeys[targetKey] < 5000) {
+        return;
+      }
+    }
+    if (source === 'network') {
+      if (now - lastDomEmitAt < 2500) {
+        lastNetworkFollowAt = now;
+        if (targetKey) recentTargetKeys[targetKey] = now;
+        if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
+        return;
+      }
+      if (!targetKey && now - lastAnyEmitAt < 1200) {
+        lastNetworkFollowAt = now;
+        return;
+      }
+      lastNetworkFollowAt = now;
+      lastAnyEmitAt = now;
+      if (targetKey) recentTargetKeys[targetKey] = now;
+      if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
+    } else {
+      if (now - lastAnyEmitAt < 2500) return;
       lastDomEmitAt = now;
+      lastAnyEmitAt = now;
+      if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
     }
     try {
       if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
@@ -370,10 +519,30 @@ const FOLLOW_TRACKER_JS: &str = r#"(function() {
     return '';
   }
 
-  function isFollowApiRequest(rawUrl, method, rawBody) {
+  function extractTargetKey(url, decodedBody) {
+    try {
+      var m = /\/friendships\/create\/([^\/?#]+)/i.exec(url) ||
+              /\/web\/friendships\/([^\/?#]+)\/follow/i.exec(url) ||
+              /\/api\/v1\/accounts\/([^\/?#]+)\/follow/i.exec(url);
+      if (m && m[1]) return String(m[1]).trim().toLowerCase();
+
+      // 相手IDを示す明示キーを優先（viewerの user_id を誤って先に拾わない）
+      m = /"(?:target_user_id|targetUserId|to_user_id|subscribee_id|subject)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
+          /(?:^|&)(?:target_user_id|to_user_id)=([a-z0-9._-]+)/i.exec(decodedBody);
+      if (m && m[1]) return String(m[1]).trim().toLowerCase();
+
+      m = /"(?:user_id|profile_id|userId)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
+          /(?:^|&)user_id=([a-z0-9._-]+)/i.exec(decodedBody) ||
+          /[?&]user_id=([a-z0-9._-]+)/i.exec(url);
+      if (m && m[1]) return String(m[1]).trim().toLowerCase();
+    } catch (_) {}
+    return '';
+  }
+
+  function detectFollowApiRequest(rawUrl, method, rawBody) {
     try {
       var m = (method || 'GET').toUpperCase();
-      if (m !== 'POST') return false;
+      if (m !== 'POST') return null;
       var url = String(rawUrl || '');
       var lowerUrl = url.toLowerCase();
       var body = bodyToSearchString(rawBody);
@@ -385,40 +554,48 @@ const FOLLOW_TRACKER_JS: &str = r#"(function() {
 
       if (/\/friendships\/create(?:\/|\?|$)/i.test(lowerUrl) ||
           /\/web\/friendships\/[^\/?#]+\/follow(?:\/|\?|$)/i.test(lowerUrl)) {
-        return !/unfollow|destroy/i.test(lowerUrl);
+        if (!/unfollow|destroy/i.test(lowerUrl)) {
+          return { targetKey: extractTargetKey(url, decodedBody) };
+        }
+        return null;
       }
 
       if (/\/(?:api\/)?graphql(?:\/|\?|$)/i.test(lowerUrl)) {
         var fnameMatch = /(?:fb_api_req_friendly_name|friendlyname)["'=\s:]+([a-z0-9_]+)/i.exec(decodedBody);
         var fname = fnameMatch ? fnameMatch[1] : '';
         if (fname) {
-          if (/unfollow|destroy|remove|cancel|block|mute|follower|following|suggestion|recommend|list|count/i.test(fname)) {
-            return false;
+          if (/unfollow|destroy|remove|cancel|block|mute|follower|following|suggestion|recommend|list|count|query|fetch|load|get|status|info|chaining|similar|show|check|batch|many|bulk|sync|refresh|feed|timeline|modal|dialog|sheet/i.test(fname)) {
+            return null;
           }
-          if (/follow/i.test(fname) && /mutation|barcelona|polaris|friendship|profile|user|comet|textpost|ig/i.test(fname)) {
-            return true;
+          if (/follow/i.test(fname) && /(?:mutation|create|add)/i.test(fname)) {
+            return { targetKey: extractTargetKey(url, decodedBody) };
           }
+          return null;
         }
-        if (/usebarcelonafollowmutation|barcelonafollowmutation|polarisfriendshipsfollow|polarisfollowmutation|usepolarisfollowmutation|textpostappfollowmutation|friendingcometfollowmutation/i.test(lowerBody) &&
-            !/unfollow/i.test(lowerBody)) {
-          return true;
+        if (/usebarcelonafollowmutation|barcelonafollowmutation|polarisfriendshipsfollow|polarisfollowmutation|usepolarisfollowmutation|polarisuserfollowmutation|igwebprofilefollowmutation|textpostappfollowmutation|friendingcometfollowmutation/i.test(lowerBody) &&
+            !/unfollow|destroy/i.test(lowerBody)) {
+          return { targetKey: extractTargetKey(url, decodedBody) };
         }
-        return false;
+        return null;
       }
 
       if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
           lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
-        return true;
+        return { targetKey: extractTargetKey(url, decodedBody) };
       }
 
-      if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) return true;
-      if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) return true;
+      if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) {
+        return { targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) {
+        return { targetKey: extractTargetKey(url, decodedBody) };
+      }
       if (/\/api\/commit\/follow\/user/i.test(lowerUrl) &&
           (/[?&]type=1(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=1(?:&|$)|"type"\s*:\s*1/i.test(lowerBody))) {
-        return true;
+        return { targetKey: extractTargetKey(url, decodedBody) };
       }
     } catch (_) {}
-    return false;
+    return null;
   }
 
   try {
@@ -440,14 +617,25 @@ const FOLLOW_TRACKER_JS: &str = r#"(function() {
             if (init.body !== undefined) reqBody = init.body;
           }
         } catch (_) {}
-        var isFollow = isFollowApiRequest(reqUrl, reqMethod, reqBody);
+        var followReq = detectFollowApiRequest(reqUrl, reqMethod, reqBody);
+        var reqInteractionId = 0;
+        if (followReq) {
+          lastNetworkFollowStartAt = Date.now();
+          inFlightFollows++;
+          reqInteractionId = currentInteractionId();
+        }
         var promise = origFetch.apply(this, arguments);
-        if (isFollow && promise && typeof promise.then === 'function') {
+        if (followReq && promise && typeof promise.then === 'function') {
           promise.then(function(res) {
+            inFlightFollows = Math.max(0, inFlightFollows - 1);
             try {
-              if (res && res.ok) emitFollow('network');
+              if (res && res.ok) emitFollow('network', followReq.targetKey, reqInteractionId);
             } catch (_) {}
-          }, function() {});
+          }, function() {
+            inFlightFollows = Math.max(0, inFlightFollows - 1);
+          });
+        } else if (followReq) {
+          inFlightFollows = Math.max(0, inFlightFollows - 1);
         }
         return promise;
       };
@@ -467,14 +655,29 @@ const FOLLOW_TRACKER_JS: &str = r#"(function() {
       };
       XMLHttpRequest.prototype.send = function(body) {
         try {
-          if (isFollowApiRequest(this.__omniUrl, this.__omniMethod, body)) {
+          var followReq = detectFollowApiRequest(this.__omniUrl, this.__omniMethod, body);
+          if (followReq) {
+            lastNetworkFollowStartAt = Date.now();
+            inFlightFollows++;
+            var reqInteractionId = currentInteractionId();
+            var done = false;
+            var finish = function() {
+              if (!done) {
+                done = true;
+                inFlightFollows = Math.max(0, inFlightFollows - 1);
+              }
+            };
             this.addEventListener('load', function() {
+              finish();
               try {
                 if (this.status >= 200 && this.status < 300) {
-                  emitFollow('network');
+                  emitFollow('network', followReq.targetKey, reqInteractionId);
                 }
               } catch (_) {}
             }, { once: true });
+            this.addEventListener('error', finish, { once: true });
+            this.addEventListener('abort', finish, { once: true });
+            this.addEventListener('timeout', finish, { once: true });
           }
         } catch (_) {}
         return origSend.apply(this, arguments);
@@ -542,6 +745,9 @@ const FOLLOW_TRACKER_JS: &str = r#"(function() {
 
   document.addEventListener('click', function(e) {
     try {
+      if (e && (e.isTrusted === false || e.button !== 0 || e.ctrlKey || e.metaKey)) return;
+      bumpUserInteraction(false);
+      var clickInteractionId = currentInteractionId();
       var target = e.target;
       if (!target) return;
       if (target.nodeType !== 1) target = target.parentElement;
@@ -555,7 +761,12 @@ const FOLLOW_TRACKER_JS: &str = r#"(function() {
 
       setTimeout(function() {
         try {
-          if (lastNetworkFollowAt >= clickedAt - 200) return;
+          if (inFlightFollows > 0 ||
+              lastNetworkFollowStartAt >= clickedAt - 300 ||
+              lastNetworkFollowAt >= clickedAt - 300 ||
+              lastAnyEmitAt >= clickedAt - 300) {
+            return;
+          }
           if (!hadDialog) {
             var dlg = document.querySelector('[role="dialog"]');
             if (dlg) {
@@ -568,25 +779,25 @@ const FOLLOW_TRACKER_JS: &str = r#"(function() {
             }
           }
           if (isElementHidden(btn)) {
-            emitFollow('dom');
+            emitFollow('dom', '', clickInteractionId);
             return;
           }
           if (btn.getAttribute('aria-pressed') === 'true') {
-            emitFollow('dom');
+            emitFollow('dom', '', clickInteractionId);
             return;
           }
           var after = readElementLabels(btn);
           if ((after.text && POST_FOLLOW_STATE_RE.test(after.text)) ||
               (after.aria && POST_FOLLOW_STATE_RE.test(after.aria))) {
-            emitFollow('dom');
+            emitFollow('dom', '', clickInteractionId);
             return;
           }
           if ((after.text !== initialLabels.text || after.aria !== initialLabels.aria) &&
               !isFollowButtonElement(btn)) {
-            emitFollow('dom');
+            emitFollow('dom', '', clickInteractionId);
           }
         } catch (_) {}
-      }, 650);
+      }, 1000);
     } catch (_) {}
   }, true);
 })();"#;
@@ -803,6 +1014,24 @@ pub fn attach_tab_handlers(
             );
         }
 
+        // 5.5 ZoomFactorChanged (Ctrl+ホイール等のネイティブズームをツールバー＆設定と同期)
+        {
+            let cb = callbacks.on_zoom_factor_changed.clone();
+            let mut token = Default::default();
+            let _ = controller.add_ZoomFactorChanged(
+                &ZoomFactorChangedEventHandler::create(Box::new(move |sender, _| {
+                    if let Some(ctrl) = sender {
+                        let mut zoom = 1.0_f64;
+                        if ctrl.ZoomFactor(&mut zoom).is_ok() && zoom.is_finite() {
+                            cb(zoom);
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            );
+        }
+
         // 6. AcceleratorKeyPressed (SNSフォーカス中でも Ctrl+K / Ctrl+1..9 / Ctrl+Alt+1..9 等を捕捉)
         {
             let cb = callbacks.on_shortcut.clone();
@@ -878,6 +1107,34 @@ pub fn attach_tab_handlers(
                     if !alt && vkey == 0x09 {
                         let _ = args.SetHandled(true);
                         cb(if shift { "previous-tab" } else { "next-tab" }, None);
+                        return Ok(());
+                    }
+
+                    // Ctrl + '+' / '=' / ';' (VK_OEM_PLUS=0xBB) / Numpad '+' (0x6B) -> 拡大
+                    if !alt && (vkey == 0xBB || vkey == 0x6B) {
+                        let _ = args.SetHandled(true);
+                        cb("zoom-in", None);
+                        return Ok(());
+                    }
+
+                    // Ctrl + '-' (VK_OEM_MINUS=0xBD) / Numpad '-' (0x6D) -> 縮小
+                    if !alt && (vkey == 0xBD || vkey == 0x6D) {
+                        let _ = args.SetHandled(true);
+                        cb("zoom-out", None);
+                        return Ok(());
+                    }
+
+                    // Ctrl + '0' (0x30) / Numpad '0' (0x60) -> ズームリセット (100%)
+                    if !shift && !alt && (vkey == 0x30 || vkey == 0x60) {
+                        let _ = args.SetHandled(true);
+                        cb("zoom-reset", None);
+                        return Ok(());
+                    }
+
+                    // Ctrl + L (0x4C) -> アドレスバーへフォーカス
+                    if !shift && !alt && vkey == 0x4C {
+                        let _ = args.SetHandled(true);
+                        cb("focus-address-bar", None);
                         return Ok(());
                     }
 

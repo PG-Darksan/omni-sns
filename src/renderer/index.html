@@ -72,6 +72,13 @@
         <div id="account-strip" class="account-strip"></div>
         <div class="accountbar-right">
           <button
+            id="btn-collapsed-new-subtab"
+            type="button"
+            class="tool-btn accountbar-collapsed-only"
+            title="同じアカウントで新しいタブを開く (Ctrl+T)"
+            aria-label="同じアカウントで新しいタブを開く"
+          >＋</button>
+          <button
             id="btn-collapsed-reload"
             type="button"
             class="tool-btn accountbar-collapsed-only"
@@ -118,8 +125,18 @@
         <div class="toolbar-address">
           <span id="active-service-dot" class="status-dot"></span>
           <span id="active-service-name" class="active-name">サービス未選択</span>
-          <button id="btn-copy-url" class="url-display" title="クリックして現在のURLをコピー">
-            <span id="active-url-text">—</span>
+          <input
+            id="active-url-input"
+            type="text"
+            class="url-input"
+            value=""
+            placeholder="URLを入力して Enter で移動（Alt+Enter で別タブ）"
+            spellcheck="false"
+            autocomplete="off"
+            aria-label="現在のURL（入力してEnterで移動、Alt+Enterで新しいタブで開く）"
+          />
+          <button id="btn-copy-url" class="tool-btn" title="現在のURLをコピー" aria-label="現在のURLをコピー">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
           <button id="btn-open-external" class="tool-btn" title="既定のブラウザで開く">↗</button>
         </div>
@@ -136,7 +153,9 @@
             <strong id="follow-today-count">0</strong>
           </button>
           <button id="btn-toggle-ua" class="tool-pill" title="PC版 / モバイル版 User-Agent を切り替え">PC版</button>
-          <button id="btn-toggle-mute" class="tool-btn" title="ミュート切替" aria-label="ミュート切替">🔊</button>
+          <button id="btn-toggle-mute" class="tool-btn" title="ミュート切替" aria-label="ミュート切替">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+          </button>
           <div class="zoom-group">
             <button id="btn-zoom-out" class="tool-btn-sm" title="縮小">−</button>
             <button id="btn-zoom-reset" class="tool-zoom-label" title="100%にリセット">100%</button>
@@ -160,7 +179,7 @@
       <!-- マルチタブバー (高さ34px固定: 現在のアカウント内で複数タブ切替・追加・複製・削除・復元) -->
       <div id="tabbar" class="tabbar" role="tablist" aria-label="ブラウザタブ一覧">
         <div id="tab-strip" class="tab-strip"></div>
-        <button id="btn-new-subtab" class="tabbar-btn" title="新しいタブを開く (Ctrl+T)">＋</button>
+        <button id="btn-new-subtab" class="tabbar-btn" title="同じアカウントで新しいタブを開く (Ctrl+T / リンクをCtrl+クリックでも別タブで開けます)">＋</button>
         <div class="tabbar-actions">
           <button id="btn-dup-subtab" class="tabbar-btn" title="現在のタブを複製">⧉</button>
           <button id="btn-close-other-subtabs" class="tabbar-btn" title="このタブ以外を閉じる">⊘</button>
@@ -349,7 +368,10 @@
         <div class="shortcut-box">
           <h3>キーボードショートカット &amp; ジェスチャー</h3>
           <ul>
-            <li><kbd>右ドラッグ</kbd> : マウスジェスチャー（タブ切替・アカウント切替・連続スクロール等）</li>
+            <li><kbd>右ドラッグ</kbd> : マウスジェスチャー（タブ切替・Ctrl+クリック・アカウント切替・連続スクロール等）</li>
+            <li><kbd>Ctrl</kbd> + <kbd>クリック</kbd> / <kbd>中クリック</kbd> : 同一アカウントのログイン状態を保ったままリンクを別タブで開く</li>
+            <li><kbd>Ctrl</kbd> + <kbd>L</kbd> : アドレスバーにフォーカス（<kbd>Enter</kbd> で移動 / <kbd>Alt</kbd>+<kbd>Enter</kbd> で別タブで開く）</li>
+            <li><kbd>Ctrl</kbd> + <kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> : 表示倍率の拡大 / 縮小 / 100%リセット</li>
             <li><kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> / <kbd>←</kbd> <kbd>→</kbd> : 同一SNS内のアカウントを瞬時に切り替え</li>
             <li><kbd>Ctrl</kbd> + <kbd>T</kbd> / <kbd>W</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> : 新しいタブ / タブを閉じる / 閉じたタブを復元</li>
             <li><kbd>Ctrl</kbd> + <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> : 次 / 前のタブへ切り替え</li>
