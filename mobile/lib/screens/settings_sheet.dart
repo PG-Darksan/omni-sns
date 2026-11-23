@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import '../models/gesture_models.dart';
 import '../models/service_models.dart';
+import 'gesture_settings_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({
@@ -17,17 +19,20 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   late bool _isDarkMode;
+  late MobileGestureSettings _gesture;
 
   @override
   void initState() {
     super.initState();
     _isDarkMode = widget.settings.isDarkMode;
+    _gesture = widget.settings.gesture;
   }
 
   void _saveAndClose() {
     Navigator.of(context).pop(
       widget.settings.copyWith(
         isDarkMode: _isDarkMode,
+        gesture: _gesture,
       ),
     );
   }
@@ -52,6 +57,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
             subtitle: const Text('OFFにするとライトテーマに切り替えます'),
             value: _isDarkMode,
             onChanged: (v) => setState(() => _isDarkMode = v),
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.gesture_rounded),
+            title: const Text('タッチジェスチャー設定'),
+            subtitle: Text(
+              _gesture.enabled
+                  ? '有効 · 12方向ボード＆連続スクロール'
+                  : '無効 · タップして設定を開く',
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () async {
+              await Navigator.of(context).push<void>(
+                MaterialPageRoute(
+                  builder: (_) => GestureSettingsScreen(
+                    initialSettings: _gesture,
+                    onChanged: (next) {
+                      setState(() => _gesture = next);
+                    },
+                  ),
+                ),
+              );
+            },
           ),
           const Divider(),
           ListTile(

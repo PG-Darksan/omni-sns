@@ -1,13 +1,8 @@
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub const LAN_SYNC_PORT: u16 = 45871;
-pub const LAN_SYNC_MAGIC: &str = "omnisns-follow-sync-v1";
 pub const GIST_FILENAME: &str = "omnisns-follow-sync.json";
 
 pub fn now_unix_secs() -> u64 {
@@ -53,6 +48,14 @@ pub struct DeviceFollowEntry {
     #[serde(default)]
     pub total_epoch: u64,
     #[serde(default)]
+    pub unfollow_today: i32,
+    #[serde(default)]
+    pub unfollow_total: i32,
+    #[serde(default)]
+    pub unfollow_today_epoch: u64,
+    #[serde(default)]
+    pub unfollow_total_epoch: u64,
+    #[serde(default)]
     pub updated_at: u64,
 }
 
@@ -65,6 +68,10 @@ pub struct AccountFollowLedger {
     pub reset_epoch: u64,
     #[serde(default)]
     pub total_reset_epoch: u64,
+    #[serde(default)]
+    pub unfollow_reset_epoch: u64,
+    #[serde(default)]
+    pub unfollow_total_reset_epoch: u64,
     #[serde(default)]
     pub devices: HashMap<String, DeviceFollowEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,6 +89,8 @@ impl AccountFollowLedger {
             for entry in self.devices.values_mut() {
                 entry.today = 0;
                 entry.today_epoch = self.reset_epoch;
+                entry.unfollow_today = 0;
+                entry.unfollow_today_epoch = self.unfollow_reset_epoch;
             }
         } else if self.date.is_empty() {
             self.date = today.to_string();
@@ -106,6 +115,24 @@ impl AccountFollowLedger {
         )
     }
 
+    pub fn effective_unfollow_counts(&self, today: &str) -> (u32, u32) {
+        let same_day = self.date == today;
+        let mut sum_today: i64 = 0;
+        let mut sum_total: i64 = 0;
+        for entry in self.devices.values() {
+            if same_day && entry.unfollow_today_epoch >= self.unfollow_reset_epoch {
+                sum_today += entry.unfollow_today as i64;
+            }
+            if entry.unfollow_total_epoch >= self.unfollow_total_reset_epoch {
+                sum_total += entry.unfollow_total as i64;
+            }
+        }
+        (
+            sum_today.clamp(0, u32::MAX as i64) as u32,
+            sum_total.clamp(0, u32::MAX as i64) as u32,
+        )
+    }
+
     /// 相手側のレジャーを競合なくマージする。ローカルに変化があれば true。
     pub fn merge_from(&mut self, other: &AccountFollowLedger, today: &str) -> bool {
         let mut changed = false;
@@ -121,6 +148,7 @@ impl AccountFollowLedger {
             if self.date.as_str() < target_date.as_str() {
                 for entry in self.devices.values_mut() {
                     entry.today = 0;
+                    entry.unfollow_today = 0;
                 }
             }
             self.date = target_date.clone();
@@ -149,6 +177,28 @@ impl AccountFollowLedger {
             changed = true;
         }
 
+        if other.unfollow_reset_epoch > self.unfollow_reset_epoch {
+            self.unfollow_reset_epoch = other.unfollow_reset_epoch;
+            for entry in self.devices.values_mut() {
+                if entry.unfollow_today_epoch < self.unfollow_reset_epoch {
+                    entry.unfollow_today = 0;
+                    entry.unfollow_today_epoch = self.unfollow_reset_epoch;
+                }
+            }
+            changed = true;
+        }
+
+        if other.unfollow_total_reset_epoch > self.unfollow_total_reset_epoch {
+            self.unfollow_total_reset_epoch = other.unfollow_total_reset_epoch;
+            for entry in self.devices.values_mut() {
+                if entry.unfollow_total_epoch < self.unfollow_total_reset_epoch {
+                    entry.unfollow_total = 0;
+                    entry.unfollow_total_epoch = self.unfollow_total_reset_epoch;
+                }
+            }
+            changed = true;
+        }
+
         let other_same_day = other.date == target_date;
         for (dev_id, remote_entry) in &other.devices {
             let mut normalized = remote_entry.clone();
@@ -160,13 +210,23 @@ impl AccountFollowLedger {
                 normalized.total = 0;
                 normalized.total_epoch = self.total_reset_epoch;
             }
+            if !other_same_day || normalized.unfollow_today_epoch < self.unfollow_reset_epoch {
+                normalized.unfollow_today = 0;
+                normalized.unfollow_today_epoch = self.unfollow_reset_epoch;
+            }
+            if normalized.unfollow_total_epoch < self.unfollow_total_reset_epoch {
+                normalized.unfollow_total = 0;
+                normalized.unfollow_total_epoch = self.unfollow_total_reset_epoch;
+            }
 
             match self.devices.get_mut(dev_id) {
                 Some(local_entry) => {
                     let remote_newer = normalized.updated_at > local_entry.updated_at
                         || (normalized.updated_at == local_entry.updated_at
                             && (normalized.total > local_entry.total
-                                || normalized.today > local_entry.today));
+                                || normalized.today > local_entry.today
+                                || normalized.unfollow_total > local_entry.unfollow_total
+                                || normalized.unfollow_today > local_entry.unfollow_today));
                     if remote_newer && *local_entry != normalized {
                         *local_entry = normalized;
                         changed = true;
@@ -251,13 +311,11 @@ impl FollowSyncLedger {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FollowSyncSettings {
     #[serde(default)]
     pub device_id: String,
-    #[serde(default = "default_true")]
-    pub lan_enabled: bool,
     #[serde(default)]
     pub github_token: String,
     #[serde(default)]
@@ -268,73 +326,11 @@ pub struct FollowSyncSettings {
     pub last_sync_status: Option<String>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-impl Default for FollowSyncSettings {
-    fn default() -> Self {
-        Self {
-            device_id: String::new(),
-            lan_enabled: true,
-            github_token: String::new(),
-            gist_id: String::new(),
-            last_sync_at: None,
-            last_sync_status: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateFollowSyncPatch {
-    pub lan_enabled: Option<bool>,
     pub github_token: Option<String>,
     pub gist_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LanSyncPacket {
-    magic: String,
-    kind: String,
-    device_id: String,
-    ledger: FollowSyncLedger,
-}
-
-/// 同一 Wi-Fi / LAN 内の他端末（Android / 別 PC）へ UDP ブロードキャスト送信する。
-pub fn broadcast_lan_ledger(device_id: &str, ledger: &FollowSyncLedger) {
-    let packet = LanSyncPacket {
-        magic: LAN_SYNC_MAGIC.to_string(),
-        kind: "beacon".to_string(),
-        device_id: device_id.to_string(),
-        ledger: ledger.clone(),
-    };
-    let Ok(payload) = serde_json::to_vec(&packet) else {
-        return;
-    };
-    if payload.len() > 60_000 {
-        return;
-    }
-    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-        let _ = sock.set_broadcast(true);
-        let target: SocketAddr = ([255, 255, 255, 255], LAN_SYNC_PORT).into();
-        let _ = sock.send_to(&payload, target);
-    }
-}
-
-fn send_lan_reply(sock: &UdpSocket, addr: SocketAddr, device_id: &str, ledger: &FollowSyncLedger) {
-    let packet = LanSyncPacket {
-        magic: LAN_SYNC_MAGIC.to_string(),
-        kind: "reply".to_string(),
-        device_id: device_id.to_string(),
-        ledger: ledger.clone(),
-    };
-    if let Ok(payload) = serde_json::to_vec(&packet) {
-        if payload.len() <= 60_000 {
-            let _ = sock.send_to(&payload, addr);
-        }
-    }
 }
 
 /// GitHub 非公開 Gist を使ったクラウド同期（4G/5G 外出先対応）。
@@ -462,84 +458,6 @@ pub fn sync_with_github_gist(
     Err("このOSではWinHTTPクラウド同期は未対応です".to_string())
 }
 
-pub struct LanSyncHandle {
-    stop_flag: Arc<AtomicBool>,
-}
-
-impl LanSyncHandle {
-    pub fn shutdown(&self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
-    }
-}
-
-/// LAN UDP 自動同期スレッドを起動する。
-/// `on_remote_ledger(remote_ledger) -> (device_id, current_local_ledger, should_reply)`
-pub fn start_lan_sync_listener<F, G>(
-    is_enabled: G,
-    on_remote_ledger: F,
-) -> LanSyncHandle
-where
-    G: Fn() -> (bool, String, FollowSyncLedger) + Send + Sync + 'static,
-    F: Fn(FollowSyncLedger) -> (String, FollowSyncLedger, bool) + Send + Sync + 'static,
-{
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_bg = stop_flag.clone();
-
-    let _ = std::thread::Builder::new()
-        .name("omnisns-lan-sync".to_string())
-        .spawn(move || {
-            let sock = match UdpSocket::bind(("0.0.0.0", LAN_SYNC_PORT)) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let _ = sock.set_broadcast(true);
-            let _ = sock.set_read_timeout(Some(Duration::from_millis(800)));
-
-            let mut buf = vec![0u8; 65_536];
-            let mut last_beacon = std::time::Instant::now()
-                .checked_sub(Duration::from_secs(30))
-                .unwrap_or_else(std::time::Instant::now);
-
-            while !stop_bg.load(Ordering::Relaxed) {
-                let (enabled, my_device_id, my_ledger) = is_enabled();
-                if enabled && last_beacon.elapsed() >= Duration::from_secs(25) {
-                    last_beacon = std::time::Instant::now();
-                    if !my_device_id.is_empty() && !my_ledger.accounts.is_empty() {
-                        broadcast_lan_ledger(&my_device_id, &my_ledger);
-                    }
-                }
-
-                match sock.recv_from(&mut buf) {
-                    Ok((len, src_addr)) => {
-                        if !enabled || len == 0 {
-                            continue;
-                        }
-                        let Ok(pkt) = serde_json::from_slice::<LanSyncPacket>(&buf[..len]) else {
-                            continue;
-                        };
-                        if pkt.magic != LAN_SYNC_MAGIC || pkt.device_id == my_device_id {
-                            continue;
-                        }
-                        let (dev_id, updated_local, should_reply) = on_remote_ledger(pkt.ledger);
-                        if pkt.kind == "beacon" && should_reply && !dev_id.is_empty() {
-                            send_lan_reply(&sock, src_addr, &dev_id, &updated_local);
-                        }
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                }
-            }
-        });
-
-    LanSyncHandle { stop_flag }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +480,10 @@ mod tests {
                 total: 40,
                 today_epoch: 0,
                 total_epoch: 0,
+                unfollow_today: 2,
+                unfollow_total: 10,
+                unfollow_today_epoch: 0,
+                unfollow_total_epoch: 0,
                 updated_at: 100,
             },
         );
@@ -582,6 +504,10 @@ mod tests {
                 total: 25,
                 today_epoch: 0,
                 total_epoch: 0,
+                unfollow_today: 3,
+                unfollow_total: 7,
+                unfollow_today_epoch: 0,
+                unfollow_total_epoch: 0,
                 updated_at: 200,
             },
         );
@@ -595,6 +521,7 @@ mod tests {
 
         let merged = pc.accounts.get("instagram:darksan560").unwrap();
         assert_eq!(merged.effective_counts(today), (20, 65));
+        assert_eq!(merged.effective_unfollow_counts(today), (5, 17));
         assert_eq!(merged.sns_following, Some(128));
         assert_eq!(merged.sns_followers, Some(345));
     }
@@ -616,6 +543,7 @@ mod tests {
                 today_epoch: 0,
                 total_epoch: 0,
                 updated_at: 100,
+                ..Default::default()
             },
         );
         a.accounts.insert("threads:darksan560".to_string(), acc_a);
@@ -636,6 +564,7 @@ mod tests {
                 today_epoch: 1,
                 total_epoch: 0,
                 updated_at: 200,
+                ..Default::default()
             },
         );
         b.accounts.insert("threads:darksan560".to_string(), acc_b);

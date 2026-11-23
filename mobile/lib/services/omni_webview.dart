@@ -24,7 +24,14 @@ typedef OmniWebViewErrorCallback = void Function(
   int errorCode,
 );
 typedef OmniWebViewExternalSchemeCallback = void Function(String url);
-typedef OmniWebViewFollowDetectedCallback = void Function(String source);
+typedef OmniWebViewFollowDetectedCallback = void Function(
+  String source,
+  String service,
+);
+typedef OmniWebViewUnfollowDetectedCallback = void Function(
+  String source,
+  String service,
+);
 typedef OmniWebViewAccountIdentityCallback = void Function(
   String service,
   String handle,
@@ -94,6 +101,7 @@ class OmniWebViewController {
     this.onWebResourceError,
     this.onExternalScheme,
     this.onFollowDetected,
+    this.onUnfollowDetected,
     this.onAccountIdentity,
   }) : _pendingUrl = initialUrl;
 
@@ -109,6 +117,7 @@ class OmniWebViewController {
   final OmniWebViewErrorCallback? onWebResourceError;
   final OmniWebViewExternalSchemeCallback? onExternalScheme;
   final OmniWebViewFollowDetectedCallback? onFollowDetected;
+  final OmniWebViewUnfollowDetectedCallback? onUnfollowDetected;
   final OmniWebViewAccountIdentityCallback? onAccountIdentity;
 
   MethodChannel? _channel;
@@ -169,7 +178,12 @@ class OmniWebViewController {
         }
       case 'onFollowDetected':
         final source = map['source'] as String? ?? 'auto';
-        onFollowDetected?.call(source);
+        final service = map['service'] as String? ?? '';
+        onFollowDetected?.call(source, service);
+      case 'onUnfollowDetected':
+        final source = map['source'] as String? ?? 'auto';
+        final service = map['service'] as String? ?? '';
+        onUnfollowDetected?.call(source, service);
       case 'onAccountIdentity':
         final service = map['service'] as String? ?? '';
         final handle = map['handle'] as String? ?? '';
@@ -261,6 +275,26 @@ class OmniWebViewController {
     } catch (_) {
       return null;
     }
+  }
+
+  Future<void> scrollBy(double dx, double dy) async {
+    if (_disposed) return;
+    try {
+      await _channel?.invokeMethod<void>(
+        'scrollBy',
+        <String, dynamic>{'dx': dx, 'dy': dy},
+      );
+    } catch (_) {}
+  }
+
+  Future<void> scrollToEdge({required bool toTop}) async {
+    if (_disposed) return;
+    try {
+      await _channel?.invokeMethod<void>(
+        'scrollToEdge',
+        <String, dynamic>{'toTop': toTop},
+      );
+    } catch (_) {}
   }
 
   void dispose() {

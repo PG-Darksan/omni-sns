@@ -67,6 +67,10 @@ export interface ServiceInstance {
   followCountToday?: number;
   /** 累計フォロー回数 */
   followCountTotal?: number;
+  /** 本日のアンフォロー回数 */
+  unfollowCountToday?: number;
+  /** 累計アンフォロー回数 */
+  unfollowCountTotal?: number;
   /** 本日カウントの日付 (YYYY-MM-DD) */
   followCountDate?: string;
   /** 自動検出または手動設定されたログイン中アカウントID (@username) */
@@ -141,7 +145,6 @@ export type ThemeMode = 'dark' | 'light';
 
 export interface FollowSyncSettings {
   deviceId: string;
-  lanEnabled: boolean;
   githubToken: string;
   gistId: string;
   lastSyncAt?: number;
@@ -149,7 +152,6 @@ export interface FollowSyncSettings {
 }
 
 export interface UpdateFollowSyncPatch {
-  lanEnabled?: boolean;
   githubToken?: string;
   gistId?: string;
 }

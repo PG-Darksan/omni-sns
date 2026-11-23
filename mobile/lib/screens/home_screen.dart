@@ -3,11 +3,14 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../models/gesture_models.dart';
 import '../models/service_models.dart';
 import '../services/app_store.dart';
 import '../services/follow_sync_service.dart';
 import '../services/omni_webview.dart';
+import '../widgets/gesture_overlay.dart';
 import 'catalog_sheet.dart';
+import 'gesture_settings_screen.dart';
 import 'settings_sheet.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -43,21 +46,32 @@ class _ServiceGroup {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  static const String _gmailUrl = 'https://mail.google.com/';
+  static const String _gmailProfileName = 'omnisns_gmail';
+
   bool _initialized = false;
   bool _multiProfileSupported = false;
+  bool _isGmailOpen = false;
+  OmniWebViewController? _gmailController;
+  TabRuntimeState _gmailRuntime = const TabRuntimeState(
+    currentUrl: _gmailUrl,
+    title: 'Gmail',
+    isSleeping: true,
+  );
   List<CategoryMeta> _categories = const [];
   List<CatalogService> _catalog = const [];
   List<ServiceInstance> _instances = [];
   AppSettings _settings = const AppSettings();
   FollowSyncSettings _followSyncSettings = const FollowSyncSettings();
   FollowSyncLedger _followLedger = FollowSyncLedger();
-  final FollowSyncService _followSyncService = FollowSyncService();
   Timer? _cloudSyncDebounce;
   Timer? _cloudSyncPeriodic;
 
   final Map<String, OmniWebViewController> _controllers = {};
   final Map<String, TabRuntimeState> _runtimeMap = {};
   final Map<String, String> _lastActiveByGroup = {};
+  final Map<String, ({String service, String handle})> _crossSiteIdentities = {};
+  final GlobalKey<MobileGestureOverlayState> _gestureOverlayKey = GlobalKey();
 
   @override
   void initState() {
@@ -69,7 +83,8 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _cloudSyncDebounce?.cancel();
     _cloudSyncPeriodic?.cancel();
-    _followSyncService.dispose();
+    _gmailController?.dispose();
+    _gmailController = null;
     for (final ctrl in _controllers.values) {
       ctrl.dispose();
     }
@@ -306,16 +321,61 @@ class _HomeScreenState extends State<HomeScreen> {
       onExternalScheme: (url) {
         _openExternalUrlSafely(url);
       },
-      onFollowDetected: (_) {
-        _adjustFollowCount(instance.instanceId, 1);
-      },
-      onAccountIdentity: (_, handle, following, followers) {
-        _handleAccountIdentity(
-          instance.instanceId,
-          handle,
-          following: following,
-          followers: followers,
+      onFollowDetected: (_, service) {
+        final src = _instances.cast<ServiceInstance?>().firstWhere(
+              (i) => i?.instanceId == instance.instanceId,
+              orElse: () => instance,
+            );
+        if (src == null) return;
+        final resolved = _resolveCounterTarget(
+          src,
+          explicitService: service,
         );
+        if (resolved.target != null) {
+          _adjustFollowCount(resolved.target!.instanceId, 1);
+        }
+      },
+      onUnfollowDetected: (_, service) {
+        final src = _instances.cast<ServiceInstance?>().firstWhere(
+              (i) => i?.instanceId == instance.instanceId,
+              orElse: () => instance,
+            );
+        if (src == null) return;
+        final resolved = _resolveCounterTarget(
+          src,
+          explicitService: service,
+        );
+        if (resolved.target != null) {
+          _adjustUnfollowCount(resolved.target!.instanceId, 1);
+        }
+      },
+      onAccountIdentity: (service, handle, following, followers) {
+        final src = _instances.cast<ServiceInstance?>().firstWhere(
+              (i) => i?.instanceId == instance.instanceId,
+              orElse: () => instance,
+            );
+        if (src == null) return;
+        final normSvc = service.trim().toLowerCase();
+        final normHandle = normalizeAccountHandle(handle);
+        if (normSvc.isNotEmpty &&
+            normSvc != src.serviceId &&
+            normHandle != null) {
+          _crossSiteIdentities[src.instanceId] =
+              (service: normSvc, handle: normHandle);
+        }
+        final resolved = _resolveCounterTarget(
+          src,
+          explicitService: normSvc,
+          handleHint: handle,
+        );
+        if (resolved.target != null) {
+          _handleAccountIdentity(
+            resolved.target!.instanceId,
+            handle,
+            following: following,
+            followers: followers,
+          );
+        }
       },
     );
 
@@ -344,10 +404,130 @@ class _HomeScreenState extends State<HomeScreen> {
   void _activateInstance(ServiceInstance inst) {
     _lastActiveByGroup[serviceGroupKey(inst)] = inst.instanceId;
     setState(() {
+      _isGmailOpen = false;
       _settings = _settings.copyWith(activeInstanceId: inst.instanceId);
     });
     _ensureController(inst);
     _persist();
+  }
+
+  OmniWebViewController _ensureGmailController() {
+    final existing = _gmailController;
+    if (existing != null && !existing.isDisposed) return existing;
+
+    final controller = OmniWebViewController(
+      initialUrl: _gmailUrl,
+      profileName: _multiProfileSupported
+          ? _gmailProfileName
+          : defaultWebViewProfileName,
+      userAgent: buildMobileUserAgent(),
+      onProgress: (progress) {
+        if (!mounted) return;
+        setState(() {
+          _gmailRuntime = _gmailRuntime.copyWith(
+            progress: progress,
+            isLoading: progress < 100,
+            isSleeping: false,
+          );
+        });
+      },
+      onPageStarted: (url) {
+        if (!mounted) return;
+        setState(() {
+          _gmailRuntime = _gmailRuntime.copyWith(
+            currentUrl: isHttpOrHttpsUrl(url) ? url : _gmailRuntime.currentUrl,
+            isLoading: true,
+            isSleeping: false,
+            clearError: true,
+          );
+        });
+      },
+      onPageFinished: (url, title, canBack, canFwd, hadError) {
+        if (!mounted) return;
+        final safeTitle = title.trim().isEmpty ? 'Gmail' : title;
+        final validUrl = isHttpOrHttpsUrl(url);
+        setState(() {
+          _gmailRuntime = _gmailRuntime.copyWith(
+            currentUrl: validUrl ? url : _gmailRuntime.currentUrl,
+            title: safeTitle,
+            progress: 100,
+            isLoading: false,
+            isSleeping: false,
+            canGoBack: canBack,
+            canGoForward: canFwd,
+            clearError: !hadError && validUrl,
+          );
+        });
+      },
+      onTitleChanged: (title) {
+        if (!mounted) return;
+        setState(() {
+          _gmailRuntime = _gmailRuntime.copyWith(
+            title: title.trim().isEmpty ? 'Gmail' : title,
+          );
+        });
+      },
+      onHistoryChanged: (url, canBack, canFwd) {
+        if (!mounted) return;
+        setState(() {
+          _gmailRuntime = _gmailRuntime.copyWith(
+            currentUrl: isHttpOrHttpsUrl(url) ? url : _gmailRuntime.currentUrl,
+            canGoBack: canBack,
+            canGoForward: canFwd,
+          );
+        });
+      },
+      onWebResourceError: (description, errorCode) {
+        if (!mounted) return;
+        setState(() {
+          _gmailRuntime = _gmailRuntime.copyWith(
+            isLoading: false,
+            loadError: '$description ($errorCode)',
+          );
+        });
+      },
+      onExternalScheme: (url) {
+        _openExternalUrlSafely(url);
+      },
+    );
+
+    _gmailController = controller;
+    _gmailRuntime = _gmailRuntime.copyWith(
+      isSleeping: false,
+      isLoading: true,
+      progress: 5,
+      clearError: true,
+    );
+    return controller;
+  }
+
+  void _toggleInAppGmail() {
+    if (_isGmailOpen) {
+      setState(() {
+        _isGmailOpen = false;
+      });
+      return;
+    }
+    _ensureGmailController();
+    setState(() {
+      _isGmailOpen = true;
+    });
+  }
+
+  Future<void> _reloadGmail() async {
+    final ctrl = _ensureGmailController();
+    final fallbackUrl = isHttpOrHttpsUrl(_gmailRuntime.currentUrl)
+        ? _gmailRuntime.currentUrl
+        : _gmailUrl;
+    setState(() {
+      _gmailRuntime = _gmailRuntime.copyWith(
+        isSleeping: false,
+        isLoading: true,
+        progress: 5,
+        clearError: true,
+      );
+    });
+    await ctrl.reload(fallbackUrl: fallbackUrl);
   }
 
   void _activateGroup(_ServiceGroup group) {
@@ -378,6 +558,10 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _reloadActiveTab() async {
+    if (_isGmailOpen) {
+      await _reloadGmail();
+      return;
+    }
     final active = _activeInstance;
     if (active == null) return;
     await _reloadInstance(active);
@@ -400,40 +584,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _startFollowSyncEngine() {
-    unawaited(
-      _followSyncService.startLanListener(
-        getState: () => (
-          enabled: _followSyncSettings.lanEnabled,
-          deviceId: _followSyncSettings.deviceId,
-          ledger: _followLedger.clone(),
-        ),
-        onRemoteLedger: (remote) {
-          final today = formatLocalYmd(DateTime.now());
-          final ledgerChanged = _followLedger.mergeFrom(remote, today);
-          final (projected, uiChanged) =
-              projectLedgerToInstances(_instances, _followLedger, today);
-          final shouldReply = _followLedger.hasNewerDataThan(remote, today);
-          if (ledgerChanged || uiChanged) {
-            if (mounted) {
-              setState(() {
-                _instances = projected;
-                _followSyncSettings = _followSyncSettings.copyWith(
-                  lastSyncAt: nowUnixSecs(),
-                  lastSyncStatus: 'LAN同期完了',
-                );
-              });
-            }
-            unawaited(_persistAllWithFollowSync());
-          }
-          return (
-            deviceId: _followSyncSettings.deviceId,
-            ledger: _followLedger.clone(),
-            shouldReply: shouldReply,
-          );
-        },
-      ),
-    );
-
     _cloudSyncPeriodic?.cancel();
     _cloudSyncPeriodic = Timer.periodic(const Duration(seconds: 60), (_) {
       if (!mounted) return;
@@ -453,16 +603,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _notifyFollowLedgerChanged() {
-    if (_followSyncSettings.lanEnabled &&
-        _followSyncSettings.deviceId.isNotEmpty &&
-        _followLedger.accounts.isNotEmpty) {
-      unawaited(
-        _followSyncService.broadcastLan(
-          _followSyncSettings.deviceId,
-          _followLedger.clone(),
-        ),
-      );
-    }
     if (_followSyncSettings.githubToken.trim().isNotEmpty) {
       _cloudSyncDebounce?.cancel();
       _cloudSyncDebounce = Timer(const Duration(seconds: 2), () {
@@ -476,25 +616,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<String> _syncFollowCloudOnce({bool silent = false}) async {
     final token = _followSyncSettings.githubToken.trim();
     if (token.isEmpty) {
-      if (_followSyncSettings.lanEnabled) {
-        await _followSyncService.broadcastLan(
-          _followSyncSettings.deviceId,
-          _followLedger.clone(),
-        );
-        const msg = '同一Wi-Fi(LAN)へ送信しました';
-        if (mounted) {
-          setState(() {
-            _followSyncSettings = _followSyncSettings.copyWith(
-              lastSyncAt: nowUnixSecs(),
-              lastSyncStatus: msg,
-            );
-          });
-        }
-        await widget.store
-            .saveFollowSyncState(_followSyncSettings, _followLedger);
-        return msg;
-      }
-      throw Exception('LAN同期またはGitHub Gistクラウド同期を有効にしてください');
+      throw Exception('GitHub Personal Access Token（gist 権限）を入力してください');
     }
 
     final today = formatLocalYmd(DateTime.now());
@@ -519,14 +641,6 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       }
       await _persistAllWithFollowSync();
-      if (_followSyncSettings.lanEnabled) {
-        unawaited(
-          _followSyncService.broadcastLan(
-            _followSyncSettings.deviceId,
-            _followLedger.clone(),
-          ),
-        );
-      }
       return 'クラウド同期完了';
     } catch (e) {
       final errText = e.toString().replaceFirst('Exception: ', '');
@@ -542,6 +656,49 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!silent) rethrow;
       return '同期エラー: $errText';
     }
+  }
+
+  ({
+    ServiceInstance? target,
+    bool isCrossSite,
+    String? effectiveService,
+  }) _resolveCounterTarget(
+    ServiceInstance source, {
+    String? explicitService,
+    String? handleHint,
+  }) {
+    final rt = _runtimeMap[source.instanceId];
+    final normExplicit = explicitService?.trim().toLowerCase();
+    final effectiveService = (normExplicit != null && normExplicit.isNotEmpty)
+        ? normExplicit
+        : (detectPlatformServiceFromUrl(rt?.currentUrl) ?? source.serviceId);
+    final isCrossSite = effectiveService != source.serviceId;
+    final crossHint = _crossSiteIdentities[source.instanceId];
+    final effectiveHandleHint = handleHint ??
+        (crossHint != null && crossHint.service == effectiveService
+            ? crossHint.handle
+            : null);
+    final target = resolveCounterTargetInstance(
+      source: source,
+      instances: _instances,
+      currentUrl: rt?.currentUrl,
+      explicitService: effectiveService,
+      handleHint: effectiveHandleHint,
+      lastActiveByGroup: _lastActiveByGroup,
+    );
+    return (
+      target: target,
+      isCrossSite: isCrossSite,
+      effectiveService: effectiveService,
+    );
+  }
+
+  String _serviceDisplayName(String serviceId) {
+    final cat = _catalog.cast<CatalogService?>().firstWhere(
+          (s) => s?.id == serviceId,
+          orElse: () => null,
+        );
+    return cat?.name ?? serviceId;
   }
 
   Future<void> _handleAccountIdentity(
@@ -560,6 +717,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final prevHandle = inst.detectedHandle;
     final prevToday = inst.effectiveFollowCountToday();
     final prevTotal = inst.followCountTotal;
+    final prevUfToday = inst.effectiveUnfollowCountToday();
+    final prevUfTotal = inst.unfollowCountTotal;
 
     var uiChanged = false;
     var ledgerChanged = false;
@@ -591,7 +750,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final devId = _followSyncSettings.deviceId;
       if (prevHandle == null &&
-          (prevToday > 0 || prevTotal > 0) &&
+          (prevToday > 0 ||
+              prevTotal > 0 ||
+              prevUfToday > 0 ||
+              prevUfTotal > 0) &&
           devId.isNotEmpty &&
           !acc.devices.containsKey(devId)) {
         acc.devices[devId] = DeviceFollowEntry(
@@ -599,6 +761,10 @@ class _HomeScreenState extends State<HomeScreen> {
           total: prevTotal,
           todayEpoch: acc.resetEpoch,
           totalEpoch: acc.totalResetEpoch,
+          unfollowToday: prevUfToday,
+          unfollowTotal: prevUfTotal,
+          unfollowTodayEpoch: acc.unfollowResetEpoch,
+          unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
           updatedAt: now,
         );
         ledgerChanged = true;
@@ -666,6 +832,8 @@ class _HomeScreenState extends State<HomeScreen> {
       final now = nowUnixSecs();
       final prevToday = inst.effectiveFollowCountToday();
       final prevTotal = inst.followCountTotal;
+      final prevUfToday = inst.effectiveUnfollowCountToday();
+      final prevUfTotal = inst.unfollowCountTotal;
 
       final acc = _followLedger.accounts.putIfAbsent(
         syncKey,
@@ -674,12 +842,20 @@ class _HomeScreenState extends State<HomeScreen> {
       acc.rollDate(today);
 
       if (!acc.devices.containsKey(devId)) {
-        final seed = acc.devices.isEmpty && (prevToday > 0 || prevTotal > 0);
+        final seed = acc.devices.isEmpty &&
+            (prevToday > 0 ||
+                prevTotal > 0 ||
+                prevUfToday > 0 ||
+                prevUfTotal > 0);
         acc.devices[devId] = DeviceFollowEntry(
           today: seed ? prevToday : 0,
           total: seed ? prevTotal : 0,
           todayEpoch: acc.resetEpoch,
           totalEpoch: acc.totalResetEpoch,
+          unfollowToday: seed ? prevUfToday : 0,
+          unfollowTotal: seed ? prevUfTotal : 0,
+          unfollowTodayEpoch: acc.unfollowResetEpoch,
+          unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
           updatedAt: now,
         );
       }
@@ -767,6 +943,130 @@ class _HomeScreenState extends State<HomeScreen> {
     await _persist();
   }
 
+  Future<void> _adjustUnfollowCount(String instanceId, int delta) async {
+    final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
+    if (idx == -1) return;
+    final today = formatLocalYmd(DateTime.now());
+    final inst = _instances[idx];
+    final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
+
+    if (syncKey != null && _followSyncSettings.deviceId.isNotEmpty) {
+      final devId = _followSyncSettings.deviceId;
+      final now = nowUnixSecs();
+      final prevToday = inst.effectiveFollowCountToday();
+      final prevTotal = inst.followCountTotal;
+      final prevUfToday = inst.effectiveUnfollowCountToday();
+      final prevUfTotal = inst.unfollowCountTotal;
+
+      final acc = _followLedger.accounts.putIfAbsent(
+        syncKey,
+        () => AccountFollowLedger(date: today),
+      );
+      acc.rollDate(today);
+
+      if (!acc.devices.containsKey(devId)) {
+        final seed = acc.devices.isEmpty &&
+            (prevToday > 0 ||
+                prevTotal > 0 ||
+                prevUfToday > 0 ||
+                prevUfTotal > 0);
+        acc.devices[devId] = DeviceFollowEntry(
+          today: seed ? prevToday : 0,
+          total: seed ? prevTotal : 0,
+          todayEpoch: acc.resetEpoch,
+          totalEpoch: acc.totalResetEpoch,
+          unfollowToday: seed ? prevUfToday : 0,
+          unfollowTotal: seed ? prevUfTotal : 0,
+          unfollowTodayEpoch: acc.unfollowResetEpoch,
+          unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
+          updatedAt: now,
+        );
+      }
+
+      final (curToday, curTotal) = acc.effectiveUnfollowCounts(today);
+      final entry = acc.devices[devId]!;
+      if (entry.unfollowTodayEpoch < acc.unfollowResetEpoch) {
+        entry.unfollowToday = 0;
+        entry.unfollowTodayEpoch = acc.unfollowResetEpoch;
+      }
+      if (entry.unfollowTotalEpoch < acc.unfollowTotalResetEpoch) {
+        entry.unfollowTotal = 0;
+        entry.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
+      }
+      if (delta >= 0) {
+        entry.unfollowToday += delta;
+        entry.unfollowTotal += delta;
+      } else {
+        final absDelta = -delta;
+        entry.unfollowToday -= min(absDelta, curToday);
+        entry.unfollowTotal -= min(absDelta, curTotal);
+      }
+      entry.updatedAt = max(now, entry.updatedAt + 1);
+
+      final (projected, _) =
+          projectLedgerToInstances(_instances, _followLedger, today);
+      setState(() {
+        _instances = projected;
+      });
+      await _persistAllWithFollowSync();
+      _notifyFollowLedgerChanged();
+      return;
+    }
+
+    setState(() {
+      _instances[idx] = _instances[idx].withUnfollowDelta(delta);
+    });
+    await _persist();
+  }
+
+  Future<void> _resetUnfollowCount(
+    String instanceId, {
+    required bool resetTotal,
+  }) async {
+    final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
+    if (idx == -1) return;
+    final today = formatLocalYmd(DateTime.now());
+    final inst = _instances[idx];
+    final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
+
+    if (syncKey != null) {
+      final now = nowUnixSecs();
+      final acc = _followLedger.accounts.putIfAbsent(
+        syncKey,
+        () => AccountFollowLedger(date: today),
+      );
+      acc.rollDate(today);
+      acc.unfollowResetEpoch += 1;
+      for (final entry in acc.devices.values) {
+        entry.unfollowToday = 0;
+        entry.unfollowTodayEpoch = acc.unfollowResetEpoch;
+        entry.updatedAt = max(now, entry.updatedAt + 1);
+      }
+      if (resetTotal) {
+        acc.unfollowTotalResetEpoch += 1;
+        for (final entry in acc.devices.values) {
+          entry.unfollowTotal = 0;
+          entry.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
+          entry.updatedAt = max(now, entry.updatedAt + 1);
+        }
+      }
+      final (projected, _) =
+          projectLedgerToInstances(_instances, _followLedger, today);
+      setState(() {
+        _instances = projected;
+      });
+      await _persistAllWithFollowSync();
+      _notifyFollowLedgerChanged();
+      return;
+    }
+
+    setState(() {
+      _instances[idx] =
+          _instances[idx].withUnfollowReset(resetTotal: resetTotal);
+    });
+    await _persist();
+  }
+
   String _formatSyncClock(int? unixSecs) {
     if (unixSecs == null) return '';
     final dt = DateTime.fromMillisecondsSinceEpoch(unixSecs * 1000);
@@ -775,7 +1075,10 @@ class _HomeScreenState extends State<HomeScreen> {
     return '$hh:$mm';
   }
 
-  Future<void> _showFollowCounterSheet(ServiceInstance target) async {
+  Future<void> _showFollowCounterSheet(
+    ServiceInstance target, {
+    String? crossSiteSourceName,
+  }) async {
     final handleCtrl = TextEditingController(text: target.detectedHandle ?? '');
     final tokenCtrl =
         TextEditingController(text: _followSyncSettings.githubToken);
@@ -813,35 +1116,36 @@ class _HomeScreenState extends State<HomeScreen> {
             final baseTitle = _multiProfileSupported
                 ? '${grp?.displayName ?? current.name} · $accLabel'
                 : (grp?.displayName ?? current.name);
-            final title = current.detectedHandle != null
+            final withHandle = current.detectedHandle != null
                 ? '$baseTitle (@${current.detectedHandle})'
                 : baseTitle;
+            final title = crossSiteSourceName != null
+                ? '$withHandle（$crossSiteSourceNameタブ内）'
+                : withHandle;
 
             final now = DateTime.now();
             final todayCount = current.effectiveFollowCountToday(now);
             final totalCount = current.followCountTotal;
+            final unfollowTodayCount = current.effectiveUnfollowCountToday(now);
+            final unfollowTotalCount = current.unfollowCountTotal;
             var allTodaySum = 0;
+            var allUnfollowTodaySum = 0;
             for (final inst in _instances) {
               allTodaySum += inst.effectiveFollowCountToday(now);
+              allUnfollowTodaySum += inst.effectiveUnfollowCountToday(now);
             }
             final colorScheme = Theme.of(ctx).colorScheme;
             final fs = _followSyncSettings;
             final hasCloud = fs.githubToken.trim().isNotEmpty;
-            final syncBadge = (hasCloud && fs.lanEnabled)
-                ? 'LAN + クラウド'
-                : hasCloud
-                    ? 'クラウド'
-                    : fs.lanEnabled
-                        ? 'LAN待機中'
-                        : 'OFF';
+            final syncBadge = hasCloud ? 'クラウド同期' : '未設定';
             final syncClock = _formatSyncClock(fs.lastSyncAt);
             final syncStatusLine = fs.lastSyncStatus != null
                 ? (syncClock.isNotEmpty
                     ? '${fs.lastSyncStatus}（$syncClock）'
                     : fs.lastSyncStatus!)
-                : (fs.lanEnabled
-                    ? '同一Wi-Fi内のPC・スマホと自動共有されます'
-                    : '同期は無効です');
+                : (hasCloud
+                    ? 'GitHub 非公開 Gist で PC・スマホ間を自動同期します'
+                    : 'GitHub Token を設定すると PC・スマホ間で自動同期されます');
 
             final snsLiveParts = <String>[];
             if (current.snsFollowingCount != null) {
@@ -874,7 +1178,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 const Text(
-                                  'フォロー回数カウンター',
+                                  'フォロー・アンフォロー カウンター',
                                   style: TextStyle(
                                     fontSize: 15,
                                     fontWeight: FontWeight.bold,
@@ -1084,6 +1388,161 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ],
                       ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'アンフォロー（フォロー解除）回数',
+                        style: TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.redAccent,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.all(10),
+                              decoration: BoxDecoration(
+                                color: Colors.redAccent.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: Colors.redAccent.withValues(alpha: 0.45),
+                                ),
+                              ),
+                              child: Column(
+                                children: [
+                                  const Text(
+                                    '今日のアンフォロー数',
+                                    style: TextStyle(fontSize: 11),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    '$unfollowTodayCount',
+                                    key: const ValueKey('unfollow-sheet-today'),
+                                    style: const TextStyle(
+                                      fontSize: 24,
+                                      fontWeight: FontWeight.w800,
+                                      color: Colors.redAccent,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.all(10),
+                              decoration: BoxDecoration(
+                                color: colorScheme.surfaceContainerHighest
+                                    .withValues(alpha: 0.6),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: colorScheme.outlineVariant,
+                                ),
+                              ),
+                              child: Column(
+                                children: [
+                                  const Text(
+                                    '累計アンフォロー数',
+                                    style: TextStyle(fontSize: 11),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    '$unfollowTotalCount',
+                                    key: const ValueKey('unfollow-sheet-total'),
+                                    style: const TextStyle(
+                                      fontSize: 24,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              key: const ValueKey('unfollow-sheet-dec'),
+                              onPressed: unfollowTodayCount > 0 ||
+                                      unfollowTotalCount > 0
+                                  ? () async {
+                                      await _adjustUnfollowCount(
+                                        current.instanceId,
+                                        -1,
+                                      );
+                                      setSheetState(() {});
+                                    }
+                                  : null,
+                              icon: const Icon(Icons.remove, size: 18),
+                              label: const Text('−1'),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              key: const ValueKey('unfollow-sheet-inc'),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.redAccent,
+                                side: BorderSide(
+                                  color: Colors.redAccent.withValues(alpha: 0.55),
+                                ),
+                              ),
+                              onPressed: () async {
+                                await _adjustUnfollowCount(
+                                  current.instanceId,
+                                  1,
+                                );
+                                setSheetState(() {});
+                              },
+                              icon: const Icon(Icons.add, size: 18),
+                              label: const Text('＋1'),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextButton(
+                              onPressed: unfollowTodayCount > 0
+                                  ? () async {
+                                      await _resetUnfollowCount(
+                                        current.instanceId,
+                                        resetTotal: false,
+                                      );
+                                      setSheetState(() {});
+                                    }
+                                  : null,
+                              child: const Text('今日をリセット'),
+                            ),
+                          ),
+                          Expanded(
+                            child: TextButton(
+                              onPressed: unfollowTotalCount > 0 ||
+                                      unfollowTodayCount > 0
+                                  ? () async {
+                                      await _resetUnfollowCount(
+                                        current.instanceId,
+                                        resetTotal: true,
+                                      );
+                                      setSheetState(() {});
+                                    }
+                                  : null,
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.redAccent,
+                              ),
+                              child: const Text('累計もリセット'),
+                            ),
+                          ),
+                        ],
+                      ),
                       const SizedBox(height: 6),
                       Row(
                         children: [
@@ -1161,34 +1620,11 @@ class _HomeScreenState extends State<HomeScreen> {
                             ],
                           ),
                           children: [
-                            SwitchListTile(
-                              contentPadding: EdgeInsets.zero,
-                              dense: true,
-                              title: const Text(
-                                '同一Wi-Fiで自動同期（LAN）',
-                                style: TextStyle(fontSize: 12.5),
-                              ),
-                              value: fs.lanEnabled,
-                              onChanged: (val) async {
-                                setState(() {
-                                  _followSyncSettings = _followSyncSettings
-                                      .copyWith(lanEnabled: val);
-                                });
-                                await widget.store.saveFollowSyncState(
-                                  _followSyncSettings,
-                                  _followLedger,
-                                );
-                                if (val) {
-                                  _notifyFollowLedgerChanged();
-                                }
-                                setSheetState(() {});
-                              },
-                            ),
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
                                 const Text(
-                                  '外出先向けクラウド同期 (GitHub非公開Gist)',
+                                  'クラウド同期 (GitHub非公開Gist)',
                                   style: TextStyle(
                                     fontSize: 11,
                                     fontWeight: FontWeight.w600,
@@ -1395,7 +1831,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       if (_instances.length >= 2) ...[
                         const Divider(height: 16),
                         Text(
-                          '全アカウント合計（今日）: $allTodaySum 回',
+                          allUnfollowTodaySum > 0
+                              ? '全アカウント合計（今日）: フォロー $allTodaySum回 / 解除 $allUnfollowTodaySum回'
+                              : '全アカウント合計（今日）: $allTodaySum 回',
                           textAlign: TextAlign.center,
                           style: const TextStyle(
                             fontSize: 12,
@@ -1405,7 +1843,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       ],
                       const SizedBox(height: 6),
                       Text(
-                        'Threads・Instagram・Bluesky 等でフォローを押すと自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。',
+                        'Threads・Instagram・Bluesky 等でフォロー／フォロー解除を押すと自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。',
                         style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
                               fontSize: 11,
                             ),
@@ -1642,6 +2080,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 await _controllers[id]?.reload();
               }
             }
+            if (_gmailController != null && !_gmailController!.isDisposed) {
+              await _reloadGmail();
+            }
           },
         ),
       ),
@@ -1653,6 +2094,228 @@ class _HomeScreenState extends State<HomeScreen> {
     widget.onThemeChanged(updated.isDarkMode);
     _ensureSafeActiveAndLoad();
     await _persist();
+  }
+
+  Future<void> _updateGestureSettings(MobileGestureSettings next) async {
+    setState(() {
+      _settings = _settings.copyWith(gesture: next);
+    });
+    await _persist();
+  }
+
+  Future<void> _openGestureSettings() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => GestureSettingsScreen(
+          initialSettings: _settings.gesture,
+          onChanged: (next) {
+            _updateGestureSettings(next);
+          },
+        ),
+      ),
+    );
+  }
+
+  OmniWebViewController? _currentForegroundController() {
+    if (_isGmailOpen) {
+      final g = _gmailController;
+      return (g != null && !g.isDisposed) ? g : null;
+    }
+    final active = _activeInstance;
+    if (active == null) return null;
+    final c = _controllers[active.instanceId];
+    return (c != null && !c.isDisposed) ? c : null;
+  }
+
+  void _showGestureNotice(String text, {bool isError = false}) {
+    final overlay = _gestureOverlayKey.currentState;
+    if (overlay != null) {
+      overlay.showNotice(text, isError: isError);
+    } else if (_settings.gesture.showFeedback) {
+      _showSnack(text);
+    }
+  }
+
+  void _handleGestureLiveScroll(double dx, double dy) {
+    final ctrl = _currentForegroundController();
+    if (ctrl == null) return;
+    ctrl.scrollBy(dx, dy);
+  }
+
+  bool _stepActiveService(int delta) {
+    final groups = _serviceGroups;
+    if (groups.length <= 1) {
+      _showGestureNotice('切り替えられるSNSが1つしかありません');
+      return false;
+    }
+    final activeGroup = _activeGroup;
+    final curIdx = activeGroup == null
+        ? 0
+        : max(0, groups.indexWhere((g) => g.key == activeGroup.key));
+    final nextIdx =
+        stepTabIndex(groups.length, curIdx, delta, _settings.gesture.wrapTabs);
+    if (nextIdx == null) {
+      _showGestureNotice(delta < 0 ? '先頭のSNSです' : '末尾のSNSです');
+      return false;
+    }
+    final nextGroup = groups[nextIdx];
+    _activateGroup(nextGroup);
+    _showGestureNotice('SNS切替: ${nextGroup.displayName}');
+    return true;
+  }
+
+  bool _stepActiveAccount(int delta) {
+    final group = _activeGroup;
+    final active = _activeInstance;
+    if (group == null || active == null || group.accounts.length <= 1) {
+      _showGestureNotice('このSNSのアカウントは1つだけです');
+      return false;
+    }
+    final curIdx = max(
+      0,
+      group.accounts.indexWhere((a) => a.instanceId == active.instanceId),
+    );
+    final nextIdx = stepTabIndex(
+      group.accounts.length,
+      curIdx,
+      delta,
+      _settings.gesture.wrapTabs,
+    );
+    if (nextIdx == null) {
+      _showGestureNotice(delta < 0 ? '先頭のアカウントです' : '末尾のアカウントです');
+      return false;
+    }
+    final nextInst = group.accounts[nextIdx];
+    final label = accountDisplayLabel(
+      nextInst,
+      nextIdx,
+      baseServiceName: group.displayName,
+    );
+    _activateInstance(nextInst);
+    _showGestureNotice('${group.displayName} · $label');
+    return true;
+  }
+
+  Future<void> _executeMobileGestureAction(String action, String shape) async {
+    final ctrl = _currentForegroundController();
+    final active = _activeInstance;
+    final activeGroup = _activeGroup;
+    final activeRt = active != null ? _runtimeMap[active.instanceId] : null;
+
+    switch (action) {
+      case 'go-back':
+        if (ctrl != null && await ctrl.canGoBack()) {
+          await ctrl.goBack();
+          _showGestureNotice('${shapeArrows(shape)} 戻る');
+        } else if (_isGmailOpen) {
+          setState(() => _isGmailOpen = false);
+          _showGestureNotice('${shapeArrows(shape)} Gmailを閉じました');
+        } else {
+          _showGestureNotice('これ以上戻れません');
+        }
+      case 'go-forward':
+        if (ctrl != null && await ctrl.canGoForward()) {
+          await ctrl.goForward();
+          _showGestureNotice('${shapeArrows(shape)} 進む');
+        } else {
+          _showGestureNotice('これ以上進めません');
+        }
+      case 'reload':
+        await _reloadActiveTab();
+        _showGestureNotice('${shapeArrows(shape)} 再読み込み');
+      case 'home':
+        if (_isGmailOpen) {
+          final g = _ensureGmailController();
+          setState(() {
+            _gmailRuntime = _gmailRuntime.copyWith(
+              isSleeping: false,
+              isLoading: true,
+              progress: 5,
+              clearError: true,
+            );
+          });
+          await g.loadUrl(_gmailUrl);
+          _showGestureNotice('${shapeArrows(shape)} Gmail 受信トレイ');
+        } else if (active != null) {
+          final c = _ensureController(active);
+          _updateRuntime(
+            active.instanceId,
+            (cur) => cur.copyWith(
+              isSleeping: false,
+              isLoading: true,
+              progress: 5,
+              clearError: true,
+            ),
+          );
+          await c.loadUrl(active.url);
+          _showGestureNotice('${shapeArrows(shape)} ホームへ移動');
+        }
+      case 'previous-service':
+        _stepActiveService(-1);
+      case 'next-service':
+        _stepActiveService(1);
+      case 'previous-account':
+        _stepActiveAccount(-1);
+      case 'next-account':
+        _stepActiveAccount(1);
+      case 'scroll-top':
+        await ctrl?.scrollToEdge(toTop: true);
+        _showGestureNotice('${shapeArrows(shape)} 一番上へ');
+      case 'scroll-bottom':
+        await ctrl?.scrollToEdge(toTop: false);
+        _showGestureNotice('${shapeArrows(shape)} 一番下へ');
+      case 'toggle-gmail':
+        _toggleInAppGmail();
+        _showGestureNotice(
+          _isGmailOpen ? 'アプリ内Gmailを開きました' : '元のSNSへ戻りました',
+        );
+      case 'open-follow-counter':
+        if (active != null && !_isGmailOpen) {
+          final resolved = _resolveCounterTarget(active);
+          if (resolved.target != null) {
+            await _showFollowCounterSheet(
+              resolved.target!,
+              crossSiteSourceName: resolved.isCrossSite
+                  ? (activeGroup?.displayName ?? active.name)
+                  : null,
+            );
+          } else if (resolved.effectiveService != null) {
+            _showGestureNotice(
+              '${_serviceDisplayName(resolved.effectiveService!)} を追加するとカウントできます',
+            );
+          }
+        }
+      case 'toggle-header':
+        await _toggleHeaderCollapsed();
+        _showGestureNotice(
+          _settings.isHeaderCollapsed ? 'ヘッダーを折り畳みました' : 'ヘッダーを展開しました',
+        );
+      case 'toggle-bottom-tabs':
+        await _toggleBottomTabsCollapsed();
+        _showGestureNotice(
+          _settings.isBottomTabsCollapsed ? '下部タブを折り畳みました' : '下部タブを展開しました',
+        );
+      case 'open-catalog':
+        await _openCatalog();
+      case 'sleep-tab':
+        if (active != null && !_isGmailOpen) {
+          _sleepInstance(active.instanceId);
+        }
+      case 'open-external':
+        if (_isGmailOpen) {
+          final url = isHttpOrHttpsUrl(_gmailRuntime.currentUrl)
+              ? _gmailRuntime.currentUrl
+              : _gmailUrl;
+          await _openExternalUrlSafely(url);
+        } else if (active != null) {
+          final url = isHttpOrHttpsUrl(activeRt?.currentUrl)
+              ? activeRt!.currentUrl
+              : active.url;
+          await _openExternalUrlSafely(url);
+        }
+      case 'gesture:settings':
+        await _openGestureSettings();
+    }
   }
 
   Future<void> _editInstance(ServiceInstance inst) async {
@@ -1923,6 +2586,17 @@ class _HomeScreenState extends State<HomeScreen> {
       canPop: false,
       onPopInvokedWithResult: (didPop, _) async {
         if (didPop) return;
+        if (_isGmailOpen) {
+          final gCtrl = _gmailController;
+          if (gCtrl != null && await gCtrl.canGoBack()) {
+            await gCtrl.goBack();
+            return;
+          }
+          if (mounted) {
+            setState(() => _isGmailOpen = false);
+          }
+          return;
+        }
         final ctrl = active != null ? _controllers[active.instanceId] : null;
         if (ctrl != null && await ctrl.canGoBack()) {
           await ctrl.goBack();
@@ -1939,7 +2613,65 @@ class _HomeScreenState extends State<HomeScreen> {
             : AppBar(
                 toolbarHeight: 50,
                 titleSpacing: 4,
-                title: active == null
+                title: _isGmailOpen
+                    ? InkWell(
+                        borderRadius: BorderRadius.circular(8),
+                        onTap: () async {
+                          await Clipboard.setData(
+                            ClipboardData(text: _gmailRuntime.currentUrl),
+                          );
+                          _showSnack('Gmail のURLをコピーしました');
+                        },
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 26,
+                              height: 26,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFEA4335),
+                                borderRadius: BorderRadius.circular(7),
+                              ),
+                              alignment: Alignment.center,
+                              child: const Text(
+                                'GM',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Text(
+                                    'Gmail（アプリ内）',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  Text(
+                                    _gmailRuntime.currentUrl,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .labelSmall
+                                        ?.copyWith(fontSize: 10.5),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    : active == null
                     ? const Text('OmniSNS')
                     : InkWell(
                         borderRadius: BorderRadius.circular(8),
@@ -2041,13 +2773,19 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                   IconButton(
                     key: const ValueKey('header-gmail-button'),
-                    icon: const Icon(Icons.mail_outline_rounded),
+                    icon: Icon(
+                      _isGmailOpen
+                          ? Icons.mark_email_read_rounded
+                          : Icons.mail_outline_rounded,
+                      color: _isGmailOpen ? const Color(0xFFEA4335) : null,
+                    ),
                     visualDensity: VisualDensity.compact,
-                    tooltip: 'Gmail を開く（SNS認証メール確認用）',
-                    onPressed: () =>
-                        _openExternalUrlSafely('https://mail.google.com/'),
+                    tooltip: _isGmailOpen
+                        ? 'Gmail を閉じて元のSNSへ戻る'
+                        : 'アプリ内で Gmail を開く（SNS認証メール確認用）',
+                    onPressed: _toggleInAppGmail,
                   ),
-                  if (active != null)
+                  if (_isGmailOpen || active != null)
                     IconButton(
                       key: const ValueKey('header-reload-button'),
                       icon: const Icon(Icons.refresh_rounded),
@@ -2070,9 +2808,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   PopupMenuButton<String>(
                     onSelected: (value) async {
-                      final ctrl = active != null
-                          ? _controllers[active.instanceId]
-                          : null;
+                      final ctrl = _isGmailOpen
+                          ? _gmailController
+                          : (active != null
+                              ? _controllers[active.instanceId]
+                              : null);
                       switch (value) {
                         case 'back':
                           if (ctrl != null && await ctrl.canGoBack()) {
@@ -2085,7 +2825,18 @@ class _HomeScreenState extends State<HomeScreen> {
                         case 'reload':
                           await _reloadActiveTab();
                         case 'home':
-                          if (active != null) {
+                          if (_isGmailOpen) {
+                            final g = _ensureGmailController();
+                            setState(() {
+                              _gmailRuntime = _gmailRuntime.copyWith(
+                                isSleeping: false,
+                                isLoading: true,
+                                progress: 5,
+                                clearError: true,
+                              );
+                            });
+                            await g.loadUrl(_gmailUrl);
+                          } else if (active != null) {
                             final c = _ensureController(active);
                             _updateRuntime(
                               active.instanceId,
@@ -2104,23 +2855,42 @@ class _HomeScreenState extends State<HomeScreen> {
                           await _toggleBottomTabsCollapsed();
                         case 'follow-counter':
                           if (active != null) {
-                            await _showFollowCounterSheet(active);
+                            final resolved = _resolveCounterTarget(active);
+                            if (resolved.target != null) {
+                              await _showFollowCounterSheet(
+                                resolved.target!,
+                                crossSiteSourceName: resolved.isCrossSite
+                                    ? (activeGroup?.displayName ?? active.name)
+                                    : null,
+                              );
+                            } else if (resolved.effectiveService != null) {
+                              _showSnack(
+                                '${_serviceDisplayName(resolved.effectiveService!)} を追加するとカウントできます',
+                              );
+                            }
                           }
                         case 'sleep':
                           if (active != null) _sleepInstance(active.instanceId);
                         case 'external':
-                          if (active != null) {
+                          if (_isGmailOpen) {
+                            final url = isHttpOrHttpsUrl(_gmailRuntime.currentUrl)
+                                ? _gmailRuntime.currentUrl
+                                : _gmailUrl;
+                            await _openExternalUrlSafely(url);
+                          } else if (active != null) {
                             final url = isHttpOrHttpsUrl(activeRt?.currentUrl)
                                 ? activeRt!.currentUrl
                                 : active.url;
                             await _openExternalUrlSafely(url);
                           }
+                        case 'gesture-settings':
+                          await _openGestureSettings();
                         case 'settings':
                           await _openSettings();
                       }
                     },
                     itemBuilder: (_) => [
-                      if (active != null) ...[
+                      if (_isGmailOpen || active != null) ...[
                         const PopupMenuItem(value: 'back', child: Text('← 戻る')),
                         const PopupMenuItem(
                           value: 'forward',
@@ -2130,9 +2900,13 @@ class _HomeScreenState extends State<HomeScreen> {
                           value: 'reload',
                           child: Text('↻ 再読み込み'),
                         ),
-                        const PopupMenuItem(
+                        PopupMenuItem(
                           value: 'home',
-                          child: Text('⌂ DM/ホーム画面へ戻る'),
+                          child: Text(
+                            _isGmailOpen
+                                ? '⌂ Gmail 受信トレイへ戻る'
+                                : '⌂ DM/ホーム画面へ戻る',
+                          ),
                         ),
                         const PopupMenuItem(
                           value: 'toggle-header',
@@ -2144,16 +2918,32 @@ class _HomeScreenState extends State<HomeScreen> {
                             tabsCollapsed ? '▲ 下部タブを展開' : '▼ 下部タブを折り畳む',
                           ),
                         ),
-                        PopupMenuItem(
-                          value: 'follow-counter',
-                          child: Text(
-                            '👤 フォロー回数 (今日 ${active.effectiveFollowCountToday()}回)',
+                        if (active != null && !_isGmailOpen) ...[
+                          () {
+                            final resolved = _resolveCounterTarget(active);
+                            final counterInst = resolved.target;
+                            final fCount =
+                                counterInst?.effectiveFollowCountToday() ?? 0;
+                            final ufCount =
+                                counterInst?.effectiveUnfollowCountToday() ?? 0;
+                            final prefix = resolved.isCrossSite &&
+                                    resolved.effectiveService != null
+                                ? '${_serviceDisplayName(resolved.effectiveService!)} '
+                                : '';
+                            return PopupMenuItem(
+                              value: 'follow-counter',
+                              child: Text(
+                                ufCount > 0
+                                    ? '👤 $prefixフォロー/解除 (今日 +$fCount / -$ufCount)'
+                                    : '👤 $prefixフォロー/解除 (今日 $fCount回)',
+                              ),
+                            );
+                          }(),
+                          const PopupMenuItem(
+                            value: 'sleep',
+                            child: Text('☾ タブ休止（メモリ解放）'),
                           ),
-                        ),
-                        const PopupMenuItem(
-                          value: 'sleep',
-                          child: Text('☾ タブ休止（メモリ解放）'),
-                        ),
+                        ],
                         const PopupMenuItem(
                           value: 'external',
                           child: Text('↗ 外部ブラウザで開く'),
@@ -2161,21 +2951,27 @@ class _HomeScreenState extends State<HomeScreen> {
                         const PopupMenuDivider(),
                       ],
                       const PopupMenuItem(
+                        value: 'gesture-settings',
+                        child: Text('✦ タッチジェスチャー設定'),
+                      ),
+                      const PopupMenuItem(
                         value: 'settings',
                         child: Text('⚙ アプリ設定'),
                       ),
                     ],
                   ),
                 ],
-                bottom: activeRt != null && activeRt.isLoading
+                bottom: (_isGmailOpen ? _gmailRuntime.isLoading : activeRt?.isLoading == true)
                     ? PreferredSize(
                         preferredSize: const Size.fromHeight(2.5),
                         child: LinearProgressIndicator(
                           minHeight: 2.5,
-                          value: activeRt.progress > 0 &&
-                                  activeRt.progress < 100
-                              ? activeRt.progress / 100
-                              : null,
+                          value: () {
+                            final p = _isGmailOpen
+                                ? _gmailRuntime.progress
+                                : (activeRt?.progress ?? 0);
+                            return p > 0 && p < 100 ? p / 100 : null;
+                          }(),
                         ),
                       )
                     : null,
@@ -2190,7 +2986,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 tabsCollapsed,
                 otherUnread,
               ),
-            if (!headerCollapsed && active != null && activeGroup != null)
+            if (!headerCollapsed && _isGmailOpen)
+              _buildInAppGmailBar()
+            else if (!headerCollapsed && active != null && activeGroup != null)
               _buildAccountSwitcherBar(activeGroup, active),
             Expanded(
               child: SafeArea(
@@ -2221,7 +3019,17 @@ class _HomeScreenState extends State<HomeScreen> {
     int otherUnread,
   ) {
     final colorScheme = Theme.of(context).colorScheme;
-    final todayFollows = active?.effectiveFollowCountToday() ?? 0;
+    final resolvedCounter =
+        active != null ? _resolveCounterTarget(active) : null;
+    final counterTarget = resolvedCounter?.target;
+    final todayFollows = counterTarget?.effectiveFollowCountToday() ?? 0;
+    final todayUnfollows = counterTarget?.effectiveUnfollowCountToday() ?? 0;
+    final hasAnyToday = todayFollows > 0 || todayUnfollows > 0;
+    final crossSiteBadge = resolvedCounter != null &&
+            resolvedCounter.isCrossSite &&
+            counterTarget != null
+        ? '${counterTarget.badge} '
+        : '';
     return Material(
       key: const ValueKey('collapsed-header-bar'),
       color: colorScheme.surfaceContainerLow,
@@ -2253,7 +3061,63 @@ class _HomeScreenState extends State<HomeScreen> {
                       onPressed: () => Scaffold.of(scaffoldCtx).openDrawer(),
                     ),
                   ),
-                  if (active != null) ...[
+                  if (_isGmailOpen) ...[
+                    Container(
+                      width: 20,
+                      height: 20,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFEA4335),
+                        borderRadius: BorderRadius.circular(5),
+                      ),
+                      alignment: Alignment.center,
+                      child: const Text(
+                        'GM',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 8.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    const Expanded(
+                      child: Text(
+                        'Gmail（アプリ内）',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      key: const ValueKey('gmail-close-chip'),
+                      borderRadius: BorderRadius.circular(99),
+                      onTap: _toggleInAppGmail,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFEA4335).withValues(alpha: 0.16),
+                          borderRadius: BorderRadius.circular(99),
+                          border: Border.all(
+                            color: const Color(0xFFEA4335).withValues(alpha: 0.55),
+                          ),
+                        ),
+                        child: const Text(
+                          'SNSへ戻る',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFFEA4335),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ] else if (active != null) ...[
                     Container(
                       width: 20,
                       height: 20,
@@ -2286,19 +3150,33 @@ class _HomeScreenState extends State<HomeScreen> {
                     InkWell(
                       key: const ValueKey('follow-counter-chip'),
                       borderRadius: BorderRadius.circular(99),
-                      onTap: () => _showFollowCounterSheet(active),
+                      onTap: () {
+                        if (counterTarget != null) {
+                          _showFollowCounterSheet(
+                            counterTarget,
+                            crossSiteSourceName:
+                                resolvedCounter?.isCrossSite == true
+                                    ? (activeGroup?.displayName ?? active.name)
+                                    : null,
+                          );
+                        } else if (resolvedCounter?.effectiveService != null) {
+                          _showSnack(
+                            '${_serviceDisplayName(resolvedCounter!.effectiveService!)} を追加するとカウントできます',
+                          );
+                        }
+                      },
                       child: Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 7,
                           vertical: 3,
                         ),
                         decoration: BoxDecoration(
-                          color: todayFollows > 0
+                          color: hasAnyToday
                               ? colorScheme.tertiaryContainer
                               : colorScheme.surface,
                           borderRadius: BorderRadius.circular(99),
                           border: Border.all(
-                            color: todayFollows > 0
+                            color: hasAnyToday
                                 ? colorScheme.tertiary
                                 : colorScheme.outlineVariant,
                           ),
@@ -2309,17 +3187,19 @@ class _HomeScreenState extends State<HomeScreen> {
                             Icon(
                               Icons.person_add_alt_1_rounded,
                               size: 12,
-                              color: todayFollows > 0
+                              color: hasAnyToday
                                   ? colorScheme.onTertiaryContainer
                                   : colorScheme.onSurfaceVariant,
                             ),
                             const SizedBox(width: 3),
                             Text(
-                              '$todayFollows',
+                              todayUnfollows > 0
+                                  ? '$crossSiteBadge$todayFollows/-$todayUnfollows'
+                                  : '$crossSiteBadge$todayFollows',
                               style: TextStyle(
                                 fontSize: 10.5,
                                 fontWeight: FontWeight.w700,
-                                color: todayFollows > 0
+                                color: hasAnyToday
                                     ? colorScheme.onTertiaryContainer
                                     : colorScheme.onSurfaceVariant,
                               ),
@@ -2385,16 +3265,23 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                   IconButton(
                     key: const ValueKey('header-gmail-button'),
-                    icon: const Icon(Icons.mail_outline_rounded, size: 18),
+                    icon: Icon(
+                      _isGmailOpen
+                          ? Icons.mark_email_read_rounded
+                          : Icons.mail_outline_rounded,
+                      size: 18,
+                      color: _isGmailOpen ? const Color(0xFFEA4335) : null,
+                    ),
                     visualDensity: VisualDensity.compact,
                     padding: EdgeInsets.zero,
                     constraints:
                         const BoxConstraints(minWidth: 32, minHeight: 34),
-                    tooltip: 'Gmail を開く（SNS認証メール確認用）',
-                    onPressed: () =>
-                        _openExternalUrlSafely('https://mail.google.com/'),
+                    tooltip: _isGmailOpen
+                        ? 'Gmail を閉じて元のSNSへ戻る'
+                        : 'アプリ内で Gmail を開く（SNS認証メール確認用）',
+                    onPressed: _toggleInAppGmail,
                   ),
-                  if (active != null)
+                  if (_isGmailOpen || active != null)
                     IconButton(
                       key: const ValueKey('header-reload-button'),
                       icon: const Icon(Icons.refresh_rounded, size: 19),
@@ -2418,13 +3305,88 @@ class _HomeScreenState extends State<HomeScreen> {
                 ],
               ),
             ),
-            if (activeRt != null && activeRt.isLoading)
+            if (_isGmailOpen
+                ? _gmailRuntime.isLoading
+                : activeRt != null && activeRt.isLoading)
               LinearProgressIndicator(
                 minHeight: 2,
-                value: activeRt.progress > 0 && activeRt.progress < 100
-                    ? activeRt.progress / 100
-                    : null,
+                value: () {
+                  final p = _isGmailOpen
+                      ? _gmailRuntime.progress
+                      : (activeRt?.progress ?? 0);
+                  return p > 0 && p < 100 ? p / 100 : null;
+                }(),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInAppGmailBar() {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Material(
+      key: const ValueKey('inapp-gmail-bar'),
+      color: colorScheme.surfaceContainerLow,
+      child: Container(
+        height: 40,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(
+              color: colorScheme.outlineVariant.withValues(alpha: 0.5),
+            ),
+          ),
+        ),
+        child: Row(
+          children: [
+            IconButton(
+              icon: const Icon(Icons.arrow_back_rounded, size: 18),
+              visualDensity: VisualDensity.compact,
+              tooltip: '戻る',
+              onPressed: _gmailRuntime.canGoBack
+                  ? () => _gmailController?.goBack()
+                  : null,
+            ),
+            IconButton(
+              icon: const Icon(Icons.arrow_forward_rounded, size: 18),
+              visualDensity: VisualDensity.compact,
+              tooltip: '進む',
+              onPressed: _gmailRuntime.canGoForward
+                  ? () => _gmailController?.goForward()
+                  : null,
+            ),
+            IconButton(
+              icon: const Icon(Icons.home_outlined, size: 18),
+              visualDensity: VisualDensity.compact,
+              tooltip: 'Gmail 受信トレイへ戻る',
+              onPressed: () {
+                final g = _ensureGmailController();
+                setState(() {
+                  _gmailRuntime = _gmailRuntime.copyWith(
+                    isLoading: true,
+                    progress: 5,
+                    clearError: true,
+                  );
+                });
+                g.loadUrl(_gmailUrl);
+              },
+            ),
+            const Spacer(),
+            FilledButton.tonalIcon(
+              key: const ValueKey('gmail-back-to-sns-button'),
+              style: FilledButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                minimumSize: const Size(0, 28),
+              ),
+              onPressed: _toggleInAppGmail,
+              icon: const Icon(Icons.close_rounded, size: 15),
+              label: const Text(
+                '元のSNSへ戻る',
+                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700),
+              ),
+            ),
           ],
         ),
       ),
@@ -2436,7 +3398,14 @@ class _HomeScreenState extends State<HomeScreen> {
     ServiceInstance active,
   ) {
     final colorScheme = Theme.of(context).colorScheme;
-    final todayFollows = active.effectiveFollowCountToday();
+    final resolvedCounter = _resolveCounterTarget(active);
+    final counterTarget = resolvedCounter.target;
+    final todayFollows = counterTarget?.effectiveFollowCountToday() ?? 0;
+    final todayUnfollows = counterTarget?.effectiveUnfollowCountToday() ?? 0;
+    final hasAnyToday = todayFollows > 0 || todayUnfollows > 0;
+    final crossSitePrefix = resolvedCounter.isCrossSite && counterTarget != null
+        ? '${counterTarget.badge} '
+        : '';
     return Material(
       color: colorScheme.surfaceContainerLow,
       child: Container(
@@ -2605,17 +3574,29 @@ class _HomeScreenState extends State<HomeScreen> {
               child: InkWell(
                 key: const ValueKey('follow-counter-chip'),
                 borderRadius: BorderRadius.circular(99),
-                onTap: () => _showFollowCounterSheet(active),
+                onTap: () {
+                  if (counterTarget != null) {
+                    _showFollowCounterSheet(
+                      counterTarget,
+                      crossSiteSourceName:
+                          resolvedCounter.isCrossSite ? group.displayName : null,
+                    );
+                  } else if (resolvedCounter.effectiveService != null) {
+                    _showSnack(
+                      '${_serviceDisplayName(resolvedCounter.effectiveService!)} を追加するとカウントできます',
+                    );
+                  }
+                },
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 9),
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
-                    color: todayFollows > 0
+                    color: hasAnyToday
                         ? colorScheme.tertiaryContainer
                         : colorScheme.surface,
                     borderRadius: BorderRadius.circular(99),
                     border: Border.all(
-                      color: todayFollows > 0
+                      color: hasAnyToday
                           ? colorScheme.tertiary
                           : colorScheme.outlineVariant,
                     ),
@@ -2626,17 +3607,19 @@ class _HomeScreenState extends State<HomeScreen> {
                       Icon(
                         Icons.person_add_alt_1_rounded,
                         size: 13.5,
-                        color: todayFollows > 0
+                        color: hasAnyToday
                             ? colorScheme.onTertiaryContainer
                             : colorScheme.onSurfaceVariant,
                       ),
                       const SizedBox(width: 4),
                       Text(
-                        'フォロー $todayFollows',
+                        todayUnfollows > 0
+                            ? '$crossSitePrefixフォロー $todayFollows / 解除 $todayUnfollows'
+                            : '$crossSitePrefixフォロー $todayFollows',
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w700,
-                          color: todayFollows > 0
+                          color: hasAnyToday
                               ? colorScheme.onTertiaryContainer
                               : colorScheme.onSurfaceVariant,
                         ),
@@ -2657,7 +3640,7 @@ class _HomeScreenState extends State<HomeScreen> {
     ServiceInstance? active,
     TabRuntimeState? activeRt,
   ) {
-    if (active == null) {
+    if (!_isGmailOpen && active == null) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -2691,15 +3674,25 @@ class _HomeScreenState extends State<HomeScreen> {
         .where((i) => _controllers.containsKey(i.instanceId))
         .map((i) => i.instanceId)
         .toList();
-    final activeIndex = liveIds.indexOf(active.instanceId);
-    final isSleeping =
-        activeRt?.isSleeping == true || !_controllers.containsKey(active.instanceId);
-    final hasError = activeRt?.loadError != null;
+    final hasGmailView =
+        _gmailController != null && !_gmailController!.isDisposed;
+    final gmailStackIndex = hasGmailView ? liveIds.length : -1;
+    final activeIndex = _isGmailOpen
+        ? gmailStackIndex
+        : (active != null ? liveIds.indexOf(active.instanceId) : -1);
+    final isSleeping = _isGmailOpen
+        ? !hasGmailView
+        : (active == null ||
+            activeRt?.isSleeping == true ||
+            !_controllers.containsKey(active.instanceId));
+    final currentLoadError =
+        _isGmailOpen ? _gmailRuntime.loadError : activeRt?.loadError;
+    final hasError = currentLoadError != null;
     final showWebView = !isSleeping && !hasError && activeIndex >= 0;
 
     return Stack(
       children: [
-        if (liveIds.isNotEmpty)
+        if (liveIds.isNotEmpty || hasGmailView)
           Positioned.fill(
             child: Offstage(
               offstage: !showWebView,
@@ -2711,11 +3704,16 @@ class _HomeScreenState extends State<HomeScreen> {
                       key: ValueKey('wv-$id'),
                       controller: _controllers[id]!,
                     ),
+                  if (hasGmailView)
+                    OmniWebViewWidget(
+                      key: const ValueKey('wv-inapp-gmail'),
+                      controller: _gmailController!,
+                    ),
                 ],
               ),
             ),
           ),
-        if (isSleeping)
+        if (!_isGmailOpen && isSleeping && active != null)
           Positioned.fill(
             child: ColoredBox(
               color: Theme.of(context).scaffoldBackgroundColor,
@@ -2770,7 +3768,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                       const SizedBox(height: 6),
-                      Text(activeRt!.loadError!, textAlign: TextAlign.center),
+                      Text(currentLoadError, textAlign: TextAlign.center),
                       const SizedBox(height: 14),
                       Wrap(
                         spacing: 8,
@@ -2781,9 +3779,13 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                           OutlinedButton(
                             onPressed: () {
-                              final url = isHttpOrHttpsUrl(activeRt.currentUrl)
-                                  ? activeRt.currentUrl
-                                  : active.url;
+                              final url = _isGmailOpen
+                                  ? (isHttpOrHttpsUrl(_gmailRuntime.currentUrl)
+                                      ? _gmailRuntime.currentUrl
+                                      : _gmailUrl)
+                                  : (isHttpOrHttpsUrl(activeRt?.currentUrl)
+                                      ? activeRt!.currentUrl
+                                      : active!.url);
                               _openExternalUrlSafely(url);
                             },
                             child: const Text('外部ブラウザで開く'),
@@ -2794,6 +3796,26 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               ),
+            ),
+          ),
+        if (_settings.gesture.enabled)
+          Positioned.fill(
+            child: MobileGestureOverlay(
+              key: _gestureOverlayKey,
+              settings: _settings.gesture,
+              onAction: (action, shape) {
+                _executeMobileGestureAction(action, shape);
+              },
+              onLiveScroll: _handleGestureLiveScroll,
+              onHandleMoved: (xFrac, yFrac) {
+                _updateGestureSettings(
+                  _settings.gesture.copyWith(
+                    handleXFraction: xFrac,
+                    handleYFraction: yFrac,
+                  ),
+                );
+              },
+              onOpenSettings: _openGestureSettings,
             ),
           ),
       ],
@@ -3099,7 +4121,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ),
                         Text(
-                          'Android · v1.4.0',
+                          'Android · v1.6.0',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],
@@ -3221,6 +4243,18 @@ class _HomeScreenState extends State<HomeScreen> {
                       },
                       icon: const Icon(Icons.add),
                       label: const Text('サービスを追加'),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        Navigator.of(context).pop();
+                        _openGestureSettings();
+                      },
+                      icon: const Icon(Icons.gesture_rounded),
+                      label: const Text('タッチジェスチャー設定'),
                     ),
                   ),
                   const SizedBox(height: 6),

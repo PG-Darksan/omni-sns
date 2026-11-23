@@ -50,12 +50,14 @@ async fn app_get_bootstrap(
         view_manager::activate_tab(&app, &shared, active_id);
     }
 
-    let (config, runtime_states, closed_tabs_count) = {
+    let (config, runtime_states, closed_tabs_count, gmail_open, gmail_runtime) = {
         let guard = shared.inner.lock().unwrap();
         (
             guard.store.get_config(),
             SharedState::build_all_runtime_states(&guard),
             guard.closed_tabs.len(),
+            guard.gmail_open,
+            guard.gmail_tab.as_ref().map(|t| t.to_info()),
         )
     };
 
@@ -69,6 +71,8 @@ async fn app_get_bootstrap(
         runtime_states,
         app_version: app.package_info().version.to_string(),
         closed_tabs_count,
+        gmail_open,
+        gmail_runtime,
     })
 }
 
@@ -327,6 +331,26 @@ async fn follow_reset(
 }
 
 #[tauri::command]
+async fn unfollow_adjust(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+    delta: i32,
+) -> Result<Option<ServiceInstance>, String> {
+    Ok(view_manager::adjust_unfollow_count(&app, &shared, &instance_id, delta))
+}
+
+#[tauri::command]
+async fn unfollow_reset(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+    reset_total: bool,
+) -> Result<Option<ServiceInstance>, String> {
+    Ok(view_manager::reset_unfollow_count(&app, &shared, &instance_id, reset_total))
+}
+
+#[tauri::command]
 async fn follow_set_handle(
     app: AppHandle,
     shared: State<'_, SharedState>,
@@ -410,8 +434,35 @@ fn app_open_external_url(url: String) {
     }
 }
 
+#[tauri::command]
+async fn gmail_toggle(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    open: Option<bool>,
+) -> Result<bool, String> {
+    Ok(view_manager::set_gmail_open(&app, &shared, open))
+}
+
+#[tauri::command]
+async fn gmail_action(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    action: String,
+) -> Result<(), String> {
+    view_manager::perform_gmail_action(&app, &shared, &action);
+    Ok(())
+}
+
+#[tauri::command]
+async fn gmail_navigate(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    url: String,
+) -> Result<String, String> {
+    view_manager::navigate_gmail(&app, &shared, &url)
+}
+
 fn shutdown_gesture_host(shared: &SharedState) {
-    view_manager::shutdown_lan_sync(shared);
     #[cfg(windows)]
     {
         let host = {
@@ -740,30 +791,8 @@ pub fn run() {
 
             let _ = setup_tray(&app_handle, shared.clone());
 
-            // フォロー数クロスデバイス同期（同一Wi-Fi自動LAN同期 + GitHub非公開Gist定期同期）
+            // フォロー数クロスデバイス同期（GitHub非公開Gist定期同期）
             if !smoke_test {
-                let shared_lan_cfg = shared.clone();
-                let app_lan_recv = app_handle.clone();
-                let shared_lan_recv = shared.clone();
-                let lan_handle = follow_sync::start_lan_sync_listener(
-                    move || {
-                        let guard = shared_lan_cfg.inner.lock().unwrap();
-                        let fs = guard.store.get_follow_sync_settings();
-                        (fs.lan_enabled, fs.device_id, guard.store.get_follow_ledger())
-                    },
-                    move |remote_ledger| {
-                        view_manager::apply_remote_follow_ledger(
-                            &app_lan_recv,
-                            &shared_lan_recv,
-                            remote_ledger,
-                        )
-                    },
-                );
-                {
-                    let mut guard = shared.inner.lock().unwrap();
-                    guard.lan_sync = Some(lan_handle);
-                }
-
                 let app_cloud = app_handle.clone();
                 let shared_cloud = shared.clone();
                 std::thread::Builder::new()
@@ -861,13 +890,18 @@ pub fn run() {
             gesture_update_settings,
             follow_adjust,
             follow_reset,
+            unfollow_adjust,
+            unfollow_reset,
             follow_set_handle,
             follow_sync_update_settings,
             follow_sync_now,
             settings_update,
             ui_set_overlay,
             ui_copy_text,
-            app_open_external_url
+            app_open_external_url,
+            gmail_toggle,
+            gmail_action,
+            gmail_navigate
         ])
         .run(tauri::generate_context!())
         .expect("error while running OmniSNS");

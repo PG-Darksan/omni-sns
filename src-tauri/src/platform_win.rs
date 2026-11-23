@@ -528,31 +528,46 @@ pub struct TabWebviewCallbacks {
     pub on_favicon_changed: Arc<dyn Fn(String) + Send + Sync>,
     pub on_zoom_factor_changed: Arc<dyn Fn(f64) + Send + Sync>,
     pub on_shortcut: Arc<dyn Fn(&'static str, Option<usize>) + Send + Sync>,
-    pub on_follow_detected: Arc<dyn Fn() + Send + Sync>,
-    pub on_account_identity: Arc<dyn Fn(String, Option<u32>, Option<u32>) + Send + Sync>,
+    pub on_follow_detected: Arc<dyn Fn(Option<String>) + Send + Sync>,
+    pub on_unfollow_detected: Arc<dyn Fn(Option<String>) + Send + Sync>,
+    pub on_account_identity: Arc<dyn Fn(Option<String>, String, Option<u32>, Option<u32>) + Send + Sync>,
 }
 
-/// Threads / Instagram / Bluesky / mixi2 等のフォロー操作を自動検知してホストへ通知するスクリプト。
+/// Threads / Instagram / Bluesky / mixi2 等のフォロー・アンフォロー操作を自動検知してホストへ通知するスクリプト。
 pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
   if (window !== window.top) return;
   if (window.__omniFollowTrackerInstalled) return;
   window.__omniFollowTrackerInstalled = true;
 
-  var NEGATIVE_RE = /(フォロー中|フォロー済|フォロー解除|フォロワー|リクエスト済|リクエスト中|承認待ち|解除|following|unfollow|followers|requested|pending|remove|cancel|block|mute)/i;
+  var NEGATIVE_FOLLOW_RE = /(フォロー中|フォロー済|フォロー解除|フォローをやめる|フォローを外す|フォロワー|リクエスト済|リクエスト中|承認待ち|解除|following|unfollow|followers|requested|pending|remove|cancel|block|mute)/i;
   var EXACT_FOLLOW_TEXT_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォローを返す|follow|follow\s+back)$/i;
   var ARIA_FOLLOW_RE = /^(?:(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|follow|follow\s+back)|.+?(?:をフォロー|をフォローする|をフォローバック)|follow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
   var POST_FOLLOW_STATE_RE = /(フォロー中|フォロー済|フォロー解除|リクエスト済|リクエスト中|承認待ち|following|unfollow|requested|pending|チェック|check)/i;
 
-  var lastNetworkFollowStartAt = 0;
-  var lastNetworkFollowAt = 0;
-  var lastDomEmitAt = 0;
-  var lastAnyEmitAt = 0;
-  var inFlightFollows = 0;
-  var recentTargetKeys = Object.create(null);
+  var EXACT_UNFOLLOW_TEXT_RE = /^(?:フォロー中|フォロー済|フォロー済み|フォロー解除|フォローを解除|フォローをやめる|フォローを外す|リクエスト済|リクエスト済み|リクエスト中|承認待ち|following|unfollow|requested)$/i;
+  var CONFIRM_UNFOLLOW_TEXT_RE = /^(?:フォロー解除|フォローを解除|フォローをやめる|フォローを外す|unfollow)$/i;
+  var ARIA_UNFOLLOW_RE = /^(?:(?:フォロー中|フォロー解除|フォローをやめる|following|unfollow)|.+?(?:のフォローを解除|のフォローをやめる|をアンフォロー)|unfollow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
+  var NON_UNFOLLOW_RE = /(フォロワー|followers|ブロック|block|ミュート|mute|報告|report|削除|remove\s+follower)/i;
+
+  function makeChannelState() {
+    return {
+      lastNetworkStartAt: 0,
+      lastNetworkAt: 0,
+      lastDomEmitAt: 0,
+      lastAnyEmitAt: 0,
+      inFlight: 0,
+      recentTargetKeys: Object.create(null),
+      emittedInteractions: Object.create(null)
+    };
+  }
+  var states = {
+    follow: makeChannelState(),
+    unfollow: makeChannelState()
+  };
+
   var userInteractionSeq = 0;
   var lastUserInteractionAt = 0;
   var lastPointerDownAt = 0;
-  var emittedInteractions = Object.create(null);
 
   function bumpUserInteraction(fromPointerDown) {
     var now = Date.now();
@@ -587,52 +602,72 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     return 0;
   }
 
-  function emitFollow(source, targetKey, interactionId) {
+  function detectCurrentService() {
+    try {
+      var h = (window.location && window.location.hostname ? window.location.hostname : '').toLowerCase();
+      if (h === 'instagram.com' || h.slice(-14) === '.instagram.com') return 'instagram';
+      if (h === 'threads.net' || h.slice(-12) === '.threads.net' || h === 'threads.com' || h.slice(-12) === '.threads.com') return 'threads';
+      if (h === 'bsky.app' || h.slice(-9) === '.bsky.app') return 'bluesky';
+      if (h === 'mixi.social' || h.slice(-12) === '.mixi.social') return 'mixi2';
+      if (h === 'x.com' || h.slice(-6) === '.x.com' || h === 'twitter.com' || h.slice(-12) === '.twitter.com') return 'x';
+      if (h === 'tiktok.com' || h.slice(-11) === '.tiktok.com') return 'tiktok';
+      if (h === 'facebook.com' || h.slice(-13) === '.facebook.com') return 'facebook';
+    } catch (_) {}
+    return '';
+  }
+
+  function emitRelation(action, source, targetKey, interactionId) {
+    var st = states[action];
+    if (!st) return;
     var now = Date.now();
     if (interactionId && interactionId > 0) {
-      for (var ik in emittedInteractions) {
-        if (now - emittedInteractions[ik] > 15000) delete emittedInteractions[ik];
+      for (var ik in st.emittedInteractions) {
+        if (now - st.emittedInteractions[ik] > 15000) delete st.emittedInteractions[ik];
       }
-      if (emittedInteractions[interactionId]) {
+      if (st.emittedInteractions[interactionId]) {
         if (source === 'network') {
-          lastNetworkFollowAt = now;
-          if (targetKey) recentTargetKeys[targetKey] = now;
+          st.lastNetworkAt = now;
+          if (targetKey) st.recentTargetKeys[targetKey] = now;
         }
         return;
       }
     }
     if (targetKey) {
-      for (var k in recentTargetKeys) {
-        if (now - recentTargetKeys[k] > 15000) delete recentTargetKeys[k];
+      for (var k in st.recentTargetKeys) {
+        if (now - st.recentTargetKeys[k] > 15000) delete st.recentTargetKeys[k];
       }
-      if (recentTargetKeys[targetKey] && now - recentTargetKeys[targetKey] < 5000) {
+      if (st.recentTargetKeys[targetKey] && now - st.recentTargetKeys[targetKey] < 5000) {
         return;
       }
     }
     if (source === 'network') {
-      if (now - lastDomEmitAt < 2500) {
-        lastNetworkFollowAt = now;
-        if (targetKey) recentTargetKeys[targetKey] = now;
-        if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
+      if (now - st.lastDomEmitAt < 2500) {
+        st.lastNetworkAt = now;
+        if (targetKey) st.recentTargetKeys[targetKey] = now;
+        if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
         return;
       }
-      if (!targetKey && now - lastAnyEmitAt < 1200) {
-        lastNetworkFollowAt = now;
+      if (!targetKey && now - st.lastAnyEmitAt < 1200) {
+        st.lastNetworkAt = now;
         return;
       }
-      lastNetworkFollowAt = now;
-      lastAnyEmitAt = now;
-      if (targetKey) recentTargetKeys[targetKey] = now;
-      if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
+      st.lastNetworkAt = now;
+      st.lastAnyEmitAt = now;
+      if (targetKey) st.recentTargetKeys[targetKey] = now;
+      if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
     } else {
-      if (now - lastAnyEmitAt < 2500) return;
-      lastDomEmitAt = now;
-      lastAnyEmitAt = now;
-      if (interactionId && interactionId > 0) emittedInteractions[interactionId] = now;
+      if (now - st.lastAnyEmitAt < 2500) return;
+      st.lastDomEmitAt = now;
+      st.lastAnyEmitAt = now;
+      if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
     }
     try {
       if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
-        window.chrome.webview.postMessage(JSON.stringify({ type: 'omnisns:follow', source: source || 'auto' }));
+        window.chrome.webview.postMessage(JSON.stringify({
+          type: action === 'unfollow' ? 'omnisns:unfollow' : 'omnisns:follow',
+          source: source || 'auto',
+          service: detectCurrentService()
+        }));
       }
     } catch (_) {}
   }
@@ -657,13 +692,12 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
 
   function extractTargetKey(url, decodedBody) {
     try {
-      var m = /\/friendships\/create\/([^\/?#]+)/i.exec(url) ||
-              /\/web\/friendships\/([^\/?#]+)\/follow/i.exec(url) ||
-              /\/api\/v1\/accounts\/([^\/?#]+)\/follow/i.exec(url);
+      var m = /\/friendships\/(?:create|destroy)\/([^\/?#]+)/i.exec(url) ||
+              /\/web\/friendships\/([^\/?#]+)\/(?:follow|unfollow)/i.exec(url) ||
+              /\/api\/v1\/accounts\/([^\/?#]+)\/(?:follow|unfollow)/i.exec(url);
       if (m && m[1]) return String(m[1]).trim().toLowerCase();
 
-      // 相手IDを示す明示キーを優先（viewerの user_id を誤って先に拾わない）
-      m = /"(?:target_user_id|targetUserId|to_user_id|subscribee_id|subject)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
+      m = /"(?:target_user_id|targetUserId|to_user_id|subscribee_id|subject|rkey)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
           /(?:^|&)(?:target_user_id|to_user_id)=([a-z0-9._-]+)/i.exec(decodedBody);
       if (m && m[1]) return String(m[1]).trim().toLowerCase();
 
@@ -675,7 +709,7 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     return '';
   }
 
-  function detectFollowApiRequest(rawUrl, method, rawBody) {
+  function detectRelationApiRequest(rawUrl, method, rawBody) {
     try {
       var m = (method || 'GET').toUpperCase();
       if (m !== 'POST') return null;
@@ -688,10 +722,15 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       } catch (_) {}
       var lowerBody = decodedBody.toLowerCase();
 
+      if (/\/friendships\/destroy(?:\/|\?|$)/i.test(lowerUrl) ||
+          /\/web\/friendships\/[^\/?#]+\/unfollow(?:\/|\?|$)/i.test(lowerUrl)) {
+        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+
       if (/\/friendships\/create(?:\/|\?|$)/i.test(lowerUrl) ||
           /\/web\/friendships\/[^\/?#]+\/follow(?:\/|\?|$)/i.test(lowerUrl)) {
         if (!/unfollow|destroy/i.test(lowerUrl)) {
-          return { targetKey: extractTargetKey(url, decodedBody) };
+          return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
         }
         return null;
       }
@@ -700,35 +739,57 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
         var fnameMatch = /(?:fb_api_req_friendly_name|friendlyname)["'=\s:]+([a-z0-9_]+)/i.exec(decodedBody);
         var fname = fnameMatch ? fnameMatch[1] : '';
         if (fname) {
-          if (/unfollow|destroy|remove|cancel|block|mute|follower|following|suggestion|recommend|list|count|query|fetch|load|get|status|info|chaining|similar|show|check|batch|many|bulk|sync|refresh|feed|timeline|modal|dialog|sheet/i.test(fname)) {
+          if (/remove.?follower|block|mute|restrict|suggestion|recommend|list|count|query|fetch|load|get|status|info|chaining|similar|show|check|batch|many|bulk|sync|refresh|feed|timeline|modal|dialog|sheet/i.test(fname)) {
             return null;
           }
-          if (/follow/i.test(fname) && /(?:mutation|create|add)/i.test(fname)) {
-            return { targetKey: extractTargetKey(url, decodedBody) };
+          if (/unfollow/i.test(fname) ||
+              (/(?:friendship|follow)/i.test(fname) && /(?:destroy|delete|cancel)/i.test(fname))) {
+            return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+          }
+          if (/follow/i.test(fname) && /(?:mutation|create|add)/i.test(fname) &&
+              !/unfollow|destroy|remove|cancel|follower|following/i.test(fname)) {
+            return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
           }
           return null;
         }
+        if (/usebarcelonaunfollowmutation|barcelonaunfollowmutation|polarisfriendshipsunfollow|polarisunfollowmutation|usepolarisunfollowmutation|polarisuserunfollowmutation|igwebprofileunfollowmutation|textpostappunfollowmutation|friendingcometunfollowmutation|polarisfriendshipsdestroy/i.test(lowerBody)) {
+          return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+        }
         if (/usebarcelonafollowmutation|barcelonafollowmutation|polarisfriendshipsfollow|polarisfollowmutation|usepolarisfollowmutation|polarisuserfollowmutation|igwebprofilefollowmutation|textpostappfollowmutation|friendingcometfollowmutation/i.test(lowerBody) &&
             !/unfollow|destroy/i.test(lowerBody)) {
-          return { targetKey: extractTargetKey(url, decodedBody) };
+          return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
         }
         return null;
       }
 
       if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
           lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
-        return { targetKey: extractTargetKey(url, decodedBody) };
+        return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (lowerUrl.indexOf('com.atproto.repo.deleterecord') >= 0 &&
+          lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
+        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
       }
 
+      if (/\/api\/v1\/accounts\/[^\/?#]+\/unfollow(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+      }
       if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) {
-        return { targetKey: extractTargetKey(url, decodedBody) };
+        return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/api\/following\/delete(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
       }
       if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) {
-        return { targetKey: extractTargetKey(url, decodedBody) };
+        return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
       }
-      if (/\/api\/commit\/follow\/user/i.test(lowerUrl) &&
-          (/[?&]type=1(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=1(?:&|$)|"type"\s*:\s*1/i.test(lowerBody))) {
-        return { targetKey: extractTargetKey(url, decodedBody) };
+      if (/\/api\/commit\/follow\/user/i.test(lowerUrl)) {
+        if (/[?&]type=1(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=1(?:&|$)|"type"\s*:\s*1/i.test(lowerBody)) {
+          return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+        }
+        if (/[?&]type=0(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=0(?:&|$)|"type"\s*:\s*0/i.test(lowerBody)) {
+          return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+        }
       }
     } catch (_) {}
     return null;
@@ -738,6 +799,8 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     var origFetch = window.fetch;
     if (typeof origFetch === 'function') {
       window.fetch = function(input, init) {
+        var isInternal = !!(init && init.__omniStatsInternal);
+        if (isInternal) return origFetch.apply(this, arguments);
         var reqUrl = '';
         var reqMethod = 'GET';
         var reqBody = null;
@@ -753,25 +816,26 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
             if (init.body !== undefined) reqBody = init.body;
           }
         } catch (_) {}
-        var followReq = detectFollowApiRequest(reqUrl, reqMethod, reqBody);
+        var relReq = detectRelationApiRequest(reqUrl, reqMethod, reqBody);
         var reqInteractionId = 0;
-        if (followReq) {
-          lastNetworkFollowStartAt = Date.now();
-          inFlightFollows++;
+        var st = relReq ? states[relReq.action] : null;
+        if (relReq && st) {
+          st.lastNetworkStartAt = Date.now();
+          st.inFlight++;
           reqInteractionId = currentInteractionId();
         }
         var promise = origFetch.apply(this, arguments);
-        if (followReq && promise && typeof promise.then === 'function') {
+        if (relReq && st && promise && typeof promise.then === 'function') {
           promise.then(function(res) {
-            inFlightFollows = Math.max(0, inFlightFollows - 1);
+            st.inFlight = Math.max(0, st.inFlight - 1);
             try {
-              if (res && res.ok) emitFollow('network', followReq.targetKey, reqInteractionId);
+              if (res && res.ok) emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
             } catch (_) {}
           }, function() {
-            inFlightFollows = Math.max(0, inFlightFollows - 1);
+            st.inFlight = Math.max(0, st.inFlight - 1);
           });
-        } else if (followReq) {
-          inFlightFollows = Math.max(0, inFlightFollows - 1);
+        } else if (relReq && st) {
+          st.inFlight = Math.max(0, st.inFlight - 1);
         }
         return promise;
       };
@@ -791,23 +855,24 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       };
       XMLHttpRequest.prototype.send = function(body) {
         try {
-          var followReq = detectFollowApiRequest(this.__omniUrl, this.__omniMethod, body);
-          if (followReq) {
-            lastNetworkFollowStartAt = Date.now();
-            inFlightFollows++;
+          var relReq = detectRelationApiRequest(this.__omniUrl, this.__omniMethod, body);
+          var st = relReq ? states[relReq.action] : null;
+          if (relReq && st) {
+            st.lastNetworkStartAt = Date.now();
+            st.inFlight++;
             var reqInteractionId = currentInteractionId();
             var done = false;
             var finish = function() {
               if (!done) {
                 done = true;
-                inFlightFollows = Math.max(0, inFlightFollows - 1);
+                st.inFlight = Math.max(0, st.inFlight - 1);
               }
             };
             this.addEventListener('load', function() {
               finish();
               try {
                 if (this.status >= 200 && this.status < 300) {
-                  emitFollow('network', followReq.targetKey, reqInteractionId);
+                  emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
                 }
               } catch (_) {}
             }, { once: true });
@@ -849,8 +914,8 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
         if (/\/(following|followers)(?:\/|\?|$)/.test(href)) return false;
       }
       var labels = readElementLabels(el);
-      if (labels.text && NEGATIVE_RE.test(labels.text)) return false;
-      if (labels.aria && NEGATIVE_RE.test(labels.aria)) return false;
+      if (labels.text && NEGATIVE_FOLLOW_RE.test(labels.text)) return false;
+      if (labels.aria && NEGATIVE_FOLLOW_RE.test(labels.aria)) return false;
       if (labels.text && labels.text.length <= 24 && EXACT_FOLLOW_TEXT_RE.test(labels.text)) {
         return true;
       }
@@ -859,6 +924,28 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       }
       if (labels.text && labels.text.length <= 4 && /^[+＋]$/.test(labels.text) &&
           labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function isUnfollowButtonElement(el) {
+    if (!el || el.disabled) return false;
+    try {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      if (el.closest('nav')) return false;
+      if (el.tagName && el.tagName.toUpperCase() === 'A') {
+        var href = (el.getAttribute('href') || '').toLowerCase();
+        if (/\/(following|followers)(?:\/|\?|$)/.test(href)) return false;
+      }
+      var labels = readElementLabels(el);
+      if (labels.text && NON_UNFOLLOW_RE.test(labels.text)) return false;
+      if (labels.aria && NON_UNFOLLOW_RE.test(labels.aria)) return false;
+      if (labels.text && labels.text.length <= 24 && EXACT_UNFOLLOW_TEXT_RE.test(labels.text)) {
+        return true;
+      }
+      if (!labels.text && labels.aria && labels.aria.length <= 64 && ARIA_UNFOLLOW_RE.test(labels.aria)) {
         return true;
       }
     } catch (_) {}
@@ -889,57 +976,93 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       if (target.nodeType !== 1) target = target.parentElement;
       if (!target || typeof target.closest !== 'function') return;
       var btn = target.closest('button, [role="button"], a');
-      if (!btn || !isFollowButtonElement(btn)) return;
+      if (!btn) return;
+
+      var isFollowBtn = isFollowButtonElement(btn);
+      var isUnfollowBtn = !isFollowBtn && isUnfollowButtonElement(btn);
+      if (!isFollowBtn && !isUnfollowBtn) return;
 
       var clickedAt = Date.now();
       var hadDialog = !!document.querySelector('[role="dialog"]');
+      var inDialog = !!btn.closest('[role="dialog"]');
       var initialLabels = readElementLabels(btn);
 
-      setTimeout(function() {
-        try {
-          if (inFlightFollows > 0 ||
-              lastNetworkFollowStartAt >= clickedAt - 300 ||
-              lastNetworkFollowAt >= clickedAt - 300 ||
-              lastAnyEmitAt >= clickedAt - 300) {
-            return;
-          }
-          if (!hadDialog) {
-            var dlg = document.querySelector('[role="dialog"]');
-            if (dlg) {
-              var dlgBtns = dlg.querySelectorAll('button, [role="button"]');
-              for (var i = 0; i < dlgBtns.length; i++) {
-                if (dlgBtns[i] !== btn && isFollowButtonElement(dlgBtns[i])) {
-                  return;
+      if (isFollowBtn) {
+        var fst = states.follow;
+        setTimeout(function() {
+          try {
+            if (fst.inFlight > 0 ||
+                fst.lastNetworkStartAt >= clickedAt - 300 ||
+                fst.lastNetworkAt >= clickedAt - 300 ||
+                fst.lastAnyEmitAt >= clickedAt - 300) {
+              return;
+            }
+            if (!hadDialog) {
+              var dlg = document.querySelector('[role="dialog"]');
+              if (dlg) {
+                var dlgBtns = dlg.querySelectorAll('button, [role="button"]');
+                for (var i = 0; i < dlgBtns.length; i++) {
+                  if (dlgBtns[i] !== btn && isFollowButtonElement(dlgBtns[i])) {
+                    return;
+                  }
                 }
               }
             }
-          }
-          if (isElementHidden(btn)) {
-            emitFollow('dom', '', clickInteractionId);
-            return;
-          }
-          if (btn.getAttribute('aria-pressed') === 'true') {
-            emitFollow('dom', '', clickInteractionId);
-            return;
-          }
-          var after = readElementLabels(btn);
-          if ((after.text && POST_FOLLOW_STATE_RE.test(after.text)) ||
-              (after.aria && POST_FOLLOW_STATE_RE.test(after.aria))) {
-            emitFollow('dom', '', clickInteractionId);
-            return;
-          }
-          if ((after.text !== initialLabels.text || after.aria !== initialLabels.aria) &&
-              !isFollowButtonElement(btn)) {
-            emitFollow('dom', '', clickInteractionId);
-          }
-        } catch (_) {}
-      }, 1000);
+            if (isElementHidden(btn)) {
+              emitRelation('follow', 'dom', '', clickInteractionId);
+              return;
+            }
+            if (btn.getAttribute('aria-pressed') === 'true') {
+              emitRelation('follow', 'dom', '', clickInteractionId);
+              return;
+            }
+            var after = readElementLabels(btn);
+            if ((after.text && POST_FOLLOW_STATE_RE.test(after.text)) ||
+                (after.aria && POST_FOLLOW_STATE_RE.test(after.aria))) {
+              emitRelation('follow', 'dom', '', clickInteractionId);
+              return;
+            }
+            if ((after.text !== initialLabels.text || after.aria !== initialLabels.aria) &&
+                !isFollowButtonElement(btn)) {
+              emitRelation('follow', 'dom', '', clickInteractionId);
+            }
+          } catch (_) {}
+        }, 1000);
+      } else if (isUnfollowBtn) {
+        var ust = states.unfollow;
+        var isConfirmBtn = inDialog && CONFIRM_UNFOLLOW_TEXT_RE.test(initialLabels.text || '');
+        setTimeout(function() {
+          try {
+            if (ust.inFlight > 0 ||
+                ust.lastNetworkStartAt >= clickedAt - 300 ||
+                ust.lastNetworkAt >= clickedAt - 300 ||
+                ust.lastAnyEmitAt >= clickedAt - 300) {
+              return;
+            }
+            if (!hadDialog) {
+              var dlg2 = document.querySelector('[role="dialog"]');
+              if (dlg2) {
+                return;
+              }
+            }
+            if (isConfirmBtn && isElementHidden(btn)) {
+              emitRelation('unfollow', 'dom', '', clickInteractionId);
+              return;
+            }
+            var afterU = readElementLabels(btn);
+            if ((afterU.text && EXACT_FOLLOW_TEXT_RE.test(afterU.text)) ||
+                (!afterU.text && afterU.aria && ARIA_FOLLOW_RE.test(afterU.aria))) {
+              emitRelation('unfollow', 'dom', '', clickInteractionId);
+            }
+          } catch (_) {}
+        }, 1000);
+      }
     } catch (_) {}
   }, true);
 })();"#;
 
-/// Instagram / Threads / Bluesky 等で表示されたアカウントの横に、ページ遷移なしで
-/// フォロー数・フォロワー数をインライン可視化するスクリプト。
+/// Instagram / Threads / Bluesky 等で表示されたアカウント（フォロワー一覧・フィード等）に、
+/// ページ遷移なしでフォロー数・フォロワー数・投稿数・非公開状態をインライン可視化するスクリプト。
 /// またログイン中アカウント自身のハンドルと実フォロー数・フォロワー数もホストへ通知する。
 pub const PROFILE_STATS_JS: &str = r#"(function() {
   if (window !== window.top) return;
@@ -968,24 +1091,58 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     channel: 1, audio: 1, locations: 1, directory: 1, nametag: 1, session: 1, oauth: 1
   };
 
-  var CACHE_KEY = 'omnisns_ff_cache_v1_' + platform;
-  var CACHE_TTL_MS = 30 * 60 * 1000;
-  var MAX_CACHE_ENTRIES = 400;
+  var CACHE_KEY = 'omnisns_ff_cache_v2_' + platform;
+  var CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+  var MAX_CACHE_ENTRIES = 600;
   var statsMap = Object.create(null);
+  var userIdMap = Object.create(null);
+  var privateMap = Object.create(null);
+  var failedMap = Object.create(null);
   var inFlight = Object.create(null);
   var queue = [];
   var queuedSet = Object.create(null);
   var queueRunning = false;
   var queueStartTimer = null;
   var backoffUntil = 0;
+  var consecutiveFailures = 0;
+  var preferredIgRoute = '';
   var selfHandle = '';
+  var selfIdFetchStarted = false;
   var lastPostedIdentityKey = '';
   var persistTimer = null;
   var renderTimer = null;
 
+  var capturedHeaders = Object.create(null);
+  var capturedProfileGql = null;
+
+  function getCookieValue(name) {
+    try {
+      var cookies = document.cookie ? document.cookie.split(';') : [];
+      var prefix = name + '=';
+      for (var i = 0; i < cookies.length; i++) {
+        var c = cookies[i].trim();
+        if (c.indexOf(prefix) === 0) {
+          return decodeURIComponent(c.slice(prefix.length));
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function getStorage() {
+    try {
+      if (window.localStorage) return window.localStorage;
+    } catch (_) {}
+    try {
+      if (window.sessionStorage) return window.sessionStorage;
+    } catch (_) {}
+    return null;
+  }
+
   function loadCache() {
     try {
-      var raw = window.sessionStorage && window.sessionStorage.getItem(CACHE_KEY);
+      var st = getStorage();
+      var raw = st && st.getItem(CACHE_KEY);
       if (!raw) return;
       var parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== 'object') return;
@@ -996,8 +1153,11 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           statsMap[k] = {
             followers: typeof e.followers === 'number' ? e.followers : null,
             following: typeof e.following === 'number' ? e.following : null,
+            posts: typeof e.posts === 'number' ? e.posts : null,
+            isPrivate: typeof e.isPrivate === 'boolean' ? e.isPrivate : null,
             ts: e.ts || now
           };
+          if (typeof e.isPrivate === 'boolean') privateMap[k] = e.isPrivate;
         }
       }
     } catch (_) {}
@@ -1008,7 +1168,8 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     persistTimer = setTimeout(function() {
       persistTimer = null;
       try {
-        if (!window.sessionStorage) return;
+        var st = getStorage();
+        if (!st) return;
         var keys = Object.keys(statsMap);
         if (keys.length > MAX_CACHE_ENTRIES) {
           keys.sort(function(a, b) { return (statsMap[b].ts || 0) - (statsMap[a].ts || 0); });
@@ -1016,7 +1177,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           for (var i = 0; i < MAX_CACHE_ENTRIES; i++) trimmed[keys[i]] = statsMap[keys[i]];
           statsMap = trimmed;
         }
-        window.sessionStorage.setItem(CACHE_KEY, JSON.stringify(statsMap));
+        st.setItem(CACHE_KEY, JSON.stringify(statsMap));
       } catch (_) {}
     }, 1500);
   }
@@ -1096,18 +1257,38 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     }
   }
 
-  function recordStats(rawHandle, followers, following) {
+  function hasUsableStats(entry) {
+    return !!(entry && (typeof entry.followers === 'number' || typeof entry.following === 'number'));
+  }
+
+  function recordStats(rawHandle, followers, following, posts, isPrivate) {
     var h = normalizeHandle(rawHandle);
-    if (!h) return;
+    if (!h) return false;
     var f1 = typeof followers === 'number' && isFinite(followers) && followers >= 0 ? Math.round(followers) : null;
     var f2 = typeof following === 'number' && isFinite(following) && following >= 0 ? Math.round(following) : null;
-    if (f1 === null && f2 === null) return;
+    var p = typeof posts === 'number' && isFinite(posts) && posts >= 0 ? Math.round(posts) : null;
+    var priv = typeof isPrivate === 'boolean' ? isPrivate : (typeof privateMap[h] === 'boolean' ? privateMap[h] : null);
+    if (typeof isPrivate === 'boolean') privateMap[h] = isPrivate;
+    if (f1 === null && f2 === null) return false;
 
+    delete failedMap[h];
     var prev = statsMap[h];
     var nextFollowers = f1 !== null ? f1 : (prev ? prev.followers : null);
     var nextFollowing = f2 !== null ? f2 : (prev ? prev.following : null);
-    var changed = !prev || prev.followers !== nextFollowers || prev.following !== nextFollowing;
-    statsMap[h] = { followers: nextFollowers, following: nextFollowing, ts: Date.now() };
+    var nextPosts = p !== null ? p : (prev ? prev.posts : null);
+    var nextPriv = priv !== null ? priv : (prev ? prev.isPrivate : null);
+    var changed = !prev ||
+      prev.followers !== nextFollowers ||
+      prev.following !== nextFollowing ||
+      prev.posts !== nextPosts ||
+      prev.isPrivate !== nextPriv;
+    statsMap[h] = {
+      followers: nextFollowers,
+      following: nextFollowing,
+      posts: nextPosts,
+      isPrivate: nextPriv,
+      ts: Date.now()
+    };
     if (changed) {
       schedulePersistCache();
       scheduleRenderBadges();
@@ -1115,17 +1296,19 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     if (h === selfHandle) {
       postIdentityToHost(h, nextFollowing, nextFollowers);
     }
+    return true;
   }
 
   function extractFromJsonObject(root) {
-    if (!root || typeof root !== 'object') return;
+    if (!root || typeof root !== 'object') return false;
+    var foundStats = false;
     var stack = [{ node: root, depth: 0 }];
     var visited = 0;
-    while (stack.length > 0 && visited < 1400) {
+    while (stack.length > 0 && visited < 2200) {
       var cur = stack.pop();
       var obj = cur.node;
       var depth = cur.depth;
-      if (!obj || typeof obj !== 'object' || depth > 11) continue;
+      if (!obj || typeof obj !== 'object' || depth > 12) continue;
       visited++;
       if (Array.isArray(obj)) {
         for (var i = obj.length - 1; i >= 0; i--) {
@@ -1141,18 +1324,42 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         (typeof obj.handle === 'string' && obj.handle) ||
         '';
       if (candidateHandle) {
-        var flwrs = null;
-        var flwng = null;
-        if (typeof obj.follower_count === 'number') flwrs = obj.follower_count;
-        else if (typeof obj.followersCount === 'number') flwrs = obj.followersCount;
-        else if (obj.edge_followed_by && typeof obj.edge_followed_by.count === 'number') flwrs = obj.edge_followed_by.count;
+        var normH = normalizeHandle(candidateHandle);
+        if (normH) {
+          var rawId = obj.pk || obj.pk_id || obj.id || obj.fbid_v2;
+          if (rawId !== undefined && rawId !== null) {
+            var idStr = String(rawId).trim();
+            if (/^\d{5,24}$/.test(idStr)) {
+              userIdMap[normH] = idStr;
+            }
+          }
+          if (typeof obj.is_private === 'boolean') {
+            privateMap[normH] = obj.is_private;
+          }
 
-        if (typeof obj.following_count === 'number') flwng = obj.following_count;
-        else if (typeof obj.followsCount === 'number') flwng = obj.followsCount;
-        else if (obj.edge_follow && typeof obj.edge_follow.count === 'number') flwng = obj.edge_follow.count;
+          var flwrs = null;
+          var flwng = null;
+          var posts = null;
+          if (typeof obj.follower_count === 'number') flwrs = obj.follower_count;
+          else if (typeof obj.text_post_app_follower_count === 'number') flwrs = obj.text_post_app_follower_count;
+          else if (typeof obj.followersCount === 'number') flwrs = obj.followersCount;
+          else if (obj.edge_followed_by && typeof obj.edge_followed_by.count === 'number') flwrs = obj.edge_followed_by.count;
 
-        if (flwrs !== null || flwng !== null) {
-          recordStats(candidateHandle, flwrs, flwng);
+          if (typeof obj.following_count === 'number') flwng = obj.following_count;
+          else if (typeof obj.followsCount === 'number') flwng = obj.followsCount;
+          else if (obj.edge_follow && typeof obj.edge_follow.count === 'number') flwng = obj.edge_follow.count;
+
+          if (typeof obj.media_count === 'number') posts = obj.media_count;
+          else if (typeof obj.postsCount === 'number') posts = obj.postsCount;
+          else if (obj.edge_owner_to_timeline_media && typeof obj.edge_owner_to_timeline_media.count === 'number') {
+            posts = obj.edge_owner_to_timeline_media.count;
+          }
+
+          if (flwrs !== null || flwng !== null) {
+            if (recordStats(normH, flwrs, flwng, posts, typeof obj.is_private === 'boolean' ? obj.is_private : null)) {
+              foundStats = true;
+            }
+          }
         }
       }
 
@@ -1170,22 +1377,33 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         }
       }
     }
+    return foundStats;
   }
 
   function extractFromHtmlForHandle(html, targetHandle) {
-    if (!html || typeof html !== 'string') return;
+    if (!html || typeof html !== 'string') return false;
     var followers = null;
     var following = null;
+    var posts = null;
+    var isPrivate = null;
 
     var m1 = /"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/.exec(html) ||
-             /"follower_count"\s*:\s*(\d+)/.exec(html);
+             /"follower_count"\s*:\s*(\d+)/.exec(html) ||
+             /"text_post_app_follower_count"\s*:\s*(\d+)/.exec(html);
     if (m1) followers = parseInt(m1[1], 10);
 
     var m2 = /"edge_follow"\s*:\s*\{\s*"count"\s*:\s*(\d+)/.exec(html) ||
              /"following_count"\s*:\s*(\d+)/.exec(html);
     if (m2) following = parseInt(m2[1], 10);
 
-    if (followers === null || following === null) {
+    var m3 = /"edge_owner_to_timeline_media"\s*:\s*\{\s*"count"\s*:\s*(\d+)/.exec(html) ||
+             /"media_count"\s*:\s*(\d+)/.exec(html);
+    if (m3) posts = parseInt(m3[1], 10);
+
+    var mPriv = /"is_private"\s*:\s*(true|false)/.exec(html);
+    if (mPriv) isPrivate = mPriv[1] === 'true';
+
+    if (followers === null || following === null || posts === null) {
       var metaMatch = /<meta[^>]+(?:name|property)=["'](?:og:description|description)["'][^>]+content=["']([^"']+)["']/i.exec(html) ||
                       /<meta[^>]+content=["']([^"']+)["'][^>]+(?:name|property)=["'](?:og:description|description)["']/i.exec(html);
       if (metaMatch && metaMatch[1]) {
@@ -1198,21 +1416,87 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           var mg = /([0-9.,]+[KMB]?)\s+Following/i.exec(desc) || /フォロー中\s*([0-9.,]+[万千億KMB]?)\s*人/.exec(desc);
           if (mg) following = parseHumanNumber(mg[1]);
         }
+        if (posts === null) {
+          var mp = /([0-9.,]+[KMB]?)\s+Posts/i.exec(desc) || /投稿\s*([0-9.,]+[万千億KMB]?)\s*件/.exec(desc);
+          if (mp) posts = parseHumanNumber(mp[1]);
+        }
       }
     }
 
     if (followers !== null || following !== null) {
-      recordStats(targetHandle, followers, following);
+      return recordStats(targetHandle, followers, following, posts, isPrivate);
     }
+    return false;
+  }
+
+  function captureHeaderPair(key, val) {
+    if (!key || !val) return;
+    var k = String(key).toLowerCase().trim();
+    if (k === 'x-ig-app-id' || k === 'x-csrftoken' || k === 'x-ig-www-claim' ||
+        k === 'x-asbd-id' || k === 'x-fb-lsd' || k === 'x-bloks-version-id') {
+      capturedHeaders[k] = String(val).trim();
+    }
+  }
+
+  function captureRequestHeaders(headers) {
+    if (!headers) return;
+    try {
+      if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+        headers.forEach(function(v, k) { captureHeaderPair(k, v); });
+      } else if (Array.isArray(headers)) {
+        for (var i = 0; i < headers.length; i++) {
+          if (headers[i] && headers[i].length >= 2) captureHeaderPair(headers[i][0], headers[i][1]);
+        }
+      } else if (typeof headers === 'object') {
+        var ks = Object.keys(headers);
+        for (var j = 0; j < ks.length; j++) captureHeaderPair(ks[j], headers[ks[j]]);
+      }
+    } catch (_) {}
+  }
+
+  function captureProfileGraphqlTemplate(url, body) {
+    if (platform !== 'instagram' && platform !== 'threads') return;
+    if (!url || !body) return;
+    var u = String(url);
+    if (u.indexOf('/graphql') < 0) return;
+    try {
+      var str = '';
+      if (typeof body === 'string') str = body;
+      else if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) str = body.toString();
+      if (!str || str.indexOf('doc_id=') < 0) return;
+      var params = new URLSearchParams(str);
+      var fname = params.get('fb_api_req_friendly_name') || '';
+      if (!/PolarisProfilePageContentQuery|PolarisProfileHoverCardQuery|BarcelonaProfileRootQuery|BarcelonaProfilePageQuery/i.test(fname)) {
+        return;
+      }
+      var docId = params.get('doc_id') || '';
+      var varsStr = params.get('variables') || '';
+      if (!docId || !varsStr) return;
+      var varsObj = JSON.parse(varsStr);
+      if (!varsObj || typeof varsObj !== 'object') return;
+      var idKey = '';
+      if (typeof varsObj.id === 'string' || typeof varsObj.id === 'number') idKey = 'id';
+      else if (typeof varsObj.userID === 'string' || typeof varsObj.userID === 'number') idKey = 'userID';
+      else if (typeof varsObj.user_id === 'string' || typeof varsObj.user_id === 'number') idKey = 'user_id';
+      if (!idKey) return;
+      var baseParams = Object.create(null);
+      params.forEach(function(v, k) {
+        if (k !== 'variables') baseParams[k] = v;
+      });
+      capturedProfileGql = {
+        url: u,
+        fname: fname,
+        idKey: idKey,
+        templateVars: varsObj,
+        baseParams: baseParams
+      };
+    } catch (_) {}
   }
 
   function shouldSniffUrl(rawUrl) {
     var u = String(rawUrl || '').toLowerCase();
     if (!u) return false;
-    if (platform === 'instagram') {
-      return u.indexOf('/graphql') >= 0 || u.indexOf('/api/v1/') >= 0;
-    }
-    if (platform === 'threads') {
+    if (platform === 'instagram' || platform === 'threads') {
       return u.indexOf('/graphql') >= 0 || u.indexOf('/api/v1/') >= 0;
     }
     if (platform === 'bluesky') {
@@ -1222,10 +1506,10 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   }
 
   function sniffJsonText(txt) {
-    if (!txt || txt.length > 2500000) return;
+    if (!txt || txt.length > 3500000) return;
     if (txt.indexOf('follower') < 0 && txt.indexOf('edge_followed_by') < 0 &&
         txt.indexOf('followersCount') < 0 && txt.indexOf('followsCount') < 0 &&
-        txt.indexOf('viewer_username') < 0) {
+        txt.indexOf('viewer_username') < 0 && txt.indexOf('"username"') < 0) {
       return;
     }
     try {
@@ -1233,10 +1517,9 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var parsed = JSON.parse(clean);
       extractFromJsonObject(parsed);
     } catch (_) {
-      // NDJSON (Instagram/Threads streaming GraphQL chunks)
       try {
         var lines = txt.split('\n');
-        for (var i = 0; i < lines.length && i < 30; i++) {
+        for (var i = 0; i < lines.length && i < 40; i++) {
           var line = lines[i].trim();
           if (line.length > 2 && line[0] === '{') {
             extractFromJsonObject(JSON.parse(line));
@@ -1246,15 +1529,22 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     }
   }
 
-  // Passive sniffer: fetch
+  var origFetchRef = window.fetch;
   try {
-    var origFetch = window.fetch;
-    if (typeof origFetch === 'function') {
+    if (typeof origFetchRef === 'function') {
       window.fetch = function(input, init) {
-        var reqUrl = typeof input === 'string' ? input : (input && input.url ? input.url : '');
         var isInternal = !!(init && init.__omniStatsInternal);
-        var promise = origFetch.apply(this, arguments);
-        if (!isInternal && shouldSniffUrl(reqUrl) && promise && typeof promise.then === 'function') {
+        if (isInternal) {
+          return origFetchRef.apply(this, arguments);
+        }
+        var reqUrl = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        try {
+          if (init && init.headers) captureRequestHeaders(init.headers);
+          if (input && typeof input === 'object' && input.headers) captureRequestHeaders(input.headers);
+          if (init && init.body) captureProfileGraphqlTemplate(reqUrl, init.body);
+        } catch (_) {}
+        var promise = origFetchRef.apply(this, arguments);
+        if (shouldSniffUrl(reqUrl) && promise && typeof promise.then === 'function') {
           promise.then(function(res) {
             try {
               if (!res || !res.ok || typeof res.clone !== 'function') return;
@@ -1270,17 +1560,24 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     }
   } catch (_) {}
 
-  // Passive sniffer: XMLHttpRequest
   try {
     var origOpen = XMLHttpRequest.prototype.open;
+    var origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
     var origSend = XMLHttpRequest.prototype.send;
     if (typeof origOpen === 'function' && typeof origSend === 'function') {
       XMLHttpRequest.prototype.open = function(method, url) {
         try { this.__omniStatsUrl = url; } catch (_) {}
         return origOpen.apply(this, arguments);
       };
-      XMLHttpRequest.prototype.send = function() {
+      if (typeof origSetHeader === 'function') {
+        XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+          try { captureHeaderPair(name, value); } catch (_) {}
+          return origSetHeader.apply(this, arguments);
+        };
+      }
+      XMLHttpRequest.prototype.send = function(body) {
         try {
+          if (body) captureProfileGraphqlTemplate(this.__omniStatsUrl, body);
           if (shouldSniffUrl(this.__omniStatsUrl)) {
             this.addEventListener('load', function() {
               try {
@@ -1298,13 +1595,57 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     }
   } catch (_) {}
 
-  // Initial SSR script scanner
+  function internalFetch(url, opts) {
+    var o = Object.assign({ __omniStatsInternal: true }, opts || {});
+    return origFetchRef ? origFetchRef.call(window, url, o) : window.fetch(url, o);
+  }
+
+  function buildIgHeaders(appIdOverride) {
+    var h = {
+      'x-ig-app-id': appIdOverride || capturedHeaders['x-ig-app-id'] || '936619743392459',
+      'x-requested-with': 'XMLHttpRequest',
+      'accept': '*/*'
+    };
+    var csrf = getCookieValue('csrftoken') || capturedHeaders['x-csrftoken'];
+    if (csrf) h['x-csrftoken'] = csrf;
+    var claim = capturedHeaders['x-ig-www-claim'] || '';
+    if (!claim) {
+      try { claim = (window.sessionStorage && window.sessionStorage.getItem('www-claim-v2')) || ''; } catch (_) {}
+    }
+    if (claim) h['x-ig-www-claim'] = claim;
+    if (capturedHeaders['x-asbd-id']) h['x-asbd-id'] = capturedHeaders['x-asbd-id'];
+    if (capturedHeaders['x-fb-lsd']) h['x-fb-lsd'] = capturedHeaders['x-fb-lsd'];
+    if (capturedHeaders['x-bloks-version-id']) h['x-bloks-version-id'] = capturedHeaders['x-bloks-version-id'];
+    return h;
+  }
+
+  function tryFetchSelfByCookie() {
+    if (platform !== 'instagram' || selfHandle || selfIdFetchStarted) return;
+    var dsUserId = getCookieValue('ds_user_id');
+    if (!dsUserId || !/^\d{5,24}$/.test(dsUserId)) return;
+    selfIdFetchStarted = true;
+    internalFetch('/api/v1/users/' + encodeURIComponent(dsUserId) + '/info/', {
+      method: 'GET',
+      credentials: 'include',
+      headers: buildIgHeaders()
+    }).then(function(res) {
+      if (!res || !res.ok) return;
+      return res.json().then(function(data) {
+        var u = data && data.user;
+        if (u && typeof u.username === 'string') {
+          setSelfHandle(u.username);
+          extractFromJsonObject(data);
+        }
+      }).catch(function() {});
+    }).catch(function() {});
+  }
+
   function scanSsrScripts() {
     try {
       var scripts = document.querySelectorAll('script[type="application/json"]');
-      for (var i = 0; i < scripts.length && i < 60; i++) {
+      for (var i = 0; i < scripts.length && i < 80; i++) {
         var txt = scripts[i].textContent || '';
-        if (txt.length > 10 && txt.length < 1500000) {
+        if (txt.length > 10 && txt.length < 1800000) {
           sniffJsonText(txt);
         }
       }
@@ -1315,7 +1656,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     try {
       if (platform === 'instagram') {
         var navLinks = document.querySelectorAll('nav a[href], [role="navigation"] a[href], div[class] a[href]');
-        for (var i = 0; i < navLinks.length && i < 200; i++) {
+        for (var i = 0; i < navLinks.length && i < 240; i++) {
           var a = navLinks[i];
           var href = a.getAttribute('href') || '';
           var m = /^\/([a-z0-9._]{1,35})\/?(?:\?.*)?$/i.exec(href);
@@ -1328,11 +1669,12 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           var alt = img ? (img.getAttribute('alt') || '') : '';
           if (/^(プロフィール|profile)$/i.test(label) ||
               /^(プロフィール|profile)$/i.test(aria) ||
-              /(プロフィール写真|profile picture)/i.test(alt) && a.closest('nav, [role="navigation"]')) {
+              (/(プロフィール写真|profile picture)/i.test(alt) && a.closest('nav, [role="navigation"]'))) {
             setSelfHandle(h);
             return;
           }
         }
+        tryFetchSelfByCookie();
       } else if (platform === 'threads') {
         var tLinks = document.querySelectorAll('nav a[href^="/@"], [role="navigation"] a[href^="/@"], a[href^="/@"]');
         for (var j = 0; j < tLinks.length && j < 120; j++) {
@@ -1400,13 +1742,18 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     return '';
   }
 
-  function enqueueFetch(rawHandle, priority) {
+  function enqueueFetch(rawHandle, priority, forceRetry) {
     var h = normalizeHandle(rawHandle);
     if (!h) return;
-    if (Date.now() < backoffUntil) return;
+    if (forceRetry) {
+      delete failedMap[h];
+      if (Date.now() < backoffUntil) backoffUntil = 0;
+    } else {
+      if (Date.now() < backoffUntil) return;
+      if (failedMap[h] && Date.now() - failedMap[h] < 45000) return;
+    }
     var existing = statsMap[h];
-    if (existing && (Date.now() - existing.ts) < CACHE_TTL_MS &&
-        (existing.followers !== null || existing.following !== null)) {
+    if (!forceRetry && hasUsableStats(existing) && (Date.now() - existing.ts) < CACHE_TTL_MS) {
       return;
     }
     if (inFlight[h]) return;
@@ -1423,7 +1770,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     queuedSet[h] = true;
     if (priority) queue.unshift(h);
     else queue.push(h);
-    if (queue.length > 60) {
+    if (queue.length > 80) {
       var dropped = queue.pop();
       if (dropped) delete queuedSet[dropped];
     }
@@ -1431,83 +1778,198 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       queueStartTimer = setTimeout(function() {
         queueStartTimer = null;
         processQueue();
-      }, platform === 'bluesky' ? 40 : 10);
+      }, platform === 'bluesky' ? 30 : 20);
     }
   }
 
-  function fetchInstagramProfile(handle) {
-    var enc = encodeURIComponent(handle);
-    return window.fetch('/api/v1/users/web_profile_info/?username=' + enc, {
+  function fetchIgViaCapturedGql(handle) {
+    var pk = userIdMap[handle];
+    if (!pk || !capturedProfileGql) return Promise.resolve({ ok: false, rateLimited: false });
+    try {
+      var bodyParams = new URLSearchParams();
+      for (var k in capturedProfileGql.baseParams) {
+        bodyParams.set(k, capturedProfileGql.baseParams[k]);
+      }
+      var vars = Object.assign({}, capturedProfileGql.templateVars);
+      vars[capturedProfileGql.idKey] = pk;
+      bodyParams.set('variables', JSON.stringify(vars));
+      var headers = buildIgHeaders();
+      headers['content-type'] = 'application/x-www-form-urlencoded';
+      if (capturedProfileGql.fname) headers['x-fb-friendly-name'] = capturedProfileGql.fname;
+      return internalFetch(capturedProfileGql.url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: headers,
+        body: bodyParams.toString()
+      }).then(function(res) {
+        if (res.status === 429) return { ok: false, rateLimited: true };
+        if (!res.ok) return { ok: false, rateLimited: false };
+        return res.text().then(function(txt) {
+          sniffJsonText(txt);
+          return { ok: hasUsableStats(statsMap[handle]), rateLimited: false };
+        });
+      }).catch(function() { return { ok: false, rateLimited: false }; });
+    } catch (_) {
+      return Promise.resolve({ ok: false, rateLimited: false });
+    }
+  }
+
+  function fetchIgViaUserInfo(handle) {
+    var pk = userIdMap[handle];
+    if (!pk) return Promise.resolve({ ok: false, rateLimited: false });
+    return internalFetch('/api/v1/users/' + encodeURIComponent(pk) + '/info/', {
       method: 'GET',
       credentials: 'include',
-      headers: {
-        'x-ig-app-id': '936619743392459',
-        'x-requested-with': 'XMLHttpRequest'
-      },
-      __omniStatsInternal: true
+      headers: buildIgHeaders()
     }).then(function(res) {
-      if (res.status === 429 || res.status === 401 || res.status === 403) {
-        backoffUntil = Date.now() + 120000;
-        return;
+      if (res.status === 429) return { ok: false, rateLimited: true };
+      if (!res.ok) return { ok: false, rateLimited: false };
+      return res.json().then(function(data) {
+        extractFromJsonObject(data);
+        return { ok: hasUsableStats(statsMap[handle]), rateLimited: false };
+      }).catch(function() { return { ok: false, rateLimited: false }; });
+    }).catch(function() { return { ok: false, rateLimited: false }; });
+  }
+
+  function fetchIgViaWebProfileInfo(handle, appId) {
+    var enc = encodeURIComponent(handle);
+    return internalFetch('/api/v1/users/web_profile_info/?username=' + enc, {
+      method: 'GET',
+      credentials: 'include',
+      headers: buildIgHeaders(appId)
+    }).then(function(res) {
+      if (res.status === 429) return { ok: false, rateLimited: true };
+      if (!res.ok || (res.redirected && String(res.url || '').indexOf('/accounts/login') >= 0)) {
+        return { ok: false, rateLimited: false };
       }
-      if (res.redirected && String(res.url || '').indexOf('/accounts/login') >= 0) {
-        backoffUntil = Date.now() + 120000;
-        return;
+      return res.json().then(function(data) {
+        extractFromJsonObject(data);
+        var u = data && data.data && data.data.user;
+        if (u && !hasUsableStats(statsMap[handle])) {
+          var flwrs = u.edge_followed_by && typeof u.edge_followed_by.count === 'number'
+            ? u.edge_followed_by.count
+            : (typeof u.follower_count === 'number' ? u.follower_count : null);
+          var flwng = u.edge_follow && typeof u.edge_follow.count === 'number'
+            ? u.edge_follow.count
+            : (typeof u.following_count === 'number' ? u.following_count : null);
+          var posts = u.edge_owner_to_timeline_media && typeof u.edge_owner_to_timeline_media.count === 'number'
+            ? u.edge_owner_to_timeline_media.count
+            : (typeof u.media_count === 'number' ? u.media_count : null);
+          recordStats(handle, flwrs, flwng, posts, typeof u.is_private === 'boolean' ? u.is_private : null);
+        }
+        return { ok: hasUsableStats(statsMap[handle]), rateLimited: false };
+      }).catch(function() { return { ok: false, rateLimited: false }; });
+    }).catch(function() { return { ok: false, rateLimited: false }; });
+  }
+
+  function fetchIgViaHtml(handle, includeCreds) {
+    var enc = encodeURIComponent(handle);
+    return internalFetch('/' + enc + '/', {
+      method: 'GET',
+      credentials: includeCreds ? 'include' : 'omit',
+      headers: { 'accept': 'text/html,application/xhtml+xml' }
+    }).then(function(res) {
+      if (res.status === 429) return { ok: false, rateLimited: true };
+      if (!res.ok) return { ok: false, rateLimited: false };
+      return res.text().then(function(html) {
+        var ok = extractFromHtmlForHandle(html, handle);
+        return { ok: ok || hasUsableStats(statsMap[handle]), rateLimited: false };
+      });
+    }).catch(function() { return { ok: false, rateLimited: false }; });
+  }
+
+  function fetchInstagramProfile(handle) {
+    var primaryAppId = capturedHeaders['x-ig-app-id'] || '936619743392459';
+    var altAppId = primaryAppId === '1217981644879628' ? '936619743392459' : '1217981644879628';
+    var routes = [];
+    if (userIdMap[handle] && capturedProfileGql) routes.push({ name: 'gql', fn: function() { return fetchIgViaCapturedGql(handle); } });
+    if (userIdMap[handle]) routes.push({ name: 'user_info', fn: function() { return fetchIgViaUserInfo(handle); } });
+    routes.push({ name: 'web_info_1', fn: function() { return fetchIgViaWebProfileInfo(handle, primaryAppId); } });
+    routes.push({ name: 'web_info_2', fn: function() { return fetchIgViaWebProfileInfo(handle, altAppId); } });
+    routes.push({ name: 'html_inc', fn: function() { return fetchIgViaHtml(handle, true); } });
+    routes.push({ name: 'html_omit', fn: function() { return fetchIgViaHtml(handle, false); } });
+
+    if (preferredIgRoute) {
+      routes.sort(function(a, b) {
+        if (a.name === preferredIgRoute) return -1;
+        if (b.name === preferredIgRoute) return 1;
+        return 0;
+      });
+    }
+
+    var idx = 0;
+    function nextRoute() {
+      if (idx >= routes.length) {
+        consecutiveFailures++;
+        failedMap[handle] = Date.now();
+        if (consecutiveFailures >= 4) {
+          backoffUntil = Date.now() + 25000;
+          consecutiveFailures = 0;
+        }
+        scheduleRenderBadges();
+        return Promise.resolve();
       }
-      if (res.ok) {
-        return res.json().then(function(data) {
-          var u = data && data.data && data.data.user;
-          if (u) {
-            var flwrs = u.edge_followed_by && typeof u.edge_followed_by.count === 'number'
-              ? u.edge_followed_by.count
-              : (typeof u.follower_count === 'number' ? u.follower_count : null);
-            var flwng = u.edge_follow && typeof u.edge_follow.count === 'number'
-              ? u.edge_follow.count
-              : (typeof u.following_count === 'number' ? u.following_count : null);
-            recordStats(handle, flwrs, flwng);
-          }
-        }).catch(function() {});
-      }
-      // HTML fallback
-      return window.fetch('/' + enc + '/', {
-        method: 'GET',
-        credentials: 'include',
-        __omniStatsInternal: true
-      }).then(function(r2) {
-        if (!r2.ok) return;
-        return r2.text().then(function(html) {
-          extractFromHtmlForHandle(html, handle);
-        });
-      }).catch(function() {});
-    }).catch(function() {});
+      var r = routes[idx++];
+      return r.fn().then(function(res) {
+        if (res && res.ok) {
+          preferredIgRoute = r.name;
+          consecutiveFailures = 0;
+          return;
+        }
+        if (res && res.rateLimited) {
+          backoffUntil = Date.now() + 50000;
+          failedMap[handle] = Date.now();
+          scheduleRenderBadges();
+          return;
+        }
+        return nextRoute();
+      });
+    }
+    return nextRoute();
   }
 
   function fetchThreadsProfile(handle) {
     var enc = encodeURIComponent(handle);
-    return window.fetch('/@' + enc, {
-      method: 'GET',
-      credentials: 'include',
-      __omniStatsInternal: true
-    }).then(function(res) {
-      if (res.status === 429 || res.status === 401 || res.status === 403) {
-        backoffUntil = Date.now() + 120000;
-        return;
-      }
-      if (!res.ok) return;
-      return res.text().then(function(html) {
-        extractFromHtmlForHandle(html, handle);
+    function tryHtml(includeCreds) {
+      return internalFetch('/@' + enc, {
+        method: 'GET',
+        credentials: includeCreds ? 'include' : 'omit',
+        headers: { 'accept': 'text/html,application/xhtml+xml' }
+      }).then(function(res) {
+        if (res.status === 429) return { ok: false, rateLimited: true };
+        if (!res.ok) return { ok: false, rateLimited: false };
+        return res.text().then(function(html) {
+          var ok = extractFromHtmlForHandle(html, handle);
+          return { ok: ok || hasUsableStats(statsMap[handle]), rateLimited: false };
+        });
+      }).catch(function() { return { ok: false, rateLimited: false }; });
+    }
+    var chain = (userIdMap[handle] && capturedProfileGql)
+      ? fetchIgViaCapturedGql(handle)
+      : Promise.resolve({ ok: false, rateLimited: false });
+    return chain.then(function(r0) {
+      if (r0 && r0.ok) { consecutiveFailures = 0; return; }
+      if (r0 && r0.rateLimited) { backoffUntil = Date.now() + 50000; failedMap[handle] = Date.now(); scheduleRenderBadges(); return; }
+      return tryHtml(true).then(function(r1) {
+        if (r1 && r1.ok) { consecutiveFailures = 0; return; }
+        if (r1 && r1.rateLimited) { backoffUntil = Date.now() + 50000; failedMap[handle] = Date.now(); scheduleRenderBadges(); return; }
+        return tryHtml(false).then(function(r2) {
+          if (r2 && r2.ok) { consecutiveFailures = 0; return; }
+          if (r2 && r2.rateLimited) backoffUntil = Date.now() + 50000;
+          failedMap[handle] = Date.now();
+          scheduleRenderBadges();
+        });
       });
-    }).catch(function() {});
+    });
   }
 
   function fetchBlueskyBatch(handles) {
     var qs = handles.map(function(h) { return 'actors=' + encodeURIComponent(h); }).join('&');
-    return window.fetch('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles?' + qs, {
-      method: 'GET',
-      __omniStatsInternal: true
+    return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles?' + qs, {
+      method: 'GET'
     }).then(function(res) {
       if (res.status === 429) {
-        backoffUntil = Date.now() + 60000;
+        backoffUntil = Date.now() + 45000;
         return;
       }
       if (!res.ok) return;
@@ -1516,7 +1978,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           for (var i = 0; i < data.profiles.length; i++) {
             var p = data.profiles[i];
             if (p && p.handle) {
-              recordStats(p.handle, p.followersCount, p.followsCount);
+              recordStats(p.handle, p.followersCount, p.followsCount, p.postsCount, null);
             }
           }
         }
@@ -1540,7 +2002,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         setTimeout(function() {
           queueRunning = false;
           processQueue();
-        }, 320);
+        }, 280);
       });
       return;
     }
@@ -1548,8 +2010,9 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     var handle = queue.shift();
     delete queuedSet[handle];
     inFlight[handle] = true;
+    scheduleRenderBadges();
     var req = platform === 'instagram' ? fetchInstagramProfile(handle) : fetchThreadsProfile(handle);
-    var delayMs = platform === 'instagram' ? 850 : 1050;
+    var delayMs = platform === 'instagram' ? 620 : 820;
     req.then(function() {
       delete inFlight[handle];
       setTimeout(function() {
@@ -1567,49 +2030,247 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       '.omni-ff-badge{' +
       'display:inline-flex;align-items:center;gap:3px;margin-left:5px;padding:1px 6px;' +
       'border-radius:999px;font-size:10.5px;font-weight:600;line-height:1.35;' +
-      'background:rgba(21,156,171,0.16);border:1px solid rgba(21,156,171,0.4);' +
-      'color:inherit;white-space:nowrap;pointer-events:none;user-select:none;' +
-      'vertical-align:middle;opacity:0.9;letter-spacing:0;' +
+      'background:rgba(21,156,171,0.16);border:1px solid rgba(21,156,171,0.42);' +
+      'color:inherit;white-space:nowrap;user-select:none;vertical-align:middle;' +
+      'opacity:0.94;letter-spacing:0;pointer-events:none;' +
+      '}' +
+      '.omni-ff-badge-row{' +
+      'display:inline-flex;align-items:center;flex-wrap:wrap;gap:3px;margin:3px 0 0 0;padding:1.5px 7px;' +
+      'border-radius:999px;font-size:10.5px;font-weight:600;line-height:1.35;' +
+      'background:rgba(21,156,171,0.18);border:1px solid rgba(21,156,171,0.45);' +
+      'color:inherit;max-width:100%;width:fit-content;user-select:none;letter-spacing:0;' +
+      'pointer-events:auto;cursor:pointer;' +
+      '}' +
+      '.omni-ff-badge-row.is-pending{' +
+      'background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.3);opacity:0.72;' +
+      '}' +
+      '.omni-ff-badge-row.is-retry{' +
+      'background:rgba(245,158,11,0.14);border-color:rgba(245,158,11,0.42);opacity:0.88;' +
       '}';
     (document.head || document.documentElement).appendChild(style);
   }
 
-  function formatBadgeDisplay(entry) {
-    if (!entry) return null;
+  function formatBadgeDisplay(entry, includePosts) {
+    if (!hasUsableStats(entry)) return null;
     var hasFollowing = typeof entry.following === 'number';
     var hasFollowers = typeof entry.followers === 'number';
-    if (!hasFollowing && !hasFollowers) return null;
-    var text = '';
-    var title = '';
-    if (hasFollowing && hasFollowers) {
-      text = 'フォロー ' + formatCompactCount(entry.following) + ' · フォロワー ' + formatCompactCount(entry.followers);
-      title = 'フォロー中: ' + entry.following.toLocaleString('ja-JP') + '人 / フォロワー: ' + entry.followers.toLocaleString('ja-JP') + '人';
-    } else if (hasFollowers) {
-      text = 'フォロワー ' + formatCompactCount(entry.followers);
-      title = 'フォロワー: ' + entry.followers.toLocaleString('ja-JP') + '人';
-    } else {
-      text = 'フォロー ' + formatCompactCount(entry.following);
-      title = 'フォロー中: ' + entry.following.toLocaleString('ja-JP') + '人';
+    var hasPosts = includePosts && typeof entry.posts === 'number';
+    var parts = [];
+    var titleParts = [];
+    if (entry.isPrivate === true) {
+      parts.push('🔒');
+      titleParts.push('非公開アカウント');
     }
-    return { text: text, title: title };
+    if (hasFollowing) {
+      parts.push('フォロー ' + formatCompactCount(entry.following));
+      titleParts.push('フォロー中: ' + entry.following.toLocaleString('ja-JP') + '人');
+    }
+    if (hasFollowers) {
+      parts.push('フォロワー ' + formatCompactCount(entry.followers));
+      titleParts.push('フォロワー: ' + entry.followers.toLocaleString('ja-JP') + '人');
+    }
+    if (hasPosts) {
+      parts.push('投稿 ' + formatCompactCount(entry.posts));
+      titleParts.push('投稿: ' + entry.posts.toLocaleString('ja-JP') + '件');
+    }
+    if (parts.length === 0) return null;
+    var prefix = parts[0] === '🔒' ? '🔒 ' : '';
+    var body = (prefix ? parts.slice(1) : parts).join(' · ');
+    return { text: prefix + body, title: titleParts.join(' / ') };
   }
 
-  var NON_USER_TEXT_RE = /^(?:フォロー|フォロー中|フォローする|フォローバック|フォロワー|投稿|返信|いいね|もっと見る|すべて見る|メッセージ|follow|following|followers|posts|replies|likes|more|message|\d+(?:秒|分|時間|日|週間|[smhdw])?)$/i;
+  var NON_USER_TEXT_RE = /^(?:フォロー|フォロー中|フォローする|フォローバック|フォロワー|投稿|返信|いいね|もっと見る|すべて見る|メッセージ|削除|リクエスト済|リクエスト中|承認待ち|follow|follow\s+back|following|followers|posts|replies|likes|more|message|remove|requested|\d+(?:秒|分|時間|日|週間|[smhdw])?)$/i;
+  var FOLLOW_LIST_BTN_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォロー中|フォロー済|リクエスト済|リクエスト中|承認待ち|follow|follow\s+back|following|requested)$/i;
+
+  function isInViewport(el) {
+    try {
+      var r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) return false;
+      var vh = window.innerHeight || 900;
+      return r.bottom >= -180 && r.top <= vh + 260;
+    } catch (_) {
+      return false;
+    }
+  }
 
   function isBadgeTargetLink(a, handle) {
     try {
       if (a.closest('nav, [role="navigation"]')) return false;
-      if (a.querySelector('img, video, canvas')) return false;
       var txt = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
       if (!txt || txt.length > 48) return false;
       if (NON_USER_TEXT_RE.test(txt)) return false;
-      // すでにそのプロフィールページを開いている場合のヘッダー内リンクには重複表示しない
       var curPath = (window.location && window.location.pathname || '').toLowerCase().replace(/^\/@?/, '').replace(/\/.*$/, '');
       if (curPath === handle && a.closest('header')) return false;
       return true;
     } catch (_) {
       return false;
     }
+  }
+
+  function extractHandleFromRow(row) {
+    try {
+      var links = row.querySelectorAll('a[href]');
+      for (var i = 0; i < links.length; i++) {
+        var h = extractHandleFromLink(links[i]);
+        if (h) return h;
+      }
+      var imgs = row.querySelectorAll('img[alt]');
+      for (var j = 0; j < imgs.length; j++) {
+        var alt = (imgs[j].getAttribute('alt') || '').trim();
+        var am = /^@?([a-z0-9._]{1,35})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
+        if (am) {
+          var ah = normalizeHandle(am[1]);
+          if (ah) return ah;
+        }
+      }
+      var spans = row.querySelectorAll('span, div');
+      for (var k = 0; k < spans.length && k < 40; k++) {
+        var s = spans[k];
+        if (s.children && s.children.length > 0) continue;
+        if (s.closest('button, [role="button"]')) continue;
+        var t = (s.textContent || '').trim();
+        if (!t || t.length > 36 || /\s/.test(t) || NON_USER_TEXT_RE.test(t)) continue;
+        var nh = normalizeHandle(t);
+        if (nh && (userIdMap[nh] || /[._0-9]/.test(nh) || /^[a-z][a-z0-9._]{2,30}$/.test(nh))) {
+          return nh;
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function findRowTextColumn(row, btn, handle) {
+    try {
+      var anchor = null;
+      var links = row.querySelectorAll('a[href]');
+      for (var i = 0; i < links.length; i++) {
+        if (extractHandleFromLink(links[i]) === handle && !links[i].querySelector('img, video, canvas')) {
+          anchor = links[i];
+          break;
+        }
+      }
+      if (!anchor) {
+        var leaves = row.querySelectorAll('span, div');
+        for (var j = 0; j < leaves.length && j < 40; j++) {
+          var el = leaves[j];
+          if (el.children && el.children.length > 0) continue;
+          if (el.closest('button, [role="button"]')) continue;
+          var txt = (el.textContent || '').trim().replace(/^@+/, '').toLowerCase();
+          if (txt === handle) {
+            anchor = el;
+            break;
+          }
+        }
+      }
+      if (!anchor) return null;
+      var cur = anchor;
+      var best = anchor.parentElement || anchor;
+      for (var step = 0; step < 5 && cur && cur !== row; step++) {
+        var p = cur.parentElement;
+        if (!p || p === row) break;
+        if (p.contains(btn)) break;
+        if (p.querySelector('img[width], canvas')) break;
+        var r = p.getBoundingClientRect();
+        if (r.width >= 90 && r.height >= 24 && r.height <= 120) {
+          best = p;
+        }
+        cur = p;
+      }
+      return best;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function upsertRowBadge(container, handle) {
+    ensureStyles();
+    var entry = statsMap[handle];
+    var display = formatBadgeDisplay(entry, true);
+    var badge = container.querySelector('.omni-ff-badge-row[data-omni-ff-user="' + handle + '"]');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.className = 'omni-ff-badge-row';
+      badge.setAttribute('data-omni-ff-user', handle);
+      badge.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        enqueueFetch(handle, true, true);
+        upsertRowBadge(container, handle);
+      });
+      try {
+        container.appendChild(badge);
+      } catch (_) {
+        return;
+      }
+    }
+
+    if (display) {
+      badge.className = 'omni-ff-badge-row';
+      if (badge.textContent !== display.text) badge.textContent = display.text;
+      if (badge.title !== display.title) badge.title = display.title + '（クリックで再取得）';
+    } else if (inFlight[handle] || queuedSet[handle]) {
+      badge.className = 'omni-ff-badge-row is-pending';
+      if (badge.textContent !== '人数を取得中…') badge.textContent = '人数を取得中…';
+      badge.title = 'フォロー数・フォロワー数を取得中';
+    } else if (failedMap[handle] || Date.now() < backoffUntil) {
+      badge.className = 'omni-ff-badge-row is-retry';
+      if (badge.textContent !== '人数を取得 ↻') badge.textContent = '人数を取得 ↻';
+      badge.title = 'クリックしてフォロー数・フォロワー数を取得';
+    } else {
+      badge.className = 'omni-ff-badge-row is-pending';
+      if (badge.textContent !== '人数を取得中…') badge.textContent = '人数を取得中…';
+      badge.title = 'クリックして優先取得';
+    }
+  }
+
+  function scanFollowListRows() {
+    var handledRows = [];
+    try {
+      var btns = document.querySelectorAll('button, [role="button"]');
+      for (var i = 0; i < btns.length && i < 600; i++) {
+        var btn = btns[i];
+        if (btn.closest('nav, [role="navigation"]')) continue;
+        var bTxt = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!bTxt || bTxt.length > 20 || !FOLLOW_LIST_BTN_RE.test(bTxt)) continue;
+
+        var row = null;
+        var cur = btn.parentElement;
+        for (var depth = 0; depth < 7 && cur && cur !== document.body; depth++) {
+          var rect = cur.getBoundingClientRect();
+          if (rect.height >= 42 && rect.height <= 190 && rect.width >= 210) {
+            var followBtnCount = 0;
+            var subBtns = cur.querySelectorAll('button, [role="button"]');
+            for (var sb = 0; sb < subBtns.length; sb++) {
+              var st = (subBtns[sb].innerText || subBtns[sb].textContent || '').replace(/\s+/g, ' ').trim();
+              if (st && st.length <= 20 && FOLLOW_LIST_BTN_RE.test(st)) followBtnCount++;
+            }
+            if (followBtnCount === 1) {
+              var hCand = extractHandleFromRow(cur);
+              if (hCand) {
+                row = cur;
+                break;
+              }
+            }
+          }
+          cur = cur.parentElement;
+        }
+        if (!row) continue;
+
+        var handle = extractHandleFromRow(row);
+        if (!handle) continue;
+        var col = findRowTextColumn(row, btn, handle);
+        if (!col) continue;
+
+        row.setAttribute('data-omni-ff-row', handle);
+        handledRows.push(row);
+        var visible = isInViewport(row);
+        if (!hasUsableStats(statsMap[handle]) && visible) {
+          enqueueFetch(handle, false, false);
+        }
+        upsertRowBadge(col, handle);
+      }
+    } catch (_) {}
+    return handledRows;
   }
 
   var io = null;
@@ -1620,16 +2281,16 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           if (entries[i].isIntersecting) {
             var el = entries[i].target;
             var h = el.getAttribute('data-omni-ff-handle');
-            if (h) enqueueFetch(h, false);
+            if (h) enqueueFetch(h, false, false);
           }
         }
-      }, { rootMargin: '120px' });
+      }, { rootMargin: '160px' });
     }
   } catch (_) {}
 
   function applyBadgeToLink(a, handle) {
     var entry = statsMap[handle];
-    var display = formatBadgeDisplay(entry);
+    var display = formatBadgeDisplay(entry, false);
     if (!display) return;
 
     var next = a.nextElementSibling;
@@ -1640,12 +2301,13 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       return;
     }
 
-    // 同一ヘッダー行・カード内に既に同じアカウントのバッジがあれば重複させない
-    var scope = a.closest('header, [role="listitem"], li') || a.parentElement;
+    var scope = a.closest('[data-omni-ff-row], header, [role="listitem"], li') || a.parentElement;
     if (scope) {
-      var existing = scope.querySelector('.omni-ff-badge[data-omni-ff-user="' + handle + '"]');
+      var existing = scope.querySelector('.omni-ff-badge[data-omni-ff-user="' + handle + '"], .omni-ff-badge-row[data-omni-ff-user="' + handle + '"]');
       if (existing) {
-        if (existing.textContent !== display.text) existing.textContent = display.text;
+        if (!existing.classList.contains('omni-ff-badge-row') && existing.textContent !== display.text) {
+          existing.textContent = display.text;
+        }
         return;
       }
     }
@@ -1663,30 +2325,34 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   function scanAndRender() {
     detectSelfAccountFromDom();
+    scanFollowListRows();
     var links = document.querySelectorAll('a[href]');
-    for (var i = 0; i < links.length && i < 600; i++) {
+    for (var i = 0; i < links.length && i < 3000; i++) {
       var a = links[i];
+      if (a.closest('[data-omni-ff-row]')) continue;
       var handle = a.getAttribute('data-omni-ff-handle');
-      if (handle === null) {
+      if (!handle) {
         handle = extractHandleFromLink(a);
-        a.setAttribute('data-omni-ff-handle', handle || '');
         if (handle) {
+          a.setAttribute('data-omni-ff-handle', handle);
           (function(linkEl, h) {
             linkEl.addEventListener('pointerenter', function() {
-              enqueueFetch(h, true);
+              enqueueFetch(h, true, false);
             }, { passive: true });
           })(a, handle);
-          if (isBadgeTargetLink(a, handle)) {
-            a.setAttribute('data-omni-ff-target', '1');
-            if (io) io.observe(a);
-          }
         }
       }
-      if (handle && a.getAttribute('data-omni-ff-target') === '1') {
-        if (statsMap[handle]) {
-          applyBadgeToLink(a, handle);
-        } else if (!io) {
-          enqueueFetch(handle, false);
+      if (handle) {
+        if (a.getAttribute('data-omni-ff-target') !== '1' && isBadgeTargetLink(a, handle)) {
+          a.setAttribute('data-omni-ff-target', '1');
+          if (io) io.observe(a);
+        }
+        if (a.getAttribute('data-omni-ff-target') === '1') {
+          if (hasUsableStats(statsMap[handle])) {
+            applyBadgeToLink(a, handle);
+          } else if (isInViewport(a)) {
+            enqueueFetch(handle, false, false);
+          }
         }
       }
     }
@@ -1697,14 +2363,40 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     renderTimer = setTimeout(function() {
       renderTimer = null;
       scanAndRender();
-    }, 180);
+    }, 150);
   }
 
   loadCache();
 
+  function hookHistory() {
+    try {
+      var origPush = history.pushState;
+      var origReplace = history.replaceState;
+      if (typeof origPush === 'function') {
+        history.pushState = function() {
+          var r = origPush.apply(this, arguments);
+          setTimeout(scheduleRenderBadges, 250);
+          return r;
+        };
+      }
+      if (typeof origReplace === 'function') {
+        history.replaceState = function() {
+          var r = origReplace.apply(this, arguments);
+          setTimeout(scheduleRenderBadges, 250);
+          return r;
+        };
+      }
+      window.addEventListener('popstate', function() { setTimeout(scheduleRenderBadges, 250); }, { passive: true });
+    } catch (_) {}
+  }
+
   function boot() {
+    hookHistory();
     scanSsrScripts();
     scanAndRender();
+    try {
+      window.addEventListener('scroll', scheduleRenderBadges, true);
+    } catch (_) {}
     try {
       if (typeof MutationObserver === 'function' && document.body) {
         var mo = new MutationObserver(function(mutations) {
@@ -1718,8 +2410,16 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         mo.observe(document.body, { childList: true, subtree: true });
       }
     } catch (_) {}
-    setTimeout(function() { scanSsrScripts(); scanAndRender(); }, 1200);
-    setTimeout(function() { scanAndRender(); }, 3500);
+    setTimeout(function() { scanSsrScripts(); scanAndRender(); }, 1000);
+    setTimeout(function() { scanAndRender(); }, 3000);
+    setInterval(function() {
+      if (document.visibilityState === 'visible') {
+        scanAndRender();
+        if (!queueRunning && queue.length > 0 && Date.now() >= backoffUntil) {
+          processQueue();
+        }
+      }
+    }, 2800);
   }
 
   if (document.readyState === 'loading') {
@@ -1805,10 +2505,11 @@ pub fn attach_tab_handlers(
             }
         }
 
-        // WebMessage でフォロー検知・ログインアカウントID＆実フォロー数を受信する
+        // WebMessage でフォロー/アンフォロー検知・ログインアカウントID＆実フォロー数を受信する
         // （スクリプト自体は WebviewBuilder::initialization_script でページ読み込み前に先行注入済み）
         {
             let cb_follow = callbacks.on_follow_detected.clone();
+            let cb_unfollow = callbacks.on_unfollow_detected.clone();
             let cb_identity = callbacks.on_account_identity.clone();
             let mut token = Default::default();
             let _ = wv.add_WebMessageReceived(
@@ -1818,7 +2519,25 @@ pub fn attach_tab_handlers(
                         if args.TryGetWebMessageAsString(&mut raw).is_ok() {
                             let msg = take_pwstr(raw);
                             if msg.contains("\"omnisns:follow\"") {
-                                cb_follow();
+                                let svc = serde_json::from_str::<serde_json::Value>(&msg)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("service")
+                                            .and_then(|x| x.as_str())
+                                            .map(|s| s.trim().to_ascii_lowercase())
+                                            .filter(|s| !s.is_empty())
+                                    });
+                                cb_follow(svc);
+                            } else if msg.contains("\"omnisns:unfollow\"") {
+                                let svc = serde_json::from_str::<serde_json::Value>(&msg)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("service")
+                                            .and_then(|x| x.as_str())
+                                            .map(|s| s.trim().to_ascii_lowercase())
+                                            .filter(|s| !s.is_empty())
+                                    });
+                                cb_unfollow(svc);
                             } else if msg.contains("\"omnisns:account-identity\"") {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
                                     if let Some(handle) = v
@@ -1827,6 +2546,11 @@ pub fn attach_tab_handlers(
                                         .map(|s| s.trim().trim_start_matches('@').to_lowercase())
                                         .filter(|s| !s.is_empty())
                                     {
+                                        let svc = v
+                                            .get("service")
+                                            .and_then(|x| x.as_str())
+                                            .map(|s| s.trim().to_ascii_lowercase())
+                                            .filter(|s| !s.is_empty());
                                         let following = v
                                             .get("following")
                                             .and_then(|x| x.as_u64())
@@ -1835,7 +2559,7 @@ pub fn attach_tab_handlers(
                                             .get("followers")
                                             .and_then(|x| x.as_u64())
                                             .map(|n| n.min(u32::MAX as u64) as u32);
-                                        cb_identity(handle, following, followers);
+                                        cb_identity(svc, handle, following, followers);
                                     }
                                 }
                             }

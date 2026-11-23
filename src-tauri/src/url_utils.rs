@@ -352,6 +352,63 @@ pub fn service_group_key(service_id: &str, url: &str, instance_id: &str) -> Stri
     format!("custom:{instance_id}")
 }
 
+/// 現在表示中のURLから対応する主要SNSカタログIDを推定する。
+/// 例: Threadsタブ内で `https://www.instagram.com/...` を開いた際に `"instagram"` を返す。
+pub fn detect_platform_service_from_url(raw_url: &str) -> Option<&'static str> {
+    let parsed = Url::parse(raw_url.trim()).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let matches_host = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    if matches_host("instagram.com") {
+        return Some("instagram");
+    }
+    if matches_host("threads.com") || matches_host("threads.net") {
+        return Some("threads");
+    }
+    if matches_host("bsky.app") || matches_host("bsky.social") {
+        return Some("bluesky");
+    }
+    if matches_host("mixi.social") {
+        return Some("mixi2");
+    }
+    if matches_host("x.com") || matches_host("twitter.com") {
+        return Some("x");
+    }
+    if matches_host("tiktok.com") {
+        return Some("tiktok");
+    }
+    if matches_host("facebook.com") {
+        return Some("facebook");
+    }
+    if matches_host("messenger.com") {
+        return Some("messenger");
+    }
+    if matches_host("note.com") {
+        return Some("note");
+    }
+    if matches_host("youtube.com") {
+        return Some("youtube");
+    }
+    if matches_host("twitch.tv") {
+        return Some("twitch");
+    }
+    if matches_host("reddit.com") {
+        return Some("reddit");
+    }
+    if matches_host("pinterest.com") || matches_host("pinterest.jp") {
+        return Some("pinterest");
+    }
+    if matches_host("linkedin.com") {
+        return Some("linkedin");
+    }
+    if matches_host("tumblr.com") {
+        return Some("tumblr");
+    }
+    if matches_host("pixiv.net") {
+        return Some("pixiv");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +522,34 @@ mod tests {
         assert_ne!(
             service_group_key("custom", "https://other.example.org/", "svc-3"),
             "custom:chat.example.com"
+        );
+    }
+
+    #[test]
+    fn detect_platform_service_handles_threads_to_instagram_navigation() {
+        assert_eq!(
+            detect_platform_service_from_url("https://www.instagram.com/alice/followers/"),
+            Some("instagram")
+        );
+        assert_eq!(
+            detect_platform_service_from_url("https://www.threads.com/@alice"),
+            Some("threads")
+        );
+        assert_eq!(
+            detect_platform_service_from_url("https://www.threads.net/@alice"),
+            Some("threads")
+        );
+        assert_eq!(
+            detect_platform_service_from_url("https://bsky.app/profile/alice.bsky.social"),
+            Some("bluesky")
+        );
+        assert_eq!(
+            detect_platform_service_from_url("https://mixi.social/home"),
+            Some("mixi2")
+        );
+        assert_eq!(
+            detect_platform_service_from_url("https://example.com/unknown"),
+            None
         );
     }
 }

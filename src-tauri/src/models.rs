@@ -60,6 +60,10 @@ pub struct ServiceInstance {
     #[serde(default)]
     pub follow_count_total: u32,
     #[serde(default)]
+    pub unfollow_count_today: u32,
+    #[serde(default)]
+    pub unfollow_count_total: u32,
+    #[serde(default)]
     pub follow_count_date: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_handle: Option<String>,
@@ -206,6 +210,9 @@ pub struct BootstrapPayload {
     pub runtime_states: Vec<TabRuntimeState>,
     pub app_version: String,
     pub closed_tabs_count: usize,
+    pub gmail_open: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gmail_runtime: Option<BrowserTabInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,6 +221,9 @@ pub struct StateUpdatedPayload {
     pub config: AppConfig,
     pub runtime_states: Vec<TabRuntimeState>,
     pub closed_tabs_count: usize,
+    pub gmail_open: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gmail_runtime: Option<BrowserTabInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]

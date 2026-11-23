@@ -3,6 +3,7 @@ import { omniApi } from './omni-api';
 import {
   AddInstancePayload,
   AppConfig,
+  BrowserTabInfo,
   CatalogService,
   CategoryMeta,
   ServiceCategory,
@@ -11,6 +12,7 @@ import {
   UserAgentMode
 } from '../shared/types';
 import {
+  detectPlatformServiceFromUrl,
   getAccountDisplayLabel,
   getServiceGroupKey,
   makeBadgeText,
@@ -34,6 +36,8 @@ interface UiState {
   runtimeMap: Map<string, TabRuntimeState>;
   lastActiveByGroup: Map<string, string>;
   closedTabsCount: number;
+  gmailOpen: boolean;
+  gmailRuntime: BrowserTabInfo | null;
   selectedCatalogCategory: ServiceCategory | 'all';
   catalogSearchQuery: string;
   sidebarFilterQuery: string;
@@ -49,6 +53,8 @@ const state: UiState = {
   runtimeMap: new Map(),
   lastActiveByGroup: new Map(),
   closedTabsCount: 0,
+  gmailOpen: false,
+  gmailRuntime: null,
   selectedCatalogCategory: 'all',
   catalogSearchQuery: '',
   sidebarFilterQuery: '',
@@ -585,7 +591,7 @@ function renderAccountBar(): void {
     }`;
 
     pill.addEventListener('click', () => {
-      if (!isCurrent || rt?.isSleeping) {
+      if (!isCurrent || rt?.isSleeping || state.gmailOpen) {
         void omniApi.activateTab(inst.instanceId);
       }
     });
@@ -736,17 +742,74 @@ const ICON_VOLUME_ON =
 const ICON_VOLUME_OFF =
   '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>';
 
+function getInstanceDisplayTitle(inst: ServiceInstance): string {
+  const key = getServiceGroupKey(inst);
+  const group = getServiceGroups().find((g) => g.key === key);
+  if (!group) return inst.name;
+  const idx = Math.max(
+    0,
+    group.accounts.findIndex((a) => a.instanceId === inst.instanceId)
+  );
+  const label = getAccountDisplayLabel(inst, idx, group.displayName);
+  return `${group.displayName} · ${label}`;
+}
+
 function getActiveDisplayTitle(): string {
   const active = getActiveInstance();
   if (!active) return 'サービス未選択';
-  const group = getActiveGroup();
-  if (!group) return active.name;
-  const idx = Math.max(
-    0,
-    group.accounts.findIndex((a) => a.instanceId === active.instanceId)
-  );
-  const label = getAccountDisplayLabel(active, idx, group.displayName);
-  return `${group.displayName} · ${label}`;
+  return getInstanceDisplayTitle(active);
+}
+
+interface CounterTargetInfo {
+  target: ServiceInstance | undefined;
+  isCrossSite: boolean;
+  effectiveService: string | null;
+}
+
+/**
+ * Threads タブ内で Instagram を開いている場合など、現在表示中URLのSNSに合わせて
+ * フォロー・アンフォローカウンターの表示／操作対象インスタンスを解決する。
+ */
+function getCounterTargetInfo(): CounterTargetInfo {
+  const active = getActiveInstance();
+  if (!active || !state.config) {
+    return { target: undefined, isCrossSite: false, effectiveService: null };
+  }
+  const rt = state.runtimeMap.get(active.instanceId);
+  const detectedService = detectPlatformServiceFromUrl(rt?.currentUrl);
+  if (!detectedService || detectedService === active.serviceId) {
+    return { target: active, isCrossSite: false, effectiveService: active.serviceId };
+  }
+
+  const candidates = state.config.instances.filter((i) => i.serviceId === detectedService);
+  if (candidates.length === 0) {
+    return { target: undefined, isCrossSite: true, effectiveService: detectedService };
+  }
+
+  // 1. 同一 @handle（Threads ↔ Instagram 連携アカウント）
+  if (active.detectedHandle) {
+    const byHandle = candidates.find((c) => c.detectedHandle === active.detectedHandle);
+    if (byHandle) {
+      return { target: byHandle, isCrossSite: true, effectiveService: detectedService };
+    }
+  }
+  // 2. 対象サービスで直近アクティブだったアカウント
+  const remembered = state.lastActiveByGroup.get(detectedService);
+  if (remembered) {
+    const byLast = candidates.find((c) => c.instanceId === remembered);
+    if (byLast) {
+      return { target: byLast, isCrossSite: true, effectiveService: detectedService };
+    }
+  }
+  // 3. 同一アカウントラベル
+  const activeLbl = active.accountLabel?.trim();
+  if (activeLbl) {
+    const byLbl = candidates.find((c) => c.accountLabel?.trim() === activeLbl);
+    if (byLbl) {
+      return { target: byLbl, isCrossSite: true, effectiveService: detectedService };
+    }
+  }
+  return { target: candidates[0], isCrossSite: true, effectiveService: detectedService };
 }
 
 function renderToolbarAndViewport(): void {
@@ -764,11 +827,29 @@ function renderToolbarAndViewport(): void {
   const zoomResetBtn = el<HTMLButtonElement>('btn-zoom-reset');
 
   const followBtn = el<HTMLButtonElement>('btn-follow-counter');
+  const followLabelEl = el<HTMLElement>('follow-pill-label');
   const followTodayEl = el<HTMLElement>('follow-today-count');
+  const unfollowSepEl = el<HTMLElement>('unfollow-pill-sep');
+  const unfollowLabelEl = el<HTMLElement>('unfollow-pill-label');
+  const unfollowTodayEl = el<HTMLElement>('unfollow-today-count');
   const collapsedNewTabBtn = el<HTMLButtonElement>('btn-collapsed-new-subtab');
   const collapsedFollowBtn = el<HTMLButtonElement>('btn-collapsed-follow');
   const collapsedFollowEl = el<HTMLSpanElement>('collapsed-follow-count');
   const collapsedReloadBtn = el<HTMLButtonElement>('btn-collapsed-reload');
+  const gmailBtn = el<HTMLButtonElement>('btn-open-gmail');
+  const gmailLabelEl = el<HTMLSpanElement>('open-gmail-label');
+  const collapsedGmailBtn = el<HTMLButtonElement>('btn-collapsed-gmail');
+  const collapsedGmailLabelEl = el<HTMLSpanElement>('collapsed-gmail-label');
+
+  gmailBtn.classList.toggle('active', state.gmailOpen);
+  collapsedGmailBtn.classList.toggle('active', state.gmailOpen);
+  gmailLabelEl.textContent = state.gmailOpen ? 'Gmail ✕' : 'Gmail';
+  collapsedGmailLabelEl.textContent = state.gmailOpen ? 'Gmail ✕' : 'Gmail';
+  const gmailTip = state.gmailOpen
+    ? 'Gmailを閉じて元のSNSへ戻る'
+    : 'アプリ内で Gmail を開く（SNS認証メール確認用）';
+  gmailBtn.title = gmailTip;
+  collapsedGmailBtn.title = gmailTip;
 
   const emptyEl = el<HTMLDivElement>('empty-state');
   const sleepingEl = el<HTMLDivElement>('sleeping-state');
@@ -777,6 +858,43 @@ function renderToolbarAndViewport(): void {
   emptyEl.classList.add('hidden');
   sleepingEl.classList.add('hidden');
   errorEl.classList.add('hidden');
+
+  if (state.gmailOpen) {
+    const grt = state.gmailRuntime;
+    backBtn.disabled = !grt?.canGoBack;
+    fwdBtn.disabled = !grt?.canGoForward;
+    collapsedReloadBtn.disabled = false;
+    copyUrlBtn.disabled = false;
+    urlInput.disabled = false;
+    dotEl.className = `status-dot ${grt?.isLoading ? 'loading' : 'ready'}`;
+    nameEl.textContent = 'Gmail（アプリ内）';
+    const gmailUrl = grt?.currentUrl || 'https://mail.google.com/';
+    if (document.activeElement !== urlInput) {
+      urlInput.value = gmailUrl;
+    }
+    if (grt?.loadError) {
+      el<HTMLParagraphElement>('error-detail').textContent = grt.loadError;
+      errorEl.classList.remove('hidden');
+    }
+    if (!active) {
+      followBtn.disabled = true;
+      collapsedNewTabBtn.disabled = true;
+      collapsedFollowBtn.disabled = true;
+      followTodayEl.textContent = '0';
+      unfollowTodayEl.textContent = '0';
+      unfollowSepEl.classList.add('hidden');
+      unfollowLabelEl.classList.add('hidden');
+      unfollowTodayEl.classList.add('hidden');
+      collapsedFollowEl.textContent = '0';
+      followBtn.classList.remove('has-count');
+      collapsedFollowBtn.classList.remove('has-count');
+      uaBtn.textContent = 'PC版';
+      uaBtn.classList.remove('mobile-mode');
+      muteBtn.innerHTML = ICON_VOLUME_ON;
+      zoomResetBtn.textContent = '100%';
+    }
+    return;
+  }
 
   if (!active) {
     backBtn.disabled = true;
@@ -789,6 +907,10 @@ function renderToolbarAndViewport(): void {
     urlInput.disabled = true;
     urlInput.value = '';
     followTodayEl.textContent = '0';
+    unfollowTodayEl.textContent = '0';
+    unfollowSepEl.classList.add('hidden');
+    unfollowLabelEl.classList.add('hidden');
+    unfollowTodayEl.classList.add('hidden');
     collapsedFollowEl.textContent = '0';
     followBtn.classList.remove('has-count');
     collapsedFollowBtn.classList.remove('has-count');
@@ -803,31 +925,53 @@ function renderToolbarAndViewport(): void {
   }
 
   const displayTitle = getActiveDisplayTitle();
-  const todayFollow = active.followCountToday ?? 0;
-  followBtn.disabled = false;
+  const counterInfo = getCounterTargetInfo();
+  const counterInst = counterInfo.target;
+  const todayFollow = counterInst?.followCountToday ?? 0;
+  const todayUnfollow = counterInst?.unfollowCountToday ?? 0;
+  followBtn.disabled = !counterInst;
   collapsedNewTabBtn.disabled = false;
-  collapsedFollowBtn.disabled = false;
+  collapsedFollowBtn.disabled = !counterInst;
   collapsedReloadBtn.disabled = false;
   copyUrlBtn.disabled = false;
   urlInput.disabled = false;
+  followLabelEl.textContent =
+    counterInfo.isCrossSite && counterInst ? `${counterInst.badge} フォロー` : 'フォロー';
   followTodayEl.textContent = String(todayFollow);
-  collapsedFollowEl.textContent = String(todayFollow);
-  followBtn.classList.toggle('has-count', todayFollow > 0);
-  collapsedFollowBtn.classList.toggle('has-count', todayFollow > 0);
-  const liveParts: string[] = [];
-  if (active.detectedHandle) liveParts.push(`@${active.detectedHandle}`);
-  if (typeof active.snsFollowingCount === 'number') {
-    liveParts.push(`SNS実フォロー中 ${active.snsFollowingCount.toLocaleString()}人`);
+  unfollowTodayEl.textContent = String(todayUnfollow);
+  const showUnfollowPill = todayUnfollow > 0;
+  unfollowSepEl.classList.toggle('hidden', !showUnfollowPill);
+  unfollowLabelEl.classList.toggle('hidden', !showUnfollowPill);
+  unfollowTodayEl.classList.toggle('hidden', !showUnfollowPill);
+  const crossPrefix = counterInfo.isCrossSite && counterInst ? `${counterInst.badge} ` : '';
+  collapsedFollowEl.textContent = showUnfollowPill
+    ? `${crossPrefix}${todayFollow}/-${todayUnfollow}`
+    : `${crossPrefix}${todayFollow}`;
+  followBtn.classList.toggle('has-count', todayFollow > 0 || todayUnfollow > 0);
+  collapsedFollowBtn.classList.toggle('has-count', todayFollow > 0 || todayUnfollow > 0);
+  if (counterInst) {
+    const liveParts: string[] = [];
+    if (counterInfo.isCrossSite) {
+      liveParts.push(`${getInstanceDisplayTitle(counterInst)} を表示中`);
+    }
+    if (counterInst.detectedHandle) liveParts.push(`@${counterInst.detectedHandle}`);
+    if (typeof counterInst.snsFollowingCount === 'number') {
+      liveParts.push(`SNS実フォロー中 ${counterInst.snsFollowingCount.toLocaleString()}人`);
+    }
+    if (typeof counterInst.snsFollowersCount === 'number') {
+      liveParts.push(`フォロワー ${counterInst.snsFollowersCount.toLocaleString()}人`);
+    }
+    const baseTip = `フォロー: 今日 ${todayFollow} / 累計 ${counterInst.followCountTotal ?? 0} · アンフォロー: 今日 ${todayUnfollow} / 累計 ${counterInst.unfollowCountTotal ?? 0}`;
+    const followTip = liveParts.length > 0 ? `${baseTip}\n${liveParts.join(' · ')}` : baseTip;
+    followBtn.title = followTip;
+    collapsedFollowBtn.title = followTip;
+  } else if (counterInfo.isCrossSite && counterInfo.effectiveService) {
+    const svcName =
+      getCatalogService(counterInfo.effectiveService)?.name ?? counterInfo.effectiveService;
+    const tip = `${svcName} を表示中（サービス一覧に ${svcName} を追加するとカウントできます）`;
+    followBtn.title = tip;
+    collapsedFollowBtn.title = tip;
   }
-  if (typeof active.snsFollowersCount === 'number') {
-    liveParts.push(`フォロワー ${active.snsFollowersCount.toLocaleString()}人`);
-  }
-  const followTip =
-    liveParts.length > 0
-      ? `フォロー回数カウンター（今日: ${todayFollow} / 累計: ${active.followCountTotal ?? 0}）\n${liveParts.join(' · ')}`
-      : `フォロー回数カウンター（今日: ${todayFollow} / 累計: ${active.followCountTotal ?? 0}）`;
-  followBtn.title = followTip;
-  collapsedFollowBtn.title = followTip;
   if (!el('follow-modal').classList.contains('hidden')) {
     renderFollowModal();
   }
@@ -1160,20 +1304,35 @@ function parseSharedSyncConfig(raw: string): { token: string; gistId: string } |
 }
 
 function renderFollowModal(): void {
-  const active = getActiveInstance();
+  const counterInfo = getCounterTargetInfo();
+  const active = counterInfo.target;
   if (!active || !state.config) return;
   const todayCount = active.followCountToday ?? 0;
   const totalCount = active.followCountTotal ?? 0;
+  const unfollowTodayCount = active.unfollowCountToday ?? 0;
+  const unfollowTotalCount = active.unfollowCountTotal ?? 0;
 
-  const accountSubtitle = active.detectedHandle
-    ? `${getActiveDisplayTitle()} (@${active.detectedHandle})`
-    : getActiveDisplayTitle();
+  const baseTitle = getInstanceDisplayTitle(active);
+  const withHandle = active.detectedHandle
+    ? `${baseTitle} (@${active.detectedHandle})`
+    : baseTitle;
+  const accountSubtitle = counterInfo.isCrossSite
+    ? `${withHandle}（${getActiveDisplayTitle()}タブ内で表示中）`
+    : withHandle;
   el<HTMLParagraphElement>('follow-modal-account').textContent = accountSubtitle;
   el<HTMLElement>('follow-modal-today').textContent = String(todayCount);
   el<HTMLElement>('follow-modal-total').textContent = String(totalCount);
   el<HTMLButtonElement>('btn-follow-dec').disabled = todayCount <= 0 && totalCount <= 0;
   el<HTMLButtonElement>('btn-follow-reset-today').disabled = todayCount <= 0;
   el<HTMLButtonElement>('btn-follow-reset-all').disabled = todayCount <= 0 && totalCount <= 0;
+
+  el<HTMLElement>('unfollow-modal-today').textContent = String(unfollowTodayCount);
+  el<HTMLElement>('unfollow-modal-total').textContent = String(unfollowTotalCount);
+  el<HTMLButtonElement>('btn-unfollow-dec').disabled =
+    unfollowTodayCount <= 0 && unfollowTotalCount <= 0;
+  el<HTMLButtonElement>('btn-unfollow-reset-today').disabled = unfollowTodayCount <= 0;
+  el<HTMLButtonElement>('btn-unfollow-reset-all').disabled =
+    unfollowTodayCount <= 0 && unfollowTotalCount <= 0;
 
   // SNS サーバー側の実フォロー中／フォロワー数
   const snsLiveBar = el<HTMLDivElement>('follow-sns-live-bar');
@@ -1199,13 +1358,11 @@ function renderFollowModal(): void {
   // PC・スマホ同期設定
   const fs = state.config.settings.followSync;
   if (fs) {
-    const lanCheck = el<HTMLInputElement>('follow-sync-lan');
     const tokenInput = el<HTMLInputElement>('follow-sync-token');
     const gistInput = el<HTMLInputElement>('follow-sync-gist');
     const badge = el<HTMLSpanElement>('follow-sync-badge');
     const statusEl = el<HTMLDivElement>('follow-sync-status');
 
-    lanCheck.checked = fs.lanEnabled;
     if (document.activeElement !== tokenInput) {
       tokenInput.value = fs.githubToken ?? '';
     }
@@ -1214,25 +1371,17 @@ function renderFollowModal(): void {
     }
 
     const hasCloud = Boolean(fs.githubToken?.trim());
-    if (hasCloud && fs.lanEnabled) {
-      badge.textContent = 'LAN + クラウド';
-    } else if (hasCloud) {
-      badge.textContent = 'クラウド同期';
-    } else if (fs.lanEnabled) {
-      badge.textContent = 'LAN待機中';
-    } else {
-      badge.textContent = '同期OFF';
-    }
+    badge.textContent = hasCloud ? 'クラウド同期' : '未設定';
 
     const timeStr = formatSyncTime(fs.lastSyncAt);
     if (fs.lastSyncStatus) {
       statusEl.textContent = timeStr
         ? `${fs.lastSyncStatus}（最終: ${timeStr}）`
         : fs.lastSyncStatus;
-    } else if (fs.lanEnabled) {
-      statusEl.textContent = '同一Wi-Fi内のPC・スマホと自動で合算共有されます';
+    } else if (hasCloud) {
+      statusEl.textContent = 'GitHub 非公開 Gist で PC・スマホ間を自動同期します';
     } else {
-      statusEl.textContent = '同期は無効です（LAN または GitHub Gist を有効にしてください）';
+      statusEl.textContent = 'GitHub Token を設定すると PC・スマホ間で自動同期されます';
     }
   }
 
@@ -1241,13 +1390,16 @@ function renderFollowModal(): void {
   const instances = state.config.instances;
   if (instances.length >= 2) {
     let allToday = 0;
+    let allUnfollowToday = 0;
     summaryList.innerHTML = '';
     const groups = getServiceGroups();
     for (const grp of groups) {
       grp.accounts.forEach((inst, idx) => {
         const c = inst.followCountToday ?? 0;
+        const u = inst.unfollowCountToday ?? 0;
         allToday += c;
-        if (c > 0 || inst.instanceId === active.instanceId) {
+        allUnfollowToday += u;
+        if (c > 0 || u > 0 || inst.instanceId === active.instanceId) {
           const row = document.createElement('div');
           row.className = 'follow-summary-row';
           const lbl = getAccountDisplayLabel(inst, idx, grp.displayName);
@@ -1256,14 +1408,15 @@ function renderFollowModal(): void {
             ? `${grp.displayName} · ${lbl} (@${inst.detectedHandle})`
             : `${grp.displayName} · ${lbl}`;
           const cntSpan = document.createElement('strong');
-          cntSpan.textContent = `${c} 回`;
+          cntSpan.textContent = u > 0 ? `+${c} / -${u} 回` : `${c} 回`;
           row.appendChild(nameSpan);
           row.appendChild(cntSpan);
           summaryList.appendChild(row);
         }
       });
     }
-    el<HTMLElement>('follow-all-today').textContent = `${allToday} 回`;
+    el<HTMLElement>('follow-all-today').textContent =
+      allUnfollowToday > 0 ? `フォロー ${allToday} / 解除 ${allUnfollowToday} 回` : `${allToday} 回`;
     summaryBox.classList.remove('hidden');
   } else {
     summaryBox.classList.add('hidden');
@@ -1271,7 +1424,7 @@ function renderFollowModal(): void {
 }
 
 async function openFollowModal(): Promise<void> {
-  if (!getActiveInstance()) return;
+  if (!getCounterTargetInfo().target) return;
   renderFollowModal();
   el('follow-modal').classList.remove('hidden');
   await syncOverlayToMain();
@@ -1353,7 +1506,7 @@ function renderTabBar(): void {
     chip.title = `${tab.title || active.name}\n${tab.currentUrl}\n（中クリックで閉じる）`;
 
     chip.addEventListener('click', () => {
-      if (!isCurrent || tab.isSleeping) {
+      if (!isCurrent || tab.isSleeping || state.gmailOpen) {
         void omniApi.activateSubTab(active.instanceId, tab.tabId);
       }
     });
@@ -1437,6 +1590,19 @@ function bindEvents(): void {
 
   // Toolbar actions
   const runActiveAction = async (action: string) => {
+    if (
+      state.gmailOpen &&
+      (action === 'back' ||
+        action === 'forward' ||
+        action === 'reload' ||
+        action === 'hard-reload' ||
+        action === 'home' ||
+        action === 'open-external' ||
+        action === 'devtools')
+    ) {
+      await omniApi.gmailAction(action);
+      return;
+    }
     const active = getActiveInstance();
     if (!active) return;
     await omniApi.tabAction(active.instanceId, action);
@@ -1532,16 +1698,22 @@ function bindEvents(): void {
     void omniApi.openExternalUrl('https://hisator-notebook.com/');
   });
 
-  const openGmail = () => {
-    void omniApi.openExternalUrl('https://mail.google.com/');
+  const toggleGmail = () => {
+    void omniApi.toggleGmail();
   };
-  el<HTMLButtonElement>('btn-open-gmail').addEventListener('click', openGmail);
-  el<HTMLButtonElement>('btn-collapsed-gmail').addEventListener('click', openGmail);
+  el<HTMLButtonElement>('btn-open-gmail').addEventListener('click', toggleGmail);
+  el<HTMLButtonElement>('btn-collapsed-gmail').addEventListener('click', toggleGmail);
 
   el<HTMLButtonElement>('btn-copy-url').addEventListener('click', async () => {
-    const active = getActiveInstance();
-    const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
-    const urlText = rt?.currentUrl || active?.url || el<HTMLInputElement>('active-url-input').value.trim();
+    const urlText = state.gmailOpen
+      ? state.gmailRuntime?.currentUrl ||
+        el<HTMLInputElement>('active-url-input').value.trim() ||
+        'https://mail.google.com/'
+      : (() => {
+          const active = getActiveInstance();
+          const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+          return rt?.currentUrl || active?.url || el<HTMLInputElement>('active-url-input').value.trim();
+        })();
     if (!urlText) return;
     await omniApi.copyText(urlText);
     showToast('URLをクリップボードにコピーしました');
@@ -1555,21 +1727,34 @@ function bindEvents(): void {
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      const active = getActiveInstance();
-      const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
-      urlInput.value = rt?.currentUrl || active?.url || '';
+      if (state.gmailOpen) {
+        urlInput.value = state.gmailRuntime?.currentUrl || 'https://mail.google.com/';
+      } else {
+        const active = getActiveInstance();
+        const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+        urlInput.value = rt?.currentUrl || active?.url || '';
+      }
       urlInput.blur();
       return;
     }
     if (e.key === 'Enter') {
       e.preventDefault();
-      const active = getActiveInstance();
-      if (!active) return;
       const normalized = normalizeServiceUrl(urlInput.value);
       if (!normalized) {
         showToast('有効な http:// または https:// URL を入力してください');
         return;
       }
+      if (state.gmailOpen) {
+        try {
+          await omniApi.navigateGmail(normalized);
+          urlInput.blur();
+        } catch (err) {
+          showToast(String(err));
+        }
+        return;
+      }
+      const active = getActiveInstance();
+      if (!active) return;
       const openInNewTab = e.altKey || e.ctrlKey || e.metaKey;
       try {
         if (openInNewTab) {
@@ -1700,34 +1885,56 @@ function bindEvents(): void {
     }
   });
   el<HTMLButtonElement>('btn-follow-inc').addEventListener('click', async () => {
-    const active = getActiveInstance();
-    if (!active) return;
-    await omniApi.adjustFollowCount(active.instanceId, 1);
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
+    await omniApi.adjustFollowCount(target.instanceId, 1);
   });
   el<HTMLButtonElement>('btn-follow-dec').addEventListener('click', async () => {
-    const active = getActiveInstance();
-    if (!active) return;
-    await omniApi.adjustFollowCount(active.instanceId, -1);
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
+    await omniApi.adjustFollowCount(target.instanceId, -1);
   });
   el<HTMLButtonElement>('btn-follow-reset-today').addEventListener('click', async () => {
-    const active = getActiveInstance();
-    if (!active) return;
-    await omniApi.resetFollowCount(active.instanceId, false);
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
+    await omniApi.resetFollowCount(target.instanceId, false);
     showToast('今日のフォロー回数をリセットしました');
   });
   el<HTMLButtonElement>('btn-follow-reset-all').addEventListener('click', async () => {
-    const active = getActiveInstance();
-    if (!active) return;
-    await omniApi.resetFollowCount(active.instanceId, true);
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
+    await omniApi.resetFollowCount(target.instanceId, true);
     showToast('フォロー回数をすべてリセットしました');
+  });
+  el<HTMLButtonElement>('btn-unfollow-inc').addEventListener('click', async () => {
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
+    await omniApi.adjustUnfollowCount(target.instanceId, 1);
+  });
+  el<HTMLButtonElement>('btn-unfollow-dec').addEventListener('click', async () => {
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
+    await omniApi.adjustUnfollowCount(target.instanceId, -1);
+  });
+  el<HTMLButtonElement>('btn-unfollow-reset-today').addEventListener('click', async () => {
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
+    await omniApi.resetUnfollowCount(target.instanceId, false);
+    showToast('今日のアンフォロー回数をリセットしました');
+  });
+  el<HTMLButtonElement>('btn-unfollow-reset-all').addEventListener('click', async () => {
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
+    await omniApi.resetUnfollowCount(target.instanceId, true);
+    showToast('アンフォロー回数をすべてリセットしました');
   });
 
   const saveFollowHandle = async () => {
-    const active = getActiveInstance();
-    if (!active) return;
+    const target = getCounterTargetInfo().target;
+    if (!target) return;
     const raw = el<HTMLInputElement>('follow-handle-input').value.trim();
     try {
-      const updated = await omniApi.setFollowHandle(active.instanceId, raw);
+      const updated = await omniApi.setFollowHandle(target.instanceId, raw);
       showToast(
         updated.detectedHandle
           ? `同期アカウントを @${updated.detectedHandle} に設定しました`
@@ -1743,12 +1950,6 @@ function bindEvents(): void {
       e.preventDefault();
       void saveFollowHandle();
     }
-  });
-
-  el<HTMLInputElement>('follow-sync-lan').addEventListener('change', async (e) => {
-    const lanEnabled = (e.target as HTMLInputElement).checked;
-    await omniApi.updateFollowSyncSettings({ lanEnabled });
-    showToast(lanEnabled ? '同一Wi-FiのLAN自動同期を有効にしました' : 'LAN自動同期を無効にしました');
   });
 
   el<HTMLButtonElement>('btn-follow-open-github-token').addEventListener('click', () => {
@@ -1769,13 +1970,12 @@ function bindEvents(): void {
 
   el<HTMLButtonElement>('btn-follow-sync-now').addEventListener('click', async () => {
     const btn = el<HTMLButtonElement>('btn-follow-sync-now');
-    const lanEnabled = el<HTMLInputElement>('follow-sync-lan').checked;
     const githubToken = el<HTMLInputElement>('follow-sync-token').value.trim();
     const gistId = el<HTMLInputElement>('follow-sync-gist').value.trim();
     btn.disabled = true;
     btn.textContent = '同期中...';
     try {
-      await omniApi.updateFollowSyncSettings({ lanEnabled, githubToken, gistId });
+      await omniApi.updateFollowSyncSettings({ githubToken, gistId });
       const res = await omniApi.syncFollowNow();
       showToast(res.lastSyncStatus || '同期が完了しました');
     } catch (err) {
@@ -1808,9 +2008,7 @@ function bindEvents(): void {
       }
       el<HTMLInputElement>('follow-sync-token').value = parsed.token;
       el<HTMLInputElement>('follow-sync-gist').value = parsed.gistId;
-      const lanEnabled = el<HTMLInputElement>('follow-sync-lan').checked;
       await omniApi.updateFollowSyncSettings({
-        lanEnabled,
         githubToken: parsed.token,
         gistId: parsed.gistId
       });
@@ -2016,6 +2214,8 @@ async function bootstrap(): Promise<void> {
   omniApi.onStateUpdated((payload) => {
     state.config = payload.config;
     state.closedTabsCount = payload.closedTabsCount ?? 0;
+    state.gmailOpen = Boolean(payload.gmailOpen);
+    state.gmailRuntime = payload.gmailRuntime ?? null;
     state.runtimeMap = new Map(payload.runtimeStates.map((rt) => [rt.instanceId, rt]));
     renderAll();
   });
@@ -2049,6 +2249,8 @@ async function bootstrap(): Promise<void> {
   state.catalog = data.catalog;
   state.categories = data.categories;
   state.closedTabsCount = data.closedTabsCount ?? 0;
+  state.gmailOpen = Boolean(data.gmailOpen);
+  state.gmailRuntime = data.gmailRuntime ?? null;
   state.runtimeMap = new Map(data.runtimeStates.map((rt) => [rt.instanceId, rt]));
 
   el<HTMLSpanElement>('app-version').textContent = `v${data.appVersion} · Windows`;

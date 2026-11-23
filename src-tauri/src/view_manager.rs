@@ -11,17 +11,16 @@ use tauri::{
     WebviewWindowBuilder,
 };
 
-use crate::follow_sync::{
-    FollowSyncLedger, FollowSyncSettings, LanSyncHandle, UpdateFollowSyncPatch,
-};
+use crate::follow_sync::{FollowSyncSettings, UpdateFollowSyncPatch};
 use crate::gesture::{step_tab_index, GestureSettings};
 use crate::models::{
     BrowserTabInfo, SavedSubTab, ServiceInstance, TabRuntimeState, UpdateSettingsPatch,
 };
 use crate::store::ConfigStore;
 use crate::url_utils::{
-    build_user_agent, is_auth_popup_for_site, is_auth_popup_url, is_http_url, is_same_site_url,
-    normalize_service_url, parse_unread_count_from_title, service_group_key,
+    build_user_agent, detect_platform_service_from_url, is_auth_popup_for_site, is_auth_popup_url,
+    is_http_url, is_same_site_url, normalize_service_url, parse_unread_count_from_title,
+    service_group_key,
 };
 
 /// 同一プロファイルを共有する全タブ WebView2 へ統一指定する高速起動フラグ。
@@ -32,6 +31,7 @@ const WEBVIEW2_FAST_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI
 
 const BG_WARM_MAX_SECS: u64 = 8;
 const BG_WARM_POST_LOAD_MS: u64 = 2500;
+const GMAIL_HOME_URL: &str = "https://mail.google.com/";
 
 pub const ACCOUNTBAR_HEIGHT: f64 = 40.0;
 pub const TOOLBAR_HEIGHT: f64 = 44.0;
@@ -115,7 +115,7 @@ impl BrowserTabEntry {
         }
     }
 
-    fn to_info(&self) -> BrowserTabInfo {
+    pub fn to_info(&self) -> BrowserTabInfo {
         BrowserTabInfo {
             tab_id: self.tab_id.clone(),
             instance_id: self.instance_id.clone(),
@@ -237,8 +237,12 @@ pub struct AppStateInner {
     /// `tab_id -> pending_webview_label`（`win.add_child` 実行中の重複生成防止および孤立判定用）
     pub creating_tabs: HashMap<String, String>,
     pub last_active_by_group: HashMap<String, String>,
+    pub cross_site_identities: HashMap<String, (String, String)>,
     pub closed_tabs: Vec<ClosedEntry>,
     pub active_instance_id: Option<String>,
+    pub gmail_open: bool,
+    pub gmail_tab: Option<BrowserTabEntry>,
+    pub gmail_creating_label: Option<String>,
     pub overlay_visible: bool,
     pub is_quitting: bool,
     pub bootstrapped: bool,
@@ -246,7 +250,6 @@ pub struct AppStateInner {
     pub profiles_root: PathBuf,
     pub chrome_version: String,
     pub main_hwnd: isize,
-    pub lan_sync: Option<LanSyncHandle>,
     pub cloud_sync_gen: Arc<AtomicU64>,
     #[cfg(windows)]
     pub gesture_host: Option<crate::gesture_win::GestureWinHost>,
@@ -278,8 +281,12 @@ impl SharedState {
                 services,
                 creating_tabs: HashMap::new(),
                 last_active_by_group: HashMap::new(),
+                cross_site_identities: HashMap::new(),
                 closed_tabs: Vec::new(),
                 active_instance_id: None,
+                gmail_open: false,
+                gmail_tab: None,
+                gmail_creating_label: None,
                 overlay_visible: false,
                 is_quitting: false,
                 bootstrapped: false,
@@ -292,7 +299,6 @@ impl SharedState {
                 profiles_root,
                 chrome_version,
                 main_hwnd: 0,
-                lan_sync: None,
                 cloud_sync_gen: Arc::new(AtomicU64::new(0)),
                 #[cfg(windows)]
                 gesture_host: None,
@@ -402,15 +408,23 @@ pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
     {
         let (host, main_hwnd, sidebar_w, top_h, suspended, settings) = {
             let guard = shared.inner.lock().unwrap();
-            let active_sleeping_or_err = guard
-                .active_instance_id
-                .as_deref()
-                .and_then(|id| guard.services.get(id))
-                .and_then(|s| s.active_tab())
-                .map(|t| t.is_sleeping || t.load_error.is_some() || t.webview_label.is_none())
-                .unwrap_or(true);
+            let active_sleeping_or_err = if guard.gmail_open {
+                guard
+                    .gmail_tab
+                    .as_ref()
+                    .map(|t| t.is_sleeping || t.load_error.is_some() || t.webview_label.is_none())
+                    .unwrap_or(true)
+            } else {
+                guard
+                    .active_instance_id
+                    .as_deref()
+                    .and_then(|id| guard.services.get(id))
+                    .and_then(|s| s.active_tab())
+                    .map(|t| t.is_sleeping || t.load_error.is_some() || t.webview_label.is_none())
+                    .unwrap_or(true)
+            };
             let suspended = guard.overlay_visible
-                || guard.active_instance_id.is_none()
+                || (!guard.gmail_open && guard.active_instance_id.is_none())
                 || active_sleeping_or_err;
             let st = guard.store.get_settings();
             let tab_count = active_tab_count(&guard);
@@ -480,6 +494,8 @@ pub fn emit_state_updated(app: &AppHandle, shared: &SharedState) {
             config: guard.store.get_config(),
             runtime_states: SharedState::build_all_runtime_states(&guard),
             closed_tabs_count: guard.closed_tabs.len(),
+            gmail_open: guard.gmail_open,
+            gmail_runtime: guard.gmail_tab.as_ref().map(|t| t.to_info()),
         }
     };
 
@@ -650,33 +666,54 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
     let (target_label, bounds, tracked_labels, creating_labels, warming_labels, should_focus_shell) = {
         let mut guard = shared.inner.lock().unwrap();
         let now = Instant::now();
-        let active_tab = guard
-            .active_instance_id
-            .as_deref()
-            .and_then(|id| guard.services.get(id))
-            .and_then(|s| s.active_tab());
-
-        let active_has_error = active_tab
-            .map(|t| t.load_error.is_some())
-            .unwrap_or(false);
-        let active_is_sleeping = active_tab
-            .map(|t| t.is_sleeping)
-            .unwrap_or(true);
-
-        let should_hide = guard.overlay_visible
-            || guard.active_instance_id.is_none()
-            || active_has_error
-            || active_is_sleeping;
-
-        let target = if should_hide {
-            None
+        let target = if guard.gmail_open {
+            let gmail_has_error = guard
+                .gmail_tab
+                .as_ref()
+                .map(|t| t.load_error.is_some())
+                .unwrap_or(false);
+            if guard.overlay_visible || gmail_has_error {
+                None
+            } else {
+                guard
+                    .gmail_tab
+                    .as_ref()
+                    .and_then(|t| t.webview_label.clone())
+            }
         } else {
-            active_tab.and_then(|t| t.webview_label.clone())
+            let active_tab = guard
+                .active_instance_id
+                .as_deref()
+                .and_then(|id| guard.services.get(id))
+                .and_then(|s| s.active_tab());
+
+            let active_has_error = active_tab
+                .map(|t| t.load_error.is_some())
+                .unwrap_or(false);
+            let active_is_sleeping = active_tab
+                .map(|t| t.is_sleeping)
+                .unwrap_or(true);
+
+            let should_hide = guard.overlay_visible
+                || guard.active_instance_id.is_none()
+                || active_has_error
+                || active_is_sleeping;
+
+            if should_hide {
+                None
+            } else {
+                active_tab.and_then(|t| t.webview_label.clone())
+            }
         };
 
         let allow_warming = !guard.overlay_visible;
         let mut tracked = HashSet::new();
         let mut warming = HashSet::new();
+        if let Some(ref gmail_tab) = guard.gmail_tab {
+            if let Some(ref l) = gmail_tab.webview_label {
+                tracked.insert(l.clone());
+            }
+        }
         for svc in guard.services.values_mut() {
             for tab in &mut svc.tabs {
                 if let Some(ref l) = tab.webview_label {
@@ -695,7 +732,10 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
                 }
             }
         }
-        let creating: HashSet<String> = guard.creating_tabs.values().cloned().collect();
+        let mut creating: HashSet<String> = guard.creating_tabs.values().cloned().collect();
+        if let Some(ref gl) = guard.gmail_creating_label {
+            creating.insert(gl.clone());
+        }
         (
             target,
             guard.bounds,
@@ -765,6 +805,7 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
 pub fn activate_tab(app: &AppHandle, shared: &SharedState, instance_id: Option<String>) {
     let needs_create: Option<(ServiceInstance, String, String)> = {
         let mut guard = shared.inner.lock().unwrap();
+        guard.gmail_open = false;
         guard.active_instance_id = instance_id.clone();
 
         match instance_id {
@@ -821,6 +862,7 @@ pub fn activate_subtab(app: &AppHandle, shared: &SharedState, instance_id: &str,
             return;
         };
         let gkey = service_group_key(&inst.service_id, &inst.url, &inst.instance_id);
+        guard.gmail_open = false;
         guard.last_active_by_group.insert(gkey, inst.instance_id.clone());
         guard.active_instance_id = Some(instance_id.to_string());
         guard.store.update_settings(UpdateSettingsPatch {
@@ -938,6 +980,7 @@ pub fn create_subtab_with_options(
         };
 
         if activate {
+            guard.gmail_open = false;
             guard.active_instance_id = Some(instance_id.to_string());
             guard.store.update_settings(UpdateSettingsPatch {
                 active_instance_id: Some(Some(instance_id.to_string())),
@@ -1512,8 +1555,9 @@ fn create_tab_webview(
                     }
                 });
             if let Some(epoch) = tab_meta {
-                let is_active_tab = guard.active_instance_id.as_deref()
-                    == Some(instance.instance_id.as_str())
+                let is_active_tab = !guard.gmail_open
+                    && guard.active_instance_id.as_deref()
+                        == Some(instance.instance_id.as_str())
                     && guard
                         .services
                         .get(&instance.instance_id)
@@ -1772,7 +1816,8 @@ fn create_tab_webview(
     let (committed, started_warming, should_hide_immediately) = {
         let mut guard = shared.inner.lock().unwrap();
         guard.creating_tabs.remove(&tab_id);
-        let is_active_now = guard.active_instance_id.as_deref() == Some(instance_id.as_str())
+        let is_active_now = !guard.gmail_open
+            && guard.active_instance_id.as_deref() == Some(instance_id.as_str())
             && guard
                 .services
                 .get(&instance_id)
@@ -1897,6 +1942,12 @@ fn attach_windows_handlers(
     let id_follow = instance_id.clone();
     let tid_follow = tid.clone();
     let label_follow = wv_label.clone();
+
+    let app_unfollow = app.clone();
+    let shared_unfollow = shared.clone();
+    let id_unfollow = instance_id.clone();
+    let tid_unfollow = tid.clone();
+    let label_unfollow = wv_label.clone();
 
     let app_ident = app.clone();
     let shared_ident = shared.clone();
@@ -2106,35 +2157,106 @@ fn attach_windows_handlers(
         on_shortcut: Arc::new(move |action, payload| {
             handle_shortcut_from_child(&app_key, &shared_key, action, payload);
         }),
-        on_follow_detected: Arc::new(move || {
-            let alive = {
+        on_follow_detected: Arc::new(move |service_hint| {
+            let target_id = {
                 let guard = shared_follow.inner.lock().unwrap();
-                guard
+                let tab_url = guard
                     .services
                     .get(&id_follow)
                     .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_follow))
-                    .map(|t| t.webview_label.as_deref() == Some(label_follow.as_str()))
-                    .unwrap_or(false)
+                    .and_then(|t| {
+                        if t.webview_label.as_deref() == Some(label_follow.as_str()) {
+                            Some(t.current_url.clone())
+                        } else {
+                            None
+                        }
+                    });
+                tab_url.and_then(|url| {
+                    resolve_counter_target_instance_id(
+                        &guard,
+                        &id_follow,
+                        Some(url.as_str()),
+                        service_hint.as_deref(),
+                        None,
+                    )
+                })
             };
-            if alive {
-                adjust_follow_count(&app_follow, &shared_follow, &id_follow, 1);
+            if let Some(tid) = target_id {
+                adjust_follow_count(&app_follow, &shared_follow, &tid, 1);
             }
         }),
-        on_account_identity: Arc::new(move |handle, following, followers| {
-            let alive = {
-                let guard = shared_ident.inner.lock().unwrap();
-                guard
+        on_unfollow_detected: Arc::new(move |service_hint| {
+            let target_id = {
+                let guard = shared_unfollow.inner.lock().unwrap();
+                let tab_url = guard
+                    .services
+                    .get(&id_unfollow)
+                    .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_unfollow))
+                    .and_then(|t| {
+                        if t.webview_label.as_deref() == Some(label_unfollow.as_str()) {
+                            Some(t.current_url.clone())
+                        } else {
+                            None
+                        }
+                    });
+                tab_url.and_then(|url| {
+                    resolve_counter_target_instance_id(
+                        &guard,
+                        &id_unfollow,
+                        Some(url.as_str()),
+                        service_hint.as_deref(),
+                        None,
+                    )
+                })
+            };
+            if let Some(tid) = target_id {
+                adjust_unfollow_count(&app_unfollow, &shared_unfollow, &tid, 1);
+            }
+        }),
+        on_account_identity: Arc::new(move |service_hint, handle, following, followers| {
+            let target_id = {
+                let mut guard = shared_ident.inner.lock().unwrap();
+                let tab_url = guard
                     .services
                     .get(&id_ident)
                     .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_ident))
-                    .map(|t| t.webview_label.as_deref() == Some(label_ident.as_str()))
-                    .unwrap_or(false)
+                    .and_then(|t| {
+                        if t.webview_label.as_deref() == Some(label_ident.as_str()) {
+                            Some(t.current_url.clone())
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(url) = tab_url {
+                    if let Some(ref svc) = service_hint {
+                        let source_svc = guard
+                            .store
+                            .get_instance(&id_ident)
+                            .map(|i| i.service_id);
+                        if source_svc.as_deref() != Some(svc.as_str()) {
+                            if let Some(norm) = crate::follow_sync::normalize_account_handle(&handle) {
+                                guard
+                                    .cross_site_identities
+                                    .insert(id_ident.clone(), (svc.clone(), norm));
+                            }
+                        }
+                    }
+                    resolve_counter_target_instance_id(
+                        &guard,
+                        &id_ident,
+                        Some(url.as_str()),
+                        service_hint.as_deref(),
+                        Some(handle.as_str()),
+                    )
+                } else {
+                    None
+                }
             };
-            if alive {
+            if let Some(tid) = target_id {
                 handle_account_identity(
                     &app_ident,
                     &shared_ident,
-                    &id_ident,
+                    &tid,
                     &handle,
                     following,
                     followers,
@@ -2240,8 +2362,16 @@ pub fn destroy_all_views(app: &AppHandle, shared: &SharedState) {
     let labels: Vec<String> = {
         let mut guard = shared.inner.lock().unwrap();
         guard.active_instance_id = None;
+        guard.gmail_open = false;
+        guard.gmail_creating_label = None;
         guard.creating_tabs.clear();
         let mut out = Vec::new();
+        if let Some(ref mut gt) = guard.gmail_tab {
+            gt.creation_epoch = gt.creation_epoch.wrapping_add(1);
+            if let Some(l) = gt.webview_label.take() {
+                out.push(l);
+            }
+        }
         for svc in guard.services.values_mut() {
             for tab in &mut svc.tabs {
                 tab.creation_epoch = tab.creation_epoch.wrapping_add(1);
@@ -2307,12 +2437,16 @@ fn get_all_open_webviews_for_service(
 pub fn get_current_active_webview(app: &AppHandle, shared: &SharedState) -> Option<Webview> {
     let label = {
         let guard = shared.inner.lock().unwrap();
-        guard
-            .active_instance_id
-            .as_deref()
-            .and_then(|id| guard.services.get(id))
-            .and_then(|s| s.active_tab())
-            .and_then(|t| t.webview_label.clone())
+        if guard.gmail_open {
+            guard.gmail_tab.as_ref().and_then(|t| t.webview_label.clone())
+        } else {
+            guard
+                .active_instance_id
+                .as_deref()
+                .and_then(|id| guard.services.get(id))
+                .and_then(|s| s.active_tab())
+                .and_then(|t| t.webview_label.clone())
+        }
     }?;
     app.get_webview(&label)
 }
@@ -2342,6 +2476,501 @@ pub fn dispatch_live_scroll(
     {
         let _ = (app, shared, origin_css_x, origin_css_y, dx, dy);
     }
+}
+
+/// アプリ内 Gmail パネルを開閉する（ログインセッションは維持される）。
+pub fn set_gmail_open(app: &AppHandle, shared: &SharedState, open: Option<bool>) -> bool {
+    let (next_open, needs_create) = {
+        let mut guard = shared.inner.lock().unwrap();
+        let next = open.unwrap_or(!guard.gmail_open);
+        guard.gmail_open = next;
+        let needs = if next {
+            if guard.gmail_tab.is_none() {
+                guard.gmail_tab = Some(BrowserTabEntry {
+                    tab_id: "gmail-tab".to_string(),
+                    instance_id: "omnisns-gmail".to_string(),
+                    webview_label: None,
+                    creation_epoch: 0,
+                    warming_until: None,
+                    current_url: GMAIL_HOME_URL.to_string(),
+                    title: "Gmail".to_string(),
+                    favicon_url: None,
+                    unread_count: 0,
+                    is_loading: false,
+                    is_sleeping: true,
+                    can_go_back: false,
+                    can_go_forward: false,
+                    load_error: None,
+                });
+            }
+            let has_wv = guard
+                .gmail_tab
+                .as_ref()
+                .and_then(|t| t.webview_label.as_ref())
+                .is_some();
+            !has_wv && guard.gmail_creating_label.is_none()
+        } else {
+            false
+        };
+        (next, needs)
+    };
+
+    if needs_create {
+        create_gmail_webview(app, shared);
+    }
+
+    update_bounds_from_window(app, shared);
+    emit_state_updated(app, shared);
+    next_open
+}
+
+fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
+    let Some(win) = app.get_window("main") else {
+        return;
+    };
+
+    let Ok(parsed_url) = url::Url::parse(GMAIL_HOME_URL) else {
+        return;
+    };
+
+    let gen = WEBVIEW_GEN.fetch_add(1, Ordering::Relaxed);
+    let label = format!("gmail-{gen}");
+
+    let Some((bounds, profile_dir, chrome_ver, start_offscreen, my_epoch)) = ({
+        let mut guard = shared.inner.lock().unwrap();
+        if guard.is_quitting || guard.gmail_creating_label.is_some() {
+            None
+        } else if let Some(ref tab) = guard.gmail_tab {
+            if tab.webview_label.is_some() {
+                None
+            } else {
+                let epoch = tab.creation_epoch;
+                let start_offscreen = guard.overlay_visible || !guard.gmail_open;
+                guard.gmail_creating_label = Some(label.clone());
+                Some((
+                    guard.bounds,
+                    guard.profiles_root.join("omnisns-gmail"),
+                    guard.chrome_version.clone(),
+                    start_offscreen,
+                    epoch,
+                ))
+            }
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+
+    let _ = fs::create_dir_all(&profile_dir);
+    let ua = build_user_agent("desktop", &chrome_ver);
+
+    let app_for_title = app.clone();
+    let shared_for_title = shared.clone();
+    let label_for_title = label.clone();
+
+    let app_for_popup = app.clone();
+    let shared_for_popup = shared.clone();
+    let label_for_popup = label.clone();
+    let ua_for_popup = ua.clone();
+
+    #[allow(unused_mut)]
+    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
+        .data_directory(profile_dir)
+        .user_agent(&ua)
+        .disable_drag_drop_handler()
+        .enable_clipboard_access()
+        .zoom_hotkeys_enabled(true)
+        .focused(false);
+
+    #[cfg(windows)]
+    {
+        builder = builder.additional_browser_args(WEBVIEW2_FAST_BROWSER_ARGS);
+    }
+
+    let builder = builder
+        .on_permission_request(|_wv, kind| match kind {
+            PermissionKind::Notifications
+            | PermissionKind::ClipboardRead
+            | PermissionKind::WindowManagement => PermissionResponse::Allow,
+            _ => PermissionResponse::Default,
+        })
+        .on_document_title_changed(move |_wv, title| {
+            let clean_title = if title.trim().is_empty() {
+                "Gmail".to_string()
+            } else {
+                title
+            };
+            let changed = {
+                let mut guard = shared_for_title.inner.lock().unwrap();
+                if let Some(ref mut tab) = guard.gmail_tab {
+                    if tab.webview_label.as_deref() == Some(label_for_title.as_str()) {
+                        tab.title = clean_title;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if changed {
+                emit_state_updated(&app_for_title, &shared_for_title);
+            }
+        })
+        .on_new_window(move |target_url, features| {
+            let (is_alive, current_url) = {
+                let guard = shared_for_popup.inner.lock().unwrap();
+                let alive = guard
+                    .gmail_tab
+                    .as_ref()
+                    .map(|t| t.webview_label.as_deref() == Some(label_for_popup.as_str()))
+                    .unwrap_or(false);
+                let cur = guard
+                    .gmail_tab
+                    .as_ref()
+                    .map(|t| t.current_url.clone())
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| GMAIL_HOME_URL.to_string());
+                (alive, cur)
+            };
+            if !is_alive {
+                return NewWindowResponse::Deny;
+            }
+            let target_str = target_url.as_str();
+            let has_popup_features = features.size().is_some() || features.position().is_some();
+            if is_auth_popup_for_site(target_str, &current_url)
+                || (has_popup_features && is_auth_popup_url(target_str))
+            {
+                let popup_id = POPUP_GEN.fetch_add(1, Ordering::Relaxed);
+                let popup_label = format!("popup-{popup_id}");
+                let blank_url: url::Url = "about:blank".parse().unwrap();
+                let popup_builder = WebviewWindowBuilder::new(
+                    &app_for_popup,
+                    &popup_label,
+                    WebviewUrl::External(blank_url),
+                )
+                .title("Gmail - 認証 / ウィンドウ")
+                .inner_size(560.0, 760.0)
+                .user_agent(&ua_for_popup)
+                .window_features(features);
+                let popup_builder =
+                    if let Some(icon) = app_for_popup.default_window_icon().cloned() {
+                        match popup_builder.icon(icon) {
+                            Ok(b) => b,
+                            Err(_) => return NewWindowResponse::Allow,
+                        }
+                    } else {
+                        popup_builder
+                    };
+                match popup_builder.build() {
+                    Ok(window) => NewWindowResponse::Create { window },
+                    Err(_) => NewWindowResponse::Allow,
+                }
+            } else if is_same_site_url(target_str, &current_url) {
+                let app_bg = app_for_popup.clone();
+                let shared_bg = shared_for_popup.clone();
+                let url_bg = target_str.to_string();
+                tauri::async_runtime::spawn(async move {
+                    let _ = navigate_gmail(&app_bg, &shared_bg, &url_bg);
+                });
+                NewWindowResponse::Deny
+            } else {
+                if is_http_url(target_str) {
+                    #[cfg(windows)]
+                    crate::platform_win::open_external_url(target_str);
+                }
+                NewWindowResponse::Deny
+            }
+        });
+
+    let init_pos = if start_offscreen {
+        LogicalPosition::new(-10000.0, -10000.0)
+    } else {
+        LogicalPosition::new(bounds.x, bounds.y)
+    };
+    let init_size = LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0));
+
+    let Ok(webview) = win.add_child(builder, init_pos, init_size) else {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.gmail_creating_label = None;
+        return;
+    };
+
+    let (committed, should_hide_immediately) = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.gmail_creating_label = None;
+        if guard.is_quitting {
+            (false, true)
+        } else {
+            let hide_now = guard.overlay_visible || !guard.gmail_open;
+            if let Some(ref mut tab) = guard.gmail_tab {
+                if tab.creation_epoch == my_epoch && tab.webview_label.is_none() {
+                    tab.webview_label = Some(label.clone());
+                    tab.is_sleeping = false;
+                    tab.is_loading = true;
+                    tab.load_error = None;
+                    (true, hide_now)
+                } else {
+                    (false, true)
+                }
+            } else {
+                (false, true)
+            }
+        }
+    };
+
+    if !committed {
+        close_webview_cleanly(&webview);
+        refresh_attached_view(app, shared);
+        return;
+    }
+
+    if should_hide_immediately {
+        let _ = webview.hide();
+    }
+
+    #[cfg(windows)]
+    {
+        let app_start = app.clone();
+        let shared_start = shared.clone();
+        let label_start = label.clone();
+
+        let app_done = app.clone();
+        let shared_done = shared.clone();
+        let label_done = label.clone();
+
+        let app_nav = app.clone();
+        let shared_nav = shared.clone();
+        let label_nav = label.clone();
+
+        let app_fav = app.clone();
+        let shared_fav = shared.clone();
+        let label_fav = label.clone();
+
+        let app_key = app.clone();
+        let shared_key = shared.clone();
+
+        let ua_owned = ua.clone();
+        let callbacks = crate::platform_win::TabWebviewCallbacks {
+            on_navigation_starting: Arc::new(move || {
+                let (changed, was_error) = {
+                    let mut guard = shared_start.inner.lock().unwrap();
+                    if let Some(ref mut tab) = guard.gmail_tab {
+                        if tab.webview_label.as_deref() == Some(label_start.as_str()) {
+                            let had_err = tab.load_error.is_some();
+                            tab.is_loading = true;
+                            tab.is_sleeping = false;
+                            tab.load_error = None;
+                            (true, had_err)
+                        } else {
+                            (false, false)
+                        }
+                    } else {
+                        (false, false)
+                    }
+                };
+                if was_error {
+                    refresh_attached_view(&app_start, &shared_start);
+                }
+                if changed {
+                    emit_state_updated(&app_start, &shared_start);
+                }
+            }),
+            on_navigation_completed: Arc::new(move |ok, err_msg, url, can_back, can_fwd| {
+                let changed = {
+                    let mut guard = shared_done.inner.lock().unwrap();
+                    if let Some(ref mut tab) = guard.gmail_tab {
+                        if tab.webview_label.as_deref() == Some(label_done.as_str()) {
+                            tab.is_loading = false;
+                            tab.is_sleeping = false;
+                            if !url.is_empty() {
+                                tab.current_url = url;
+                            }
+                            tab.can_go_back = can_back;
+                            tab.can_go_forward = can_fwd;
+                            tab.load_error = if ok { None } else { err_msg };
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if changed && !ok {
+                    refresh_attached_view(&app_done, &shared_done);
+                }
+                if changed {
+                    emit_state_updated(&app_done, &shared_done);
+                }
+            }),
+            on_nav_flags_changed: Arc::new(move |url, can_back, can_fwd| {
+                let changed = {
+                    let mut guard = shared_nav.inner.lock().unwrap();
+                    if let Some(ref mut tab) = guard.gmail_tab {
+                        if tab.webview_label.as_deref() == Some(label_nav.as_str()) {
+                            if !url.is_empty() {
+                                tab.current_url = url;
+                            }
+                            tab.can_go_back = can_back;
+                            tab.can_go_forward = can_fwd;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    emit_state_updated(&app_nav, &shared_nav);
+                }
+            }),
+            on_favicon_changed: Arc::new(move |favicon| {
+                let changed = {
+                    let mut guard = shared_fav.inner.lock().unwrap();
+                    if let Some(ref mut tab) = guard.gmail_tab {
+                        if tab.webview_label.as_deref() == Some(label_fav.as_str()) {
+                            tab.favicon_url = Some(favicon);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    emit_state_updated(&app_fav, &shared_fav);
+                }
+            }),
+            on_zoom_factor_changed: Arc::new(move |_zoom| {}),
+            on_shortcut: Arc::new(move |action, payload| {
+                handle_shortcut_from_child(&app_key, &shared_key, action, payload);
+            }),
+            on_follow_detected: Arc::new(move |_| {}),
+            on_unfollow_detected: Arc::new(move |_| {}),
+            on_account_identity: Arc::new(move |_s, _h, _flwng, _flwrs| {}),
+        };
+
+        let _ = webview.with_webview(move |platform_wv| {
+            let controller = platform_wv.controller();
+            crate::platform_win::attach_tab_handlers(&controller, false, 1.0, &ua_owned, callbacks);
+        });
+    }
+
+    emit_state_updated(app, shared);
+    refresh_attached_view(app, shared);
+}
+
+pub fn perform_gmail_action(app: &AppHandle, shared: &SharedState, action: &str) {
+    if action == "close" {
+        let _ = set_gmail_open(app, shared, Some(false));
+        return;
+    }
+
+    let (label_opt, current_url) = {
+        let guard = shared.inner.lock().unwrap();
+        let label = guard.gmail_tab.as_ref().and_then(|t| t.webview_label.clone());
+        let url = guard
+            .gmail_tab
+            .as_ref()
+            .map(|t| t.current_url.clone())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| GMAIL_HOME_URL.to_string());
+        (label, url)
+    };
+
+    match action {
+        "back" => {
+            #[cfg(windows)]
+            if let Some(wv) = label_opt.and_then(|l| app.get_webview(&l)) {
+                let _ = wv.with_webview(|pwv| crate::platform_win::go_back(&pwv.controller()));
+            }
+        }
+        "forward" => {
+            #[cfg(windows)]
+            if let Some(wv) = label_opt.and_then(|l| app.get_webview(&l)) {
+                let _ = wv.with_webview(|pwv| crate::platform_win::go_forward(&pwv.controller()));
+            }
+        }
+        "reload" | "hard-reload" => {
+            let hard = action == "hard-reload";
+            if let Some(wv) = label_opt.and_then(|l| app.get_webview(&l)) {
+                #[cfg(windows)]
+                let _ = wv.with_webview(move |pwv| {
+                    crate::platform_win::reload(&pwv.controller(), hard)
+                });
+            } else {
+                let _ = set_gmail_open(app, shared, Some(true));
+            }
+        }
+        "home" => {
+            if let Some(wv) = label_opt.and_then(|l| app.get_webview(&l)) {
+                #[cfg(windows)]
+                let _ = wv.with_webview(|pwv| {
+                    crate::platform_win::navigate(&pwv.controller(), GMAIL_HOME_URL)
+                });
+            } else {
+                let _ = set_gmail_open(app, shared, Some(true));
+            }
+            refresh_attached_view(app, shared);
+        }
+        "open-external" => {
+            if is_http_url(&current_url) {
+                #[cfg(windows)]
+                crate::platform_win::open_external_url(&current_url);
+            }
+        }
+        "devtools" => {
+            #[cfg(windows)]
+            if let Some(wv) = label_opt.and_then(|l| app.get_webview(&l)) {
+                let _ = wv.with_webview(|pwv| crate::platform_win::open_devtools(&pwv.controller()));
+            }
+        }
+        "scroll-top" | "scroll-bottom" => {
+            let to_top = action == "scroll-top";
+            #[cfg(windows)]
+            if let Some(wv) = label_opt.and_then(|l| app.get_webview(&l)) {
+                let _ = wv.with_webview(move |pwv| {
+                    crate::platform_win::scroll_to_edge(&pwv.controller(), to_top)
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn navigate_gmail(
+    app: &AppHandle,
+    shared: &SharedState,
+    raw_url: &str,
+) -> Result<String, String> {
+    let target_url = normalize_service_url(raw_url)
+        .ok_or_else(|| "有効な http:// または https:// URL を入力してください".to_string())?;
+    let label_opt = {
+        let mut guard = shared.inner.lock().unwrap();
+        if let Some(ref mut tab) = guard.gmail_tab {
+            tab.current_url = target_url.clone();
+            tab.load_error = None;
+            tab.webview_label.clone()
+        } else {
+            None
+        }
+    };
+    if let Some(wv) = label_opt.and_then(|l| app.get_webview(&l)) {
+        let url_owned = target_url.clone();
+        #[cfg(windows)]
+        let _ = wv.with_webview(move |pwv| {
+            crate::platform_win::navigate(&pwv.controller(), &url_owned);
+        });
+    } else {
+        let _ = set_gmail_open(app, shared, Some(true));
+    }
+    refresh_attached_view(app, shared);
+    emit_state_updated(app, shared);
+    Ok(target_url)
 }
 
 pub fn perform_tab_action(app: &AppHandle, shared: &SharedState, instance_id: &str, action: &str) {
@@ -2561,9 +3190,14 @@ pub fn execute_gesture_action_with_origin(
     origin_lx: Option<f64>,
     origin_ly: Option<f64>,
 ) {
-    let active_pair: Option<(String, String, bool, bool)> = {
+    let (gmail_open, gmail_nav, active_pair) = {
         let guard = shared.inner.lock().unwrap();
-        guard.active_instance_id.as_ref().and_then(|inst_id| {
+        let g_nav = guard
+            .gmail_tab
+            .as_ref()
+            .map(|t| (t.can_go_back, t.can_go_forward))
+            .unwrap_or((false, false));
+        let pair = guard.active_instance_id.as_ref().and_then(|inst_id| {
             guard.services.get(inst_id).and_then(|svc| {
                 svc.active_tab().map(|t| {
                     (
@@ -2574,8 +3208,41 @@ pub fn execute_gesture_action_with_origin(
                     )
                 })
             })
-        })
+        });
+        (guard.gmail_open, g_nav, pair)
     };
+
+    if gmail_open {
+        match action {
+            "close-tab" => {
+                let _ = set_gmail_open(app, shared, Some(false));
+                show_overlay_notice(shared, "Gmailを閉じました", false);
+                return;
+            }
+            "go-back" => {
+                if gmail_nav.0 {
+                    perform_gmail_action(app, shared, "back");
+                } else {
+                    show_overlay_notice(shared, "これ以上戻れません", false);
+                }
+                return;
+            }
+            "go-forward" => {
+                if gmail_nav.1 {
+                    perform_gmail_action(app, shared, "forward");
+                } else {
+                    show_overlay_notice(shared, "これ以上進めません", false);
+                }
+                return;
+            }
+            "reload" | "hard-reload" | "home" | "open-external" | "scroll-top"
+            | "scroll-bottom" => {
+                perform_gmail_action(app, shared, action);
+                return;
+            }
+            _ => {}
+        }
+    }
 
     match action {
         "previous-tab" => {
@@ -2705,6 +3372,95 @@ pub fn update_gesture_settings(
     updated
 }
 
+/// タブ内で別SNS（例: ThreadsタブからInstagramへ遷移）を表示している場合、
+/// 実際に表示中のサービスに一致するアカウントインスタンスを解決する。
+/// 一致するサービスのインスタンスが存在しない場合は `None` を返し、元SNSのカウントを誤加算しない。
+fn resolve_counter_target_instance_id(
+    guard: &AppStateInner,
+    source_instance_id: &str,
+    current_url: Option<&str>,
+    service_hint: Option<&str>,
+    handle_hint: Option<&str>,
+) -> Option<String> {
+    let instances = guard.store.get_instances();
+    let source = instances
+        .iter()
+        .find(|i| i.instance_id == source_instance_id)?;
+
+    let effective_service = service_hint
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            current_url
+                .and_then(detect_platform_service_from_url)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| source.service_id.clone());
+
+    if effective_service == source.service_id {
+        return Some(source.instance_id.clone());
+    }
+
+    let candidates: Vec<&ServiceInstance> = instances
+        .iter()
+        .filter(|i| i.service_id == effective_service)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // 1. 明示または直近検出したクロスサイトハンドル一致
+    let effective_handle = handle_hint
+        .and_then(crate::follow_sync::normalize_account_handle)
+        .or_else(|| {
+            guard
+                .cross_site_identities
+                .get(source_instance_id)
+                .filter(|(svc, _)| svc == &effective_service)
+                .map(|(_, h)| h.clone())
+        });
+    if let Some(ref h) = effective_handle {
+        if let Some(matched) = candidates
+            .iter()
+            .find(|c| c.detected_handle.as_deref() == Some(h.as_str()))
+        {
+            return Some(matched.instance_id.clone());
+        }
+    }
+
+    // 2. 元インスタンスと同じ @handle（Threads ↔ Instagram 連携アカウント）
+    if let Some(ref sh) = source.detected_handle {
+        if let Some(matched) = candidates
+            .iter()
+            .find(|c| c.detected_handle.as_deref() == Some(sh.as_str()))
+        {
+            return Some(matched.instance_id.clone());
+        }
+    }
+
+    // 3. 対象サービスで直近アクティブだったアカウント
+    if let Some(last_id) = guard.last_active_by_group.get(&effective_service) {
+        if let Some(matched) = candidates.iter().find(|c| &c.instance_id == last_id) {
+            return Some(matched.instance_id.clone());
+        }
+    }
+
+    // 4. アカウントラベル一致（例: 「サブ」「アカウント 2」）
+    if let Some(ref lbl) = source.account_label {
+        let trimmed = lbl.trim();
+        if !trimmed.is_empty() {
+            if let Some(matched) = candidates
+                .iter()
+                .find(|c| c.account_label.as_deref().map(str::trim) == Some(trimmed))
+            {
+                return Some(matched.instance_id.clone());
+            }
+        }
+    }
+
+    Some(candidates[0].instance_id.clone())
+}
+
 pub fn adjust_follow_count(
     app: &AppHandle,
     shared: &SharedState,
@@ -2731,6 +3487,40 @@ pub fn reset_follow_count(
     let updated = {
         let mut guard = shared.inner.lock().unwrap();
         guard.store.reset_follow_count(instance_id, reset_total)
+    };
+    if updated.is_some() {
+        emit_state_updated(app, shared);
+        notify_follow_ledger_changed(app, shared);
+    }
+    updated
+}
+
+pub fn adjust_unfollow_count(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    delta: i32,
+) -> Option<ServiceInstance> {
+    let updated = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.store.adjust_unfollow_count(instance_id, delta)
+    };
+    if updated.is_some() {
+        emit_state_updated(app, shared);
+        notify_follow_ledger_changed(app, shared);
+    }
+    updated
+}
+
+pub fn reset_unfollow_count(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    reset_total: bool,
+) -> Option<ServiceInstance> {
+    let updated = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard.store.reset_unfollow_count(instance_id, reset_total)
     };
     if updated.is_some() {
         emit_state_updated(app, shared);
@@ -2778,50 +3568,12 @@ pub fn set_instance_handle(
     Ok(updated)
 }
 
-pub fn apply_remote_follow_ledger(
-    app: &AppHandle,
-    shared: &SharedState,
-    remote: FollowSyncLedger,
-) -> (String, FollowSyncLedger, bool) {
-    let today = crate::store::local_today_ymd();
-    let (device_id, current_ledger, changed, should_reply) = {
-        let mut guard = shared.inner.lock().unwrap();
-        let changed = guard.store.merge_follow_ledger(&remote);
-        let ledger = guard.store.get_follow_ledger();
-        let device_id = guard.store.get_follow_sync_settings().device_id;
-        let should_reply = ledger.has_newer_data_than(&remote, &today);
-        if changed {
-            let now = crate::follow_sync::now_unix_secs();
-            guard
-                .store
-                .set_follow_sync_status(None, "LAN同期完了".to_string(), Some(now));
-        }
-        (device_id, ledger, changed, should_reply)
-    };
-    if changed {
-        emit_state_updated(app, shared);
-    }
-    (device_id, current_ledger, should_reply)
-}
-
 pub fn notify_follow_ledger_changed(app: &AppHandle, shared: &SharedState) {
-    let (lan_enabled, device_id, token, ledger, gen_arc) = {
+    let (token, gen_arc) = {
         let guard = shared.inner.lock().unwrap();
         let fs = guard.store.get_follow_sync_settings();
-        (
-            fs.lan_enabled,
-            fs.device_id,
-            fs.github_token,
-            guard.store.get_follow_ledger(),
-            guard.cloud_sync_gen.clone(),
-        )
+        (fs.github_token, guard.cloud_sync_gen.clone())
     };
-
-    if lan_enabled && !device_id.is_empty() && !ledger.accounts.is_empty() {
-        std::thread::spawn(move || {
-            crate::follow_sync::broadcast_lan_ledger(&device_id, &ledger);
-        });
-    }
 
     if !token.trim().is_empty() {
         let my_gen = gen_arc.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
@@ -2840,16 +3592,10 @@ pub fn sync_cloud_gist_once_blocking(
     app: &AppHandle,
     shared: &SharedState,
 ) -> Result<FollowSyncSettings, String> {
-    let (token, gist_id, local_ledger, lan_enabled, device_id) = {
+    let (token, gist_id, local_ledger) = {
         let guard = shared.inner.lock().unwrap();
         let fs = guard.store.get_follow_sync_settings();
-        (
-            fs.github_token,
-            fs.gist_id,
-            guard.store.get_follow_ledger(),
-            fs.lan_enabled,
-            fs.device_id,
-        )
+        (fs.github_token, fs.gist_id, guard.store.get_follow_ledger())
     };
 
     if token.trim().is_empty() {
@@ -2860,20 +3606,15 @@ pub fn sync_cloud_gist_once_blocking(
     match crate::follow_sync::sync_with_github_gist(&token, &gist_id, &local_ledger, &today) {
         Ok((resolved_gist_id, merged_ledger, _remote_changed)) => {
             let now = crate::follow_sync::now_unix_secs();
-            let (updated_settings, final_ledger) = {
+            let updated_settings = {
                 let mut guard = shared.inner.lock().unwrap();
                 let _ = guard.store.merge_follow_ledger(&merged_ledger);
-                let st = guard.store.set_follow_sync_status(
+                guard.store.set_follow_sync_status(
                     Some(resolved_gist_id),
                     "クラウド同期完了".to_string(),
                     Some(now),
-                );
-                let ledger = guard.store.get_follow_ledger();
-                (st, ledger)
+                )
             };
-            if lan_enabled && !device_id.is_empty() && !final_ledger.accounts.is_empty() {
-                crate::follow_sync::broadcast_lan_ledger(&device_id, &final_ledger);
-            }
             emit_state_updated(app, shared);
             Ok(updated_settings)
         }
@@ -2900,20 +3641,6 @@ pub fn update_follow_sync_settings(
         guard.store.update_follow_sync_settings(patch)
     };
     emit_state_updated(app, shared);
-    if updated.lan_enabled {
-        let (dev_id, ledger) = {
-            let guard = shared.inner.lock().unwrap();
-            (
-                guard.store.get_follow_sync_settings().device_id,
-                guard.store.get_follow_ledger(),
-            )
-        };
-        if !dev_id.is_empty() && !ledger.accounts.is_empty() {
-            std::thread::spawn(move || {
-                crate::follow_sync::broadcast_lan_ledger(&dev_id, &ledger);
-            });
-        }
-    }
     updated
 }
 
@@ -2921,24 +3648,10 @@ pub async fn trigger_follow_sync_now(
     app: &AppHandle,
     shared: &SharedState,
 ) -> Result<FollowSyncSettings, String> {
-    let (lan_enabled, device_id, token, ledger) = {
+    let token = {
         let guard = shared.inner.lock().unwrap();
-        let fs = guard.store.get_follow_sync_settings();
-        (
-            fs.lan_enabled,
-            fs.device_id,
-            fs.github_token,
-            guard.store.get_follow_ledger(),
-        )
+        guard.store.get_follow_sync_settings().github_token
     };
-
-    if lan_enabled && !device_id.is_empty() && !ledger.accounts.is_empty() {
-        let dev_bg = device_id.clone();
-        let led_bg = ledger.clone();
-        std::thread::spawn(move || {
-            crate::follow_sync::broadcast_lan_ledger(&dev_bg, &led_bg);
-        });
-    }
 
     if !token.trim().is_empty() {
         let app_bg = app.clone();
@@ -2950,29 +3663,5 @@ pub async fn trigger_follow_sync_now(
         .map_err(|e| format!("同期タスクの実行に失敗しました: {e}"))?;
     }
 
-    if lan_enabled {
-        let now = crate::follow_sync::now_unix_secs();
-        let updated = {
-            let mut guard = shared.inner.lock().unwrap();
-            guard.store.set_follow_sync_status(
-                None,
-                "同一Wi-Fi(LAN)へ送信しました".to_string(),
-                Some(now),
-            )
-        };
-        emit_state_updated(app, shared);
-        Ok(updated)
-    } else {
-        Err("LAN同期またはGitHub Gistクラウド同期を有効にしてください".to_string())
-    }
-}
-
-pub fn shutdown_lan_sync(shared: &SharedState) {
-    let handle = {
-        let mut guard = shared.inner.lock().unwrap();
-        guard.lan_sync.take()
-    };
-    if let Some(h) = handle {
-        h.shutdown();
-    }
+    Err("GitHub Personal Access Token（gist権限）を入力してください".to_string())
 }

@@ -828,13 +828,20 @@ html[data-theme='light'] .account-pill.active .account-pill-tabs {
   padding: 0 9px;
 }
 
-.gmail-pill:hover {
-  border-color: rgba(234, 67, 53, 0.55);
-  background: rgba(234, 67, 53, 0.14);
+.gmail-pill:hover,
+.gmail-pill.active {
+  border-color: rgba(234, 67, 53, 0.65);
+  background: rgba(234, 67, 53, 0.18);
   color: #f87171;
 }
 
-html[data-theme='light'] .gmail-pill:hover {
+.gmail-pill.active {
+  font-weight: 700;
+  box-shadow: 0 0 0 1px rgba(234, 67, 53, 0.25);
+}
+
+html[data-theme='light'] .gmail-pill:hover,
+html[data-theme='light'] .gmail-pill.active {
   color: #dc2626;
 }
 
@@ -906,6 +913,56 @@ html[data-theme='light'] .follow-pill.has-count {
 
 html[data-theme='light'] .follow-stat-card.primary .follow-stat-value {
   color: #0e7480;
+}
+
+.follow-stat-card.danger {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.45);
+}
+
+.follow-stat-card.danger .follow-stat-value {
+  color: #f87171;
+}
+
+html[data-theme='light'] .follow-stat-card.danger .follow-stat-value {
+  color: #dc2626;
+}
+
+.follow-section-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  margin-bottom: -4px;
+}
+
+.unfollow-section-label {
+  margin-top: 4px;
+  color: #f87171;
+}
+
+html[data-theme='light'] .unfollow-section-label {
+  color: #dc2626;
+}
+
+.danger-outline-btn {
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #f87171;
+}
+
+.danger-outline-btn:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.16);
+}
+
+html[data-theme='light'] .danger-outline-btn {
+  color: #dc2626;
+}
+
+.unfollow-pill-part {
+  color: #f87171;
+}
+
+html[data-theme='light'] .unfollow-pill-part {
+  color: #dc2626;
 }
 
 .follow-adjust-row,
@@ -2278,16 +2335,6 @@ kbd {
   display: flex;
   flex-direction: column;
   gap: 8px;
-}
-
-.follow-sync-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  font-size: 12px;
-  color: var(--text-primary);
-  cursor: pointer;
 }
 
 .follow-sync-cloud-fields {

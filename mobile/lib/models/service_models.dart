@@ -1,4 +1,5 @@
 import 'dart:ui';
+import 'gesture_models.dart';
 
 /// Android WebView の既定プロファイル名（AndroidX WebKit `Profile.DEFAULT_PROFILE_NAME` 準拠）
 const String defaultWebViewProfileName = 'Default';
@@ -105,6 +106,8 @@ class ServiceInstance {
     required this.order,
     this.followCountToday = 0,
     this.followCountTotal = 0,
+    this.unfollowCountToday = 0,
+    this.unfollowCountTotal = 0,
     this.followCountDate,
     this.detectedHandle,
     this.snsFollowingCount,
@@ -124,6 +127,8 @@ class ServiceInstance {
   final int order;
   final int followCountToday;
   final int followCountTotal;
+  final int unfollowCountToday;
+  final int unfollowCountTotal;
   final String? followCountDate;
   final String? detectedHandle;
   final int? snsFollowingCount;
@@ -142,15 +147,23 @@ class ServiceInstance {
     return followCountDate == today ? followCountToday : 0;
   }
 
+  /// 本日分の有効なアンフォロー回数（日付が変わっていれば自動で 0）。
+  int effectiveUnfollowCountToday([DateTime? now]) {
+    final today = formatLocalYmd(now ?? DateTime.now());
+    return followCountDate == today ? unfollowCountToday : 0;
+  }
+
   /// フォロー回数を delta (+1 / -1) 増減した新しいインスタンスを返す。
   ServiceInstance withFollowDelta(int delta, [DateTime? now]) {
     final today = formatLocalYmd(now ?? DateTime.now());
-    final baseToday = followCountDate == today ? followCountToday : 0;
+    final sameDay = followCountDate == today;
+    final baseToday = sameDay ? followCountToday : 0;
     final nextToday = (baseToday + delta).clamp(0, 999999);
     final nextTotal = (followCountTotal + delta).clamp(0, 99999999);
     return copyWith(
       followCountToday: nextToday,
       followCountTotal: nextTotal,
+      unfollowCountToday: sameDay ? unfollowCountToday : 0,
       followCountDate: today,
     );
   }
@@ -158,9 +171,38 @@ class ServiceInstance {
   /// フォロー回数をリセットした新しいインスタンスを返す。
   ServiceInstance withFollowReset({required bool resetTotal, DateTime? now}) {
     final today = formatLocalYmd(now ?? DateTime.now());
+    final sameDay = followCountDate == today;
     return copyWith(
       followCountToday: 0,
       followCountTotal: resetTotal ? 0 : followCountTotal,
+      unfollowCountToday: sameDay ? unfollowCountToday : 0,
+      followCountDate: today,
+    );
+  }
+
+  /// アンフォロー回数を delta (+1 / -1) 増減した新しいインスタンスを返す。
+  ServiceInstance withUnfollowDelta(int delta, [DateTime? now]) {
+    final today = formatLocalYmd(now ?? DateTime.now());
+    final sameDay = followCountDate == today;
+    final baseToday = sameDay ? unfollowCountToday : 0;
+    final nextToday = (baseToday + delta).clamp(0, 999999);
+    final nextTotal = (unfollowCountTotal + delta).clamp(0, 99999999);
+    return copyWith(
+      followCountToday: sameDay ? followCountToday : 0,
+      unfollowCountToday: nextToday,
+      unfollowCountTotal: nextTotal,
+      followCountDate: today,
+    );
+  }
+
+  /// アンフォロー回数をリセットした新しいインスタンスを返す。
+  ServiceInstance withUnfollowReset({required bool resetTotal, DateTime? now}) {
+    final today = formatLocalYmd(now ?? DateTime.now());
+    final sameDay = followCountDate == today;
+    return copyWith(
+      followCountToday: sameDay ? followCountToday : 0,
+      unfollowCountToday: 0,
+      unfollowCountTotal: resetTotal ? 0 : unfollowCountTotal,
       followCountDate: today,
     );
   }
@@ -177,6 +219,8 @@ class ServiceInstance {
     int? order,
     int? followCountToday,
     int? followCountTotal,
+    int? unfollowCountToday,
+    int? unfollowCountTotal,
     String? followCountDate,
     String? detectedHandle,
     bool clearDetectedHandle = false,
@@ -198,6 +242,8 @@ class ServiceInstance {
       order: order ?? this.order,
       followCountToday: followCountToday ?? this.followCountToday,
       followCountTotal: followCountTotal ?? this.followCountTotal,
+      unfollowCountToday: unfollowCountToday ?? this.unfollowCountToday,
+      unfollowCountTotal: unfollowCountTotal ?? this.unfollowCountTotal,
       followCountDate: followCountDate ?? this.followCountDate,
       detectedHandle: clearDetectedHandle
           ? null
@@ -223,6 +269,8 @@ class ServiceInstance {
       'order': order,
       'followCountToday': followCountToday,
       'followCountTotal': followCountTotal,
+      'unfollowCountToday': unfollowCountToday,
+      'unfollowCountTotal': unfollowCountTotal,
       if (followCountDate != null && followCountDate!.isNotEmpty)
         'followCountDate': followCountDate,
       if (detectedHandle != null && detectedHandle!.trim().isNotEmpty)
@@ -257,6 +305,10 @@ class ServiceInstance {
           ((json['followCountToday'] as num?)?.toInt() ?? 0).clamp(0, 999999),
       followCountTotal: ((json['followCountTotal'] as num?)?.toInt() ?? 0)
           .clamp(0, 99999999),
+      unfollowCountToday:
+          ((json['unfollowCountToday'] as num?)?.toInt() ?? 0).clamp(0, 999999),
+      unfollowCountTotal: ((json['unfollowCountTotal'] as num?)?.toInt() ?? 0)
+          .clamp(0, 99999999),
       followCountDate:
           (rawFollowDate == null || rawFollowDate.isEmpty) ? null : rawFollowDate,
       detectedHandle: rawHandle,
@@ -272,12 +324,14 @@ class AppSettings {
     this.activeInstanceId,
     this.isBottomTabsCollapsed = false,
     this.isHeaderCollapsed = false,
+    this.gesture = const MobileGestureSettings(),
   });
 
   final bool isDarkMode;
   final String? activeInstanceId;
   final bool isBottomTabsCollapsed;
   final bool isHeaderCollapsed;
+  final MobileGestureSettings gesture;
 
   AppSettings copyWith({
     bool? isDarkMode,
@@ -285,6 +339,7 @@ class AppSettings {
     bool clearActive = false,
     bool? isBottomTabsCollapsed,
     bool? isHeaderCollapsed,
+    MobileGestureSettings? gesture,
   }) {
     return AppSettings(
       isDarkMode: isDarkMode ?? this.isDarkMode,
@@ -293,6 +348,7 @@ class AppSettings {
       isBottomTabsCollapsed:
           isBottomTabsCollapsed ?? this.isBottomTabsCollapsed,
       isHeaderCollapsed: isHeaderCollapsed ?? this.isHeaderCollapsed,
+      gesture: gesture ?? this.gesture,
     );
   }
 
@@ -302,15 +358,20 @@ class AppSettings {
       'activeInstanceId': activeInstanceId,
       'isBottomTabsCollapsed': isBottomTabsCollapsed,
       'isHeaderCollapsed': isHeaderCollapsed,
+      'gesture': gesture.toJson(),
     };
   }
 
   factory AppSettings.fromJson(Map<String, dynamic> json) {
+    final rawGesture = json['gesture'];
     return AppSettings(
       isDarkMode: json['isDarkMode'] as bool? ?? true,
       activeInstanceId: json['activeInstanceId'] as String?,
       isBottomTabsCollapsed: json['isBottomTabsCollapsed'] as bool? ?? false,
       isHeaderCollapsed: json['isHeaderCollapsed'] as bool? ?? false,
+      gesture: rawGesture is Map<String, dynamic>
+          ? MobileGestureSettings.fromJson(rawGesture)
+          : const MobileGestureSettings(),
     );
   }
 }
@@ -559,13 +620,17 @@ String? makeAccountSyncKey(String serviceId, String? handle) {
 
 int nowUnixSecs() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
-/// 端末ごとのフォロー回数エントリ（Rust `DeviceFollowEntry` と完全互換 JSON）。
+/// 端末ごとのフォロー・アンフォロー回数エントリ（Rust `DeviceFollowEntry` と完全互換 JSON）。
 class DeviceFollowEntry {
   DeviceFollowEntry({
     this.today = 0,
     this.total = 0,
     this.todayEpoch = 0,
     this.totalEpoch = 0,
+    this.unfollowToday = 0,
+    this.unfollowTotal = 0,
+    this.unfollowTodayEpoch = 0,
+    this.unfollowTotalEpoch = 0,
     this.updatedAt = 0,
   });
 
@@ -573,6 +638,10 @@ class DeviceFollowEntry {
   int total;
   int todayEpoch;
   int totalEpoch;
+  int unfollowToday;
+  int unfollowTotal;
+  int unfollowTodayEpoch;
+  int unfollowTotalEpoch;
   int updatedAt;
 
   DeviceFollowEntry clone() => DeviceFollowEntry(
@@ -580,6 +649,10 @@ class DeviceFollowEntry {
         total: total,
         todayEpoch: todayEpoch,
         totalEpoch: totalEpoch,
+        unfollowToday: unfollowToday,
+        unfollowTotal: unfollowTotal,
+        unfollowTodayEpoch: unfollowTodayEpoch,
+        unfollowTotalEpoch: unfollowTotalEpoch,
         updatedAt: updatedAt,
       );
 
@@ -588,6 +661,10 @@ class DeviceFollowEntry {
       total == other.total &&
       todayEpoch == other.todayEpoch &&
       totalEpoch == other.totalEpoch &&
+      unfollowToday == other.unfollowToday &&
+      unfollowTotal == other.unfollowTotal &&
+      unfollowTodayEpoch == other.unfollowTodayEpoch &&
+      unfollowTotalEpoch == other.unfollowTotalEpoch &&
       updatedAt == other.updatedAt;
 
   Map<String, dynamic> toJson() => {
@@ -595,6 +672,10 @@ class DeviceFollowEntry {
         'total': total,
         'todayEpoch': todayEpoch,
         'totalEpoch': totalEpoch,
+        'unfollowToday': unfollowToday,
+        'unfollowTotal': unfollowTotal,
+        'unfollowTodayEpoch': unfollowTodayEpoch,
+        'unfollowTotalEpoch': unfollowTotalEpoch,
         'updatedAt': updatedAt,
       };
 
@@ -604,6 +685,10 @@ class DeviceFollowEntry {
       total: (json['total'] as num?)?.toInt() ?? 0,
       todayEpoch: (json['todayEpoch'] as num?)?.toInt() ?? 0,
       totalEpoch: (json['totalEpoch'] as num?)?.toInt() ?? 0,
+      unfollowToday: (json['unfollowToday'] as num?)?.toInt() ?? 0,
+      unfollowTotal: (json['unfollowTotal'] as num?)?.toInt() ?? 0,
+      unfollowTodayEpoch: (json['unfollowTodayEpoch'] as num?)?.toInt() ?? 0,
+      unfollowTotalEpoch: (json['unfollowTotalEpoch'] as num?)?.toInt() ?? 0,
       updatedAt: (json['updatedAt'] as num?)?.toInt() ?? 0,
     );
   }
@@ -615,6 +700,8 @@ class AccountFollowLedger {
     this.date = '',
     this.resetEpoch = 0,
     this.totalResetEpoch = 0,
+    this.unfollowResetEpoch = 0,
+    this.unfollowTotalResetEpoch = 0,
     Map<String, DeviceFollowEntry>? devices,
     this.snsFollowing,
     this.snsFollowers,
@@ -624,6 +711,8 @@ class AccountFollowLedger {
   String date;
   int resetEpoch;
   int totalResetEpoch;
+  int unfollowResetEpoch;
+  int unfollowTotalResetEpoch;
   Map<String, DeviceFollowEntry> devices;
   int? snsFollowing;
   int? snsFollowers;
@@ -633,6 +722,8 @@ class AccountFollowLedger {
         date: date,
         resetEpoch: resetEpoch,
         totalResetEpoch: totalResetEpoch,
+        unfollowResetEpoch: unfollowResetEpoch,
+        unfollowTotalResetEpoch: unfollowTotalResetEpoch,
         devices: {for (final e in devices.entries) e.key: e.value.clone()},
         snsFollowing: snsFollowing,
         snsFollowers: snsFollowers,
@@ -647,6 +738,8 @@ class AccountFollowLedger {
       for (final entry in devices.values) {
         entry.today = 0;
         entry.todayEpoch = resetEpoch;
+        entry.unfollowToday = 0;
+        entry.unfollowTodayEpoch = unfollowResetEpoch;
       }
     }
   }
@@ -669,6 +762,24 @@ class AccountFollowLedger {
     );
   }
 
+  (int, int) effectiveUnfollowCounts(String today) {
+    final sameDay = date == today;
+    var sumToday = 0;
+    var sumTotal = 0;
+    for (final entry in devices.values) {
+      if (sameDay && entry.unfollowTodayEpoch >= unfollowResetEpoch) {
+        sumToday += entry.unfollowToday;
+      }
+      if (entry.unfollowTotalEpoch >= unfollowTotalResetEpoch) {
+        sumTotal += entry.unfollowTotal;
+      }
+    }
+    return (
+      sumToday.clamp(0, 999999),
+      sumTotal.clamp(0, 99999999),
+    );
+  }
+
   /// 相手側レジャーを CRDT マージする。ローカルに変化があれば true。
   bool mergeFrom(AccountFollowLedger other, String today) {
     var changed = false;
@@ -683,6 +794,7 @@ class AccountFollowLedger {
       if (date.compareTo(targetDate) < 0) {
         for (final entry in devices.values) {
           entry.today = 0;
+          entry.unfollowToday = 0;
         }
       }
       date = targetDate;
@@ -711,6 +823,28 @@ class AccountFollowLedger {
       changed = true;
     }
 
+    if (other.unfollowResetEpoch > unfollowResetEpoch) {
+      unfollowResetEpoch = other.unfollowResetEpoch;
+      for (final entry in devices.values) {
+        if (entry.unfollowTodayEpoch < unfollowResetEpoch) {
+          entry.unfollowToday = 0;
+          entry.unfollowTodayEpoch = unfollowResetEpoch;
+        }
+      }
+      changed = true;
+    }
+
+    if (other.unfollowTotalResetEpoch > unfollowTotalResetEpoch) {
+      unfollowTotalResetEpoch = other.unfollowTotalResetEpoch;
+      for (final entry in devices.values) {
+        if (entry.unfollowTotalEpoch < unfollowTotalResetEpoch) {
+          entry.unfollowTotal = 0;
+          entry.unfollowTotalEpoch = unfollowTotalResetEpoch;
+        }
+      }
+      changed = true;
+    }
+
     final otherSameDay = other.date == targetDate;
     for (final item in other.devices.entries) {
       final normalized = item.value.clone();
@@ -722,6 +856,14 @@ class AccountFollowLedger {
         normalized.total = 0;
         normalized.totalEpoch = totalResetEpoch;
       }
+      if (!otherSameDay || normalized.unfollowTodayEpoch < unfollowResetEpoch) {
+        normalized.unfollowToday = 0;
+        normalized.unfollowTodayEpoch = unfollowResetEpoch;
+      }
+      if (normalized.unfollowTotalEpoch < unfollowTotalResetEpoch) {
+        normalized.unfollowTotal = 0;
+        normalized.unfollowTotalEpoch = unfollowTotalResetEpoch;
+      }
       final local = devices[item.key];
       if (local == null) {
         devices[item.key] = normalized;
@@ -730,7 +872,9 @@ class AccountFollowLedger {
         final remoteNewer = normalized.updatedAt > local.updatedAt ||
             (normalized.updatedAt == local.updatedAt &&
                 (normalized.total > local.total ||
-                    normalized.today > local.today));
+                    normalized.today > local.today ||
+                    normalized.unfollowTotal > local.unfollowTotal ||
+                    normalized.unfollowToday > local.unfollowToday));
         if (remoteNewer && !local.equalsValue(normalized)) {
           devices[item.key] = normalized;
           changed = true;
@@ -761,6 +905,8 @@ class AccountFollowLedger {
         'date': date,
         'resetEpoch': resetEpoch,
         'totalResetEpoch': totalResetEpoch,
+        'unfollowResetEpoch': unfollowResetEpoch,
+        'unfollowTotalResetEpoch': unfollowTotalResetEpoch,
         'devices': {for (final e in devices.entries) e.key: e.value.toJson()},
         if (snsFollowing != null) 'snsFollowing': snsFollowing,
         if (snsFollowers != null) 'snsFollowers': snsFollowers,
@@ -783,6 +929,9 @@ class AccountFollowLedger {
       date: (json['date'] as String?) ?? '',
       resetEpoch: (json['resetEpoch'] as num?)?.toInt() ?? 0,
       totalResetEpoch: (json['totalResetEpoch'] as num?)?.toInt() ?? 0,
+      unfollowResetEpoch: (json['unfollowResetEpoch'] as num?)?.toInt() ?? 0,
+      unfollowTotalResetEpoch:
+          (json['unfollowTotalResetEpoch'] as num?)?.toInt() ?? 0,
       devices: devices,
       snsFollowing: (json['snsFollowing'] as num?)?.toInt(),
       snsFollowers: (json['snsFollowers'] as num?)?.toInt(),
@@ -856,7 +1005,6 @@ class FollowSyncLedger {
 class FollowSyncSettings {
   const FollowSyncSettings({
     this.deviceId = '',
-    this.lanEnabled = true,
     this.githubToken = '',
     this.gistId = '',
     this.lastSyncAt,
@@ -864,7 +1012,6 @@ class FollowSyncSettings {
   });
 
   final String deviceId;
-  final bool lanEnabled;
   final String githubToken;
   final String gistId;
   final int? lastSyncAt;
@@ -872,7 +1019,6 @@ class FollowSyncSettings {
 
   FollowSyncSettings copyWith({
     String? deviceId,
-    bool? lanEnabled,
     String? githubToken,
     String? gistId,
     int? lastSyncAt,
@@ -880,7 +1026,6 @@ class FollowSyncSettings {
   }) {
     return FollowSyncSettings(
       deviceId: deviceId ?? this.deviceId,
-      lanEnabled: lanEnabled ?? this.lanEnabled,
       githubToken: githubToken ?? this.githubToken,
       gistId: gistId ?? this.gistId,
       lastSyncAt: lastSyncAt ?? this.lastSyncAt,
@@ -890,7 +1035,6 @@ class FollowSyncSettings {
 
   Map<String, dynamic> toJson() => {
         'deviceId': deviceId,
-        'lanEnabled': lanEnabled,
         'githubToken': githubToken,
         'gistId': gistId,
         if (lastSyncAt != null) 'lastSyncAt': lastSyncAt,
@@ -900,7 +1044,6 @@ class FollowSyncSettings {
   factory FollowSyncSettings.fromJson(Map<String, dynamic> json) {
     return FollowSyncSettings(
       deviceId: (json['deviceId'] as String?)?.trim() ?? '',
-      lanEnabled: json['lanEnabled'] as bool? ?? true,
       githubToken: (json['githubToken'] as String?)?.trim() ?? '',
       gistId: (json['gistId'] as String?)?.trim() ?? '',
       lastSyncAt: (json['lastSyncAt'] as num?)?.toInt(),
@@ -922,10 +1065,13 @@ class FollowSyncSettings {
     final acc = ledger.accounts[key];
     if (acc == null) return inst;
     final (sumToday, sumTotal) = acc.effectiveCounts(today);
+    final (ufToday, ufTotal) = acc.effectiveUnfollowCounts(today);
     final nextFlwng = acc.snsFollowing ?? inst.snsFollowingCount;
     final nextFlwrs = acc.snsFollowers ?? inst.snsFollowersCount;
     if (inst.followCountToday != sumToday ||
         inst.followCountTotal != sumTotal ||
+        inst.unfollowCountToday != ufToday ||
+        inst.unfollowCountTotal != ufTotal ||
         inst.followCountDate != today ||
         inst.snsFollowingCount != nextFlwng ||
         inst.snsFollowersCount != nextFlwrs) {
@@ -933,6 +1079,8 @@ class FollowSyncSettings {
       return inst.copyWith(
         followCountToday: sumToday,
         followCountTotal: sumTotal,
+        unfollowCountToday: ufToday,
+        unfollowCountTotal: ufTotal,
         followCountDate: today,
         snsFollowingCount: nextFlwng,
         snsFollowersCount: nextFlwrs,
@@ -941,4 +1089,94 @@ class FollowSyncSettings {
     return inst;
   }).toList();
   return (out, changed);
+}
+
+/// 現在表示中のURLから対応する主要SNSカタログIDを推定する。
+/// 例: Threadsタブ内で `https://www.instagram.com/...` を開いた際に `'instagram'` を返す。
+String? detectPlatformServiceFromUrl(String? rawUrl) {
+  final trimmed = rawUrl?.trim();
+  if (trimmed == null || trimmed.isEmpty) return null;
+  final uri = Uri.tryParse(trimmed);
+  final host = uri?.host.toLowerCase() ?? '';
+  if (host.isEmpty) return null;
+  bool matchesHost(String domain) => host == domain || host.endsWith('.$domain');
+  if (matchesHost('instagram.com')) return 'instagram';
+  if (matchesHost('threads.com') || matchesHost('threads.net')) return 'threads';
+  if (matchesHost('bsky.app') || matchesHost('bsky.social')) return 'bluesky';
+  if (matchesHost('mixi.social')) return 'mixi2';
+  if (matchesHost('x.com') || matchesHost('twitter.com')) return 'x';
+  if (matchesHost('tiktok.com')) return 'tiktok';
+  if (matchesHost('facebook.com')) return 'facebook';
+  if (matchesHost('messenger.com')) return 'messenger';
+  if (matchesHost('note.com')) return 'note';
+  if (matchesHost('youtube.com')) return 'youtube';
+  if (matchesHost('twitch.tv')) return 'twitch';
+  if (matchesHost('reddit.com')) return 'reddit';
+  if (matchesHost('pinterest.com') || matchesHost('pinterest.jp')) {
+    return 'pinterest';
+  }
+  if (matchesHost('linkedin.com')) return 'linkedin';
+  if (matchesHost('tumblr.com')) return 'tumblr';
+  if (matchesHost('pixiv.net')) return 'pixiv';
+  return null;
+}
+
+/// タブ内で別SNS（例: Threadsタブ内から Instagram を開いた場合）を表示している際、
+/// 表示中サービスのアカウントインスタンスへカウンター対象を切り替える。
+/// 該当サービスが一覧に未登録の場合は null を返し、元のSNSのカウントが引き継がれないようにする。
+ServiceInstance? resolveCounterTargetInstance({
+  required ServiceInstance source,
+  required List<ServiceInstance> instances,
+  String? currentUrl,
+  String? explicitService,
+  String? handleHint,
+  Map<String, String> lastActiveByGroup = const {},
+}) {
+  final normService = explicitService?.trim().toLowerCase();
+  final effectiveService = (normService != null && normService.isNotEmpty)
+      ? normService
+      : (detectPlatformServiceFromUrl(currentUrl) ?? source.serviceId);
+
+  if (effectiveService == source.serviceId) {
+    return source;
+  }
+
+  final candidates =
+      instances.where((i) => i.serviceId == effectiveService).toList();
+  if (candidates.isEmpty) {
+    return null;
+  }
+
+  // 1. 明示または直近検出のクロスサイトハンドル一致
+  final normHint = normalizeAccountHandle(handleHint);
+  if (normHint != null) {
+    for (final c in candidates) {
+      if (c.detectedHandle == normHint) return c;
+    }
+  }
+
+  // 2. 元インスタンスと同一 @handle（Threads ↔ Instagram 連携アカウント）
+  if (source.detectedHandle != null) {
+    for (final c in candidates) {
+      if (c.detectedHandle == source.detectedHandle) return c;
+    }
+  }
+
+  // 3. 対象サービスで直近アクティブだったアカウント
+  final rememberedId = lastActiveByGroup[effectiveService];
+  if (rememberedId != null) {
+    for (final c in candidates) {
+      if (c.instanceId == rememberedId) return c;
+    }
+  }
+
+  // 4. アカウントラベル一致
+  final srcLabel = source.accountLabel?.trim();
+  if (srcLabel != null && srcLabel.isNotEmpty) {
+    for (final c in candidates) {
+      if (c.accountLabel?.trim() == srcLabel) return c;
+    }
+  }
+
+  return candidates.first;
 }

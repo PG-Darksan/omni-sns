@@ -1,10 +1,7 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import '../models/service_models.dart';
 
-const int kLanSyncPort = 45871;
-const String kLanSyncMagic = 'omnisns-follow-sync-v1';
 const String kGistFilename = 'omnisns-follow-sync.json';
 
 class GistSyncResult {
@@ -46,156 +43,8 @@ String encodeSharedSyncConfig(String token, String gistId) {
   }
 }
 
-/// 同一 Wi-Fi 自動 LAN 同期 (UDP 45871) ＋ GitHub 非公開 Gist クラウド同期サービス。
+/// GitHub 非公開 Gist クラウド同期サービス。
 class FollowSyncService {
-  RawDatagramSocket? _socket;
-  Timer? _beaconTimer;
-  bool _disposed = false;
-
-  Future<void> startLanListener({
-    required ({bool enabled, String deviceId, FollowSyncLedger ledger})
-        Function() getState,
-    required ({String deviceId, FollowSyncLedger ledger, bool shouldReply})
-        Function(FollowSyncLedger remote) onRemoteLedger,
-  }) async {
-    if (_disposed || _socket != null) return;
-    try {
-      final sock = await RawDatagramSocket.bind(
-        InternetAddress.anyIPv4,
-        kLanSyncPort,
-        reuseAddress: true,
-      );
-      if (_disposed) {
-        sock.close();
-        return;
-      }
-      sock.broadcastEnabled = true;
-      _socket = sock;
-
-      sock.listen(
-        (event) {
-          if (event != RawSocketEvent.read || _disposed) return;
-          final dg = sock.receive();
-          if (dg == null || dg.data.isEmpty) return;
-          final st = getState();
-          if (!st.enabled) return;
-          try {
-            final decoded = jsonDecode(utf8.decode(dg.data));
-            if (decoded is! Map<String, dynamic>) return;
-            if (decoded['magic'] != kLanSyncMagic) return;
-            final peerId = (decoded['deviceId'] as String?) ?? '';
-            if (peerId.isEmpty || peerId == st.deviceId) return;
-            final ledgerMap = decoded['ledger'];
-            if (ledgerMap is! Map) return;
-            final remoteLedger = FollowSyncLedger.fromJson(
-              Map<String, dynamic>.from(ledgerMap),
-            );
-            final res = onRemoteLedger(remoteLedger);
-            if (decoded['kind'] == 'beacon' &&
-                res.shouldReply &&
-                res.deviceId.isNotEmpty) {
-              _sendPacket(
-                sock,
-                dg.address,
-                dg.port,
-                kind: 'reply',
-                deviceId: res.deviceId,
-                ledger: res.ledger,
-              );
-            }
-          } catch (_) {}
-        },
-        onError: (_) {},
-      );
-
-      _beaconTimer?.cancel();
-      _beaconTimer = Timer.periodic(const Duration(seconds: 25), (_) {
-        if (_disposed) return;
-        final st = getState();
-        if (st.enabled &&
-            st.deviceId.isNotEmpty &&
-            st.ledger.accounts.isNotEmpty) {
-          broadcastLan(st.deviceId, st.ledger);
-        }
-      });
-
-      final initSt = getState();
-      if (initSt.enabled &&
-          initSt.deviceId.isNotEmpty &&
-          initSt.ledger.accounts.isNotEmpty) {
-        broadcastLan(initSt.deviceId, initSt.ledger);
-      }
-    } catch (_) {
-      // テスト環境・ネットワーク権限制限時は無音フォールバック
-    }
-  }
-
-  void _sendPacket(
-    RawDatagramSocket sock,
-    InternetAddress addr,
-    int port, {
-    required String kind,
-    required String deviceId,
-    required FollowSyncLedger ledger,
-  }) {
-    try {
-      final bytes = utf8.encode(
-        jsonEncode({
-          'magic': kLanSyncMagic,
-          'kind': kind,
-          'deviceId': deviceId,
-          'ledger': ledger.toJson(),
-        }),
-      );
-      if (bytes.length <= 60000) {
-        sock.send(bytes, addr, port);
-      }
-    } catch (_) {}
-  }
-
-  Future<void> broadcastLan(String deviceId, FollowSyncLedger ledger) async {
-    if (_disposed || deviceId.isEmpty || ledger.accounts.isEmpty) return;
-    final sock = _socket;
-    final broadcastAddr = InternetAddress('255.255.255.255');
-    if (sock != null) {
-      _sendPacket(
-        sock,
-        broadcastAddr,
-        kLanSyncPort,
-        kind: 'beacon',
-        deviceId: deviceId,
-        ledger: ledger,
-      );
-      return;
-    }
-    RawDatagramSocket? temp;
-    try {
-      temp = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-      temp.broadcastEnabled = true;
-      _sendPacket(
-        temp,
-        broadcastAddr,
-        kLanSyncPort,
-        kind: 'beacon',
-        deviceId: deviceId,
-        ledger: ledger,
-      );
-    } catch (_) {
-    } finally {
-      temp?.close();
-    }
-  }
-
-  void dispose() {
-    _disposed = true;
-    _beaconTimer?.cancel();
-    _beaconTimer = null;
-    try {
-      _socket?.close();
-    } catch (_) {}
-    _socket = null;
-  }
-
   static Future<(int, String)> _githubJsonRequest({
     required String method,
     required String path,

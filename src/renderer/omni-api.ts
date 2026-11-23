@@ -4,6 +4,7 @@ import {
   AddInstancePayload,
   AppConfig,
   AppSettings,
+  BrowserTabInfo,
   CatalogService,
   CategoryMeta,
   FollowSyncSettings,
@@ -20,12 +21,16 @@ export interface BootstrapPayload {
   runtimeStates: TabRuntimeState[];
   appVersion: string;
   closedTabsCount: number;
+  gmailOpen: boolean;
+  gmailRuntime?: BrowserTabInfo | null;
 }
 
 export interface StateUpdatedPayload {
   config: AppConfig;
   runtimeStates: TabRuntimeState[];
   closedTabsCount: number;
+  gmailOpen: boolean;
+  gmailRuntime?: BrowserTabInfo | null;
 }
 
 export interface ShortcutEventPayload {
@@ -57,6 +62,8 @@ export interface OmniApi {
   updateGestureSettings: (gesture: GestureSettings) => Promise<GestureSettings>;
   adjustFollowCount: (instanceId: string, delta: number) => Promise<ServiceInstance | null>;
   resetFollowCount: (instanceId: string, resetTotal: boolean) => Promise<ServiceInstance | null>;
+  adjustUnfollowCount: (instanceId: string, delta: number) => Promise<ServiceInstance | null>;
+  resetUnfollowCount: (instanceId: string, resetTotal: boolean) => Promise<ServiceInstance | null>;
   setFollowHandle: (instanceId: string, handle: string) => Promise<ServiceInstance>;
   updateFollowSyncSettings: (patch: UpdateFollowSyncPatch) => Promise<FollowSyncSettings>;
   syncFollowNow: () => Promise<FollowSyncSettings>;
@@ -64,6 +71,9 @@ export interface OmniApi {
   setOverlayVisible: (visible: boolean) => Promise<void>;
   copyText: (text: string) => Promise<void>;
   openExternalUrl: (url: string) => Promise<void>;
+  toggleGmail: (open?: boolean) => Promise<boolean>;
+  gmailAction: (action: string) => Promise<void>;
+  navigateGmail: (url: string) => Promise<string>;
   onStateUpdated: (listener: (payload: StateUpdatedPayload) => void) => () => void;
   onRuntimeUpdated: (listener: (state: TabRuntimeState) => void) => () => void;
   onShortcut: (listener: (payload: ShortcutEventPayload) => void) => () => void;
@@ -121,6 +131,10 @@ export const omniApi: OmniApi = {
     invoke<ServiceInstance | null>('follow_adjust', { instanceId, delta }),
   resetFollowCount: (instanceId, resetTotal) =>
     invoke<ServiceInstance | null>('follow_reset', { instanceId, resetTotal }),
+  adjustUnfollowCount: (instanceId, delta) =>
+    invoke<ServiceInstance | null>('unfollow_adjust', { instanceId, delta }),
+  resetUnfollowCount: (instanceId, resetTotal) =>
+    invoke<ServiceInstance | null>('unfollow_reset', { instanceId, resetTotal }),
   setFollowHandle: (instanceId, handle) =>
     invoke<ServiceInstance>('follow_set_handle', { instanceId, handle }),
   updateFollowSyncSettings: (patch) =>
@@ -130,6 +144,9 @@ export const omniApi: OmniApi = {
   setOverlayVisible: (visible) => invoke<void>('ui_set_overlay', { visible }),
   copyText: (text) => invoke<void>('ui_copy_text', { text }),
   openExternalUrl: (url) => invoke<void>('app_open_external_url', { url }),
+  toggleGmail: (open) => invoke<boolean>('gmail_toggle', { open: open ?? null }),
+  gmailAction: (action) => invoke<void>('gmail_action', { action }),
+  navigateGmail: (url) => invoke<string>('gmail_navigate', { url }),
   onStateUpdated: (listener) => subscribe<StateUpdatedPayload>('app:state-updated', listener),
   onRuntimeUpdated: (listener) => subscribe<TabRuntimeState>('tab:runtime-updated', listener),
   onShortcut: (listener) => subscribe<ShortcutEventPayload>('app:shortcut', listener)

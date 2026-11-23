@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { CATEGORIES, SERVICE_CATALOG } from '../src/shared/catalog';
 import {
   buildUserAgent,
+  detectPlatformServiceFromUrl,
   getAccountDisplayLabel,
   getServiceGroupKey,
   isSameSiteUrl,
@@ -154,4 +155,15 @@ test('account grouping and display label helpers work cleanly for multi-account 
   assert.equal(nextDefaultAccountLabel(['メイン']), 'アカウント 2');
   assert.equal(nextDefaultAccountLabel(['メイン', 'アカウント 2']), 'アカウント 3');
   assert.equal(nextDefaultAccountLabel(['メイン', 'アカウント 3', '仕事用']), 'アカウント 4');
+});
+
+test('detectPlatformServiceFromUrl identifies Instagram opened inside Threads tab', () => {
+  assert.equal(
+    detectPlatformServiceFromUrl('https://www.instagram.com/alice/followers/'),
+    'instagram'
+  );
+  assert.equal(detectPlatformServiceFromUrl('https://www.threads.com/@alice'), 'threads');
+  assert.equal(detectPlatformServiceFromUrl('https://www.threads.net/@alice'), 'threads');
+  assert.equal(detectPlatformServiceFromUrl('https://bsky.app/profile/alice.bsky.social'), 'bluesky');
+  assert.equal(detectPlatformServiceFromUrl('https://example.com/other'), null);
 });

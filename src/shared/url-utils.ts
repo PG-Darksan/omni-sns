@@ -259,3 +259,35 @@ export function nextDefaultAccountLabel(existingLabels: string[]): string {
   }
   return `アカウント ${n}`;
 }
+
+/**
+ * 現在表示中のURLから対応する主要SNSカタログIDを推定する。
+ * 例: Threadsタブ内で Instagram を開いた際に 'instagram' を返す。
+ */
+export function detectPlatformServiceFromUrl(rawUrl?: string | null): string | null {
+  if (!rawUrl || !rawUrl.trim()) return null;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    const host = parsed.hostname.toLowerCase();
+    const matchHost = (domain: string) => host === domain || host.endsWith(`.${domain}`);
+    if (matchHost('instagram.com')) return 'instagram';
+    if (matchHost('threads.com') || matchHost('threads.net')) return 'threads';
+    if (matchHost('bsky.app') || matchHost('bsky.social')) return 'bluesky';
+    if (matchHost('mixi.social')) return 'mixi2';
+    if (matchHost('x.com') || matchHost('twitter.com')) return 'x';
+    if (matchHost('tiktok.com')) return 'tiktok';
+    if (matchHost('facebook.com')) return 'facebook';
+    if (matchHost('messenger.com')) return 'messenger';
+    if (matchHost('note.com')) return 'note';
+    if (matchHost('youtube.com')) return 'youtube';
+    if (matchHost('twitch.tv')) return 'twitch';
+    if (matchHost('reddit.com')) return 'reddit';
+    if (matchHost('pinterest.com') || matchHost('pinterest.jp')) return 'pinterest';
+    if (matchHost('linkedin.com')) return 'linkedin';
+    if (matchHost('tumblr.com')) return 'tumblr';
+    if (matchHost('pixiv.net')) return 'pixiv';
+  } catch {
+    // ignore
+  }
+  return null;
+}

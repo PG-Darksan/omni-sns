@@ -2,8 +2,10 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:omni_sns_mobile/models/gesture_models.dart';
 import 'package:omni_sns_mobile/models/service_models.dart';
 import 'package:omni_sns_mobile/screens/catalog_sheet.dart';
+import 'package:omni_sns_mobile/screens/gesture_settings_screen.dart';
 import 'package:omni_sns_mobile/screens/home_screen.dart';
 import 'package:omni_sns_mobile/services/app_store.dart';
 import 'package:omni_sns_mobile/services/follow_sync_service.dart';
@@ -155,7 +157,16 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
 
     // ヘッダーに Gmail ボタン・再読み込みボタン・折り畳みボタンが表示される
-    expect(find.byKey(const ValueKey('header-gmail-button')), findsOneWidget);
+    final gmailBtn = find.byKey(const ValueKey('header-gmail-button'));
+    expect(gmailBtn, findsOneWidget);
+    // Gmail ボタンをタップすると外部ブラウザではなくアプリ内 Gmail バーが開く
+    await tester.tap(gmailBtn);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('inapp-gmail-bar')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('gmail-back-to-sns-button')));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('inapp-gmail-bar')), findsNothing);
+
     final reloadBtn = find.byKey(const ValueKey('header-reload-button'));
     expect(reloadBtn, findsOneWidget);
     expect(find.byTooltip('再読み込み'), findsOneWidget);
@@ -444,5 +455,125 @@ void main() {
     expect(decoded!.token, 'ghp_testToken123');
     expect(decoded.gistId, 'gist_abc456');
     expect(parseSharedSyncConfig('invalid'), isNull);
+  });
+
+  test('Unfollow count rollover/reset, Threads-to-Instagram counter switch, and mobile gestures work cleanly', () {
+    final day1 = DateTime(2026, 11, 22);
+    final day2 = DateTime(2026, 11, 23);
+    const threads = ServiceInstance(
+      instanceId: 'svc-threads-1',
+      serviceId: 'threads',
+      name: 'Threads',
+      accountLabel: 'メイン',
+      category: 'major-sns',
+      url: 'https://www.threads.com/',
+      colorHex: '#18181B',
+      badge: 'TH',
+      notificationsEnabled: true,
+      order: 0,
+      followCountToday: 12,
+      followCountTotal: 40,
+      followCountDate: '2026-11-23',
+      detectedHandle: 'darksan',
+    );
+    const ig = ServiceInstance(
+      instanceId: 'svc-ig-1',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      accountLabel: 'メイン',
+      category: 'major-sns',
+      url: 'https://www.instagram.com/direct/inbox/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 1,
+      followCountToday: 3,
+      followCountTotal: 15,
+      followCountDate: '2026-11-23',
+      detectedHandle: 'darksan',
+    );
+
+    // アンフォローカウント増減・日次ロールオーバー・リセット
+    final uf2 = ig.withUnfollowDelta(1, day1).withUnfollowDelta(1, day1);
+    expect(uf2.effectiveUnfollowCountToday(day1), 2);
+    expect(uf2.unfollowCountTotal, 2);
+    expect(uf2.effectiveUnfollowCountToday(day2), 0);
+    final ufResetToday = uf2.withUnfollowDelta(1, day2).withUnfollowReset(resetTotal: false, now: day2);
+    expect(ufResetToday.effectiveUnfollowCountToday(day2), 0);
+    expect(ufResetToday.unfollowCountTotal, 3);
+
+    // Threadsタブ内でInstagram URLを開いたらInstagramインスタンスへ切替（Threadsの12を引き継がない）
+    expect(detectPlatformServiceFromUrl('https://www.instagram.com/alice/'), 'instagram');
+    final resolvedIg = resolveCounterTargetInstance(
+      source: threads,
+      instances: [threads, ig],
+      currentUrl: 'https://www.instagram.com/alice/',
+    );
+    expect(resolvedIg?.instanceId, 'svc-ig-1');
+    expect(resolvedIg?.followCountToday, 3);
+
+    // Instagramインスタンス未登録時はThreadsを返さず null を返す
+    final resolvedMissing = resolveCounterTargetInstance(
+      source: threads,
+      instances: [threads],
+      currentUrl: 'https://www.instagram.com/alice/',
+    );
+    expect(resolvedMissing, isNull);
+
+    // 12方向ジェスチャー認識エンジン
+    final path = GesturePath();
+    path.reset(const Offset(200, 200));
+    path.push(const Offset(160, 200));
+    expect(path.shape, 'L');
+    path.push(const Offset(160, 150));
+    expect(path.shape, 'LU');
+    // 180度逆戻りまたは3方向目はキャンセル
+    path.push(const Offset(160, 210));
+    expect(path.invalidated, isTrue);
+    expect(path.shape, '');
+
+    // 設定ラウンドトリップ
+    final gSettings = const MobileGestureSettings(
+      enabled: true,
+      triggerSide: 'both',
+      tremor: 14,
+      handleXFraction: 0.12,
+      handleYFraction: 0.72,
+    );
+    final appSettings = AppSettings(gesture: gSettings);
+    final restored = AppSettings.fromJson(appSettings.toJson());
+    expect(restored.gesture.enabled, isTrue);
+    expect(restored.gesture.triggerSide, 'both');
+    expect(restored.gesture.tremor, 14);
+    expect(restored.gesture.actionFor('DL'), 'toggle-gmail');
+  });
+
+  testWidgets('GestureSettingsScreen renders 12-direction board and updates toggle', (tester) async {
+    MobileGestureSettings? latest;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: GestureSettingsScreen(
+          initialSettings: const MobileGestureSettings(),
+          onChanged: (next) => latest = next,
+        ),
+      ),
+    );
+    expect(find.text('タッチジェスチャー設定'), findsOneWidget);
+    expect(find.byKey(const ValueKey('gesture-card-L')), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('gesture-card-DL')),
+      200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.byKey(const ValueKey('gesture-card-DL')), findsOneWidget);
+
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('gesture-enabled-switch')),
+      -200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    await tester.tap(find.byKey(const ValueKey('gesture-enabled-switch')));
+    await tester.pump();
+    expect(latest?.enabled, isFalse);
   });
 }
