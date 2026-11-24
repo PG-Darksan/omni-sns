@@ -9,9 +9,12 @@ import {
   CategoryMeta,
   FollowSyncSettings,
   GestureSettings,
+  JevStateSnapshot,
+  JevTestResult,
   ServiceInstance,
   TabRuntimeState,
-  UpdateFollowSyncPatch
+  UpdateFollowSyncPatch,
+  UpdateJevSettingsPatch
 } from '../shared/types';
 
 export interface BootstrapPayload {
@@ -77,8 +80,15 @@ export interface OmniApi {
   toggleGmail: (open?: boolean) => Promise<boolean>;
   gmailAction: (action: string) => Promise<void>;
   navigateGmail: (url: string) => Promise<string>;
+  getJevState: () => Promise<JevStateSnapshot>;
+  updateJevSettings: (patch: UpdateJevSettingsPatch) => Promise<JevStateSnapshot>;
+  testJevConnection: (apiKey: string, category?: string) => Promise<JevTestResult>;
+  clearJevCache: () => Promise<JevStateSnapshot>;
+  resetJevUsage: () => Promise<JevStateSnapshot>;
+  clearJevError: () => Promise<JevStateSnapshot>;
   onStateUpdated: (listener: (payload: StateUpdatedPayload) => void) => () => void;
   onRuntimeUpdated: (listener: (state: TabRuntimeState) => void) => () => void;
+  onJevUpdated: (listener: (snapshot: JevStateSnapshot) => void) => () => void;
   onShortcut: (listener: (payload: ShortcutEventPayload) => void) => () => void;
 }
 
@@ -153,7 +163,15 @@ export const omniApi: OmniApi = {
   toggleGmail: (open) => invoke<boolean>('gmail_toggle', { open: open ?? null }),
   gmailAction: (action) => invoke<void>('gmail_action', { action }),
   navigateGmail: (url) => invoke<string>('gmail_navigate', { url }),
+  getJevState: () => invoke<JevStateSnapshot>('jev_get_state'),
+  updateJevSettings: (patch) => invoke<JevStateSnapshot>('jev_update_settings', { patch }),
+  testJevConnection: (apiKey, category) =>
+    invoke<JevTestResult>('jev_test_connection', { apiKey, category: category ?? null }),
+  clearJevCache: () => invoke<JevStateSnapshot>('jev_clear_cache'),
+  resetJevUsage: () => invoke<JevStateSnapshot>('jev_reset_usage'),
+  clearJevError: () => invoke<JevStateSnapshot>('jev_clear_error'),
   onStateUpdated: (listener) => subscribe<StateUpdatedPayload>('app:state-updated', listener),
   onRuntimeUpdated: (listener) => subscribe<TabRuntimeState>('tab:runtime-updated', listener),
+  onJevUpdated: (listener) => subscribe<JevStateSnapshot>('app:jev-updated', listener),
   onShortcut: (listener) => subscribe<ShortcutEventPayload>('app:shortcut', listener)
 };

@@ -220,5 +220,59 @@ test('Windows and Android PROFILE_STATS_JS are valid JS with universal mutual-fo
     assert.ok(js.includes('igConcurrency'), `${label} must use parallel workers on Instagram`);
     assert.ok(js.includes('deadRouteUntil'), `${label} must skip failing Instagram routes`);
     assert.ok(js.includes('/api/v1/friendships/show_many/'), `${label} must batch-fetch Instagram friendships`);
+    // 投稿数は取得・表示しない
+    assert.ok(!js.includes("parts.push('投稿 '"), `${label} must not display post count in inline badge`);
+  }
+});
+
+test('Windows and Android LONG_PRESS_NEW_TAB_JS and JEV_FILTER_JS parse cleanly and fit JVM string limits', () => {
+  const winSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src-tauri/src/platform_win.rs'),
+    'utf8'
+  );
+  const ktSrc = fs.readFileSync(
+    path.resolve(
+      process.cwd(),
+      'mobile/android/app/src/main/kotlin/com/pgdarksan/omni_sns_mobile/OmniWebView.kt'
+    ),
+    'utf8'
+  );
+
+  const winLpMatch = /pub const LONG_PRESS_NEW_TAB_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winLpMatch, 'Windows LONG_PRESS_NEW_TAB_JS must exist');
+  assert.doesNotThrow(() => new Function(winLpMatch[1]));
+
+  const winJevMatch = /pub const JEV_FILTER_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winJevMatch, 'Windows JEV_FILTER_JS must exist');
+  assert.doesNotThrow(() => new Function(winJevMatch[1]));
+
+  const ktLpMatch = /val LONG_PRESS_NEW_TAB_JS: String = """\r?\n([\s\S]*?)\r?\n"""/.exec(ktSrc);
+  assert.ok(ktLpMatch, 'Android LONG_PRESS_NEW_TAB_JS must exist');
+  assert.ok(Buffer.byteLength(ktLpMatch[1], 'utf8') < 60000);
+  assert.doesNotThrow(() => new Function(ktLpMatch[1]));
+
+  const jevPartRe = /private val JEV_FILTER_JS_PART_\d+: String = """\r?\n([\s\S]*?)\r?\n"""/g;
+  const jevParts: string[] = [];
+  let jm: RegExpExecArray | null;
+  while ((jm = jevPartRe.exec(ktSrc)) !== null) {
+    assert.ok(
+      Buffer.byteLength(jm[1], 'utf8') < 60000,
+      'Each Kotlin JEV_FILTER_JS part must stay under JVM 65535-byte limit'
+    );
+    jevParts.push(jm[1]);
+  }
+  assert.ok(jevParts.length >= 1, 'Android JEV_FILTER_JS parts must exist');
+  const andJevJs = jevParts.join('\n');
+  assert.doesNotThrow(() => new Function(andJevJs));
+
+  for (const [label, lp, jev] of [
+    ['Windows', winLpMatch[1], winJevMatch[1]],
+    ['Android', ktLpMatch[1], andJevJs]
+  ] as const) {
+    assert.ok(lp.includes('omnisns:open-new-tab'), `${label} long-press must support Windows bridge`);
+    assert.ok(lp.includes('onOpenNewTab'), `${label} long-press must support Android bridge`);
+    assert.ok(jev.includes('__omniJevApplyConfig'), `${label} Jev filter must expose config hook`);
+    assert.ok(jev.includes('__omniJevResolve'), `${label} Jev filter must expose batch resolver`);
+    assert.ok(jev.includes('omni-jev-active'), `${label} Jev filter must toggle CSS class`);
   }
 });

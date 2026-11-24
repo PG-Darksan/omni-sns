@@ -47,6 +47,13 @@ pub fn top_header_height(header_collapsed: bool, active_tab_count: usize) -> f64
         ACCOUNTBAR_HEIGHT
     }
 }
+
+/// PC版表示領域の下余白（論理px）。最小限のWeb表示高さを保ちつつ、画面下端の入力欄がはみ出さないよう引き上げる。
+pub fn effective_bottom_inset(setting_px: u32, logical_height: f64, top_h: f64) -> f64 {
+    let clamped = setting_px.min(crate::models::MAX_VIEWPORT_BOTTOM_INSET) as f64;
+    let max_allowed = (logical_height - top_h - 180.0).max(0.0);
+    clamped.min(max_allowed)
+}
 const MAX_SUBTABS_PER_SERVICE: usize = 20;
 const MAX_CLOSED_HISTORY: usize = 25;
 
@@ -251,6 +258,7 @@ pub struct AppStateInner {
     pub chrome_version: String,
     pub main_hwnd: isize,
     pub cloud_sync_gen: Arc<AtomicU64>,
+    pub jev: crate::jev::JevService,
     #[cfg(windows)]
     pub gesture_host: Option<crate::gesture_win::GestureWinHost>,
 }
@@ -261,7 +269,12 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    pub fn new(store: ConfigStore, profiles_root: PathBuf, chrome_version: String) -> Self {
+    pub fn new(
+        store: ConfigStore,
+        config_dir: PathBuf,
+        profiles_root: PathBuf,
+        chrome_version: String,
+    ) -> Self {
         let mut services = HashMap::new();
         for inst in store.get_instances() {
             services.insert(inst.instance_id.clone(), ServiceTabs::new_initial(&inst));
@@ -275,6 +288,7 @@ impl SharedState {
             .map(|s| s.tabs.len())
             .unwrap_or(0);
         let top_h = top_header_height(settings_init.header_collapsed, init_tab_count);
+        let jev = crate::jev::JevService::new(config_dir);
         Self {
             inner: Arc::new(Mutex::new(AppStateInner {
                 store,
@@ -300,6 +314,7 @@ impl SharedState {
                 chrome_version,
                 main_hwnd: 0,
                 cloud_sync_gen: Arc::new(AtomicU64::new(0)),
+                jev,
                 #[cfg(windows)]
                 gesture_host: None,
             })),
@@ -406,7 +421,7 @@ pub fn show_overlay_notice(shared: &SharedState, text: impl Into<String>, is_err
 pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
     #[cfg(windows)]
     {
-        let (host, main_hwnd, sidebar_w, top_h, suspended, settings) = {
+        let (host, main_hwnd, sidebar_w, top_h, bottom_setting, suspended, settings) = {
             let guard = shared.inner.lock().unwrap();
             let active_sleeping_or_err = if guard.gmail_open {
                 guard
@@ -433,6 +448,7 @@ pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
                 guard.main_hwnd,
                 st.sidebar_width as f64,
                 top_header_height(st.header_collapsed, tab_count),
+                st.viewport_bottom_inset,
                 suspended,
                 st.gesture,
             )
@@ -441,14 +457,22 @@ pub fn sync_gesture_host_state(app: &AppHandle, shared: &SharedState) {
         if let Some(host) = host {
             host.set_suspended(suspended);
             host.update_settings(settings);
-            let sf = app
-                .get_window("main")
+            let win = app.get_window("main");
+            let sf = win
+                .as_ref()
                 .and_then(|w| w.scale_factor().ok())
                 .unwrap_or(1.0);
+            let logical_h = win
+                .as_ref()
+                .and_then(|w| w.inner_size().ok())
+                .map(|p| p.to_logical::<f64>(sf).height)
+                .unwrap_or(800.0);
+            let bottom_h = effective_bottom_inset(bottom_setting, logical_h, top_h);
             if let Some(vp) = crate::gesture_win::compute_viewport_screen_rect(
                 main_hwnd,
                 sidebar_w,
                 top_h,
+                bottom_h,
                 sf,
             ) {
                 host.update_viewport(vp);
@@ -502,7 +526,200 @@ pub fn emit_state_updated(app: &AppHandle, shared: &SharedState) {
     if let Some(shell) = app.get_webview("shell") {
         let _ = shell.emit("app:state-updated", payload);
     }
+    emit_jev_updated(app, shared);
     update_window_title(app, shared);
+}
+
+pub fn get_jev_snapshot(shared: &SharedState) -> crate::jev::JevStateSnapshot {
+    let (jev, active_tid) = {
+        let guard = shared.inner.lock().unwrap();
+        let tid = if guard.gmail_open {
+            None
+        } else {
+            guard
+                .active_instance_id
+                .as_deref()
+                .and_then(|id| guard.services.get(id))
+                .map(|s| s.active_tab_id.clone())
+        };
+        (guard.jev.clone(), tid)
+    };
+    jev.snapshot(active_tid.as_deref())
+}
+
+pub fn emit_jev_updated(app: &AppHandle, shared: &SharedState) {
+    let snap = get_jev_snapshot(shared);
+    if let Some(shell) = app.get_webview("shell") {
+        let _ = shell.emit("app:jev-updated", snap);
+    }
+}
+
+pub fn push_jev_config_to_webview(app: &AppHandle, shared: &SharedState, label: &str, reset_judged: bool) {
+    let payload = {
+        let guard = shared.inner.lock().unwrap();
+        guard.jev.js_config_payload(reset_judged)
+    };
+    if let Some(wv) = app.get_webview(label) {
+        let js = format!("window.__omniJevApplyConfig && window.__omniJevApplyConfig({payload});");
+        let _ = wv.eval(&js);
+    }
+}
+
+pub fn sync_jev_config_to_all_tabs(app: &AppHandle, shared: &SharedState, reset_judged: bool) {
+    let (labels, payload) = {
+        let guard = shared.inner.lock().unwrap();
+        let labels: Vec<String> = guard
+            .services
+            .values()
+            .flat_map(|s| s.tabs.iter())
+            .filter_map(|t| t.webview_label.clone())
+            .collect();
+        (labels, guard.jev.js_config_payload(reset_judged))
+    };
+    let js = format!("window.__omniJevApplyConfig && window.__omniJevApplyConfig({payload});");
+    for label in labels {
+        if let Some(wv) = app.get_webview(&label) {
+            let _ = wv.eval(&js);
+        }
+    }
+}
+
+pub fn update_jev_settings(
+    app: &AppHandle,
+    shared: &SharedState,
+    patch: crate::jev::UpdateJevSettingsPatch,
+) -> crate::jev::JevStateSnapshot {
+    let reset_judged = {
+        let guard = shared.inner.lock().unwrap();
+        guard.jev.update_settings(patch)
+    };
+    sync_jev_config_to_all_tabs(app, shared, reset_judged);
+    emit_jev_updated(app, shared);
+    get_jev_snapshot(shared)
+}
+
+pub async fn test_jev_connection(
+    app: &AppHandle,
+    shared: &SharedState,
+    api_key: String,
+    category: Option<String>,
+) -> crate::jev::JevTestResult {
+    let jev = { shared.inner.lock().unwrap().jev.clone() };
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        jev.test_connection_blocking(&api_key, category.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| crate::jev::JevTestResult {
+        ok: false,
+        message: format!("テスト実行エラー: {e}"),
+    });
+    emit_jev_updated(app, shared);
+    res
+}
+
+pub fn clear_jev_cache(app: &AppHandle, shared: &SharedState) -> crate::jev::JevStateSnapshot {
+    {
+        let guard = shared.inner.lock().unwrap();
+        guard.jev.clear_cache();
+    }
+    sync_jev_config_to_all_tabs(app, shared, true);
+    emit_jev_updated(app, shared);
+    get_jev_snapshot(shared)
+}
+
+pub fn reset_jev_usage(app: &AppHandle, shared: &SharedState) -> crate::jev::JevStateSnapshot {
+    {
+        let guard = shared.inner.lock().unwrap();
+        guard.jev.reset_usage();
+    }
+    emit_jev_updated(app, shared);
+    get_jev_snapshot(shared)
+}
+
+pub fn clear_jev_error(app: &AppHandle, shared: &SharedState) -> crate::jev::JevStateSnapshot {
+    {
+        let guard = shared.inner.lock().unwrap();
+        guard.jev.clear_error();
+    }
+    emit_jev_updated(app, shared);
+    get_jev_snapshot(shared)
+}
+
+fn handle_jev_message_from_tab(
+    app: &AppHandle,
+    shared: &SharedState,
+    tab_id: &str,
+    wv_label: &str,
+    raw_msg: &str,
+) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_msg) else {
+        return;
+    };
+    let msg_type = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    match msg_type {
+        "omnisns:jev-get-config" => {
+            push_jev_config_to_webview(app, shared, wv_label, false);
+        }
+        "omnisns:jev-state" => {
+            let active = v.get("active").and_then(|x| x.as_bool()).unwrap_or(false);
+            let matched = v.get("matched").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let hidden = v.get("hidden").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let auto_fetching = v
+                .get("autoFetching")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            {
+                let guard = shared.inner.lock().unwrap();
+                guard.jev.update_live_tab_state(
+                    tab_id,
+                    crate::jev::JevLiveTabState {
+                        active,
+                        matched,
+                        hidden,
+                        auto_fetching,
+                    },
+                );
+            }
+            emit_jev_updated(app, shared);
+        }
+        "omnisns:jev-check" => {
+            let Some(req_id) = v.get("reqId").and_then(|x| x.as_str()).map(|s| s.to_string())
+            else {
+                return;
+            };
+            let candidates: Vec<crate::jev::JevAccountCandidate> = v
+                .get("candidates")
+                .cloned()
+                .and_then(|c| serde_json::from_value(c).ok())
+                .unwrap_or_default();
+            if candidates.is_empty() {
+                if let Some(wv) = app.get_webview(wv_label) {
+                    let req_json = serde_json::to_string(&req_id).unwrap_or_else(|_| "\"\"".into());
+                    let _ = wv.eval(&format!(
+                        "window.__omniJevResolve && window.__omniJevResolve({req_json}, {{}});"
+                    ));
+                }
+                return;
+            }
+            let jev = { shared.inner.lock().unwrap().jev.clone() };
+            let app_bg = app.clone();
+            let shared_bg = shared.clone();
+            let label_bg = wv_label.to_string();
+            std::thread::spawn(move || {
+                emit_jev_updated(&app_bg, &shared_bg);
+                let result = jev.judge_accounts_blocking(candidates);
+                let req_json = serde_json::to_string(&req_id).unwrap_or_else(|_| "\"\"".into());
+                let res_json = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
+                if let Some(wv) = app_bg.get_webview(&label_bg) {
+                    let _ = wv.eval(&format!(
+                        "window.__omniJevResolve && window.__omniJevResolve({req_json}, {res_json});"
+                    ));
+                }
+                emit_jev_updated(&app_bg, &shared_bg);
+            });
+        }
+        _ => {}
+    }
 }
 
 pub fn emit_runtime_updated(app: &AppHandle, shared: &SharedState, instance_id: &str) {
@@ -739,11 +956,12 @@ pub fn update_bounds_from_window(app: &AppHandle, shared: &SharedState) {
         let st = guard.store.get_settings();
         let sidebar_w = st.sidebar_width as f64;
         let top_h = top_header_height(st.header_collapsed, active_tab_count(&guard));
+        let bottom_h = effective_bottom_inset(st.viewport_bottom_inset, logical.height, top_h);
         guard.bounds = ContentBounds {
             x: sidebar_w,
             y: top_h,
             width: (logical.width - sidebar_w).max(0.0),
-            height: (logical.height - top_h).max(0.0),
+            height: (logical.height - top_h - bottom_h).max(0.0),
         };
     }
 
@@ -1570,38 +1788,35 @@ pub fn activate_account_by_index(app: &AppHandle, shared: &SharedState, index: u
 }
 
 /// 前のタブ / 次のタブへ切替。
-/// 現在のサービス内にサブタブが2枚以上あればサブタブを切替え、1枚のみの時はSNSサービスを切替える。
+/// 現在のアカウント内のサブタブのみを切り替える（別SNSサービスへは絶対に移動しない）。
 pub fn step_active_tab(app: &AppHandle, shared: &SharedState, delta: isize) -> Result<(), &'static str> {
-    let sub_target: Option<(String, String)> = {
+    let sub_target: Result<(String, String), &'static str> = {
         let guard = shared.inner.lock().unwrap();
-        let wrap = guard.store.get_settings().gesture.wrap_tabs;
-        if let Some(ref inst_id) = guard.active_instance_id {
-            if let Some(svc) = guard.services.get(inst_id) {
-                if svc.tabs.len() >= 2 {
-                    let cur_idx = svc
-                        .tabs
-                        .iter()
-                        .position(|t| t.tab_id == svc.active_tab_id)
-                        .unwrap_or(0);
-                    let next_idx = step_tab_index(svc.tabs.len(), cur_idx, delta, wrap)?;
-                    Some((inst_id.clone(), svc.tabs[next_idx].tab_id.clone()))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
+        if guard.gmail_open {
+            return Err("他のタブがありません");
         }
+        let wrap = guard.store.get_settings().gesture.wrap_tabs;
+        let Some(ref inst_id) = guard.active_instance_id else {
+            return Err("アクティブなタブがありません");
+        };
+        let Some(svc) = guard.services.get(inst_id) else {
+            return Err("アクティブなタブがありません");
+        };
+        if svc.tabs.len() < 2 {
+            return Err("他のタブがありません");
+        }
+        let cur_idx = svc
+            .tabs
+            .iter()
+            .position(|t| t.tab_id == svc.active_tab_id)
+            .unwrap_or(0);
+        let next_idx = step_tab_index(svc.tabs.len(), cur_idx, delta, wrap)?;
+        Ok((inst_id.clone(), svc.tabs[next_idx].tab_id.clone()))
     };
 
-    if let Some((inst_id, tab_id)) = sub_target {
-        activate_subtab(app, shared, &inst_id, &tab_id);
-        Ok(())
-    } else {
-        step_active_service(app, shared, delta)
-    }
+    let (inst_id, tab_id) = sub_target?;
+    activate_subtab(app, shared, &inst_id, &tab_id);
+    Ok(())
 }
 
 fn create_tab_webview(
@@ -1705,7 +1920,9 @@ fn create_tab_webview(
         builder = builder
             .additional_browser_args(WEBVIEW2_FAST_BROWSER_ARGS)
             .initialization_script(crate::platform_win::FOLLOW_TRACKER_JS)
-            .initialization_script(crate::platform_win::PROFILE_STATS_JS);
+            .initialization_script(crate::platform_win::PROFILE_STATS_JS)
+            .initialization_script(crate::platform_win::LONG_PRESS_NEW_TAB_JS)
+            .initialization_script(crate::platform_win::JEV_FILTER_JS);
     }
 
     let builder = builder
@@ -2044,6 +2261,16 @@ fn attach_windows_handlers(
     let tid_ident = tid.clone();
     let label_ident = wv_label.clone();
 
+    let app_lp = app.clone();
+    let shared_lp = shared.clone();
+    let id_lp = instance_id.clone();
+    let tid_lp = tid.clone();
+
+    let app_jev = app.clone();
+    let shared_jev = shared.clone();
+    let tid_jev = tid.clone();
+    let label_jev = wv_label.clone();
+
     let callbacks = crate::platform_win::TabWebviewCallbacks {
         on_navigation_starting: Arc::new(move || {
             let (changed, was_error) = {
@@ -2351,6 +2578,44 @@ fn attach_windows_handlers(
                     followers,
                 );
             }
+        }),
+        on_open_new_tab: Arc::new(move |target_url| {
+            let app_bg = app_lp.clone();
+            let shared_bg = shared_lp.clone();
+            let inst_bg = id_lp.clone();
+            let after_tid = tid_lp.clone();
+            tauri::async_runtime::spawn(async move {
+                match create_subtab_with_options(
+                    &app_bg,
+                    &shared_bg,
+                    &inst_bg,
+                    Some(target_url),
+                    Some(&after_tid),
+                    false,
+                ) {
+                    Ok(_) => {
+                        let total = {
+                            let guard = shared_bg.inner.lock().unwrap();
+                            guard
+                                .services
+                                .get(&inst_bg)
+                                .map(|s| s.tabs.len())
+                                .unwrap_or(1)
+                        };
+                        show_overlay_notice(
+                            &shared_bg,
+                            format!("別タブで開きました（全{total}タブ）"),
+                            false,
+                        );
+                    }
+                    Err(e) => {
+                        show_overlay_notice(&shared_bg, e, true);
+                    }
+                }
+            });
+        }),
+        on_jev_message: Arc::new(move |raw_msg| {
+            handle_jev_message_from_tab(&app_jev, &shared_jev, &tid_jev, &label_jev, &raw_msg);
         }),
     };
 
@@ -2674,7 +2939,9 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
 
     #[cfg(windows)]
     {
-        builder = builder.additional_browser_args(WEBVIEW2_FAST_BROWSER_ARGS);
+        builder = builder
+            .additional_browser_args(WEBVIEW2_FAST_BROWSER_ARGS)
+            .initialization_script(crate::platform_win::LONG_PRESS_NEW_TAB_JS);
     }
 
     let builder = builder
@@ -2941,6 +3208,13 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
             on_follow_detected: Arc::new(move |_| {}),
             on_unfollow_detected: Arc::new(move |_| {}),
             on_account_identity: Arc::new(move |_s, _h, _flwng, _flwrs| {}),
+            on_open_new_tab: Arc::new(move |url| {
+                if is_http_url(&url) {
+                    #[cfg(windows)]
+                    crate::platform_win::open_external_url(&url);
+                }
+            }),
+            on_jev_message: Arc::new(move |_| {}),
         };
 
         let _ = webview.with_webview(move |platform_wv| {

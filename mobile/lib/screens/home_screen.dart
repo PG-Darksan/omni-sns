@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,7 @@ import '../models/gesture_models.dart';
 import '../models/service_models.dart';
 import '../services/app_store.dart';
 import '../services/follow_sync_service.dart';
+import '../services/jev_service.dart';
 import '../services/omni_webview.dart';
 import '../widgets/gesture_overlay.dart';
 import 'catalog_sheet.dart';
@@ -45,9 +47,38 @@ class _ServiceGroup {
   final List<ServiceInstance> accounts;
 }
 
+class _ExtraSubTab {
+  _ExtraSubTab({
+    required this.tabId,
+    required this.instanceId,
+    required this.controller,
+    required this.runtime,
+  });
+
+  final String tabId;
+  final String instanceId;
+  final OmniWebViewController controller;
+  TabRuntimeState runtime;
+}
+
+class _JevTabLiveState {
+  const _JevTabLiveState({
+    this.active = false,
+    this.matched = 0,
+    this.hidden = 0,
+    this.autoFetching = false,
+  });
+
+  final bool active;
+  final int matched;
+  final int hidden;
+  final bool autoFetching;
+}
+
 class _HomeScreenState extends State<HomeScreen> {
   static const String _gmailUrl = 'https://mail.google.com/';
   static const String _gmailProfileName = 'omnisns_gmail';
+  static const int _maxExtraSubTabsPerAccount = 12;
 
   bool _initialized = false;
   bool _multiProfileSupported = false;
@@ -68,8 +99,14 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _cloudSyncDebounce;
   Timer? _cloudSyncPeriodic;
 
+  final JevService _jev = JevService();
   final Map<String, OmniWebViewController> _controllers = {};
   final Map<String, TabRuntimeState> _runtimeMap = {};
+  final Map<String, List<_ExtraSubTab>> _extraTabs = {};
+  final Map<String, String?> _activeSubTabId = {};
+  final Map<String, _JevTabLiveState> _jevLiveByKey = {};
+  int _jevCheckingCount = 0;
+  int _subTabSeq = 0;
   final Map<String, String> _lastActiveByGroup = {};
   final Map<String, ({String service, String handle})> _crossSiteIdentities = {};
   final GlobalKey<MobileGestureOverlayState> _gestureOverlayKey = GlobalKey();
@@ -77,11 +114,19 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    _jev.addListener(_onJevChanged);
+    unawaited(_jev.ensureLoaded());
     _bootstrap();
+  }
+
+  void _onJevChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
+    _jev.removeListener(_onJevChanged);
+    _jev.dispose();
     _cloudSyncDebounce?.cancel();
     _cloudSyncPeriodic?.cancel();
     _gmailController?.dispose();
@@ -90,6 +135,12 @@ class _HomeScreenState extends State<HomeScreen> {
       ctrl.dispose();
     }
     _controllers.clear();
+    for (final list in _extraTabs.values) {
+      for (final tab in list) {
+        tab.controller.dispose();
+      }
+    }
+    _extraTabs.clear();
     super.dispose();
   }
 
@@ -361,12 +412,13 @@ class _HomeScreenState extends State<HomeScreen> {
     final existing = _controllers[instance.instanceId];
     if (existing != null && !existing.isDisposed) return existing;
 
-    final controller = OmniWebViewController(
+    late final OmniWebViewController controller;
+    controller = OmniWebViewController(
       initialUrl: instance.url,
       profileName: _multiProfileSupported
           ? instance.effectiveProfileName
           : defaultWebViewProfileName,
-      userAgent: buildMobileUserAgent(),
+      userAgent: buildUserAgentForMode(instance.uaMode),
       onProgress: (progress) {
         _updateRuntime(
           instance.instanceId,
@@ -496,6 +548,30 @@ class _HomeScreenState extends State<HomeScreen> {
           );
         }
       },
+      onOpenNewTab: (url) {
+        final src = _instances.cast<ServiceInstance?>().firstWhere(
+              (i) => i?.instanceId == instance.instanceId,
+              orElse: () => instance,
+            );
+        if (src != null) {
+          _openUrlInNewSubTab(src, url, activate: false);
+        }
+      },
+      onJevGetConfig: () {
+        _pushJevConfigToController(controller);
+      },
+      onJevCheckAccounts: (reqId, payloadJson) {
+        unawaited(_handleJevCheckFromWebView(controller, reqId, payloadJson));
+      },
+      onJevState: (active, matched, hidden, autoFetching) {
+        _updateJevLiveState(
+          'main:${instance.instanceId}',
+          active: active,
+          matched: matched,
+          hidden: hidden,
+          autoFetching: autoFetching,
+        );
+      },
     );
 
     _controllers[instance.instanceId] = controller;
@@ -508,6 +584,431 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
     return controller;
+  }
+
+  _ExtraSubTab? _activeExtraTabFor(String instanceId) {
+    final activeTid = _activeSubTabId[instanceId];
+    if (activeTid == null) return null;
+    final list = _extraTabs[instanceId];
+    if (list == null) return null;
+    for (final tab in list) {
+      if (tab.tabId == activeTid) return tab;
+    }
+    return null;
+  }
+
+  String _activeJevKeyFor(ServiceInstance? active) {
+    if (active == null) return '';
+    final extra = _activeExtraTabFor(active.instanceId);
+    return extra != null ? 'sub:${extra.tabId}' : 'main:${active.instanceId}';
+  }
+
+  _JevTabLiveState _currentJevLiveState(ServiceInstance? active) {
+    if (_isGmailOpen || active == null) return const _JevTabLiveState();
+    return _jevLiveByKey[_activeJevKeyFor(active)] ?? const _JevTabLiveState();
+  }
+
+  void _updateJevLiveState(
+    String key, {
+    required bool active,
+    required int matched,
+    required int hidden,
+    required bool autoFetching,
+  }) {
+    final prev = _jevLiveByKey[key];
+    if (prev != null &&
+        prev.active == active &&
+        prev.matched == matched &&
+        prev.hidden == hidden &&
+        prev.autoFetching == autoFetching) {
+      return;
+    }
+    if (active) {
+      _jevLiveByKey[key] = _JevTabLiveState(
+        active: active,
+        matched: matched,
+        hidden: hidden,
+        autoFetching: autoFetching,
+      );
+    } else {
+      _jevLiveByKey.remove(key);
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _pushJevConfigToController(
+    OmniWebViewController ctrl, {
+    bool resetJudged = false,
+  }) {
+    if (ctrl.isDisposed) return;
+    final payload = jsonEncode(_jev.jsConfigPayload(resetJudged: resetJudged));
+    unawaited(
+      ctrl.evaluateJavascript(
+        'window.__omniJevApplyConfig && window.__omniJevApplyConfig($payload);',
+      ),
+    );
+  }
+
+  void _syncJevConfigToAllControllers({bool resetJudged = false}) {
+    for (final ctrl in _controllers.values) {
+      _pushJevConfigToController(ctrl, resetJudged: resetJudged);
+    }
+    for (final list in _extraTabs.values) {
+      for (final tab in list) {
+        _pushJevConfigToController(tab.controller, resetJudged: resetJudged);
+      }
+    }
+  }
+
+  Future<void> _handleJevCheckFromWebView(
+    OmniWebViewController ctrl,
+    String reqId,
+    String payloadJson,
+  ) async {
+    await _jev.ensureLoaded();
+    if (!_jev.isActive || ctrl.isDisposed) {
+      if (!ctrl.isDisposed) {
+        unawaited(
+          ctrl.evaluateJavascript(
+            'window.__omniJevResolve && window.__omniJevResolve(${jsonEncode(reqId)}, {});',
+          ),
+        );
+      }
+      return;
+    }
+    List<dynamic> rawList;
+    try {
+      final decoded = jsonDecode(payloadJson);
+      rawList = decoded is List ? decoded : const [];
+    } catch (_) {
+      rawList = const [];
+    }
+    final candidates = <JevAccountCandidate>[
+      for (final item in rawList)
+        if (item is Map && item['u'] is String)
+          JevAccountCandidate(
+            username: item['u'] as String,
+            displayName: (item['n'] as String?) ?? '',
+            bio: (item['bio'] as String?) ?? '',
+            avatarUrl: (item['img'] as String?) ?? '',
+            avatarBase64: item['b64'] as String?,
+            avatarFormat: item['fmt'] as String?,
+            platform: (item['p'] as String?) ?? 'instagram',
+          ),
+    ];
+    if (candidates.isEmpty) {
+      if (!ctrl.isDisposed) {
+        unawaited(
+          ctrl.evaluateJavascript(
+            'window.__omniJevResolve && window.__omniJevResolve(${jsonEncode(reqId)}, {});',
+          ),
+        );
+      }
+      return;
+    }
+    if (mounted) {
+      setState(() => _jevCheckingCount++);
+    } else {
+      _jevCheckingCount++;
+    }
+    try {
+      final res = await _jev.judgeAccounts(candidates);
+      if (!ctrl.isDisposed) {
+        unawaited(
+          ctrl.evaluateJavascript(
+            'window.__omniJevResolve && window.__omniJevResolve(${jsonEncode(reqId)}, ${jsonEncode(res)});',
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _jevCheckingCount = max(0, _jevCheckingCount - 1));
+      } else {
+        _jevCheckingCount = max(0, _jevCheckingCount - 1);
+      }
+    }
+  }
+
+  void _openUrlInNewSubTab(
+    ServiceInstance instance,
+    String rawUrl, {
+    bool activate = false,
+  }) {
+    final targetUrl = normalizeServiceUrl(rawUrl) ?? instance.url;
+    final list = _extraTabs.putIfAbsent(instance.instanceId, () => []);
+    if (list.length >= _maxExtraSubTabsPerAccount) {
+      _showSnack('1アカウントで開ける追加タブは最大 $_maxExtraSubTabsPerAccount 件です');
+      return;
+    }
+
+    final tabId = 'sub-${++_subTabSeq}';
+    final initialTitle = Uri.tryParse(targetUrl)?.host ?? instance.name;
+    late final _ExtraSubTab subTab;
+    late final OmniWebViewController ctrl;
+    ctrl = OmniWebViewController(
+      initialUrl: targetUrl,
+      profileName: _multiProfileSupported
+          ? instance.effectiveProfileName
+          : defaultWebViewProfileName,
+      userAgent: buildUserAgentForMode(instance.uaMode),
+      onProgress: (progress) {
+        subTab.runtime = subTab.runtime.copyWith(
+          progress: progress,
+          isLoading: progress < 100,
+          isSleeping: false,
+        );
+        if (mounted) setState(() {});
+      },
+      onPageStarted: (url) {
+        subTab.runtime = subTab.runtime.copyWith(
+          currentUrl: isHttpOrHttpsUrl(url) ? url : subTab.runtime.currentUrl,
+          isLoading: true,
+          isSleeping: false,
+          clearError: true,
+        );
+        if (mounted) setState(() {});
+      },
+      onPageFinished: (url, title, canBack, canFwd, hadError) {
+        final safeTitle = title.trim().isEmpty ? initialTitle : title;
+        final validUrl = isHttpOrHttpsUrl(url);
+        subTab.runtime = subTab.runtime.copyWith(
+          currentUrl: validUrl ? url : subTab.runtime.currentUrl,
+          title: safeTitle,
+          progress: 100,
+          isLoading: false,
+          isSleeping: false,
+          canGoBack: canBack,
+          canGoForward: canFwd,
+          clearError: !hadError && validUrl,
+        );
+        if (mounted) setState(() {});
+      },
+      onTitleChanged: (title) {
+        final safeTitle = title.trim().isEmpty ? initialTitle : title;
+        subTab.runtime = subTab.runtime.copyWith(title: safeTitle);
+        if (mounted) setState(() {});
+      },
+      onHistoryChanged: (url, canBack, canFwd) {
+        subTab.runtime = subTab.runtime.copyWith(
+          currentUrl: isHttpOrHttpsUrl(url) ? url : subTab.runtime.currentUrl,
+          canGoBack: canBack,
+          canGoForward: canFwd,
+        );
+        if (mounted) setState(() {});
+      },
+      onWebResourceError: (description, errorCode) {
+        subTab.runtime = subTab.runtime.copyWith(
+          isLoading: false,
+          loadError: '$description ($errorCode)',
+        );
+        if (mounted) setState(() {});
+      },
+      onExternalScheme: (url) => _openExternalUrlSafely(url),
+      onFollowDetected: (_, service) {
+        final src = _instances.cast<ServiceInstance?>().firstWhere(
+              (i) => i?.instanceId == instance.instanceId,
+              orElse: () => instance,
+            );
+        if (src == null) return;
+        final resolved = _resolveCounterTarget(src, explicitService: service);
+        if (resolved.target != null) {
+          _adjustFollowCount(resolved.target!.instanceId, 1);
+        }
+      },
+      onUnfollowDetected: (_, service) {
+        final src = _instances.cast<ServiceInstance?>().firstWhere(
+              (i) => i?.instanceId == instance.instanceId,
+              orElse: () => instance,
+            );
+        if (src == null) return;
+        final resolved = _resolveCounterTarget(src, explicitService: service);
+        if (resolved.target != null) {
+          _adjustUnfollowCount(resolved.target!.instanceId, 1);
+        }
+      },
+      onAccountIdentity: (service, handle, following, followers) {
+        final src = _instances.cast<ServiceInstance?>().firstWhere(
+              (i) => i?.instanceId == instance.instanceId,
+              orElse: () => instance,
+            );
+        if (src == null) return;
+        final resolved = _resolveCounterTarget(
+          src,
+          explicitService: service.trim().toLowerCase(),
+          handleHint: handle,
+        );
+        if (resolved.target != null) {
+          _handleAccountIdentity(
+            resolved.target!.instanceId,
+            handle,
+            following: following,
+            followers: followers,
+          );
+        }
+      },
+      onOpenNewTab: (url) {
+        final src = _instances.cast<ServiceInstance?>().firstWhere(
+              (i) => i?.instanceId == instance.instanceId,
+              orElse: () => instance,
+            );
+        if (src != null) {
+          _openUrlInNewSubTab(src, url, activate: false);
+        }
+      },
+      onJevGetConfig: () => _pushJevConfigToController(ctrl),
+      onJevCheckAccounts: (reqId, payloadJson) {
+        unawaited(_handleJevCheckFromWebView(ctrl, reqId, payloadJson));
+      },
+      onJevState: (active, matched, hidden, autoFetching) {
+        _updateJevLiveState(
+          'sub:$tabId',
+          active: active,
+          matched: matched,
+          hidden: hidden,
+          autoFetching: autoFetching,
+        );
+      },
+    );
+
+    subTab = _ExtraSubTab(
+      tabId: tabId,
+      instanceId: instance.instanceId,
+      controller: ctrl,
+      runtime: TabRuntimeState(
+        currentUrl: targetUrl,
+        title: initialTitle,
+        isSleeping: false,
+        isLoading: true,
+        progress: 10,
+      ),
+    );
+
+    list.add(subTab);
+    final totalTabs = list.length + 1;
+    if (activate) {
+      _activeSubTabId[instance.instanceId] = tabId;
+    }
+    if (mounted) {
+      setState(() {});
+      HapticFeedback.mediumImpact();
+      if (!activate) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text('新規タブで開きました（全$totalTabsタブ）'),
+              duration: const Duration(seconds: 3),
+              action: SnackBarAction(
+                label: '開く',
+                onPressed: () {
+                  if (!mounted) return;
+                  final stillExists = (_extraTabs[instance.instanceId] ?? [])
+                      .any((t) => t.tabId == tabId);
+                  if (stillExists) {
+                    setState(() {
+                      _isGmailOpen = false;
+                      _activeSubTabId[instance.instanceId] = tabId;
+                    });
+                  }
+                },
+              ),
+            ),
+          );
+      }
+    }
+  }
+
+  void _closeExtraSubTab(String instanceId, String tabId) {
+    final list = _extraTabs[instanceId];
+    if (list == null) return;
+    final idx = list.indexWhere((t) => t.tabId == tabId);
+    if (idx < 0) return;
+    final removed = list.removeAt(idx);
+    removed.controller.dispose();
+    _jevLiveByKey.remove('sub:$tabId');
+    if (_activeSubTabId[instanceId] == tabId) {
+      if (list.isEmpty) {
+        _activeSubTabId.remove(instanceId);
+      } else {
+        final nextIdx = (idx - 1).clamp(0, list.length - 1);
+        _activeSubTabId[instanceId] = idx == 0 ? null : list[nextIdx].tabId;
+      }
+    }
+    if (list.isEmpty) {
+      _extraTabs.remove(instanceId);
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _disposeExtraSubTabsFor(String instanceId) {
+    final list = _extraTabs.remove(instanceId);
+    if (list != null) {
+      for (final t in list) {
+        t.controller.dispose();
+        _jevLiveByKey.remove('sub:${t.tabId}');
+      }
+    }
+    _activeSubTabId.remove(instanceId);
+    _jevLiveByKey.remove('main:$instanceId');
+  }
+
+  bool _stepActiveSubTab(int delta) {
+    if (_isGmailOpen) {
+      _showGestureNotice('他のタブがありません');
+      return false;
+    }
+    final active = _activeInstance;
+    if (active == null) return false;
+    final extras = _extraTabs[active.instanceId] ?? const <_ExtraSubTab>[];
+    if (extras.isEmpty) {
+      _showGestureNotice('他のタブがありません');
+      return false;
+    }
+    final total = extras.length + 1;
+    final activeTid = _activeSubTabId[active.instanceId];
+    final curIdx = activeTid == null
+        ? 0
+        : (extras.indexWhere((t) => t.tabId == activeTid) + 1);
+    final nextIdx = stepTabIndex(total, curIdx, delta, _settings.gesture.wrapTabs);
+    if (nextIdx == null) {
+      _showGestureNotice(delta < 0 ? '先頭のタブです' : '末尾のタブです');
+      return false;
+    }
+    setState(() {
+      _activeSubTabId[active.instanceId] =
+          nextIdx == 0 ? null : extras[nextIdx - 1].tabId;
+    });
+    _showGestureNotice('タブ ${nextIdx + 1}/$total');
+    return true;
+  }
+
+  Future<void> _toggleDesktopMode(
+    ServiceInstance inst, {
+    bool? forceDesktop,
+  }) async {
+    final nextDesktop = forceDesktop ?? !inst.isDesktopUa;
+    final nextMode = nextDesktop ? 'desktop' : 'mobile';
+    final nextUa = buildUserAgentForMode(nextMode);
+    setState(() {
+      _instances = _instances
+          .map(
+            (i) => i.instanceId == inst.instanceId
+                ? i.copyWith(uaMode: nextMode)
+                : i,
+          )
+          .toList();
+    });
+    await _persist();
+    final mainCtrl = _controllers[inst.instanceId];
+    if (mainCtrl != null && !mainCtrl.isDisposed) {
+      await mainCtrl.setUserAgent(nextUa, reload: true);
+    }
+    for (final sub in _extraTabs[inst.instanceId] ?? const <_ExtraSubTab>[]) {
+      if (!sub.controller.isDisposed) {
+        await sub.controller.setUserAgent(nextUa, reload: true);
+      }
+    }
+    _showSnack(nextDesktop ? 'PC版サイト表示に切り替えました' : 'スマホ版サイト表示に戻しました');
   }
 
   void _updateRuntime(
@@ -683,6 +1184,17 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     final active = _activeInstance;
     if (active == null) return;
+    final extra = _activeExtraTabFor(active.instanceId);
+    if (extra != null && !extra.controller.isDisposed) {
+      extra.runtime = extra.runtime.copyWith(
+        isLoading: true,
+        progress: 5,
+        clearError: true,
+      );
+      if (mounted) setState(() {});
+      await extra.controller.reload(fallbackUrl: extra.runtime.currentUrl);
+      return;
+    }
     await _reloadInstance(active);
   }
 
@@ -2144,6 +2656,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _sleepInstance(String instanceId) {
     final removed = _controllers.remove(instanceId);
     removed?.dispose();
+    _disposeExtraSubTabsFor(instanceId);
     _updateRuntime(
       instanceId,
       (cur) => cur.copyWith(
@@ -2272,10 +2785,22 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openSettings() async {
+    final active = _activeInstance;
+    final activeGroup = _activeGroup;
     final updated = await Navigator.of(context).push<AppSettings>(
       MaterialPageRoute(
         builder: (_) => SettingsScreen(
           settings: _settings,
+          activeServiceName:
+              (!_isGmailOpen && active != null) ? (activeGroup?.displayName ?? active.name) : null,
+          activeDesktopMode: (!_isGmailOpen && active != null) ? active.isDesktopUa : null,
+          onToggleDesktopMode: (!_isGmailOpen && active != null)
+              ? (desktop) => _toggleDesktopMode(active, forceDesktop: desktop)
+              : null,
+          jevSummary: _jev.isActive
+              ? 'ON · 分類「${_jev.category}」· 累計 ${JevService.formatCostCompact(_jev.totalCostUsd)}'
+              : 'OFF · 分類「${_jev.category}」· 累計 ${JevService.formatCostCompact(_jev.totalCostUsd)}',
+          onOpenJevSettings: () => _showJevSettingsSheet(),
           onClearAllCookies: () async {
             await OmniWebViewManager.clearAllCookies();
             for (final id in _controllers.keys.toList()) {
@@ -2332,6 +2857,10 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     final active = _activeInstance;
     if (active == null) return null;
+    final extra = _activeExtraTabFor(active.instanceId);
+    if (extra != null && !extra.controller.isDisposed) {
+      return extra.controller;
+    }
     final c = _controllers[active.instanceId];
     return (c != null && !c.isDisposed) ? c : null;
   }
@@ -2458,6 +2987,24 @@ class _HomeScreenState extends State<HomeScreen> {
           );
           await c.loadUrl(active.url);
           _showGestureNotice('${shapeArrows(shape)} ホームへ移動');
+        }
+      case 'previous-tab':
+        _stepActiveSubTab(-1);
+      case 'next-tab':
+        _stepActiveSubTab(1);
+      case 'new-tab':
+        if (active != null && !_isGmailOpen) {
+          _openUrlInNewSubTab(active, active.url, activate: true);
+        }
+      case 'close-tab':
+        if (active != null && !_isGmailOpen) {
+          final extra = _activeExtraTabFor(active.instanceId);
+          if (extra != null) {
+            _closeExtraSubTab(active.instanceId, extra.tabId);
+            _showGestureNotice('タブを閉じました');
+          } else {
+            _showGestureNotice('メインタブは閉じられません');
+          }
         }
       case 'previous-service':
         _stepActiveService(-1);
@@ -2692,6 +3239,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final wasActive = _settings.activeInstanceId == inst.instanceId;
     final removedCtrl = _controllers.remove(inst.instanceId);
     removedCtrl?.dispose();
+    _disposeExtraSubTabsFor(inst.instanceId);
     _runtimeMap.remove(inst.instanceId);
     setState(() {
       _instances.removeWhere((i) => i.instanceId == inst.instanceId);
@@ -2743,6 +3291,7 @@ class _HomeScreenState extends State<HomeScreen> {
     for (final acc in group.accounts) {
       final ctrl = _controllers.remove(acc.instanceId);
       ctrl?.dispose();
+      _disposeExtraSubTabsFor(acc.instanceId);
       _runtimeMap.remove(acc.instanceId);
     }
     setState(() {
@@ -2776,8 +3325,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final active = _activeInstance;
     final activeGroup = _activeGroup;
-    final activeRt =
-        active != null ? _runtimeMap[active.instanceId] : null;
+    final activeExtraTab =
+        active != null ? _activeExtraTabFor(active.instanceId) : null;
+    final activeRt = active == null
+        ? null
+        : (activeExtraTab?.runtime ?? _runtimeMap[active.instanceId]);
     final visible = _visibleInstances;
     final groups = _serviceGroups;
     final tabsCollapsed = _settings.isBottomTabsCollapsed;
@@ -2799,9 +3351,13 @@ class _HomeScreenState extends State<HomeScreen> {
           }
           return;
         }
-        final ctrl = active != null ? _controllers[active.instanceId] : null;
+        final ctrl = _currentForegroundController();
         if (ctrl != null && await ctrl.canGoBack()) {
           await ctrl.goBack();
+          return;
+        }
+        if (active != null && activeExtraTab != null) {
+          _closeExtraSubTab(active.instanceId, activeExtraTab.tabId);
           return;
         }
         if (context.mounted) {
@@ -2907,14 +3463,45 @@ class _HomeScreenState extends State<HomeScreen> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  Text(
-                                    activeGroup?.displayName ?? active.name,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.bold,
-                                    ),
+                                  Row(
+                                    children: [
+                                      Flexible(
+                                        child: Text(
+                                          activeGroup?.displayName ?? active.name,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ),
+                                      if (active.isDesktopUa) ...[
+                                        const SizedBox(width: 5),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 5,
+                                            vertical: 1,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .primaryContainer,
+                                            borderRadius: BorderRadius.circular(4),
+                                          ),
+                                          child: Text(
+                                            'PC',
+                                            style: TextStyle(
+                                              fontSize: 9.5,
+                                              fontWeight: FontWeight.w700,
+                                              color: Theme.of(context)
+                                                  .colorScheme
+                                                  .onPrimaryContainer,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ],
                                   ),
                                   Text(
                                     activeRt?.currentUrl ?? active.url,
@@ -3010,11 +3597,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   PopupMenuButton<String>(
                     onSelected: (value) async {
-                      final ctrl = _isGmailOpen
-                          ? _gmailController
-                          : (active != null
-                              ? _controllers[active.instanceId]
-                              : null);
+                      final ctrl = _currentForegroundController();
                       switch (value) {
                         case 'back':
                           if (ctrl != null && await ctrl.canGoBack()) {
@@ -3039,18 +3622,35 @@ class _HomeScreenState extends State<HomeScreen> {
                             });
                             await g.loadUrl(_gmailUrl);
                           } else if (active != null) {
-                            final c = _ensureController(active);
-                            _updateRuntime(
-                              active.instanceId,
-                              (cur) => cur.copyWith(
-                                isSleeping: false,
+                            final extra = _activeExtraTabFor(active.instanceId);
+                            if (extra != null && !extra.controller.isDisposed) {
+                              extra.runtime = extra.runtime.copyWith(
                                 isLoading: true,
                                 progress: 5,
                                 clearError: true,
-                              ),
-                            );
-                            await c.loadUrl(active.url);
+                              );
+                              setState(() {});
+                              await extra.controller.loadUrl(active.url);
+                            } else {
+                              final c = _ensureController(active);
+                              _updateRuntime(
+                                active.instanceId,
+                                (cur) => cur.copyWith(
+                                  isSleeping: false,
+                                  isLoading: true,
+                                  progress: 5,
+                                  clearError: true,
+                                ),
+                              );
+                              await c.loadUrl(active.url);
+                            }
                           }
+                        case 'toggle-desktop-ua':
+                          if (active != null && !_isGmailOpen) {
+                            await _toggleDesktopMode(active);
+                          }
+                        case 'jev-filter':
+                          await _showJevSettingsSheet();
                         case 'toggle-header':
                           await _toggleHeaderCollapsed();
                         case 'toggle-bottom-tabs':
@@ -3095,31 +3695,48 @@ class _HomeScreenState extends State<HomeScreen> {
                     },
                     itemBuilder: (_) => [
                       if (_isGmailOpen || active != null) ...[
-                        const PopupMenuItem(value: 'back', child: Text('← 戻る')),
+                        const PopupMenuItem(value: 'back', child: Text('戻る')),
                         const PopupMenuItem(
                           value: 'forward',
-                          child: Text('→ 進む'),
+                          child: Text('進む'),
                         ),
                         const PopupMenuItem(
                           value: 'reload',
-                          child: Text('↻ 再読み込み'),
+                          child: Text('再読み込み'),
                         ),
                         PopupMenuItem(
                           value: 'home',
                           child: Text(
                             _isGmailOpen
-                                ? '⌂ Gmail 受信トレイへ戻る'
-                                : '⌂ DM/ホーム画面へ戻る',
+                                ? 'Gmail 受信トレイへ戻る'
+                                : 'DM/ホーム画面へ戻る',
+                          ),
+                        ),
+                        if (active != null && !_isGmailOpen)
+                          PopupMenuItem(
+                            value: 'toggle-desktop-ua',
+                            child: Text(
+                              active.isDesktopUa
+                                  ? 'スマホ版サイトに戻す（現在PC版）'
+                                  : 'PC版サイトで表示',
+                            ),
+                          ),
+                        PopupMenuItem(
+                          value: 'jev-filter',
+                          child: Text(
+                            _jev.isActive
+                                ? '分類フィルタ: ${_jev.category}（ON）'
+                                : '分類フィルタ（Jev）',
                           ),
                         ),
                         const PopupMenuItem(
                           value: 'toggle-header',
-                          child: Text('▲ ヘッダーを折り畳む'),
+                          child: Text('ヘッダーを折り畳む'),
                         ),
                         PopupMenuItem(
                           value: 'toggle-bottom-tabs',
                           child: Text(
-                            tabsCollapsed ? '▲ 下部タブを展開' : '▼ 下部タブを折り畳む',
+                            tabsCollapsed ? '下部タブを展開' : '下部タブを折り畳む',
                           ),
                         ),
                         if (active != null && !_isGmailOpen) ...[
@@ -3138,19 +3755,19 @@ class _HomeScreenState extends State<HomeScreen> {
                               value: 'follow-counter',
                               child: Text(
                                 ufCount > 0
-                                    ? '👤 $prefixフォロー/解除 (今日 +$fCount / -$ufCount)'
-                                    : '👤 $prefixフォロー/解除 (今日 $fCount回)',
+                                    ? '$prefixフォロー/解除 (今日 +$fCount / -$ufCount)'
+                                    : '$prefixフォロー/解除 (今日 $fCount回)',
                               ),
                             );
                           }(),
                           const PopupMenuItem(
                             value: 'sleep',
-                            child: Text('☾ タブ休止（メモリ解放）'),
+                            child: Text('タブ休止（メモリ解放）'),
                           ),
                         ],
                         const PopupMenuItem(
                           value: 'external',
-                          child: Text('↗ 外部ブラウザで開く'),
+                          child: Text('外部ブラウザで開く'),
                         ),
                         const PopupMenuDivider(),
                       ],
@@ -3158,17 +3775,17 @@ class _HomeScreenState extends State<HomeScreen> {
                         value: 'archived-logins',
                         child: Text(
                           _archivedInstances.isNotEmpty
-                              ? '🔑 ログイン記憶を呼び出す (${_archivedInstances.length})'
-                              : '🔑 ログイン記憶',
+                              ? 'ログイン記憶を呼び出す (${_archivedInstances.length})'
+                              : 'ログイン記憶',
                         ),
                       ),
                       const PopupMenuItem(
                         value: 'gesture-settings',
-                        child: Text('✦ タッチジェスチャー設定'),
+                        child: Text('タッチジェスチャー設定'),
                       ),
                       const PopupMenuItem(
                         value: 'settings',
-                        child: Text('⚙ アプリ設定'),
+                        child: Text('アプリ設定'),
                       ),
                     ],
                   ),
@@ -3202,6 +3819,16 @@ class _HomeScreenState extends State<HomeScreen> {
               _buildInAppGmailBar()
             else if (!headerCollapsed && active != null && activeGroup != null)
               _buildAccountSwitcherBar(activeGroup, active),
+            if (!_isGmailOpen &&
+                active != null &&
+                (_extraTabs[active.instanceId]?.isNotEmpty ?? false))
+              _buildSubTabStrip(active),
+            if (!_isGmailOpen &&
+                active != null &&
+                (_jev.isActive ||
+                    _jev.totalApiCalls > 0 ||
+                    (_jev.enabled && _jev.lastError != null)))
+              _buildJevStatusBar(active),
             Expanded(
               child: SafeArea(
                 top: false,
@@ -3782,7 +4409,65 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
             ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(4, 5, 8, 5),
+              padding: const EdgeInsets.fromLTRB(4, 5, 2, 5),
+              child: InkWell(
+                key: const ValueKey('jev-filter-chip'),
+                borderRadius: BorderRadius.circular(99),
+                onTap: () async {
+                  if (!_jev.hasApiKey) {
+                    await _showJevSettingsSheet();
+                  } else {
+                    final next = !_jev.enabled;
+                    final reset = await _jev.updateSettings(enabled: next);
+                    _syncJevConfigToAllControllers(resetJudged: reset);
+                    _showSnack(
+                      next
+                          ? 'Jev 分類フィルタ ON（「${_jev.category}」）'
+                          : 'Jev 分類フィルタ OFF',
+                    );
+                  }
+                },
+                onLongPress: _showJevSettingsSheet,
+                child: () {
+                  final live = _currentJevLiveState(active);
+                  final cat = _jev.category;
+                  final shortCat =
+                      cat.length > 6 ? '${cat.substring(0, 5)}…' : cat;
+                  final activeOn = _jev.isActive;
+                  final label = activeOn && live.active
+                      ? '$shortCat ${live.matched}件'
+                      : '分類:$shortCat';
+                  return Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: activeOn
+                          ? colorScheme.primaryContainer
+                          : colorScheme.surface,
+                      borderRadius: BorderRadius.circular(99),
+                      border: Border.all(
+                        color: activeOn
+                            ? colorScheme.primary
+                            : colorScheme.outlineVariant,
+                      ),
+                    ),
+                    child: Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontWeight:
+                            activeOn ? FontWeight.w700 : FontWeight.w600,
+                        color: activeOn
+                            ? colorScheme.onPrimaryContainer
+                            : colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  );
+                }(),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(2, 5, 8, 5),
               child: InkWell(
                 key: const ValueKey('follow-counter-chip'),
                 borderRadius: BorderRadius.circular(99),
@@ -3886,17 +4571,38 @@ class _HomeScreenState extends State<HomeScreen> {
         .where((i) => _controllers.containsKey(i.instanceId))
         .map((i) => i.instanceId)
         .toList();
+    final liveSubTabs = <_ExtraSubTab>[
+      for (final id in liveIds)
+        for (final sub in _extraTabs[id] ?? const <_ExtraSubTab>[])
+          if (!sub.controller.isDisposed) sub,
+    ];
     final hasGmailView =
         _gmailController != null && !_gmailController!.isDisposed;
-    final gmailStackIndex = hasGmailView ? liveIds.length : -1;
-    final activeIndex = _isGmailOpen
-        ? gmailStackIndex
-        : (active != null ? liveIds.indexOf(active.instanceId) : -1);
+    final gmailStackIndex =
+        hasGmailView ? (liveIds.length + liveSubTabs.length) : -1;
+    final activeExtra =
+        active != null ? _activeExtraTabFor(active.instanceId) : null;
+    int activeIndex = -1;
+    if (_isGmailOpen) {
+      activeIndex = gmailStackIndex;
+    } else if (active != null) {
+      if (activeExtra != null) {
+        final subIdx = liveSubTabs.indexWhere(
+          (t) => t.tabId == activeExtra.tabId,
+        );
+        if (subIdx >= 0) {
+          activeIndex = liveIds.length + subIdx;
+        }
+      } else {
+        activeIndex = liveIds.indexOf(active.instanceId);
+      }
+    }
     final isSleeping = _isGmailOpen
         ? !hasGmailView
         : (active == null ||
-            activeRt?.isSleeping == true ||
-            !_controllers.containsKey(active.instanceId));
+            (activeExtra == null &&
+                (activeRt?.isSleeping == true ||
+                    !_controllers.containsKey(active.instanceId))));
     final currentLoadError =
         _isGmailOpen ? _gmailRuntime.loadError : activeRt?.loadError;
     final hasError = currentLoadError != null;
@@ -3904,7 +4610,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return Stack(
       children: [
-        if (liveIds.isNotEmpty || hasGmailView)
+        if (liveIds.isNotEmpty || liveSubTabs.isNotEmpty || hasGmailView)
           Positioned.fill(
             child: Offstage(
               offstage: !showWebView,
@@ -3915,6 +4621,11 @@ class _HomeScreenState extends State<HomeScreen> {
                     OmniWebViewWidget(
                       key: ValueKey('wv-$id'),
                       controller: _controllers[id]!,
+                    ),
+                  for (final sub in liveSubTabs)
+                    OmniWebViewWidget(
+                      key: ValueKey('wv-sub-${sub.tabId}'),
+                      controller: sub.controller,
                     ),
                   if (hasGmailView)
                     OmniWebViewWidget(
@@ -4222,7 +4933,6 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const Divider(height: 1),
             ListTile(
-              leading: const Icon(Icons.edit_outlined),
               title: Text(
                 _multiProfileSupported ? 'アカウント名・URLを編集' : '表示名・URLを編集',
               ),
@@ -4232,7 +4942,15 @@ class _HomeScreenState extends State<HomeScreen> {
               },
             ),
             ListTile(
-              leading: const Icon(Icons.logout_outlined),
+              title: Text(
+                inst.isDesktopUa ? 'スマホ版サイトに戻す（現在PC版）' : 'PC版サイトで表示',
+              ),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _toggleDesktopMode(inst);
+              },
+            ),
+            ListTile(
               title: Text(
                 _multiProfileSupported
                     ? 'このアカウントのログイン情報を消去'
@@ -4244,7 +4962,6 @@ class _HomeScreenState extends State<HomeScreen> {
               },
             ),
             ListTile(
-              leading: const Icon(Icons.bedtime_outlined),
               title: Text(
                 _multiProfileSupported
                     ? 'このアカウントを休止（メモリ解放）'
@@ -4256,7 +4973,6 @@ class _HomeScreenState extends State<HomeScreen> {
               },
             ),
             ListTile(
-              leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
               title: Text(
                 _multiProfileSupported ? 'このアカウントを削除' : 'このサービスを削除',
                 style: const TextStyle(color: Colors.redAccent),
@@ -4268,8 +4984,6 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             if (_multiProfileSupported && grp != null && grp.accounts.length >= 2)
               ListTile(
-                leading: const Icon(Icons.delete_sweep_outlined,
-                    color: Colors.redAccent),
                 title: Text(
                   '「${grp.displayName}」の全${grp.accounts.length}アカウントを削除',
                   style: const TextStyle(color: Colors.redAccent),
@@ -4333,7 +5047,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           ),
                         ),
                         Text(
-                          'Android · v1.6.0',
+                          'Android · v1.8.0',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],
@@ -4448,37 +5162,34 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   SizedBox(
                     width: double.infinity,
-                    child: FilledButton.icon(
+                    child: FilledButton(
                       onPressed: () {
                         Navigator.of(context).pop();
                         _openCatalog();
                       },
-                      icon: const Icon(Icons.add),
-                      label: const Text('サービスを追加'),
+                      child: const Text('サービスを追加'),
                     ),
                   ),
                   const SizedBox(height: 6),
                   SizedBox(
                     width: double.infinity,
-                    child: OutlinedButton.icon(
+                    child: OutlinedButton(
                       onPressed: () {
                         Navigator.of(context).pop();
                         _openGestureSettings();
                       },
-                      icon: const Icon(Icons.gesture_rounded),
-                      label: const Text('タッチジェスチャー設定'),
+                      child: const Text('タッチジェスチャー設定'),
                     ),
                   ),
                   const SizedBox(height: 6),
                   SizedBox(
                     width: double.infinity,
-                    child: OutlinedButton.icon(
+                    child: OutlinedButton(
                       onPressed: () {
                         Navigator.of(context).pop();
                         _openSettings();
                       },
-                      icon: const Icon(Icons.settings_outlined),
-                      label: const Text('アプリ設定'),
+                      child: const Text('アプリ設定'),
                     ),
                   ),
                 ],
@@ -4488,5 +5199,527 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
+  }
+
+  Widget _buildSubTabStrip(ServiceInstance active) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final extras = _extraTabs[active.instanceId] ?? const <_ExtraSubTab>[];
+    final activeTid = _activeSubTabId[active.instanceId];
+    final mainRt = _runtimeMap[active.instanceId];
+    final mainTitle = (mainRt?.title.trim().isNotEmpty ?? false)
+        ? mainRt!.title
+        : active.name;
+
+    return Material(
+      color: colorScheme.surfaceContainerLow,
+      child: Container(
+        height: 36,
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(
+              color: colorScheme.outlineVariant.withValues(alpha: 0.45),
+            ),
+          ),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                children: [
+                  _buildSubTabPill(
+                    label: mainTitle,
+                    selected: activeTid == null,
+                    onTap: () {
+                      setState(() => _activeSubTabId.remove(active.instanceId));
+                    },
+                  ),
+                  for (final sub in extras)
+                    _buildSubTabPill(
+                      label: sub.runtime.title.trim().isEmpty
+                          ? '新しいタブ'
+                          : sub.runtime.title,
+                      selected: activeTid == sub.tabId,
+                      onTap: () {
+                        setState(
+                          () => _activeSubTabId[active.instanceId] = sub.tabId,
+                        );
+                      },
+                      onClose: () =>
+                          _closeExtraSubTab(active.instanceId, sub.tabId),
+                    ),
+                ],
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.add, size: 18),
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              tooltip: '新しいタブを開く',
+              onPressed: () =>
+                  _openUrlInNewSubTab(active, active.url, activate: true),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSubTabPill({
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+    VoidCallback? onClose,
+  }) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 160),
+          padding: EdgeInsets.fromLTRB(9, 0, onClose != null ? 4 : 9, 0),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: selected
+                ? colorScheme.primaryContainer
+                : colorScheme.surface,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: selected
+                  ? colorScheme.primary
+                  : colorScheme.outlineVariant,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                    color: selected
+                        ? colorScheme.onPrimaryContainer
+                        : colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              if (onClose != null) ...[
+                const SizedBox(width: 2),
+                InkWell(
+                  borderRadius: BorderRadius.circular(99),
+                  onTap: onClose,
+                  child: Padding(
+                    padding: const EdgeInsets.all(2),
+                    child: Icon(
+                      Icons.close,
+                      size: 13,
+                      color: selected
+                          ? colorScheme.onPrimaryContainer
+                          : colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildJevStatusBar(ServiceInstance active) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final live = _currentJevLiveState(active);
+    final costLabel = JevService.formatCostCompact(_jev.totalCostUsd);
+    final extra = _jevCheckingCount > 0
+        ? '（判定中…）'
+        : (live.autoFetching ? '（次ページ取得中…）' : '');
+    final statusText = _jev.isActive && live.active
+        ? '分類「${_jev.category}」表示 ${live.matched}件 / 非表示 ${live.hidden}件$extra · 費用 $costLabel'
+        : _jev.isActive
+            ? 'Jev 分類「${_jev.category}」ON · 費用 $costLabel'
+            : 'Jev 分類フィルタ OFF · 費用 $costLabel';
+    final hasErr = _jev.enabled && _jev.lastError != null;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Material(
+          color: colorScheme.surfaceContainerLow,
+          child: InkWell(
+            onTap: _showJevSettingsSheet,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.4),
+                  ),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      statusText,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '設定',
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: colorScheme.primary,
+                          fontWeight: FontWeight.w700,
+                        ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        if (hasErr)
+          Material(
+            color: colorScheme.errorContainer,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 2, 4, 2),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _jev.lastError!,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: colorScheme.onErrorContainer,
+                          ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _showJevSettingsSheet,
+                    child: const Text('設定'),
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    iconSize: 18,
+                    onPressed: () {
+                      _jev.clearError();
+                    },
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Future<void> _showJevSettingsSheet() async {
+    await _jev.ensureLoaded();
+    if (!mounted) return;
+    final catCtrl = TextEditingController(text: _jev.category);
+    final keyCtrl = TextEditingController(text: _jev.apiKey);
+    var enabled = _jev.hasApiKey ? _jev.enabled : true;
+    var threshold = _jev.threshold.clamp(0.40, 0.85);
+    var obscure = true;
+    var testing = false;
+    ({bool ok, String message})? testResult;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setModalState) {
+          final scheme = Theme.of(ctx).colorScheme;
+          final chips = <String>[];
+          for (final c in _jev.recentCategories) {
+            if (!chips.any((x) => x.toLowerCase() == c.toLowerCase())) {
+              chips.add(c);
+            }
+          }
+          for (final p in kJevPresetCategories) {
+            if (!chips.any((x) => x.toLowerCase() == p.toLowerCase())) {
+              chips.add(p);
+            }
+          }
+          final currentCatLower = catCtrl.text.trim().toLowerCase();
+
+          return SafeArea(
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(
+                16,
+                0,
+                16,
+                MediaQuery.viewInsetsOf(ctx).bottom + 16,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Jev 分類フィルタ',
+                      style: Theme.of(ctx)
+                          .textTheme
+                          .titleMedium
+                          ?.copyWith(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'フォロー中・フォロワー一覧のアイコン画像と名前・自己紹介を Jev（TypeSafe AI）で判定し、入力した分類に一致するアカウントだけを表示します。',
+                      style: Theme.of(ctx).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: scheme.surfaceContainerHighest
+                            .withValues(alpha: 0.55),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: scheme.outlineVariant),
+                      ),
+                      child: ListenableBuilder(
+                        listenable: _jev,
+                        builder: (context, _) => Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Text(
+                                  'Jev 利用費用',
+                                  style: Theme.of(ctx).textTheme.labelLarge,
+                                ),
+                                const Spacer(),
+                                if (_jev.totalApiCalls > 0)
+                                  TextButton(
+                                    style: TextButton.styleFrom(
+                                      visualDensity: VisualDensity.compact,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                      ),
+                                    ),
+                                    onPressed: () async {
+                                      await _jev.resetUsageStats();
+                                    },
+                                    child: const Text('費用をリセット'),
+                                  ),
+                              ],
+                            ),
+                            Text(
+                              '累計: ${JevService.formatCostCompact(_jev.totalCostUsd)}',
+                              style: Theme.of(ctx)
+                                  .textTheme
+                                  .titleSmall
+                                  ?.copyWith(fontWeight: FontWeight.bold),
+                            ),
+                            Text(
+                              '今回の起動中: ${JevService.formatCostCompact(_jev.sessionCostUsd)}',
+                              style: Theme.of(ctx).textTheme.bodySmall,
+                            ),
+                            Text(
+                              '通信 ${_jev.totalApiCalls}回 · 判定 ${_jev.totalJudgedAccounts}件 · 入力 ${_jev.totalInputTokens} tok · キャッシュ ${_jev.cacheEntries}件',
+                              style: Theme.of(ctx)
+                                  .textTheme
+                                  .labelSmall
+                                  ?.copyWith(color: scheme.onSurfaceVariant),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: catCtrl,
+                      maxLength: 60,
+                      decoration: const InputDecoration(
+                        labelText: '表示したい分類（自由入力）',
+                        hintText: '例: 女の子、カフェ、イラスト、大学生、猫…',
+                        border: OutlineInputBorder(),
+                        counterText: '',
+                      ),
+                      onChanged: (_) => setModalState(() {}),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: [
+                        for (final c in chips.take(10))
+                          ChoiceChip(
+                            label: Text(c),
+                            selected: c.toLowerCase() == currentCatLower,
+                            visualDensity: VisualDensity.compact,
+                            onSelected: (_) {
+                              catCtrl.text = c;
+                              setModalState(() {});
+                            },
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('この分類に一致するアカウントのみ表示'),
+                      value: enabled,
+                      onChanged: (v) => setModalState(() => enabled = v),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: keyCtrl,
+                      obscureText: obscure,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      decoration: InputDecoration(
+                        labelText: 'TypeSafe API キー',
+                        hintText: 'Bearer トークンを入力',
+                        helperText: 'この端末内にのみ保存されます',
+                        border: const OutlineInputBorder(),
+                        suffixIcon: TextButton(
+                          onPressed: () =>
+                              setModalState(() => obscure = !obscure),
+                          child: Text(obscure ? '表示' : '隠す'),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Text(
+                          '一致判定のしきい値: ${(threshold * 100).round()}%',
+                          style: Theme.of(ctx).textTheme.labelMedium,
+                        ),
+                        const Spacer(),
+                        Text(
+                          threshold <= 0.48
+                              ? '広めに表示'
+                              : (threshold >= 0.70 ? '確実な一致のみ' : '標準'),
+                          style: Theme.of(ctx)
+                              .textTheme
+                              .bodySmall
+                              ?.copyWith(color: scheme.onSurfaceVariant),
+                        ),
+                      ],
+                    ),
+                    Slider(
+                      value: threshold.clamp(0.40, 0.85),
+                      min: 0.40,
+                      max: 0.85,
+                      divisions: 9,
+                      label: '${(threshold * 100).round()}%',
+                      onChanged: (v) => setModalState(() => threshold = v),
+                    ),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 4,
+                      children: [
+                        OutlinedButton(
+                          onPressed: testing
+                              ? null
+                              : () async {
+                                  setModalState(() {
+                                    testing = true;
+                                    testResult = null;
+                                  });
+                                  final res = await _jev.testConnection(
+                                    keyCtrl.text,
+                                    candidateCategory: catCtrl.text,
+                                  );
+                                  if (ctx.mounted) {
+                                    setModalState(() {
+                                      testing = false;
+                                      testResult = res;
+                                    });
+                                  }
+                                },
+                          child: Text(testing ? 'テスト中…' : '接続テスト'),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            await _jev.clearCache();
+                            _syncJevConfigToAllControllers(resetJudged: true);
+                            if (mounted) {
+                              _showSnack('判定キャッシュを消去しました');
+                            }
+                          },
+                          child: const Text('判定履歴を消去'),
+                        ),
+                      ],
+                    ),
+                    if (testResult case final r?) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        r.message,
+                        style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                              color: r.ok ? scheme.primary : scheme.error,
+                              fontWeight: FontWeight.w600,
+                            ),
+                      ),
+                    ],
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () => Navigator.of(ctx).pop(),
+                            child: const Text('キャンセル'),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: FilledButton(
+                            onPressed: () async {
+                              final trimmedKey = keyCtrl.text.trim();
+                              final trimmedCat = catCtrl.text.trim().isEmpty
+                                  ? JevService.defaultCategory
+                                  : catCtrl.text.trim();
+                              final reset = await _jev.updateSettings(
+                                apiKey: trimmedKey,
+                                category: trimmedCat,
+                                enabled: enabled && trimmedKey.isNotEmpty,
+                                threshold: threshold,
+                              );
+                              _syncJevConfigToAllControllers(
+                                resetJudged: reset,
+                              );
+                              if (ctx.mounted) Navigator.of(ctx).pop();
+                              if (mounted) {
+                                _showSnack(
+                                  _jev.isActive
+                                      ? 'Jev 分類「${_jev.category}」を適用しました'
+                                      : 'Jev 分類フィルタ設定を保存しました',
+                                );
+                              }
+                            },
+                            child: const Text('保存して適用'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    catCtrl.dispose();
+    keyCtrl.dispose();
   }
 }

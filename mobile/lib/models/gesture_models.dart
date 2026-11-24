@@ -83,13 +83,35 @@ const List<GestureActionDef> kMobileGestureActions = <GestureActionDef>[
     section: 'ページ操作',
   ),
   GestureActionDef(
+    id: 'previous-tab',
+    label: '前のタブへ',
+    section: 'タブ操作',
+    subtitle: '現在のアカウント内のタブのみ切替（他SNSへは移動しません）',
+  ),
+  GestureActionDef(
+    id: 'next-tab',
+    label: '次のタブへ',
+    section: 'タブ操作',
+    subtitle: '現在のアカウント内のタブのみ切替（他SNSへは移動しません）',
+  ),
+  GestureActionDef(
+    id: 'new-tab',
+    label: '新しいタブを開く',
+    section: 'タブ操作',
+  ),
+  GestureActionDef(
+    id: 'close-tab',
+    label: '現在のタブを閉じる',
+    section: 'タブ操作',
+  ),
+  GestureActionDef(
     id: 'previous-service',
-    label: '前のSNSへ切替',
+    label: '上の項目へ（前のSNS）',
     section: 'SNS・アカウント切替',
   ),
   GestureActionDef(
     id: 'next-service',
-    label: '次のSNSへ切替',
+    label: '下の項目へ（次のSNS）',
     section: 'SNS・アカウント切替',
   ),
   GestureActionDef(

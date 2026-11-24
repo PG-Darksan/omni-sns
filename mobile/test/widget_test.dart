@@ -9,6 +9,7 @@ import 'package:omni_sns_mobile/screens/gesture_settings_screen.dart';
 import 'package:omni_sns_mobile/screens/home_screen.dart';
 import 'package:omni_sns_mobile/services/app_store.dart';
 import 'package:omni_sns_mobile/services/follow_sync_service.dart';
+import 'package:omni_sns_mobile/services/jev_service.dart';
 import 'package:omni_sns_mobile/services/omni_webview.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -657,5 +658,95 @@ void main() {
 
     expect(result, isNotNull);
     expect(result!.restoreArchivedInstanceId, 'svc-instagram-sub01');
+  });
+
+  test('JevService supports female preset and custom free-text categories with isolated caching', () async {
+    expect(JevService.isFemalePresetCategory('女の子'), isTrue);
+    expect(JevService.isFemalePresetCategory('カフェ・グルメ'), isFalse);
+
+    final candidate = JevAccountCandidate(
+      username: 'cafe_tokyo',
+      displayName: '東京カフェ',
+      bio: '渋谷のコーヒー屋巡り',
+      avatarUrl: 'https://cdn.example.com/a/icon123.jpg?sig=abc',
+      platform: 'instagram',
+    );
+    expect(candidate.cacheKey('女の子'), candidate.cacheKey('女性'));
+    expect(candidate.cacheKey('女の子'), isNot(candidate.cacheKey('カフェ')));
+
+    final customBody = JevService.buildRequestBody(
+      [candidate],
+      category: 'カフェ・グルメ',
+      nonce: 'n1',
+    );
+    expect((customBody['state'] as String).contains('カフェ・グルメ'), isTrue);
+    expect((customBody['state'] as String).contains('渋谷のコーヒー屋巡り'), isTrue);
+
+    var apiCalls = 0;
+    final jev = JevService(
+      inMemoryOnly: true,
+      avatarPreparer: (_) async => null,
+      poster: ({required apiKey, required body, required includeImageHeader}) async {
+        apiCalls++;
+        final state = body['state'] as String;
+        final isCafe = state.contains('target category: "カフェ"');
+        return (
+          statusCode: 200,
+          body: jsonEncode({
+            'answers': {
+              'q_0': {'noul': isCafe ? 0.91 : 0.12},
+            },
+            'usage': {'input_tokens': 1000},
+          }),
+        );
+      },
+    );
+    await jev.updateSettings(apiKey: 'test-key', enabled: true, category: 'カフェ');
+    final r1 = await jev.judgeAccounts([candidate]);
+    expect(r1['cafe_tokyo'], isTrue);
+    expect(apiCalls, 1);
+    expect(jev.totalJudgedAccounts, 1);
+    expect(jev.totalCostUsd, greaterThan(0));
+
+    // 同一カテゴリ再判定はキャッシュヒット（追加課金なし）
+    final r2 = await jev.judgeAccounts([candidate]);
+    expect(r2['cafe_tokyo'], isTrue);
+    expect(apiCalls, 1);
+
+    // 別カテゴリへ変更すると別キャッシュキーで再判定される
+    final changed = await jev.updateSettings(category: '女の子');
+    expect(changed, isTrue);
+    final r3 = await jev.judgeAccounts([candidate]);
+    expect(r3['cafe_tokyo'], isFalse);
+    expect(apiCalls, 2);
+
+    // PNG生成確認
+    final png = JevService.makeSolidPng(width: 16, height: 16);
+    expect(png.take(4).toList(), [0x89, 0x50, 0x4E, 0x47]);
+  });
+
+  test('ServiceInstance persists desktop uaMode and mobile gestures separate tabs from services', () {
+    const inst = ServiceInstance(
+      instanceId: 'svc-ig-1',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      category: 'major-sns',
+      url: 'https://www.instagram.com/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 0,
+      uaMode: 'desktop',
+    );
+    final roundtripped = ServiceInstance.fromJson(inst.toJson(), 0);
+    expect(roundtripped.isDesktopUa, isTrue);
+    expect(buildUserAgentForMode('desktop'), contains('Windows NT'));
+    expect(buildUserAgentForMode('mobile'), contains('Android'));
+
+    final ids = kMobileGestureActions.map((a) => a.id).toSet();
+    expect(ids.contains('previous-tab'), isTrue);
+    expect(ids.contains('next-tab'), isTrue);
+    expect(ids.contains('previous-service'), isTrue);
+    expect(ids.contains('next-service'), isTrue);
   });
 }

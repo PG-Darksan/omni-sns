@@ -53,12 +53,10 @@
         </button>
         <div class="sidebar-footer-actions">
           <button id="btn-open-archived" class="btn-icon-label" title="削除したタブの保存済みログイン記憶を呼び出す" aria-label="ログイン記憶を呼び出す">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
             <span>ログイン記憶</span>
             <span id="sidebar-archived-badge" class="sidebar-archived-badge hidden">0</span>
           </button>
           <button id="btn-open-settings" class="btn-icon-label" title="アプリ設定" aria-label="アプリ設定">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             <span>アプリ設定</span>
           </button>
         </div>
@@ -99,6 +97,14 @@
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/></svg>
             <span id="collapsed-gmail-label">Gmail</span>
+          </button>
+          <button
+            id="btn-collapsed-jev"
+            type="button"
+            class="tool-pill jev-pill accountbar-collapsed-only"
+            title="Jev 分類フィルタ（クリックで設定・分類変更 / 右クリックでON・OFF切替）"
+          >
+            <span id="collapsed-jev-label">分類: 女の子</span>
           </button>
           <button
             id="btn-collapsed-follow"
@@ -166,6 +172,14 @@
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/></svg>
             <span id="open-gmail-label">Gmail</span>
+          </button>
+          <button
+            id="btn-jev-filter"
+            type="button"
+            class="tool-pill jev-pill"
+            title="Jev 分類フィルタ（クリックで分類入力・設定 / 右クリックでON・OFF切替）"
+          >
+            <span id="jev-pill-label">分類: 女の子</span>
           </button>
           <button
             id="btn-follow-counter"
@@ -243,6 +257,23 @@
           </div>
         </div>
       </main>
+
+      <!-- 表示領域の下余白バー（画面下端の入力欄を引き上げつつ、Jev 分類フィルタ状況・費用と下余白調整を表示） -->
+      <footer id="viewport-bottom-bar" class="viewport-bottom-bar">
+        <div class="bottom-bar-left">
+          <button id="btn-bottom-jev-toggle" type="button" class="bottom-jev-toggle" title="Jev 分類フィルタの ON / OFF を切り替え">OFF</button>
+          <button id="btn-bottom-jev-open" type="button" class="bottom-jev-status" title="クリックで Jev 分類フィルタ設定・自由分類入力を開く">
+            <span id="bottom-jev-text">Jev 分類フィルタ OFF（分類: 女の子）· 費用 $0 (¥0)</span>
+          </button>
+          <span id="bottom-jev-error" class="bottom-jev-error hidden"></span>
+          <button id="btn-bottom-jev-error-dismiss" type="button" class="bottom-mini-btn hidden" title="エラー表示を閉じる">✕</button>
+        </div>
+        <div class="bottom-bar-right">
+          <span class="bottom-inset-label">下余白 <strong id="bottom-inset-val">44</strong>px</span>
+          <button id="btn-bottom-inset-dec" type="button" class="bottom-mini-btn" title="表示領域を下に広げる（下余白を減らす）">−</button>
+          <button id="btn-bottom-inset-inc" type="button" class="bottom-mini-btn" title="表示領域を上に上げる（下余白を増やす）">＋</button>
+        </div>
+      </footer>
     </div>
   </div>
 
@@ -403,9 +434,18 @@
           <input id="setting-sidebar-width" type="range" min="190" max="340" step="4" value="248" />
         </div>
 
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">表示領域の下余白 (<span id="setting-bottom-inset-val">44</span>px)</div>
+            <div class="setting-desc">画面下端の入力欄がはみ出さないよう、Web表示領域の下端を上に引き上げます</div>
+          </div>
+          <input id="setting-bottom-inset" type="range" min="0" max="160" step="4" value="44" />
+        </div>
+
         <div class="shortcut-box">
           <h3>キーボードショートカット &amp; ジェスチャー</h3>
           <ul>
+            <li><kbd>リンク長押し</kbd> : 遷移先を同一アカウントの新しいタブで開く</li>
             <li><kbd>右ドラッグ</kbd> : マウスジェスチャー（タブ切替・Ctrl+クリック・アカウント切替・連続スクロール等）</li>
             <li><kbd>Ctrl</kbd> + <kbd>クリック</kbd> / <kbd>中クリック</kbd> : 同一アカウントのログイン状態を保ったままリンクを別タブで開く</li>
             <li><kbd>Ctrl</kbd> + <kbd>L</kbd> : アドレスバーにフォーカス（<kbd>Enter</kbd> で移動 / <kbd>Alt</kbd>+<kbd>Enter</kbd> で別タブで開く）</li>
@@ -647,6 +687,85 @@
       <div class="modal-footer modal-footer-between">
         <button id="btn-archived-pick-cancel" type="button" class="btn-secondary">キャンセル</button>
         <button id="btn-archived-pick-new" type="button" class="btn-primary">＋ 新規アカウントを作成</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Jev 自由入力分類フィルタ設定モーダル -->
+  <div id="jev-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="jev-modal-title">
+    <div class="modal-dialog modal-md jev-modal-dialog">
+      <div class="modal-header">
+        <div>
+          <h2 id="jev-modal-title">Jev 分類フィルタ</h2>
+          <p class="modal-subtitle">フォロー中・フォロワー一覧のアイコン画像と名前・自己紹介を Jev（TypeSafe AI）で判定し、入力した分類に一致するアカウントだけを表示します</p>
+        </div>
+        <button id="btn-close-jev" type="button" class="btn-icon" aria-label="閉じる">✕</button>
+      </div>
+      <div class="jev-modal-body">
+        <div class="jev-cost-card">
+          <div class="jev-cost-head">
+            <span class="jev-cost-title">Jev 利用費用</span>
+            <button id="btn-jev-reset-usage" type="button" class="btn-secondary btn-xs">費用をリセット</button>
+          </div>
+          <div class="jev-cost-main" id="jev-cost-total">累計: $0 (¥0)</div>
+          <div class="jev-cost-sub" id="jev-cost-session">今回の起動中: $0 (¥0)</div>
+          <div class="jev-cost-meta" id="jev-cost-meta">通信 0回 · 判定 0件 · 入力 0 tok · キャッシュ 0件（$0.042/100万tok・出力無料）</div>
+        </div>
+
+        <label class="form-field">
+          <span>表示したい分類（自由入力）</span>
+          <input
+            id="jev-category-input"
+            type="text"
+            class="input-field"
+            placeholder="例: 女の子、カフェ・グルメ、イラスト、大学生、猫…"
+            maxlength="60"
+            autocomplete="off"
+          />
+        </label>
+
+        <div class="jev-chips-wrap">
+          <div class="jev-chips-label">よく使う分類・履歴</div>
+          <div id="jev-category-chips" class="jev-chips"></div>
+        </div>
+
+        <label class="form-field checkbox-field jev-enable-row">
+          <input id="jev-enabled" type="checkbox" class="toggle-check" />
+          <span>この分類に一致するアカウントのみ表示する</span>
+        </label>
+
+        <label class="form-field">
+          <span>TypeSafe API キー</span>
+          <div class="jev-key-row">
+            <input
+              id="jev-api-key"
+              type="password"
+              class="input-field"
+              placeholder="Bearer トークンを入力（この端末内にのみ保存）"
+              autocomplete="off"
+            />
+            <button id="btn-jev-toggle-key" type="button" class="btn-secondary btn-xs">表示</button>
+          </div>
+        </label>
+
+        <div class="jev-threshold-box">
+          <div class="jev-threshold-head">
+            <span>一致判定のしきい値: <strong id="jev-threshold-val">55</strong>%</span>
+            <span id="jev-threshold-hint" class="jev-threshold-hint">標準</span>
+          </div>
+          <input id="jev-threshold" type="range" min="40" max="85" step="5" value="55" />
+        </div>
+
+        <div class="jev-actions-row">
+          <button id="btn-jev-test" type="button" class="btn-secondary btn-xs">接続テスト</button>
+          <button id="btn-jev-clear-cache" type="button" class="btn-secondary btn-xs">判定キャッシュを消去</button>
+        </div>
+
+        <div id="jev-test-result" class="jev-test-result hidden"></div>
+      </div>
+      <div class="modal-footer modal-footer-between">
+        <button id="btn-jev-cancel" type="button" class="btn-secondary">キャンセル</button>
+        <button id="btn-jev-save" type="button" class="btn-primary">保存して適用</button>
       </div>
     </div>
   </div>

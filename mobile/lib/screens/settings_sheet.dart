@@ -8,10 +8,20 @@ class SettingsScreen extends StatefulWidget {
     super.key,
     required this.settings,
     required this.onClearAllCookies,
+    this.activeServiceName,
+    this.activeDesktopMode,
+    this.onToggleDesktopMode,
+    this.jevSummary,
+    this.onOpenJevSettings,
   });
 
   final AppSettings settings;
   final Future<void> Function() onClearAllCookies;
+  final String? activeServiceName;
+  final bool? activeDesktopMode;
+  final Future<void> Function(bool desktopMode)? onToggleDesktopMode;
+  final String? jevSummary;
+  final Future<void> Function()? onOpenJevSettings;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -20,12 +30,14 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   late bool _isDarkMode;
   late MobileGestureSettings _gesture;
+  late bool _desktopMode;
 
   @override
   void initState() {
     super.initState();
     _isDarkMode = widget.settings.isDarkMode;
     _gesture = widget.settings.gesture;
+    _desktopMode = widget.activeDesktopMode ?? false;
   }
 
   void _saveAndClose() {
@@ -45,7 +57,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         actions: [
           TextButton(
             onPressed: _saveAndClose,
-            child: const Text('保存', style: TextStyle(fontWeight: FontWeight.bold)),
+            child: const Text(
+              '保存',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
           ),
         ],
       ),
@@ -58,9 +73,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
             value: _isDarkMode,
             onChanged: (v) => setState(() => _isDarkMode = v),
           ),
+          if (widget.onToggleDesktopMode != null) ...[
+            const Divider(),
+            SwitchListTile(
+              title: Text(
+                widget.activeServiceName != null
+                    ? 'PC版サイトで表示（${widget.activeServiceName}）'
+                    : 'PC版サイトで表示',
+              ),
+              subtitle: const Text('現在のアカウントをデスクトップ版レイアウトで読み込みます'),
+              value: _desktopMode,
+              onChanged: (v) async {
+                setState(() => _desktopMode = v);
+                await widget.onToggleDesktopMode!(v);
+              },
+            ),
+          ],
+          if (widget.onOpenJevSettings != null) ...[
+            const Divider(),
+            ListTile(
+              title: const Text('Jev 分類フィルタ設定'),
+              subtitle: Text(
+                widget.jevSummary ?? '自由に入力した分類に一致するアカウントのみ表示',
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () async {
+                await widget.onOpenJevSettings!();
+              },
+            ),
+          ],
           const Divider(),
           ListTile(
-            leading: const Icon(Icons.gesture_rounded),
             title: const Text('タッチジェスチャー設定'),
             subtitle: Text(
               _gesture.enabled
@@ -83,8 +126,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const Divider(),
           ListTile(
-            leading: const Icon(Icons.delete_outline, color: Colors.redAccent),
-            title: const Text('すべてのWebログイン情報・Cookieを消去'),
+            title: const Text(
+              'すべてのWebログイン情報・Cookieを消去',
+              style: TextStyle(color: Colors.redAccent),
+            ),
             subtitle: const Text('全サービスのCookieをリセットします'),
             onTap: () async {
               final ok = await showDialog<bool>(

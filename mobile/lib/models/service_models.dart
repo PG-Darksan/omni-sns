@@ -104,6 +104,7 @@ class ServiceInstance {
     required this.badge,
     required this.notificationsEnabled,
     required this.order,
+    this.uaMode = 'mobile',
     this.followCountToday = 0,
     this.followCountTotal = 0,
     this.unfollowCountToday = 0,
@@ -125,7 +126,10 @@ class ServiceInstance {
   final String badge;
   final bool notificationsEnabled;
   final int order;
+  final String uaMode;
   final int followCountToday;
+
+  bool get isDesktopUa => uaMode == 'desktop';
   final int followCountTotal;
   final int unfollowCountToday;
   final int unfollowCountTotal;
@@ -217,6 +221,7 @@ class ServiceInstance {
     String? badge,
     bool? notificationsEnabled,
     int? order,
+    String? uaMode,
     int? followCountToday,
     int? followCountTotal,
     int? unfollowCountToday,
@@ -240,6 +245,7 @@ class ServiceInstance {
       badge: badge ?? this.badge,
       notificationsEnabled: notificationsEnabled ?? this.notificationsEnabled,
       order: order ?? this.order,
+      uaMode: uaMode ?? this.uaMode,
       followCountToday: followCountToday ?? this.followCountToday,
       followCountTotal: followCountTotal ?? this.followCountTotal,
       unfollowCountToday: unfollowCountToday ?? this.unfollowCountToday,
@@ -267,6 +273,7 @@ class ServiceInstance {
       'badge': badge,
       'notificationsEnabled': notificationsEnabled,
       'order': order,
+      if (uaMode == 'desktop') 'uaMode': 'desktop',
       'followCountToday': followCountToday,
       'followCountTotal': followCountTotal,
       'unfollowCountToday': unfollowCountToday,
@@ -301,6 +308,7 @@ class ServiceInstance {
       badge: (json['badge'] as String?) ?? makeBadgeText(safeName),
       notificationsEnabled: json['notificationsEnabled'] as bool? ?? true,
       order: json['order'] as int? ?? index,
+      uaMode: (json['uaMode'] as String?) == 'desktop' ? 'desktop' : 'mobile',
       followCountToday:
           ((json['followCountToday'] as num?)?.toInt() ?? 0).clamp(0, 999999),
       followCountTotal: ((json['followCountTotal'] as num?)?.toInt() ?? 0)
@@ -457,6 +465,17 @@ String buildMobileUserAgent() {
   return 'Mozilla/5.0 (Linux; Android 14; Pixel 8) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
       'Chrome/136.0.0.0 Mobile Safari/537.36';
+}
+
+/// スマホ上で PC 版サイトを表示するためのデスクトップ Chrome UA を返す。
+String buildDesktopUserAgent() {
+  return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+      'AppleWebKit/537.36 (KHTML, like Gecko) '
+      'Chrome/136.0.0.0 Safari/537.36';
+}
+
+String buildUserAgentForMode(String uaMode) {
+  return uaMode == 'desktop' ? buildDesktopUserAgent() : buildMobileUserAgent();
 }
 
 /// 安全な http / https URL（ホスト名あり）かを判定する。

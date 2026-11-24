@@ -158,6 +158,10 @@ private class OmniFollowBridge(
     private val onFollow: (String, String) -> Unit,
     private val onUnfollow: (String, String) -> Unit,
     private val onIdentity: (String, String, Int, Int) -> Unit,
+    private val onOpenNewTabCb: (String) -> Unit,
+    private val onJevGetConfigCb: () -> Unit,
+    private val onJevCheckAccountsCb: (String, String) -> Unit,
+    private val onJevStateCb: (Boolean, Int, Int, Boolean) -> Unit,
 ) {
     @JavascriptInterface
     fun onFollowDetected(source: String?, service: String?) {
@@ -175,6 +179,32 @@ private class OmniFollowBridge(
         if (cleanHandle.isNotEmpty()) {
             onIdentity(service?.trim().orEmpty(), cleanHandle, following, followers)
         }
+    }
+
+    @JavascriptInterface
+    fun onOpenNewTab(url: String?) {
+        val clean = url?.trim().orEmpty()
+        if (clean.startsWith("http://", ignoreCase = true) || clean.startsWith("https://", ignoreCase = true)) {
+            onOpenNewTabCb(clean)
+        }
+    }
+
+    @JavascriptInterface
+    fun onJevGetConfig() {
+        onJevGetConfigCb()
+    }
+
+    @JavascriptInterface
+    fun onJevCheckAccounts(reqId: String?, payloadJson: String?) {
+        val id = reqId?.trim().orEmpty()
+        if (id.isNotEmpty()) {
+            onJevCheckAccountsCb(id, payloadJson?.trim().orEmpty())
+        }
+    }
+
+    @JavascriptInterface
+    fun onJevState(active: Boolean, matched: Int, hidden: Int, autoFetching: Boolean) {
+        onJevStateCb(active, matched, hidden, autoFetching)
     }
 }
 
@@ -1287,7 +1317,7 @@ class OmniWebViewManager(
           bindUserId(handle, p.did);
         }
         if (p && p.handle) {
-          recordStats(p.handle, p.followersCount, p.followsCount, p.postsCount, null, null, null);
+          recordStats(p.handle, p.followersCount, p.followsCount, null, null, null, null);
         }
         scheduleRelBatch();
       }).catch(function() {});
@@ -1591,19 +1621,9 @@ class OmniWebViewManager(
           else if (obj.edge_follow && typeof obj.edge_follow.count === 'number') flwng = obj.edge_follow.count;
           else if (statsSrc && typeof statsSrc.followingCount === 'number') flwng = statsSrc.followingCount;
 
-          if (typeof obj.media_count === 'number') posts = obj.media_count;
-          else if (typeof obj.statuses_count === 'number') posts = obj.statuses_count;
-          else if (typeof obj.notesCount === 'number') posts = obj.notesCount;
-          else if (typeof obj.postsCount === 'number') posts = obj.postsCount;
-          else if (obj.edge_owner_to_timeline_media && typeof obj.edge_owner_to_timeline_media.count === 'number') {
-            posts = obj.edge_owner_to_timeline_media.count;
-          } else if (statsSrc && typeof statsSrc.videoCount === 'number') {
-            posts = statsSrc.videoCount;
-          }
-
           var rel = extractRelationFromObject(obj);
           if (flwrs !== null || flwng !== null || rel.iFollow !== null || rel.followsMe !== null) {
-            if (recordStats(normH, flwrs, flwng, posts, privFlag, rel.iFollow, rel.followsMe)) {
+            if (recordStats(normH, flwrs, flwng, null, privFlag, rel.iFollow, rel.followsMe)) {
               foundStats = true;
             }
           }
@@ -1650,11 +1670,6 @@ class OmniWebViewManager(
              /"followsCount"\s*:\s*(\d+)/.exec(html);
     if (m2) following = parseInt(m2[1], 10);
 
-    var m3 = /"edge_owner_to_timeline_media"\s*:\s*\{\s*"count"\s*:\s*(\d+)/.exec(html) ||
-             /"media_count"\s*:\s*(\d+)/.exec(html) ||
-             /"videoCount"\s*:\s*(\d+)/.exec(html);
-    if (m3) posts = parseInt(m3[1], 10);
-
     var mPriv = /"(?:is_private|privateAccount|locked)"\s*:\s*(true|false)/.exec(html);
     if (mPriv) isPrivate = mPriv[1] === 'true';
 
@@ -1673,7 +1688,7 @@ class OmniWebViewManager(
       }
     }
 
-    if (followers === null || following === null || posts === null) {
+    if (followers === null || following === null) {
       var metaMatch = /<meta[^>]+(?:name|property)=["'](?:og:description|description)["'][^>]+content=["']([^"']+)["']/i.exec(html) ||
                       /<meta[^>]+content=["']([^"']+)["'][^>]+(?:name|property)=["'](?:og:description|description)["']/i.exec(html);
       if (metaMatch && metaMatch[1]) {
@@ -1686,15 +1701,11 @@ class OmniWebViewManager(
           var mg = /([0-9.,]+[KMB]?)\s+Following/i.exec(desc) || /フォロー中\s*([0-9.,]+[万千億KMB]?)\s*人?/.exec(desc);
           if (mg) following = parseHumanNumber(mg[1]);
         }
-        if (posts === null) {
-          var mp = /([0-9.,]+[KMB]?)\s+Posts/i.exec(desc) || /投稿\s*([0-9.,]+[万千億KMB]?)\s*件?/.exec(desc);
-          if (mp) posts = parseHumanNumber(mp[1]);
-        }
       }
     }
 
     if (followers !== null || following !== null || iFollow !== null || followsMe !== null) {
-      return recordStats(targetHandle, followers, following, posts, isPrivate, iFollow, followsMe);
+      return recordStats(targetHandle, followers, following, null, isPrivate, iFollow, followsMe);
     }
     return false;
   }
@@ -1862,9 +1873,6 @@ class OmniWebViewManager(
           promise.then(function(res) {
             try {
               if (!res || !res.ok || typeof res.clone !== 'function') return;
-"""
-
-        private val PROFILE_STATS_JS_PART_2: String = """
               var ct = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
               if (ct.indexOf('json') >= 0 || ct.indexOf('text/plain') >= 0 || ct.indexOf('javascript') >= 0) {
                 res.clone().text().then(sniffJsonText, function() {});
@@ -1892,6 +1900,9 @@ class OmniWebViewManager(
           return origSetHeader.apply(this, arguments);
         };
       }
+"""
+
+        private val PROFILE_STATS_JS_PART_2: String = """
       XMLHttpRequest.prototype.send = function(body) {
         try {
           captureRequestMeta(this.__omniStatsUrl, body);
@@ -2432,12 +2443,9 @@ class OmniWebViewManager(
           var flwng = u.edge_follow && typeof u.edge_follow.count === 'number'
             ? u.edge_follow.count
             : (typeof u.following_count === 'number' ? u.following_count : null);
-          var posts = u.edge_owner_to_timeline_media && typeof u.edge_owner_to_timeline_media.count === 'number'
-            ? u.edge_owner_to_timeline_media.count
-            : (typeof u.media_count === 'number' ? u.media_count : null);
           var iFlw = typeof u.followed_by_viewer === 'boolean' ? u.followed_by_viewer : null;
           var flwsMe = typeof u.follows_viewer === 'boolean' ? u.follows_viewer : null;
-          recordStats(handle, flwrs, flwng, posts, typeof u.is_private === 'boolean' ? u.is_private : null, iFlw, flwsMe);
+          recordStats(handle, flwrs, flwng, null, typeof u.is_private === 'boolean' ? u.is_private : null, iFlw, flwsMe);
         }
         return { ok: hasUsableStats(statsMap[handle]), rateLimited: false };
       }).catch(function() { return { ok: false, rateLimited: false }; });
@@ -2584,7 +2592,7 @@ class OmniWebViewManager(
                 if (nh === selfHandle) selfDid = p.did;
                 else dids.push(p.did);
               }
-              recordStats(p.handle, p.followersCount, p.followsCount, p.postsCount, null, null, null);
+              recordStats(p.handle, p.followersCount, p.followsCount, null, null, null, null);
             }
           }
         }
@@ -2626,7 +2634,7 @@ class OmniWebViewManager(
       return res.json().then(function(acc) {
         if (acc && acc.id) {
           bindUserId(handle, acc.id);
-          recordStats(handle, acc.followers_count, acc.following_count, acc.statuses_count, typeof acc.locked === 'boolean' ? acc.locked : null, null, null);
+          recordStats(handle, acc.followers_count, acc.following_count, null, typeof acc.locked === 'boolean' ? acc.locked : null, null, null);
           scheduleRelBatch();
         }
       }).catch(function() {});
@@ -2856,15 +2864,11 @@ class OmniWebViewManager(
 
     var statsText = '';
     var statsTitle = '';
-"""
-
-        private val PROFILE_STATS_JS_PART_3: String = """
     var isFollowingHeavy = false;
 
     if (hasUsableStats(entry)) {
       var hasFollowing = typeof entry.following === 'number';
       var hasFollowers = typeof entry.followers === 'number';
-      var hasPosts = includePosts && typeof entry.posts === 'number';
       isFollowingHeavy = hasFollowing && hasFollowers && entry.following > entry.followers;
 
       var parts = [];
@@ -2881,10 +2885,6 @@ class OmniWebViewManager(
         parts.push('フォロワー ' + formatCompactCount(entry.followers));
         titleParts.push('フォロワー: ' + entry.followers.toLocaleString('ja-JP') + '人');
       }
-      if (hasPosts) {
-        parts.push('投稿 ' + formatCompactCount(entry.posts));
-        titleParts.push('投稿: ' + entry.posts.toLocaleString('ja-JP') + '件');
-      }
       if (isFollowingHeavy) {
         titleParts.push('★ フォロー中の方がフォロワーより多いユーザー');
       }
@@ -2897,6 +2897,9 @@ class OmniWebViewManager(
       }
     }
 
+"""
+
+        private val PROFILE_STATS_JS_PART_3: String = """
     if (!relText && !statsText) return null;
     return {
       relKind: relKind,
@@ -3532,6 +3535,1540 @@ class OmniWebViewManager(
             PROFILE_STATS_JS_PART_2,
             PROFILE_STATS_JS_PART_3,
         ).joinToString("\n")
+
+        val LONG_PRESS_NEW_TAB_JS: String = """
+(function() {
+  if (window !== window.top) return;
+  if (window.__omniLongPressNewTabInstalled) return;
+  window.__omniLongPressNewTabInstalled = true;
+
+  var HOLD_MS = 460;
+  var MOVE_TOLERANCE_PX = 10;
+  var activeTimer = null;
+  var activePointerId = null;
+  var startX = 0;
+  var startY = 0;
+  var suppressUntil = 0;
+  var styleInjected = false;
+
+  function ensureStyle() {
+    if (styleInjected) return;
+    var target = document.head || document.documentElement;
+    if (!target) return;
+    styleInjected = true;
+    var st = document.createElement('style');
+    st.id = 'omni-lp-style';
+    st.textContent =
+      '@keyframes omni-lp-ring {' +
+      '  0% { transform: translate(-50%, -50%) scale(0.35); opacity: 0.92; }' +
+      '  100% { transform: translate(-50%, -50%) scale(1.7); opacity: 0; }' +
+      '}\n' +
+      '.omni-lp-ripple {' +
+      '  position: fixed; z-index: 2147483647; width: 42px; height: 42px;' +
+      '  border-radius: 999px; border: 2.5px solid #38bdf8;' +
+      '  background: rgba(56, 189, 248, 0.16); pointer-events: none;' +
+      '  animation: omni-lp-ring 380ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards;' +
+      '}\n' +
+      'a[href], a[href] * { -webkit-touch-callout: none !important; }';
+    target.appendChild(st);
+  }
+
+  function showRipple(x, y) {
+    ensureStyle();
+    if (!document.body) return;
+    try {
+      var dot = document.createElement('div');
+      dot.className = 'omni-lp-ripple';
+      dot.style.left = Math.round(x) + 'px';
+      dot.style.top = Math.round(y) + 'px';
+      document.body.appendChild(dot);
+      setTimeout(function() {
+        if (dot.parentNode) dot.parentNode.removeChild(dot);
+      }, 420);
+    } catch (_) {}
+  }
+
+  function toHttpUrl(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    var trimmed = raw.trim();
+    if (!trimmed || trimmed === '#' || /^javascript:/i.test(trimmed) || /^mailto:/i.test(trimmed) || /^tel:/i.test(trimmed)) {
+      return null;
+    }
+    try {
+      var parsed = new URL(trimmed, location.href);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+      return parsed.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isEditableElement(el) {
+    if (!el || typeof el.closest !== 'function') return false;
+    return !!el.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], [role="textbox"]');
+  }
+
+  function resolveTargetUrl(el) {
+    if (!el || el.nodeType !== 1 || typeof el.closest !== 'function') return null;
+    if (isEditableElement(el)) return null;
+
+    var anchor = el.closest('a[href], area[href]');
+    if (anchor) {
+      var u1 = toHttpUrl(anchor.getAttribute('href'));
+      if (u1) return u1;
+    }
+
+    var dataHolder = el.closest('[data-href], [data-url]');
+    if (dataHolder) {
+      var u2 = toHttpUrl(dataHolder.getAttribute('data-href') || dataHolder.getAttribute('data-url'));
+      if (u2) return u2;
+    }
+
+    // フォロー・いいね等の操作ボタン自身を長押しした場合は誤爆させない
+    if (el.closest('button, [role="button"]')) return null;
+
+    // フォロー中・フォロワー行（data-omni-ff-row）の余白・表示名長押しでもプロフィール URL を解決する
+    var ffRow = el.closest('[data-omni-ff-row]');
+    if (ffRow) {
+      var rowHandle = (ffRow.getAttribute('data-omni-ff-row') || '').trim().toLowerCase();
+      var rowLinks = ffRow.querySelectorAll('a[href]');
+      var firstValid = null;
+      for (var i = 0; i < rowLinks.length; i++) {
+        var candidate = toHttpUrl(rowLinks[i].getAttribute('href'));
+        if (!candidate) continue;
+        if (!firstValid) firstValid = candidate;
+        if (rowHandle && candidate.toLowerCase().indexOf(rowHandle) >= 0) {
+          return candidate;
+        }
+      }
+      if (firstValid) return firstValid;
+    }
+
+    // 小型リンクカード（単一リンクのみ含む）の長押しフォールバック
+    var card = el.closest('[role="link"], [role="listitem"], li');
+    if (card) {
+      try {
+        var r = card.getBoundingClientRect();
+        if (r.height > 0 && r.height <= 160) {
+          var links = card.querySelectorAll('a[href]');
+          var distinct = null;
+          var multi = false;
+          for (var j = 0; j < links.length; j++) {
+            var u = toHttpUrl(links[j].getAttribute('href'));
+            if (!u) continue;
+            if (!distinct) distinct = u;
+            else if (distinct !== u) { multi = true; break; }
+          }
+          if (distinct && !multi) return distinct;
+        }
+      } catch (_) {}
+    }
+
+    return null;
+  }
+
+  function postOpenNewTab(url) {
+    try {
+      if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
+        window.chrome.webview.postMessage(JSON.stringify({ type: 'omnisns:open-new-tab', url: url }));
+        return true;
+      }
+      if (window.OmniFollowBridge && typeof window.OmniFollowBridge.onOpenNewTab === 'function') {
+        window.OmniFollowBridge.onOpenNewTab(url);
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function cancelPress() {
+    if (activeTimer) {
+      clearTimeout(activeTimer);
+      activeTimer = null;
+    }
+    activePointerId = null;
+  }
+
+  document.addEventListener('pointerdown', function(e) {
+    if (!e || e.isTrusted === false) return;
+    if (e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+    var isTouchLike = e.pointerType === 'touch' || e.pointerType === 'pen';
+    if (!isTouchLike && e.button !== 0) return;
+
+    // 複数本指タッチ（ピンチ等）は即キャンセル
+    if (activePointerId !== null) {
+      cancelPress();
+      return;
+    }
+
+    var target = e.target;
+    if (target && target.nodeType !== 1) target = target.parentElement;
+    var url = resolveTargetUrl(target);
+    if (!url) return;
+
+    ensureStyle();
+    activePointerId = e.pointerId;
+    startX = e.clientX;
+    startY = e.clientY;
+    var capturedUrl = url;
+
+    activeTimer = setTimeout(function() {
+      activeTimer = null;
+      activePointerId = null;
+      suppressUntil = Date.now() + 750;
+      try {
+        var sel = window.getSelection && window.getSelection();
+        if (sel && sel.removeAllRanges) sel.removeAllRanges();
+      } catch (_) {}
+      showRipple(startX, startY);
+      postOpenNewTab(capturedUrl);
+    }, HOLD_MS);
+  }, true);
+
+  document.addEventListener('pointermove', function(e) {
+    if (activePointerId === null || !e || e.pointerId !== activePointerId) return;
+    var dx = e.clientX - startX;
+    var dy = e.clientY - startY;
+    if ((dx * dx + dy * dy) > (MOVE_TOLERANCE_PX * MOVE_TOLERANCE_PX)) {
+      cancelPress();
+    }
+  }, true);
+
+  document.addEventListener('pointerup', function(e) {
+    if (activePointerId !== null && (!e || e.pointerId === activePointerId)) {
+      cancelPress();
+    }
+  }, true);
+
+  document.addEventListener('pointercancel', cancelPress, true);
+  window.addEventListener('scroll', cancelPress, { capture: true, passive: true });
+  window.addEventListener('wheel', cancelPress, { capture: true, passive: true });
+  window.addEventListener('blur', cancelPress);
+  document.addEventListener('visibilitychange', cancelPress);
+
+  function maybeSuppressEvent(e) {
+    if (Date.now() <= suppressUntil) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') {
+        e.stopImmediatePropagation();
+      }
+      return false;
+    }
+  }
+
+  document.addEventListener('click', maybeSuppressEvent, true);
+  document.addEventListener('contextmenu', maybeSuppressEvent, true);
+})();
+"""
+
+        private val JEV_FILTER_JS_PART_1: String = """
+(function() {
+  if (window !== window.top) return;
+  if (window.__omniJevInstalled) return;
+  window.__omniJevInstalled = true;
+
+  var host = (location.hostname || '').toLowerCase();
+  var IS_INSTAGRAM = host === 'instagram.com' || host.endsWith('.instagram.com');
+  var IS_TIKTOK = host === 'tiktok.com' || host.endsWith('.tiktok.com');
+  var IS_THREADS = host === 'threads.net' || host.endsWith('.threads.net') || host === 'threads.com' || host.endsWith('.threads.com');
+  var IS_BLUESKY = host === 'bsky.app' || host.endsWith('.bsky.app');
+  var IS_X = host === 'x.com' || host.endsWith('.x.com') || host === 'twitter.com' || host.endsWith('.twitter.com');
+
+  function detectPlatform() {
+    if (IS_INSTAGRAM) return 'instagram';
+    if (IS_TIKTOK) return 'tiktok';
+    if (IS_THREADS) return 'threads';
+    if (IS_BLUESKY) return 'bluesky';
+    if (IS_X) return 'x';
+    if (host.indexOf('facebook.com') >= 0) return 'facebook';
+    if (host.indexOf('youtube.com') >= 0) return 'youtube';
+    if (host.indexOf('mixi.social') >= 0 || host.indexOf('mixi2') >= 0) return 'mixi2';
+    if (host.indexOf('misskey') >= 0) return 'misskey';
+    if (host.indexOf('mastodon') >= 0 || host.indexOf('mstdn') >= 0) return 'mastodon';
+    if (host.indexOf('reddit.com') >= 0) return 'reddit';
+    if (host.indexOf('note.com') >= 0) return 'note';
+    return 'sns';
+  }
+
+  var PLATFORM = detectPlatform();
+  var RESERVED = new Set([
+    'explore', 'direct', 'reels', 'stories', 'accounts', 'p', 'reel', 'tv',
+    'about', 'legal', 'privacy', 'terms', 'session', 'challenge', 'oauth',
+    'graphql', 'api', 'nametag', 'directory', 'topics', 'web', 'threads',
+    'foryou', 'following', 'followers', 'friends', 'live', 'upload', 'messages',
+    'search', 'tag', 'music', 'tiktok', 'home', 'notifications', 'settings',
+    'compose', 'i', 'intent', 'hashtag', 'lists', 'bookmarks', 'communities',
+    'login', 'signup', 'register', 'help', 'support', 'profile', 'post', 'status'
+  ]);
+  var USERNAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+  var API_URL_RE = IS_TIKTOK
+    ? /(\/api\/user\/list|\/user\/(follower|following)|\/aweme\/v\d+\/user\/(follower|following)|\/relations\/)/i
+    : (IS_INSTAGRAM
+        ? /(\/api\/v1\/friendships\/|\/api\/v1\/accounts\/|\/graphql|followers|following)/i
+        : /(followers|following|follows|friendships|getFollowers|getFollows|searchActors|UserBy|Following|Followers)/i);
+  var FRIENDSHIPS_LIST_RE = IS_TIKTOK
+    ? /(\/api\/user\/list|\/user\/(follower|following)\/list|\/aweme\/v\d+\/user\/(follower|following)\/list)/i
+    : (IS_INSTAGRAM
+        ? /\/api\/v1\/friendships\/[^/?#]+\/(followers|following|mutual)/i
+        : /(getFollowers|getFollows|followers|following)/i);
+  var FOLLOW_GRAPH_KEY_RE = /^(edge_followed_by|edge_follow|xdt_api__v1__friendships|mutual_followers|userList|followers|follows)/i;
+  var IGNORE_TEXT = /^(フォロー|フォロー中|フォローバック|フォローする|友達|削除|メッセージ|リクエスト済み|ブロック|制限する|親しい友達|共通|認証済み|新しいフォロワー|すべて見る|おすすめ|購読|相互|片思い|フォロワー|Follow|Following|Follow Back|Friends|Remove|Message|Requested|Verified|New|See All|Suggested|Subscriptions|•|・|\s*)$/i;
+  var IGNORE_SUB = /(がフォロー中|Followed by|フォロワー\s*[\d,.万億kKmM]+|フォロー中\s*[\d,.万億kKmM]+|件の投稿|Followers\s*[\d,.kKmM]+|⇄\s*相互|→\s*片思い|←\s*フォロワー)/i;
+  var FOLLOW_HEADER = /^(?:[\d,.万億kKmM]+\s*(?:人|人の)?\s*)?(フォロワー|フォロー中|共通のフォロワー|友達|Followers|Following|Follows|Mutual|Mutual followers|Friends|アカウント|ユーザー|People|Accounts)(?:\s*[\d,.万億kKmM人件]+)?$/i;
+  var NON_FOLLOW_TAB = /^(おすすめ|Suggested|投稿|Posts|メディア|Media|いいね|Likes)$/i;
+  var AVATAR_SIZE = 320;
+  var MIN_VISIBLE_MATCHES = 12;
+  var PULSE_COOLDOWN_MS = 850;
+  var MAX_EMPTY_PULSES = 5;
+
+  var judged = new Map();
+  var apiUsers = new Map();
+  var pendingQueue = new Map();
+  var inflight = new Set();
+  var failCounts = new Map();
+  var hookedImages = new WeakSet();
+  var pendingRequests = new Map();
+  var reqSeq = 0;
+
+  var avatarCanvas = null;
+  var avatarCtx = null;
+  var enabled = false;
+  var currentCategory = '女の子';
+  var timer = null;
+  var cooldownTimer = null;
+  var pumping = false;
+  var observer = null;
+  var lastReportedKey = '';
+
+  var activeContextKey = '';
+  var seenInContext = new Set();
+  var apiBatchSeq = 0;
+  var apiHasMore = null;
+  var reachedEnd = false;
+  var emptyPulseCount = 0;
+  var pulseInProgress = false;
+  var autoFetching = false;
+  var lastPulseAt = 0;
+  var lastUserScrollAt = 0;
+
+  function sendToHost(type, payload) {
+    try {
+      if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
+        var msg = Object.assign({ type: type }, payload || {});
+        window.chrome.webview.postMessage(JSON.stringify(msg));
+        return true;
+      }
+      if (window.OmniFollowBridge) {
+        if (type === 'omnisns:jev-get-config' && typeof window.OmniFollowBridge.onJevGetConfig === 'function') {
+          window.OmniFollowBridge.onJevGetConfig();
+          return true;
+        }
+        if (type === 'omnisns:jev-check' && typeof window.OmniFollowBridge.onJevCheckAccounts === 'function') {
+          window.OmniFollowBridge.onJevCheckAccounts(String(payload.reqId || ''), JSON.stringify(payload.candidates || []));
+          return true;
+        }
+        if (type === 'omnisns:jev-state' && typeof window.OmniFollowBridge.onJevState === 'function') {
+          window.OmniFollowBridge.onJevState(!!payload.active, payload.matched | 0, payload.hidden | 0, !!payload.autoFetching);
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function hasHostBridge() {
+    return !!(
+      (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') ||
+      (window.OmniFollowBridge && typeof window.OmniFollowBridge.onJevCheckAccounts === 'function')
+    );
+  }
+
+  function resetPaginationState(nextKey) {
+    activeContextKey = nextKey || '';
+    seenInContext.clear();
+    apiHasMore = null;
+    reachedEnd = false;
+    emptyPulseCount = 0;
+    pulseInProgress = false;
+    autoFetching = false;
+    if (cooldownTimer) {
+      clearTimeout(cooldownTimer);
+      cooldownTimer = null;
+    }
+  }
+
+  function ensureStyle() {
+    var target = document.head || document.documentElement;
+    if (!target || document.getElementById('omni-jev-style')) return;
+    var style = document.createElement('style');
+    style.id = 'omni-jev-style';
+    style.textContent =
+      'html.omni-jev-active [data-omni-jev-match="0"],\n' +
+      'html.omni-jev-active [data-omni-jev-pending="1"] {\n' +
+      '  display: none !important;\n' +
+      '}\n' +
+      'html.omni-jev-active [data-omni-jev-match="0"][data-omni-jev-tail-probe="1"] {\n' +
+      '  display: block !important;\n' +
+      '  height: 1px !important;\n' +
+      '  min-height: 1px !important;\n' +
+      '  max-height: 1px !important;\n' +
+      '  overflow: hidden !important;\n' +
+      '  opacity: 0 !important;\n' +
+      '  pointer-events: none !important;\n' +
+      '  margin: 0 !important;\n' +
+      '  padding: 0 !important;\n' +
+      '  border: 0 !important;\n' +
+      '}';
+    target.appendChild(style);
+  }
+
+  function applyRootClass() {
+    if (enabled) ensureStyle();
+    if (document.documentElement) {
+      document.documentElement.classList.toggle('omni-jev-active', !!enabled);
+    }
+  }
+
+  function userLinkSelector() {
+    if (IS_TIKTOK || IS_THREADS) return 'a[href*="/@"]';
+    if (IS_BLUESKY) return 'a[href*="/profile/"]';
+    if (IS_INSTAGRAM || IS_X) return 'a[href^="/"]';
+    return 'a[href]';
+  }
+
+  function parseUsernameHref(href) {
+    if (!href) return null;
+    var p = href.trim();
+    if (/^https?:\/\//i.test(p)) {
+      try {
+        var uo = new URL(p);
+        if (uo.hostname.toLowerCase() !== host && !uo.hostname.toLowerCase().endsWith('.' + host.replace(/^www\./, ''))) {
+          return null;
+        }
+        p = uo.pathname + uo.search;
+      } catch (_) {
+        return null;
+      }
+    }
+    var m;
+    if (IS_TIKTOK || IS_THREADS) {
+      m = /^\/@([A-Za-z0-9._-]{1,40})\/?(?:\?.*)?$/.exec(p);
+      if (!m) return null;
+      if (RESERVED.has(m[1].toLowerCase())) return null;
+      return m[1];
+    }
+    if (IS_BLUESKY) {
+      m = /^\/profile\/([A-Za-z0-9._:-]{2,64})\/?(?:\?.*)?$/.exec(p);
+      if (!m) return null;
+      if (RESERVED.has(m[1].toLowerCase())) return null;
+      return m[1];
+    }
+    if (IS_INSTAGRAM || IS_X) {
+      m = /^\/([A-Za-z0-9._]{1,32})\/?(?:\?.*)?$/.exec(p);
+      if (!m) return null;
+      if (RESERVED.has(m[1].toLowerCase())) return null;
+      return m[1];
+    }
+    // 汎用 SNS（/@user, /@user@host, /users/user, /u/user, /user）
+    m = /^\/(?:@|users\/|u\/|profile\/)?([A-Za-z0-9._@:-]{2,64})\/?(?:\?.*)?$/.exec(p);
+    if (!m) return null;
+    var clean = m[1].replace(/^@+/, '');
+    if (!clean || RESERVED.has(clean.toLowerCase()) || !USERNAME_RE.test(clean.replace(/@/g, '_'))) return null;
+    return clean;
+  }
+
+  function enqueueCandidate(u, key, n, bio, img, b64, fmt) {
+    if (!u || !key) return;
+    var apiEntry = apiUsers.get(key);
+    var mergedName = n || (apiEntry ? apiEntry.n : '') || '';
+    var mergedBio = bio || (apiEntry ? apiEntry.bio : '') || '';
+    var mergedImg = img || (apiEntry ? apiEntry.img : '') || '';
+    var hasImg = !!(mergedImg || b64);
+    var cached = judged.get(key);
+    if (cached !== undefined && (cached.hasImg || !hasImg)) return;
+    if (inflight.has(key)) return;
+    if ((failCounts.get(key) || 0) >= 3) return;
+
+    var existing = pendingQueue.get(key);
+    if (existing) {
+      if (!existing.n && mergedName) existing.n = mergedName;
+      if (!existing.bio && mergedBio) existing.bio = mergedBio;
+      if (!existing.img && mergedImg) existing.img = mergedImg;
+      if (!existing.b64 && b64) {
+        existing.b64 = b64;
+        existing.fmt = fmt;
+      }
+      return;
+    }
+    pendingQueue.set(key, {
+      u: u,
+      key: key,
+      n: mergedName,
+      bio: mergedBio,
+      img: mergedImg,
+      b64: b64 || '',
+      fmt: fmt || ''
+    });
+  }
+
+  function pickTikTokAvatarUrl(v) {
+    if (typeof v === 'string') return v;
+    if (v && typeof v === 'object') {
+      if (Array.isArray(v.url_list) && typeof v.url_list[0] === 'string') return v.url_list[0];
+      if (Array.isArray(v.urlList) && typeof v.urlList[0] === 'string') return v.urlList[0];
+    }
+    return '';
+  }
+
+  function rememberApiUser(u, fullName, bio, picUrl, foundByKey) {
+    var uLower = u.toLowerCase();
+    var prev = apiUsers.get(uLower);
+    var entry = {
+      u: u,
+      key: uLower,
+      n: fullName || (prev ? prev.n : ''),
+      bio: bio || (prev ? prev.bio : ''),
+      img: picUrl || (prev ? prev.img : '')
+    };
+    apiUsers.set(uLower, entry);
+    if (apiUsers.size > 4000) {
+      var oldest = apiUsers.keys().next().value;
+      apiUsers.delete(oldest);
+    }
+    foundByKey.set(uLower, entry);
+  }
+
+  function inspectApiObject(rootObj, reqUrl) {
+    if (!enabled || !rootObj || typeof rootObj !== 'object') return;
+    var foundByKey = new Map();
+    var hasFollowGraphKey = false;
+    var detectedMore = null;
+    var visited = 0;
+
+    function walk(node, depth) {
+      if (!node || typeof node !== 'object' || depth > 12 || visited > 3500) return;
+      visited++;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1);
+        return;
+      }
+
+      if (IS_INSTAGRAM) {
+        if (Array.isArray(node.users) && ('next_max_id' in node || 'has_more' in node || 'big_list' in node)) {
+          detectedMore = Boolean(node.next_max_id) || node.has_more === true;
+        }
+        if (node.page_info && typeof node.page_info === 'object' &&
+            typeof node.page_info.has_next_page === 'boolean' && Array.isArray(node.edges)) {
+          detectedMore = node.page_info.has_next_page;
+        }
+        if (typeof node.username === 'string') {
+          var u = node.username.trim();
+          var uLower = u.toLowerCase();
+          if (USERNAME_RE.test(u) && !RESERVED.has(uLower) &&
+              ('profile_pic_url' in node || 'full_name' in node || 'pk' in node || 'hd_profile_pic_url_info' in node)) {
+            var fullName = typeof node.full_name === 'string' ? node.full_name.trim() : '';
+            var bio = typeof node.biography === 'string' ? node.biography.trim() : '';
+            var picUrl = (typeof node.profile_pic_url === 'string' && node.profile_pic_url) ||
+              (node.hd_profile_pic_url_info && typeof node.hd_profile_pic_url_info.url === 'string' && node.hd_profile_pic_url_info.url) || '';
+            rememberApiUser(u, fullName, bio, picUrl, foundByKey);
+          }
+        }
+      } else if (IS_TIKTOK) {
+        if (Array.isArray(node.userList) || Array.isArray(node.followers) || Array.isArray(node.followings)) {
+          if (typeof node.hasMore === 'boolean') detectedMore = node.hasMore;
+          else if (typeof node.has_more === 'boolean') detectedMore = node.has_more;
+          else if (typeof node.minCursor === 'number') detectedMore = node.minCursor > 0;
+        }
+        var ttRawId = typeof node.uniqueId === 'string'
+          ? node.uniqueId
+          : (typeof node.unique_id === 'string' ? node.unique_id : '');
+        if (ttRawId) {
+          var tu = ttRawId.trim().replace(/^@/, '');
+          var tuLower = tu.toLowerCase();
+          if (USERNAME_RE.test(tu) && !RESERVED.has(tuLower) &&
+              ('nickname' in node || 'avatarThumb' in node || 'avatarMedium' in node || 'avatarLarger' in node || 'avatar_thumb' in node)) {
+            var nick = typeof node.nickname === 'string' ? node.nickname.trim() : '';
+            var sig = typeof node.signature === 'string' ? node.signature.trim() : '';
+            var tPic = pickTikTokAvatarUrl(node.avatarMedium) ||
+              pickTikTokAvatarUrl(node.avatarThumb) ||
+              pickTikTokAvatarUrl(node.avatarLarger) ||
+              pickTikTokAvatarUrl(node.avatar_medium) ||
+              pickTikTokAvatarUrl(node.avatar_thumb);
+            rememberApiUser(tu, nick, sig, tPic, foundByKey);
+          }
+        }
+      } else if (IS_BLUESKY) {
+        if (typeof node.handle === 'string' && ('displayName' in node || 'avatar' in node || 'description' in node)) {
+          var bh = node.handle.trim();
+          if (bh && !RESERVED.has(bh.toLowerCase())) {
+            var bn = typeof node.displayName === 'string' ? node.displayName.trim() : '';
+            var bd = typeof node.description === 'string' ? node.description.trim() : '';
+            var bp = typeof node.avatar === 'string' ? node.avatar.trim() : '';
+            rememberApiUser(bh, bn, bd, bp, foundByKey);
+          }
+        }
+      }
+
+      var keys = Object.keys(node);
+      for (var kIdx = 0; kIdx < keys.length; kIdx++) {
+        var k = keys[kIdx];
+        if (FOLLOW_GRAPH_KEY_RE.test(k)) hasFollowGraphKey = true;
+        if (k === 'extensions') continue;
+        walk(node[k], depth + 1);
+      }
+    }
+
+    walk(rootObj, 0);
+    var ctxNow = findFollowListContext();
+    var isFollowApi = (FRIENDSHIPS_LIST_RE.test(reqUrl) && (!IS_TIKTOK || !!ctxNow || /scene=(21|67)\b/.test(reqUrl))) ||
+      (hasFollowGraphKey && !!ctxNow);
+    if (isFollowApi) {
+      apiBatchSeq++;
+      if (detectedMore !== null) {
+        apiHasMore = detectedMore;
+        if (!detectedMore) {
+          reachedEnd = true;
+          autoFetching = false;
+        } else {
+          reachedEnd = false;
+          emptyPulseCount = 0;
+        }
+      } else if (foundByKey.size > 0) {
+        reachedEnd = false;
+        emptyPulseCount = 0;
+      }
+
+      if (enabled && foundByKey.size > 0 && ctxNow) {
+        foundByKey.forEach(function(usr) {
+          if (ctxNow.owner && usr.key === ctxNow.owner) return;
+          seenInContext.add(usr.key);
+          enqueueCandidate(usr.u, usr.key, usr.n, usr.bio, usr.img, '', '');
+        });
+        pumpQueue();
+      }
+    }
+    if (foundByKey.size > 0 || isFollowApi) {
+      scheduleScan(16);
+    }
+  }
+
+  function inspectRawJson(raw, reqUrl) {
+    if (!enabled || !raw || typeof raw !== 'string') return;
+    var cleaned = raw.replace(/^\s*for\s*\(\s*;\s*;\s*\)\s*;?\s*/, '');
+    if (!cleaned || (cleaned[0] !== '{' && cleaned[0] !== '[')) return;
+    try {
+      inspectApiObject(JSON.parse(cleaned), reqUrl);
+    } catch (_) {}
+  }
+
+  function hookNetwork() {
+    try {
+      if (typeof window.fetch === 'function' && !window.fetch.__omniJevHooked) {
+        var origFetch = window.fetch;
+        var wrappedFetch = function(input) {
+          var p = origFetch.apply(this, arguments);
+          if (!enabled) return p;
+          var reqUrl = '';
+          try {
+            reqUrl = typeof input === 'string' ? input : ((input && input.url) || String(input || ''));
+          } catch (_) {}
+          if (API_URL_RE.test(reqUrl) && p && typeof p.then === 'function') {
+            p.then(function(res) {
+              try {
+                if (!enabled || !res || typeof res.clone !== 'function') return;
+                var ct = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+                if (ct && !/json|javascript|text/i.test(ct)) return;
+                res.clone().text().then(function(txt) { inspectRawJson(txt, reqUrl); }).catch(function() {});
+              } catch (_) {}
+            }).catch(function() {});
+          }
+          return p;
+        };
+        wrappedFetch.__omniJevHooked = true;
+        window.fetch = wrappedFetch;
+      }
+    } catch (_) {}
+
+    try {
+      if (typeof XMLHttpRequest !== 'undefined' && XMLHttpRequest.prototype && !XMLHttpRequest.prototype.__omniJevHooked) {
+        var origOpen = XMLHttpRequest.prototype.open;
+        var origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url) {
+          try { this.__omniJevReqUrl = typeof url === 'string' ? url : String(url || ''); } catch (_) {}
+          return origOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function() {
+          try {
+            if (enabled) {
+              var reqUrl = this.__omniJevReqUrl || '';
+              if (API_URL_RE.test(reqUrl)) {
+                this.addEventListener('load', function() {
+                  try {
+                    if (!enabled) return;
+                    var rt = this.responseType;
+                    if (!rt || rt === 'text') {
+                      inspectRawJson(this.responseText, reqUrl);
+                    } else if (rt === 'json' && this.response) {
+                      inspectApiObject(this.response, reqUrl);
+                    }
+                  } catch (_) {}
+                });
+              }
+            }
+          } catch (_) {}
+          return origSend.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.__omniJevHooked = true;
+      }
+    } catch (_) {}
+  }
+
+  function findFollowListContext() {
+    if (!document.body) return null;
+    var pathname = location.pathname || '';
+
+    if (IS_TIKTOK) {
+      var ttListPath = /^\/@([^/?#]+)\/(followers|following)(\/|$)/i.exec(pathname);
+      var ttProfilePath = /^\/@([A-Za-z0-9._]{1,32})\/?$/i.exec(pathname);
+      var profileOwner = ttListPath
+        ? ttListPath[1].toLowerCase()
+        : (ttProfilePath ? ttProfilePath[1].toLowerCase() : null);
+
+      var modalCandidates = Array.prototype.slice.call(document.querySelectorAll(
+        '[data-e2e="follow-info-popup"], [role="dialog"], [aria-modal="true"], #tux-portal-container > div'
+      )).filter(function(d) {
+        if (d.closest('nav, header')) return false;
+        var r = d.getBoundingClientRect();
+        return r.width > 160 && r.height > 160;
+      });
+
+      for (var i = modalCandidates.length - 1; i >= 0; i--) {
+        var d = modalCandidates[i];
+        var dRect = d.getBoundingClientRect();
+        var tabs = Array.prototype.slice.call(d.querySelectorAll('[role="tab"]'));
+        var activeTab = tabs.find(function(t) { return t.getAttribute('aria-selected') === 'true'; });
+        if (activeTab && NON_FOLLOW_TAB.test((activeTab.textContent || '').trim())) continue;
+        var headers = d.querySelectorAll('[role="tab"], h1, h2, h3, [role="heading"], header, div, span');
+        var matchedHeader = '';
+        for (var hi = 0; hi < headers.length; hi++) {
+          var h = headers[hi];
+          if (h.children.length > 2) continue;
+          var hr = h.getBoundingClientRect();
+          if (hr.top - dRect.top > 150) continue;
+          var t = (h.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t && t.length <= 36 && FOLLOW_HEADER.test(t)) {
+            matchedHeader = t;
+            if (h.getAttribute('aria-selected') === 'true' || h.tagName === 'H1' || h.tagName === 'H2') break;
+          }
+        }
+        var isExplicitPopup = d.getAttribute('data-e2e') === 'follow-info-popup' ||
+          !!d.querySelector('[data-e2e="follow-info-popup"], [data-e2e*="follow-info-item"]');
+        if (matchedHeader || isExplicitPopup) {
+          return { root: d, owner: profileOwner, isDialog: true, key: 'ttdlg:' + pathname + ':' + (matchedHeader || 'popup') };
+        }
+      }
+      if (ttListPath) {
+        return { root: document.querySelector('main') || document.body, owner: profileOwner, isDialog: false, key: 'ttpage:' + pathname };
+      }
+      return null;
+    }
+
+    if (IS_INSTAGRAM) {
+      var pathMatch = /^\/([^/]+)\/(followers|following|mutual_followers)(\/|$)/i.exec(pathname);
+      var pathOwner = pathMatch && !RESERVED.has(pathMatch[1].toLowerCase()) ? pathMatch[1].toLowerCase() : null;
+
+      var dialogs = Array.prototype.slice.call(document.querySelectorAll('[role="dialog"]')).filter(function(el) {
+        var r = el.getBoundingClientRect();
+        return r.width > 140 && r.height > 140;
+      });
+      for (var di = dialogs.length - 1; di >= 0; di--) {
+        var dlg = dialogs[di];
+        var dlgRect = dlg.getBoundingClientRect();
+        var dlgHeaders = dlg.querySelectorAll('h1, h2, [role="heading"], [role="tab"], header, div, span');
+        var dlgMatched = '';
+        for (var j = 0; j < dlgHeaders.length; j++) {
+          var dh = dlgHeaders[j];
+          if (dh.children.length > 2) continue;
+          var dhr = dh.getBoundingClientRect();
+          if (dhr.top - dlgRect.top > 130) continue;
+          var dt = (dh.textContent || '').trim();
+          if (dt && dt.length <= 30 && FOLLOW_HEADER.test(dt)) {
+            dlgMatched = dt;
+            if (dh.getAttribute('aria-selected') === 'true' || dh.tagName === 'H1' || dh.tagName === 'H2' || dh.getAttribute('role') === 'heading') break;
+          }
+        }
+        if (dlgMatched || pathOwner) {
+          return { root: dlg, owner: pathOwner, isDialog: true, key: 'igdlg:' + pathname + ':' + dlgMatched };
+        }
+      }
+      if (pathOwner) {
+        return { root: document.querySelector('main') || document.body, owner: pathOwner, isDialog: false, key: 'igpage:' + pathname };
+      }
+      return null;
+    }
+
+    if (IS_THREADS) {
+      var thMatch = /^\/@?([^/]+)\/(followers|following)(\/|$)/i.exec(pathname);
+      var thOwner = thMatch ? thMatch[1].toLowerCase() : null;
+      var thDialogs = Array.prototype.slice.call(document.querySelectorAll('[role="dialog"]')).filter(function(el) {
+        var r = el.getBoundingClientRect();
+        return r.width > 160 && r.height > 160;
+      });
+      for (var ti = thDialogs.length - 1; ti >= 0; ti--) {
+        var td = thDialogs[ti];
+        if (td.querySelectorAll('a[href*="/@"]').length >= 2) {
+          return { root: td, owner: thOwner, isDialog: true, key: 'thdlg:' + pathname };
+        }
+      }
+      if (thOwner) {
+        return { root: document.querySelector('main') || document.body, owner: thOwner, isDialog: false, key: 'thpage:' + pathname };
+      }
+      return null;
+    }
+
+    if (IS_BLUESKY) {
+      var bsMatch = /^\/profile\/([^/]+)\/(followers|follows|known-followers)(\/|$)/i.exec(pathname);
+      if (bsMatch || /^\/search/i.test(pathname)) {
+        var bsOwner = bsMatch ? bsMatch[1].toLowerCase() : null;
+        return { root: document.querySelector('main') || document.body, owner: bsOwner, isDialog: false, key: 'bspage:' + pathname + location.search };
+      }
+      return null;
+    }
+
+    if (IS_X) {
+      var xMatch = /^\/([^/]+)\/(followers|following|verified_followers|followers_you_follow)(\/|$)/i.exec(pathname);
+      if (xMatch || (/^\/search/i.test(pathname) && /f=user/i.test(location.search || ''))) {
+        var xOwner = xMatch && !RESERVED.has(xMatch[1].toLowerCase()) ? xMatch[1].toLowerCase() : null;
+        return { root: document.querySelector('main') || document.body, owner: xOwner, isDialog: false, key: 'xpage:' + pathname + location.search };
+      }
+      return null;
+    }
+
+    // 汎用 SNS（Facebook / Mastodon / Misskey / mixi2 / Reddit / note 等）
+    var genDialogs = Array.prototype.slice.call(document.querySelectorAll('[role="dialog"]')).filter(function(el) {
+      var r = el.getBoundingClientRect();
+      return r.width > 160 && r.height > 160 && el.querySelectorAll('[data-omni-ff-row]').length >= 2;
+    });
+    if (genDialogs.length > 0) {
+      return { root: genDialogs[genDialogs.length - 1], owner: null, isDialog: true, key: 'gendlg:' + pathname };
+    }
+    if (/(followers|following|follows|friends|members|people|users|search)/i.test(pathname + location.search)) {
+      var mainEl = document.querySelector('main') || document.body;
+      if (mainEl && mainEl.querySelectorAll('[data-omni-ff-row], ' + userLinkSelector()).length >= 2) {
+        return { root: mainEl, owner: null, isDialog: false, key: 'genpage:' + pathname + location.search };
+      }
+    }
+    return null;
+  }
+
+  function isSubtitleLink(a) {
+    if (a.querySelector('img, canvas, svg')) return false;
+    var span = a.closest('span');
+    if (!span || span.querySelector('div')) return false;
+    var sr = span.getBoundingClientRect();
+    if (sr.height > 32) return false;
+    var txt = (span.textContent || '').replace(/\s+/g, ' ').trim();
+    return txt.length <= 90 && /^(Followed by\s+|.+がフォロー中)/i.test(txt);
+  }
+
+  function isPrimaryUserLink(a, otherLower) {
+    if (isSubtitleLink(a)) return false;
+    if (IS_TIKTOK || IS_THREADS || IS_BLUESKY) return true;
+    if (a.querySelector('img, canvas, svg')) return true;
+    var t = (a.textContent || '').trim().toLowerCase().replace(/^@/, '');
+    return t === otherLower || t.indexOf(otherLower + '\n') === 0 || t.indexOf(otherLower + ' ') === 0;
+  }
+
+  function isScrollableBox(el) {
+    if (!el || el === document.body || el === document.documentElement) return true;
+    try {
+      var oy = getComputedStyle(el).overflowY;
+      return oy === 'auto' || oy === 'scroll' || oy === 'overlay';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function clearRowAttrs(el) {
+    el.removeAttribute('data-omni-jev-row');
+    el.removeAttribute('data-omni-jev-match');
+    el.removeAttribute('data-omni-jev-pending');
+    el.removeAttribute('data-omni-jev-tail-probe');
+  }
+
+  function reconcileMarkedRows(ctx) {
+    var sel = userLinkSelector();
+    var markedList = ctx.root.querySelectorAll('[data-omni-jev-row]');
+    for (var i = 0; i < markedList.length; i++) {
+      var el = markedList[i];
+      var prevUser = el.getAttribute('data-omni-jev-row') || '';
+      var ffAttr = (el.getAttribute('data-omni-ff-row') || '').toLowerCase();
+      if (ffAttr && ffAttr === prevUser) continue;
+      var rowLinks = el.querySelectorAll(sel);
+      var usersInRow = new Set();
+      for (var j = 0; j < rowLinks.length; j++) {
+        var a = rowLinks[j];
+        if (isSubtitleLink(a)) continue;
+        var u = parseUsernameHref(a.getAttribute('href'));
+        if (!u) continue;
+        var ul = u.toLowerCase();
+        if (ctx.owner && ul === ctx.owner) continue;
+        if (isPrimaryUserLink(a, ul)) usersInRow.add(ul);
+      }
+      if (usersInRow.size !== 1 || !usersInRow.has(prevUser)) {
+        clearRowAttrs(el);
+      }
+    }
+  }
+
+  function findRowElement(links, uLower, ctx) {
+    for (var i = 0; i < links.length; i++) {
+      var marked = links[i].closest('[data-omni-jev-row]');
+      if (marked && ctx.root.contains(marked) && marked.getAttribute('data-omni-jev-row') === uLower) {
+        return marked;
+      }
+    }
+    if (IS_X) {
+      for (var xi = 0; xi < links.length; xi++) {
+        var cell = links[xi].closest('[data-testid="UserCell"]');
+        if (cell && ctx.root.contains(cell)) {
+          cell.setAttribute('data-omni-jev-row', uLower);
+          return cell;
+        }
+      }
+    }
+    // すでに OmniSNS PROFILE_STATS_JS が識別済みの行があれば最優先で使う
+    for (var fi = 0; fi < links.length; fi++) {
+      var ffRow = links[fi].closest('[data-omni-ff-row]');
+      if (ffRow && ctx.root.contains(ffRow) && (ffRow.getAttribute('data-omni-ff-row') || '').toLowerCase() === uLower) {
+        ffRow.setAttribute('data-omni-jev-row', uLower);
+        return ffRow;
+      }
+    }
+
+    var anchor = links.find(function(a) { return !a.querySelector('img') && (a.textContent || '').toLowerCase().indexOf(uLower) >= 0; }) ||
+      links.find(function(a) { return (a.textContent || '').toLowerCase().indexOf(uLower) >= 0; }) ||
+      links[0];
+    if (!anchor) return null;
+    if (!ctx.isDialog && anchor.closest('header, nav')) return null;
+
+    var anchorRect = anchor.getBoundingClientRect();
+    var anchorCenterY = anchorRect.top + anchorRect.height / 2;
+    var sel = userLinkSelector();
+
+    var cur = anchor;
+    var depth = 0;
+    while (cur.parentElement && cur.parentElement !== ctx.root && depth < 10) {
+      var parent = cur.parentElement;
+      if (!ctx.isDialog && (parent.tagName === 'HEADER' || parent.tagName === 'NAV' || parent.tagName === 'MAIN')) break;
+      if (parent.tagName === 'UL' || parent.tagName === 'OL') break;
+      if (isScrollableBox(parent)) break;
+      if (parent.querySelector('input, h1, h2, [role="heading"], [role="tablist"]')) break;
+
+      var curH = cur.getBoundingClientRect().height;
+      var parH = parent.getBoundingClientRect().height;
+      if (curH >= 40 && parH > Math.max(260, curH * 1.85)) break;
+
+      var hasOtherUser = false;
+      if (parent.querySelector('[data-omni-jev-row]:not([data-omni-jev-row="' + uLower.replace(/"/g, '') + '"])')) {
+        hasOtherUser = true;
+      } else {
+        var pLinks = parent.querySelectorAll(sel);
+        for (var pi = 0; pi < pLinks.length; pi++) {
+          var pa = pLinks[pi];
+          if (isSubtitleLink(pa)) continue;
+          var ou = parseUsernameHref(pa.getAttribute('href'));
+          if (!ou) continue;
+          var oLower = ou.toLowerCase();
+          if (ctx.owner && oLower === ctx.owner) continue;
+          if (oLower === uLower) continue;
+          if (isPrimaryUserLink(pa, oLower)) {
+            var pr = pa.getBoundingClientRect();
+            if (pr.height === 0 || anchorRect.height === 0 || Math.abs((pr.top + pr.height / 2) - anchorCenterY) >= 30) {
+              hasOtherUser = true;
+              break;
+            }
+          }
+        }
+      }
+      if (hasOtherUser) break;
+      cur = parent;
+      depth++;
+    }
+
+    var r = cur.getBoundingClientRect();
+    if (r.height > 0 && (r.height < 26 || r.height > 360)) return null;
+    cur.setAttribute('data-omni-jev-row', uLower);
+    return cur;
+  }
+
+  function extractDisplayNameAndBio(row, uLower) {
+    var apiEntry = apiUsers.get(uLower);
+    var name = (IS_TIKTOK && apiEntry && apiEntry.n) ? apiEntry.n : '';
+    var bio = (apiEntry && apiEntry.bio) ? apiEntry.bio : '';
+    var texts = [];
+    var nodes = row.querySelectorAll('span, p, div');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.closest('button, [role="button"], .omni-ff-wrap, .omni-ff-badge')) continue;
+      if (el.querySelector('span, p, div, button, a, ul')) continue;
+      var t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 160) continue;
+      var tl = t.toLowerCase();
+      if (tl === uLower || tl === '@' + uLower) continue;
+      if (IGNORE_TEXT.test(t) || IGNORE_SUB.test(t)) continue;
+      if (texts.indexOf(t) < 0) texts.push(t);
+    }
+    if (!name && texts.length > 0 && texts[0].length <= 60) {
+      name = texts[0];
+    }
+    if (!bio && texts.length >= 2) {
+      var extra = texts.slice(1).join(' ').trim();
+      if (extra.length > 140) extra = extra.slice(0, 140);
+      bio = extra;
+    }
+    if (!name && apiEntry && apiEntry.n) name = apiEntry.n;
+    return { n: name, bio: bio };
+  }
+
+  function findAvatarImg(row, uLower) {
+    var imgs = row.querySelectorAll('img');
+    var fallback = null;
+    for (var i = 0; i < imgs.length; i++) {
+      var img = imgs[i];
+      var src = img.currentSrc || img.getAttribute('src') || '';
+      if (!src || src.indexOf('data:image/svg') === 0) continue;
+      var w = img.naturalWidth || img.width || img.clientWidth || 0;
+      var h = img.naturalHeight || img.height || img.clientHeight || 0;
+      if (w > 0 && w < 22 && h > 0 && h < 22) continue;
+      var alt = (img.getAttribute('alt') || '').toLowerCase();
+      if (alt.indexOf('プロフィール') >= 0 || alt.indexOf('profile') >= 0 || alt.indexOf('avatar') >= 0 || alt.indexOf(uLower) >= 0) {
+        return img;
+      }
+      if (!fallback) fallback = img;
+    }
+    return fallback;
+  }
+
+  function extractAvatar(row, uLower) {
+    var apiEntry = apiUsers.get(uLower);
+    var apiImgUrl = apiEntry ? apiEntry.img : '';
+    var img = findAvatarImg(row, uLower);
+    if (!img) return { url: apiImgUrl, b64: '', fmt: '' };
+    var url = img.currentSrc || img.getAttribute('src') || apiImgUrl || '';
+    if (!img.complete && !hookedImages.has(img)) {
+      hookedImages.add(img);
+      img.addEventListener('load', function() { scheduleScan(60); }, { once: true });
+    }
+    if (img.complete && img.naturalWidth >= 22 && img.naturalHeight >= 22) {
+      try {
+        if (!avatarCanvas) {
+          avatarCanvas = document.createElement('canvas');
+          avatarCanvas.width = AVATAR_SIZE;
+          avatarCanvas.height = AVATAR_SIZE;
+          avatarCtx = avatarCanvas.getContext('2d', { willReadFrequently: false });
+        }
+        if (avatarCtx) {
+          avatarCtx.fillStyle = '#ffffff';
+          avatarCtx.fillRect(0, 0, AVATAR_SIZE, AVATAR_SIZE);
+          var sw = img.naturalWidth;
+          var sh = img.naturalHeight;
+          var scale = Math.max(AVATAR_SIZE / sw, AVATAR_SIZE / sh);
+          var dw = sw * scale;
+          var dh = sh * scale;
+          var dx = (AVATAR_SIZE - dw) / 2;
+          var dy = (AVATAR_SIZE - dh) / 2;
+          avatarCtx.drawImage(img, dx, dy, dw, dh);
+          var dataUrl = avatarCanvas.toDataURL('image/jpeg', 0.82);
+          var comma = dataUrl.indexOf(',');
+          if (comma > 0) {
+            return { url: url, b64: dataUrl.slice(comma + 1), fmt: 'jpg' };
+          }
+        }
+      } catch (_) {
+        // CORS 制約時は url をホスト側へ渡して直接ダウンロード・320x320 化する
+      }
+    }
+    return { url: url, b64: '', fmt: '' };
+  }
+
+  function applyRowJudgment(row, matched) {
+    row.removeAttribute('data-omni-jev-pending');
+    if (matched) {
+      row.setAttribute('data-omni-jev-match', '1');
+      row.removeAttribute('data-omni-jev-tail-probe');
+    } else {
+      row.setAttribute('data-omni-jev-match', '0');
+    }
+  }
+
+  function findScrollContainer(ctx) {
+    var sel = userLinkSelector();
+    var candidates = [ctx.root].concat(Array.prototype.slice.call(ctx.root.querySelectorAll('div, ul')));
+    var best = null;
+    var bestScore = 0;
+    for (var i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      if (el === document.body || el === document.documentElement) continue;
+      if (!isScrollableBox(el)) continue;
+      var ch = el.clientHeight || 0;
+      if (ch < 100) continue;
+      var hasRow = !!el.querySelector('[data-omni-jev-row], ' + sel);
+      var score = ch + (hasRow ? 10000 : 0);
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+    if (best) return best;
+    return ctx.isDialog ? ctx.root : (document.scrollingElement || document.documentElement);
+  }
+
+  function computeCounts(ctx) {
+    if (!enabled || !ctx || !ctx.root) return { matched: 0, hidden: 0, domMatched: 0 };
+    var domMatched = ctx.root.querySelectorAll('[data-omni-jev-match="1"]').length;
+    var domHidden = ctx.root.querySelectorAll('[data-omni-jev-match="0"]').length;
+    var seenMatched = 0;
+    var seenHidden = 0;
+    seenInContext.forEach(function(key) {
+      var j = judged.get(key);
+      if (!j) return;
+      if (j.matched) seenMatched++;
+      else seenHidden++;
+    });
+    return {
+      matched: Math.max(domMatched, seenMatched),
+      hidden: Math.max(domHidden, seenHidden),
+      domMatched: domMatched
+    };
+  }
+
+  function reportState(active, matched, hidden, fetching) {
+    var key = active + ':' + matched + ':' + hidden + ':' + (fetching ? 1 : 0);
+    if (key === lastReportedKey) return;
+    lastReportedKey = key;
+    sendToHost('omnisns:jev-state', {
+      active: !!active,
+      matched: matched | 0,
+      hidden: hidden | 0,
+      autoFetching: !!fetching
+    });
+  }
+
+  function triggerPaginationPulse(ctx, scrollEl, matchedRows, allRows) {
+    pulseInProgress = true;
+    autoFetching = true;
+    lastPulseAt = Date.now();
+    var beforeSeen = seenInContext.size;
+    var beforeSeq = apiBatchSeq;
+    var counts = computeCounts(ctx);
+    reportState(true, counts.matched, counts.hidden, true);
+
+    var anchorRow = matchedRows.length > 0 ? matchedRows[matchedRows.length - 1] : allRows[0];
+    var spacer = document.getElementById('omni-jev-spacer');
+    if (!spacer) {
+      spacer = document.createElement('div');
+      spacer.id = 'omni-jev-spacer';
+      spacer.setAttribute('aria-hidden', 'true');
+    }
+    var pushPx = Math.max(1600, (window.innerHeight || 800) * 2);
+    spacer.style.cssText = 'display:block;width:1px;height:' + pushPx + 'px;flex-shrink:0;pointer-events:none;opacity:0;';
+
+    try {
+      if (anchorRow && anchorRow.parentNode) {
+        anchorRow.after(spacer);
+      } else {
+        ctx.root.appendChild(spacer);
+      }
+    } catch (_) {}
+
+    var raf = window.requestAnimationFrame || function(fn) { setTimeout(fn, 16); };
+    raf(function() {
+      raf(function() {
+        try {
+          spacer.style.height = '0px';
+          var tailRows = allRows.slice(-3);
+          for (var ti = 0; ti < tailRows.length; ti++) {
+            if (tailRows[ti].getAttribute('data-omni-jev-match') === '0') {
+              tailRows[ti].setAttribute('data-omni-jev-tail-probe', '1');
+            }
+          }
+
+          var isDocScroll = scrollEl === document.scrollingElement || scrollEl === document.documentElement || scrollEl === document.body;
+          if (!isDocScroll && scrollEl && matchedRows.length < MIN_VISIBLE_MATCHES) {
+            var maxTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+            if (maxTop > 0 && maxTop <= 240) {
+              scrollEl.scrollTop = maxTop;
+            }
+          }
+
+          if (scrollEl && scrollEl !== window) {
+            scrollEl.dispatchEvent(new Event('scroll', { bubbles: true }));
+          }
+          ctx.root.dispatchEvent(new Event('scroll', { bubbles: true }));
+          window.dispatchEvent(new Event('scroll'));
+
+          setTimeout(function() {
+            try {
+              if (spacer.parentNode) spacer.parentNode.removeChild(spacer);
+              for (var k = 0; k < tailRows.length; k++) tailRows[k].removeAttribute('data-omni-jev-tail-probe');
+            } catch (_) {}
+          }, 150);
+        } catch (_) {}
+
+        setTimeout(function() {
+          pulseInProgress = false;
+          var gotNewData = seenInContext.size > beforeSeen || apiBatchSeq > beforeSeq;
+          if (gotNewData) {
+            emptyPulseCount = 0;
+          } else {
+            emptyPulseCount++;
+            if (emptyPulseCount >= MAX_EMPTY_PULSES) {
+              reachedEnd = true;
+              autoFetching = false;
+            }
+          }
+          scheduleScan(20);
+        }, 760);
+      });
+    });
+  }
+
+  function maybeAutoFetchNextPage(ctx) {
+    if (!enabled || !ctx || !ctx.root) {
+      autoFetching = false;
+      return;
+    }
+    if (pulseInProgress) return;
+    if (pendingQueue.size > 0 || inflight.size > 0) return;
+    if (reachedEnd || apiHasMore === false) {
+      autoFetching = false;
+      return;
+    }
+
+    var allRows = Array.prototype.slice.call(ctx.root.querySelectorAll('[data-omni-jev-row]'));
+    if (allRows.length === 0 && seenInContext.size === 0) return;
+
+    var matchedRows = allRows.filter(function(r) { return r.getAttribute('data-omni-jev-match') === '1'; });
+    var scrollEl = findScrollContainer(ctx);
+    var isDocScroll = scrollEl === document.scrollingElement || scrollEl === document.documentElement || scrollEl === document.body;
+    var viewportBottom = isDocScroll
+      ? (window.innerHeight || document.documentElement.clientHeight || 700)
+      : scrollEl.getBoundingClientRect().bottom;
+
+    var needsMore = false;
+    if (matchedRows.length === 0) {
+      needsMore = true;
+    } else {
+      var lastRect = matchedRows[matchedRows.length - 1].getBoundingClientRect();
+      if (viewportBottom - lastRect.bottom > -180) {
+        needsMore = true;
+      } else if (matchedRows.length < MIN_VISIBLE_MATCHES) {
+        var viewH = isDocScroll ? viewportBottom : (scrollEl.clientHeight || 0);
+        var scrollH = isDocScroll
+          ? Math.max(scrollEl.scrollHeight || 0, document.body ? document.body.scrollHeight : 0)
+          : (scrollEl.scrollHeight || 0);
+        if (scrollH <= viewH + 100) needsMore = true;
+      }
+    }
+"""
+
+        private val JEV_FILTER_JS_PART_2: String = """
+
+    if (!needsMore) {
+      autoFetching = false;
+      return;
+    }
+
+    var elapsed = Date.now() - lastPulseAt;
+    if (elapsed < PULSE_COOLDOWN_MS) {
+      autoFetching = true;
+      if (!cooldownTimer) {
+        cooldownTimer = setTimeout(function() {
+          cooldownTimer = null;
+          scheduleScan(0);
+        }, PULSE_COOLDOWN_MS - elapsed + 20);
+      }
+      return;
+    }
+
+    triggerPaginationPulse(ctx, scrollEl, matchedRows, allRows);
+  }
+
+  function requestCheckBatch(candidates) {
+    return new Promise(function(resolve) {
+      var id = 'jev_' + (++reqSeq) + '_' + Date.now();
+      var done = false;
+      var tmo = setTimeout(function() {
+        if (done) return;
+        done = true;
+        pendingRequests.delete(id);
+        resolve(null);
+      }, 35000);
+      pendingRequests.set(id, function(res) {
+        if (done) return;
+        done = true;
+        clearTimeout(tmo);
+        pendingRequests.delete(id);
+        resolve(res);
+      });
+      if (!sendToHost('omnisns:jev-check', { reqId: id, candidates: candidates })) {
+        done = true;
+        clearTimeout(tmo);
+        pendingRequests.delete(id);
+        resolve(null);
+      }
+    });
+  }
+
+  window.__omniJevResolve = function(reqId, resultMap) {
+    var fn = pendingRequests.get(reqId);
+    if (fn) {
+      fn(resultMap && typeof resultMap === 'object' ? resultMap : null);
+    }
+  };
+
+  async function pumpQueue() {
+    if (pumping || !enabled || pendingQueue.size === 0 || !hasHostBridge()) return;
+    pumping = true;
+    try {
+      while (enabled && pendingQueue.size > 0) {
+        var batch = [];
+        pendingQueue.forEach(function(item) {
+          if (batch.length < 16) batch.push(item);
+        });
+        for (var i = 0; i < batch.length; i++) {
+          pendingQueue.delete(batch[i].key);
+          inflight.add(batch[i].key);
+        }
+
+        var payload = batch.map(function(x) {
+          return { u: x.u, n: x.n, bio: x.bio, img: x.img, b64: x.b64, fmt: x.fmt, p: PLATFORM };
+        });
+        var res = await requestCheckBatch(payload);
+
+        var retryItems = [];
+        for (var j = 0; j < batch.length; j++) {
+          var it = batch[j];
+          inflight.delete(it.key);
+          if (res && typeof res === 'object' && Object.prototype.hasOwnProperty.call(res, it.u)) {
+            judged.set(it.key, { matched: !!res[it.u], hasImg: !!(it.img || it.b64) });
+            failCounts.delete(it.key);
+          } else if (enabled) {
+            var fails = (failCounts.get(it.key) || 0) + 1;
+            failCounts.set(it.key, fails);
+            if (fails < 3) retryItems.push(it);
+          }
+        }
+
+        syncDom();
+
+        if (retryItems.length > 0 && enabled) {
+          await new Promise(function(r) { setTimeout(r, 500); });
+          for (var rIdx = 0; rIdx < retryItems.length; rIdx++) {
+            var ri = retryItems[rIdx];
+            if (!judged.has(ri.key) && !pendingQueue.has(ri.key)) {
+              pendingQueue.set(ri.key, ri);
+            }
+          }
+        }
+      }
+    } finally {
+      pumping = false;
+      syncDom();
+    }
+  }
+
+  function syncDom() {
+    applyRootClass();
+    if (!enabled) {
+      reportState(false, 0, 0, false);
+      return;
+    }
+    var ctx = findFollowListContext();
+    if (!ctx || !ctx.root) {
+      if (activeContextKey !== '') resetPaginationState('');
+      reportState(false, 0, 0, false);
+      return;
+    }
+    if (ctx.key !== activeContextKey) {
+      resetPaginationState(ctx.key);
+    }
+
+    reconcileMarkedRows(ctx);
+
+    var byUser = new Map();
+    var anchors = ctx.root.querySelectorAll(userLinkSelector());
+    for (var i = 0; i < anchors.length; i++) {
+      var a = anchors[i];
+      if (isSubtitleLink(a)) continue;
+      var u = parseUsernameHref(a.getAttribute('href'));
+      if (!u) continue;
+      var uLower = u.toLowerCase();
+      if (ctx.owner && uLower === ctx.owner) continue;
+      var entry = byUser.get(uLower);
+      if (!entry) {
+        entry = { username: u, links: [] };
+        byUser.set(uLower, entry);
+      }
+      entry.links.push(a);
+    }
+
+    // 汎用 SNS ですでに data-omni-ff-row が付いている行も補完
+    var ffRows = ctx.root.querySelectorAll('[data-omni-ff-row]');
+    for (var f = 0; f < ffRows.length; f++) {
+      var fr = ffRows[f];
+      var fh = (fr.getAttribute('data-omni-ff-row') || '').trim();
+      if (!fh) continue;
+      var fhLower = fh.toLowerCase();
+      if (ctx.owner && fhLower === ctx.owner) continue;
+      if (!byUser.has(fhLower)) {
+        var rowLink = fr.querySelector('a[href]');
+        if (rowLink) {
+          byUser.set(fhLower, { username: fh, links: [rowLink] });
+        }
+      }
+    }
+
+    byUser.forEach(function(ent, uLowerKey) {
+      var row = findRowElement(ent.links, uLowerKey, ctx);
+      if (!row) return;
+      seenInContext.add(uLowerKey);
+      var cached = judged.get(uLowerKey);
+      if (cached !== undefined) {
+        applyRowJudgment(row, cached.matched);
+        if (!cached.hasImg) {
+          var av2 = extractAvatar(row, uLowerKey);
+          if (av2.url || av2.b64) {
+            var meta2 = extractDisplayNameAndBio(row, uLowerKey);
+            enqueueCandidate(ent.username, uLowerKey, meta2.n, meta2.bio, av2.url, av2.b64, av2.fmt);
+          }
+        }
+      } else {
+        var meta = extractDisplayNameAndBio(row, uLowerKey);
+        var av = extractAvatar(row, uLowerKey);
+        row.setAttribute('data-omni-jev-pending', '1');
+        enqueueCandidate(ent.username, uLowerKey, meta.n, meta.bio, av.url, av.b64, av.fmt);
+      }
+    });
+
+    if (pendingQueue.size > 0) {
+      pumpQueue();
+    } else {
+      maybeAutoFetchNextPage(ctx);
+    }
+
+    var counts = computeCounts(ctx);
+    reportState(true, counts.matched, counts.hidden, autoFetching);
+  }
+
+  function scheduleScan(delay) {
+    if (!enabled) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function() {
+      timer = null;
+      syncDom();
+    }, delay);
+  }
+
+  function startObserver() {
+    if (observer || !document.documentElement) return;
+    observer = new MutationObserver(function() {
+      if (enabled) scheduleScan(24);
+    });
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['href', 'src', 'aria-selected']
+    });
+  }
+
+  function stopObserver() {
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  }
+
+  window.__omniJevApplyConfig = function(cfg) {
+    if (!cfg || typeof cfg !== 'object') return;
+    var prevEnabled = enabled;
+    var nextEnabled = !!cfg.enabled;
+    var nextCat = typeof cfg.category === 'string' && cfg.category.trim() ? cfg.category.trim() : currentCategory;
+    var resetJudged = !!cfg.resetJudged || (nextCat !== currentCategory);
+
+    enabled = nextEnabled;
+    currentCategory = nextCat;
+    failCounts.clear();
+
+    if (resetJudged) {
+      judged.clear();
+      pendingQueue.clear();
+      resetPaginationState('');
+      document.querySelectorAll('[data-omni-jev-match],[data-omni-jev-pending],[data-omni-jev-tail-probe]')
+        .forEach(function(el) {
+          el.removeAttribute('data-omni-jev-match');
+          el.removeAttribute('data-omni-jev-pending');
+          el.removeAttribute('data-omni-jev-tail-probe');
+        });
+    } else if (!enabled) {
+      pendingQueue.clear();
+      autoFetching = false;
+      document.querySelectorAll('[data-omni-jev-pending],[data-omni-jev-tail-probe]')
+        .forEach(function(el) {
+          el.removeAttribute('data-omni-jev-pending');
+          el.removeAttribute('data-omni-jev-tail-probe');
+        });
+    } else if (!prevEnabled && enabled) {
+      reachedEnd = false;
+      emptyPulseCount = 0;
+    }
+
+    applyRootClass();
+    if (enabled) {
+      startObserver();
+      scheduleScan(0);
+    } else {
+      stopObserver();
+      reportState(false, 0, 0, false);
+    }
+  };
+
+  hookNetwork();
+  window.addEventListener('popstate', function() { if (enabled) scheduleScan(30); });
+  window.addEventListener('scroll', function(ev) {
+    if (!enabled) return;
+    var now = Date.now();
+    if (ev && ev.isTrusted && reachedEnd && apiHasMore !== false &&
+        now - lastPulseAt > 1500 && now - lastUserScrollAt > 800) {
+      reachedEnd = false;
+      emptyPulseCount = Math.max(0, MAX_EMPTY_PULSES - 2);
+    }
+    if (!ev || ev.isTrusted) lastUserScrollAt = now;
+    scheduleScan(24);
+  }, { capture: true, passive: true });
+
+  function requestInitialConfig() {
+    sendToHost('omnisns:jev-get-config', {});
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', requestInitialConfig, { once: true });
+  } else {
+    requestInitialConfig();
+  }
+})();
+"""
+
+        val JEV_FILTER_JS: String = listOf(
+            JEV_FILTER_JS_PART_1,
+            JEV_FILTER_JS_PART_2,
+        ).joinToString("\n")
     }
 
     private val channel = MethodChannel(messenger, MANAGER_CHANNEL)
@@ -3919,7 +5456,7 @@ class OmniWebViewPlatformView(
     private lateinit var webView: OmniWebView
     val appliedProfileName: String
     private val initialUrl: String
-    private val userAgent: String
+    private var userAgent: String
 
     private var disposed = false
     private var popupDialog: Dialog? = null
@@ -4312,6 +5849,29 @@ class OmniWebViewPlatformView(
                         if (followers >= 0) payload["followers"] = followers
                         invokeDart("onAccountIdentity", payload)
                     },
+                    onOpenNewTabCb = { url ->
+                        invokeDart("onOpenNewTab", mapOf("url" to url))
+                    },
+                    onJevGetConfigCb = {
+                        invokeDart("onJevGetConfig", null)
+                    },
+                    onJevCheckAccountsCb = { reqId, payloadJson ->
+                        invokeDart(
+                            "onJevCheckAccounts",
+                            mapOf("reqId" to reqId, "payload" to payloadJson),
+                        )
+                    },
+                    onJevStateCb = { active, matched, hidden, autoFetching ->
+                        invokeDart(
+                            "onJevState",
+                            mapOf(
+                                "active" to active,
+                                "matched" to matched,
+                                "hidden" to hidden,
+                                "autoFetching" to autoFetching,
+                            ),
+                        )
+                    },
                 ),
                 "OmniFollowBridge",
             )
@@ -4331,6 +5891,16 @@ class OmniWebViewPlatformView(
                     OmniWebViewManager.PROFILE_STATS_JS,
                     setOf("*"),
                 )
+                WebViewCompat.addDocumentStartJavaScript(
+                    target,
+                    OmniWebViewManager.LONG_PRESS_NEW_TAB_JS,
+                    setOf("*"),
+                )
+                WebViewCompat.addDocumentStartJavaScript(
+                    target,
+                    OmniWebViewManager.JEV_FILTER_JS,
+                    setOf("*"),
+                )
                 documentStartFollowInstalled = true
             }
         } catch (e: Throwable) {
@@ -4343,6 +5913,8 @@ class OmniWebViewPlatformView(
         try {
             target.evaluateJavascript(OmniWebViewManager.FOLLOW_TRACKER_JS, null)
             target.evaluateJavascript(OmniWebViewManager.PROFILE_STATS_JS, null)
+            target.evaluateJavascript(OmniWebViewManager.LONG_PRESS_NEW_TAB_JS, null)
+            target.evaluateJavascript(OmniWebViewManager.JEV_FILTER_JS, null)
         } catch (_: Throwable) {
         }
     }
@@ -5064,6 +6636,38 @@ class OmniWebViewPlatformView(
             }
             "getAppliedProfileName" -> {
                 result.success(appliedProfileName)
+            }
+            "setUserAgent" -> {
+                val nextUa = call.argument<String>("userAgent")?.trim().orEmpty()
+                val shouldReload = call.argument<Boolean>("reload") ?: true
+                if (nextUa.isNotEmpty() && !renderProcessCrashed) {
+                    userAgent = nextUa
+                    try {
+                        webView.settings.userAgentString = nextUa
+                        webView.settings.useWideViewPort = true
+                        webView.settings.loadWithOverviewMode = true
+                        if (shouldReload) {
+                            val current = webView.url
+                            if (!current.isNullOrEmpty() && isHttpOrHttpsUrl(current)) {
+                                loadUrlInternal(current)
+                            } else {
+                                reloadInternal(initialUrl)
+                            }
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
+                result.success(null)
+            }
+            "evaluateJavascript" -> {
+                val script = call.argument<String>("script").orEmpty()
+                if (script.isNotEmpty() && !renderProcessCrashed) {
+                    try {
+                        webView.evaluateJavascript(script, null)
+                    } catch (_: Throwable) {
+                    }
+                }
+                result.success(null)
             }
             "scrollBy" -> {
                 val dx = (call.argument<Number>("dx"))?.toDouble() ?: 0.0

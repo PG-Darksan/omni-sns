@@ -14,7 +14,8 @@ use crate::follow_sync::{
 use crate::gesture::{sanitize_gesture_settings, GestureSettings};
 use crate::models::{
     AddInstancePayload, AppConfig, AppSettings, ArchivedInstance, SavedSubTab, ServiceInstance,
-    UpdateInstancePatch, UpdateSettingsPatch, WindowBounds,
+    UpdateInstancePatch, UpdateSettingsPatch, WindowBounds, DEFAULT_VIEWPORT_BOTTOM_INSET,
+    MAX_VIEWPORT_BOTTOM_INSET,
 };
 use crate::url_utils::{
     is_valid_hex_color, make_badge_text, normalize_service_url, service_group_key,
@@ -149,6 +150,7 @@ pub fn create_default_settings() -> AppSettings {
         sidebar_width: 248,
         active_instance_id: None,
         header_collapsed: false,
+        viewport_bottom_inset: DEFAULT_VIEWPORT_BOTTOM_INSET,
         gesture: GestureSettings::default(),
         follow_sync: FollowSyncSettings {
             device_id: format!("win-{}", next_short_hex_id()),
@@ -239,6 +241,7 @@ struct RawSettings {
     sidebar_width: Option<u32>,
     active_instance_id: Option<String>,
     header_collapsed: Option<bool>,
+    viewport_bottom_inset: Option<u32>,
     gesture: Option<GestureSettings>,
     follow_sync: Option<FollowSyncSettings>,
 }
@@ -452,6 +455,9 @@ impl ConfigStore {
             }
             if let Some(hc) = rs.header_collapsed {
                 settings.header_collapsed = hc;
+            }
+            if let Some(bi) = rs.viewport_bottom_inset {
+                settings.viewport_bottom_inset = bi.clamp(0, MAX_VIEWPORT_BOTTOM_INSET);
             }
             if let Some(g) = rs.gesture {
                 settings.gesture = sanitize_gesture_settings(g);
@@ -977,6 +983,9 @@ impl ConfigStore {
         }
         if let Some(hc) = patch.header_collapsed {
             self.config.settings.header_collapsed = hc;
+        }
+        if let Some(bi) = patch.viewport_bottom_inset {
+            self.config.settings.viewport_bottom_inset = bi.clamp(0, MAX_VIEWPORT_BOTTOM_INSET);
         }
         if let Some(gesture) = patch.gesture {
             self.config.settings.gesture = sanitize_gesture_settings(gesture);
@@ -2000,6 +2009,32 @@ mod tests {
         assert_eq!(reloaded.get_config().archived_instances.len(), 1);
         assert!(reloaded.purge_archived_instance(&saved_id).is_some());
         assert!(reloaded.get_config().archived_instances.is_empty());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn viewport_bottom_inset_defaults_clamps_and_persists() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-inset-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+
+        let mut store = ConfigStore::new(config_path.clone());
+        assert_eq!(store.get_settings().viewport_bottom_inset, DEFAULT_VIEWPORT_BOTTOM_INSET);
+
+        store.update_settings(UpdateSettingsPatch {
+            viewport_bottom_inset: Some(999),
+            ..Default::default()
+        });
+        assert_eq!(store.get_settings().viewport_bottom_inset, MAX_VIEWPORT_BOTTOM_INSET);
+
+        store.update_settings(UpdateSettingsPatch {
+            viewport_bottom_inset: Some(64),
+            ..Default::default()
+        });
+        let reloaded = ConfigStore::new(config_path);
+        assert_eq!(reloaded.get_settings().viewport_bottom_inset, 64);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

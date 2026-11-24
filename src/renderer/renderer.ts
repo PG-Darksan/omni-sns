@@ -7,6 +7,7 @@ import {
   BrowserTabInfo,
   CatalogService,
   CategoryMeta,
+  JevStateSnapshot,
   ServiceCategory,
   ServiceInstance,
   TabRuntimeState,
@@ -45,7 +46,17 @@ interface UiState {
   editingMode: 'create' | 'edit' | null;
   editingInstanceId: string | null;
   editingTemplate: CatalogService | null;
+  jev: JevStateSnapshot | null;
 }
+
+const JEV_PRESET_CATEGORIES = [
+  '女の子',
+  'カフェ・グルメ',
+  'イラスト・絵師',
+  'ペット・動物',
+  'ファッション・美容',
+  '写真・カメラ'
+];
 
 const state: UiState = {
   config: null,
@@ -61,7 +72,8 @@ const state: UiState = {
   sidebarFilterQuery: '',
   editingMode: null,
   editingInstanceId: null,
-  editingTemplate: null
+  editingTemplate: null,
+  jev: null
 };
 
 let toastTimer: number | null = null;
@@ -98,6 +110,7 @@ function isAnyModalOpen(): boolean {
     !el('settings-modal').classList.contains('hidden') ||
     !el('gesture-modal').classList.contains('hidden') ||
     !el('follow-modal').classList.contains('hidden') ||
+    !el('jev-modal').classList.contains('hidden') ||
     !el('archived-pick-modal').classList.contains('hidden') ||
     !el('confirm-modal').classList.contains('hidden')
   );
@@ -291,8 +304,17 @@ function applyThemeAndLayout(): void {
   if (!state.config) return;
   const { theme, sidebarWidth } = state.config.settings;
   const headerCollapsed = Boolean(state.config.settings.headerCollapsed);
+  const bottomInset = Math.max(
+    0,
+    Math.min(160, state.config.settings.viewportBottomInset ?? 44)
+  );
   document.documentElement.setAttribute('data-theme', theme);
   document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
+  document.documentElement.style.setProperty('--viewport-bottom-inset', `${bottomInset}px`);
+
+  const bottomBar = el<HTMLElement>('viewport-bottom-bar');
+  bottomBar.classList.toggle('is-compact', bottomInset < 24);
+  el<HTMLElement>('bottom-inset-val').textContent = String(bottomInset);
 
   const mainArea = el<HTMLDivElement>('main-area');
   const active = getActiveInstance();
@@ -1549,6 +1571,9 @@ async function openSettingsModal(): Promise<void> {
   el<HTMLInputElement>('setting-minimize-tray').checked = s.minimizeToTray;
   el<HTMLInputElement>('setting-sidebar-width').value = String(s.sidebarWidth);
   el<HTMLSpanElement>('setting-sidebar-width-val').textContent = String(s.sidebarWidth);
+  const bottomInset = Math.max(0, Math.min(160, s.viewportBottomInset ?? 44));
+  el<HTMLInputElement>('setting-bottom-inset').value = String(bottomInset);
+  el<HTMLSpanElement>('setting-bottom-inset-val').textContent = String(bottomInset);
 
   el('settings-modal').classList.remove('hidden');
   await syncOverlayToMain();
@@ -1834,6 +1859,202 @@ function renderTabBar(): void {
   }
 }
 
+function formatJevUsd(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '$0';
+  if (usd < 0.0001) return `$${usd.toFixed(6)}`;
+  if (usd < 0.01) {
+    const s = usd.toFixed(5).replace(/0+$/, '');
+    return `$${s.endsWith('.') ? `${s}0` : s}`;
+  }
+  if (usd < 1) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+function formatJevJpy(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '¥0';
+  const jpy = usd * 155;
+  if (jpy < 0.01) return `約¥${jpy.toFixed(4)}`;
+  if (jpy < 1) return `約¥${jpy.toFixed(2)}`;
+  if (jpy < 100) return `約¥${jpy.toFixed(1)}`;
+  return `約¥${Math.round(jpy)}`;
+}
+
+function formatJevCostCompact(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '$0 (¥0)';
+  return `${formatJevUsd(usd)} (${formatJevJpy(usd)})`;
+}
+
+function updateJevThresholdLabel(percent: number): void {
+  el<HTMLElement>('jev-threshold-val').textContent = String(percent);
+  el<HTMLElement>('jev-threshold-hint').textContent =
+    percent <= 48 ? '広めに表示' : percent >= 70 ? '確実な一致のみ' : '標準';
+}
+
+function renderJevCategoryChips(selected: string): void {
+  const wrap = el<HTMLDivElement>('jev-category-chips');
+  wrap.innerHTML = '';
+  const merged: string[] = [];
+  const pushUnique = (label: string) => {
+    const t = label.trim();
+    if (!t) return;
+    if (!merged.some((x) => x.toLowerCase() === t.toLowerCase())) {
+      merged.push(t);
+    }
+  };
+  for (const r of state.jev?.recentCategories ?? []) pushUnique(r);
+  for (const p of JEV_PRESET_CATEGORIES) pushUnique(p);
+
+  const selLower = selected.trim().toLowerCase();
+  for (const cat of merged.slice(0, 12)) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'jev-chip';
+    if (cat.toLowerCase() === selLower) btn.classList.add('active');
+    btn.textContent = cat;
+    btn.addEventListener('click', () => {
+      el<HTMLInputElement>('jev-category-input').value = cat;
+      renderJevCategoryChips(cat);
+    });
+    wrap.appendChild(btn);
+  }
+}
+
+function renderJevUi(): void {
+  const jev = state.jev;
+  const cat = jev?.category?.trim() || '女の子';
+  const shortCat = cat.length > 9 ? `${cat.slice(0, 8)}…` : cat;
+  const active = Boolean(jev?.isActive);
+  const busy = Boolean(jev && (jev.checkingRequests > 0 || jev.liveAutoFetching));
+  const pillText = active && jev?.liveInList
+    ? `${shortCat} ${jev.liveMatched}件${busy ? '…' : ''}`
+    : `分類: ${shortCat}`;
+
+  const pillBtn = el<HTMLButtonElement>('btn-jev-filter');
+  const collapsedBtn = el<HTMLButtonElement>('btn-collapsed-jev');
+  el<HTMLSpanElement>('jev-pill-label').textContent = pillText;
+  el<HTMLSpanElement>('collapsed-jev-label').textContent = pillText;
+  pillBtn.classList.toggle('jev-active', active);
+  collapsedBtn.classList.toggle('jev-active', active);
+
+  const toggleBtn = el<HTMLButtonElement>('btn-bottom-jev-toggle');
+  toggleBtn.textContent = active ? 'ON' : 'OFF';
+  toggleBtn.classList.toggle('active', active);
+
+  const costLabel = formatJevCostCompact(jev?.totalCostUsd ?? 0);
+  const extraStatus = jev && jev.checkingRequests > 0
+    ? '（判定中…）'
+    : jev?.liveAutoFetching
+      ? '（次ページ取得中…）'
+      : '';
+  const statusText = active && jev?.liveInList
+    ? `Jev 分類「${cat}」: 表示 ${jev.liveMatched}件 / 非表示 ${jev.liveHidden}件${extraStatus} · 費用 ${costLabel}`
+    : active
+      ? `Jev 分類「${cat}」ON（フォロー中・フォロワー一覧で自動絞り込み）· 費用 ${costLabel}`
+      : `Jev 分類フィルタ OFF（分類: ${cat}）· 費用 ${costLabel}`;
+  el<HTMLSpanElement>('bottom-jev-text').textContent = statusText;
+
+  const errEl = el<HTMLSpanElement>('bottom-jev-error');
+  const errDismissBtn = el<HTMLButtonElement>('btn-bottom-jev-error-dismiss');
+  if (jev?.lastError && jev.enabled) {
+    errEl.textContent = jev.lastError;
+    errEl.title = jev.lastError;
+    errEl.classList.remove('hidden');
+    errDismissBtn.classList.remove('hidden');
+  } else {
+    errEl.classList.add('hidden');
+    errDismissBtn.classList.add('hidden');
+  }
+
+  if (jev && !el('jev-modal').classList.contains('hidden')) {
+    el<HTMLElement>('jev-cost-total').textContent = `累計: ${formatJevCostCompact(jev.totalCostUsd)}`;
+    el<HTMLElement>('jev-cost-session').textContent = `今回の起動中: ${formatJevCostCompact(jev.sessionCostUsd)}`;
+    el<HTMLElement>('jev-cost-meta').textContent =
+      `通信 ${jev.totalApiCalls}回 · 判定 ${jev.totalJudgedAccounts}件 · 入力 ${jev.totalInputTokens.toLocaleString('ja-JP')} tok · キャッシュ ${jev.cacheEntries}件（$0.042/100万tok・出力無料）`;
+  }
+}
+
+async function openJevModal(): Promise<void> {
+  const jev = await omniApi.getJevState();
+  state.jev = jev;
+
+  const catInput = el<HTMLInputElement>('jev-category-input');
+  const keyInput = el<HTMLInputElement>('jev-api-key');
+  const enabledInput = el<HTMLInputElement>('jev-enabled');
+  const thresholdInput = el<HTMLInputElement>('jev-threshold');
+  const testResultEl = el<HTMLDivElement>('jev-test-result');
+
+  catInput.value = jev.category || '女の子';
+  keyInput.value = jev.apiKey || '';
+  keyInput.type = 'password';
+  el<HTMLButtonElement>('btn-jev-toggle-key').textContent = '表示';
+  enabledInput.checked = jev.hasApiKey ? jev.enabled : true;
+
+  const pct = Math.round(Math.min(0.85, Math.max(0.4, jev.threshold || 0.55)) * 100 / 5) * 5;
+  thresholdInput.value = String(pct);
+  updateJevThresholdLabel(pct);
+  renderJevCategoryChips(catInput.value);
+
+  testResultEl.classList.add('hidden');
+  testResultEl.classList.remove('ok', 'err');
+  testResultEl.textContent = '';
+
+  el('jev-modal').classList.remove('hidden');
+  renderJevUi();
+  await syncOverlayToMain();
+  catInput.focus();
+  catInput.select();
+}
+
+async function closeJevModal(): Promise<void> {
+  el('jev-modal').classList.add('hidden');
+  await syncOverlayToMain();
+}
+
+async function quickToggleJevFilter(): Promise<void> {
+  const jev = state.jev ?? (await omniApi.getJevState());
+  state.jev = jev;
+  if (!jev.hasApiKey) {
+    await openJevModal();
+    return;
+  }
+  const nextEnabled = !jev.enabled;
+  state.jev = await omniApi.updateJevSettings({ enabled: nextEnabled });
+  renderJevUi();
+  showToast(
+    nextEnabled
+      ? `Jev 分類フィルタ ON（「${state.jev.category}」）`
+      : 'Jev 分類フィルタ OFF'
+  );
+}
+
+async function saveJevModal(): Promise<void> {
+  const rawKey = el<HTMLInputElement>('jev-api-key').value.trim();
+  const rawCat = el<HTMLInputElement>('jev-category-input').value.trim() || '女の子';
+  const wantEnabled = el<HTMLInputElement>('jev-enabled').checked;
+  const pct = Number(el<HTMLInputElement>('jev-threshold').value) || 55;
+  state.jev = await omniApi.updateJevSettings({
+    apiKey: rawKey,
+    category: rawCat,
+    enabled: wantEnabled && rawKey.length > 0,
+    threshold: pct / 100
+  });
+  renderJevUi();
+  await closeJevModal();
+  if (state.jev.isActive) {
+    showToast(`Jev 分類「${state.jev.category}」を適用しました`);
+  } else {
+    showToast('Jev 分類フィルタ設定を保存しました');
+  }
+}
+
+async function adjustBottomInset(delta: number): Promise<void> {
+  if (!state.config) return;
+  const cur = state.config.settings.viewportBottomInset ?? 44;
+  const next = Math.max(0, Math.min(160, cur + delta));
+  if (next === cur) return;
+  await omniApi.updateSettings({ viewportBottomInset: next });
+}
+
 function renderAll(): void {
   recordLastActiveForCurrent();
   applyThemeAndLayout();
@@ -1841,6 +2062,7 @@ function renderAll(): void {
   renderAccountBar();
   renderToolbarAndViewport();
   renderTabBar();
+  renderJevUi();
   if (state.config?.settings.gesture) {
     gestureModal?.syncSettings(state.config.settings.gesture);
   }
@@ -2362,14 +2584,100 @@ function bindEvents(): void {
     const val = (e.target as HTMLInputElement).value;
     el<HTMLSpanElement>('setting-sidebar-width-val').textContent = val;
   });
+  el<HTMLInputElement>('setting-bottom-inset').addEventListener('input', (e) => {
+    const val = (e.target as HTMLInputElement).value;
+    el<HTMLSpanElement>('setting-bottom-inset-val').textContent = val;
+  });
   el<HTMLButtonElement>('btn-save-settings').addEventListener('click', async () => {
     await omniApi.updateSettings({
       theme: el<HTMLSelectElement>('setting-theme').value as 'dark' | 'light',
       minimizeToTray: el<HTMLInputElement>('setting-minimize-tray').checked,
-      sidebarWidth: Number(el<HTMLInputElement>('setting-sidebar-width').value)
+      sidebarWidth: Number(el<HTMLInputElement>('setting-sidebar-width').value),
+      viewportBottomInset: Number(el<HTMLInputElement>('setting-bottom-inset').value)
     });
     await closeSettingsModal();
     showToast('アプリ設定を保存しました');
+  });
+
+  // Bottom viewport margin quick adjust & Jev category filter
+  el<HTMLButtonElement>('btn-bottom-inset-dec').addEventListener('click', () =>
+    void adjustBottomInset(-12)
+  );
+  el<HTMLButtonElement>('btn-bottom-inset-inc').addEventListener('click', () =>
+    void adjustBottomInset(12)
+  );
+  el<HTMLButtonElement>('btn-jev-filter').addEventListener('click', () => void openJevModal());
+  el<HTMLButtonElement>('btn-jev-filter').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    void quickToggleJevFilter();
+  });
+  el<HTMLButtonElement>('btn-collapsed-jev').addEventListener('click', () => void openJevModal());
+  el<HTMLButtonElement>('btn-collapsed-jev').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    void quickToggleJevFilter();
+  });
+  el<HTMLButtonElement>('btn-bottom-jev-toggle').addEventListener('click', () =>
+    void quickToggleJevFilter()
+  );
+  el<HTMLButtonElement>('btn-bottom-jev-open').addEventListener('click', () => void openJevModal());
+  el<HTMLButtonElement>('btn-bottom-jev-error-dismiss').addEventListener('click', async () => {
+    state.jev = await omniApi.clearJevError();
+    renderJevUi();
+  });
+
+  el<HTMLButtonElement>('btn-close-jev').addEventListener('click', () => void closeJevModal());
+  el<HTMLButtonElement>('btn-jev-cancel').addEventListener('click', () => void closeJevModal());
+  el<HTMLDivElement>('jev-modal').addEventListener('click', (e) => {
+    if (e.target === el('jev-modal')) {
+      void closeJevModal();
+    }
+  });
+  el<HTMLInputElement>('jev-category-input').addEventListener('input', (e) => {
+    renderJevCategoryChips((e.target as HTMLInputElement).value);
+  });
+  el<HTMLInputElement>('jev-category-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void saveJevModal();
+    }
+  });
+  el<HTMLButtonElement>('btn-jev-toggle-key').addEventListener('click', () => {
+    const input = el<HTMLInputElement>('jev-api-key');
+    const showing = input.type === 'text';
+    input.type = showing ? 'password' : 'text';
+    el<HTMLButtonElement>('btn-jev-toggle-key').textContent = showing ? '表示' : '隠す';
+  });
+  el<HTMLInputElement>('jev-threshold').addEventListener('input', (e) => {
+    updateJevThresholdLabel(Number((e.target as HTMLInputElement).value) || 55);
+  });
+  el<HTMLButtonElement>('btn-jev-save').addEventListener('click', () => void saveJevModal());
+  el<HTMLButtonElement>('btn-jev-test').addEventListener('click', async () => {
+    const btn = el<HTMLButtonElement>('btn-jev-test');
+    const resultEl = el<HTMLDivElement>('jev-test-result');
+    const key = el<HTMLInputElement>('jev-api-key').value.trim();
+    const cat = el<HTMLInputElement>('jev-category-input').value.trim() || '女の子';
+    btn.disabled = true;
+    btn.textContent = 'テスト中…';
+    resultEl.classList.add('hidden');
+    try {
+      const res = await omniApi.testJevConnection(key, cat);
+      resultEl.textContent = res.message;
+      resultEl.classList.remove('hidden', 'ok', 'err');
+      resultEl.classList.add(res.ok ? 'ok' : 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '接続テスト';
+    }
+  });
+  el<HTMLButtonElement>('btn-jev-clear-cache').addEventListener('click', async () => {
+    state.jev = await omniApi.clearJevCache();
+    renderJevUi();
+    showToast('Jev 判定キャッシュを消去しました');
+  });
+  el<HTMLButtonElement>('btn-jev-reset-usage').addEventListener('click', async () => {
+    state.jev = await omniApi.resetJevUsage();
+    renderJevUi();
+    showToast('Jev 利用費用カウンタをリセットしました');
   });
 
   // Global keyboard shortcuts inside shell UI
@@ -2383,6 +2691,8 @@ function bindEvents(): void {
         void resolveConfirmDialog(false);
       } else if (!el('archived-pick-modal').classList.contains('hidden')) {
         void closeArchivedPickModal();
+      } else if (!el('jev-modal').classList.contains('hidden')) {
+        void closeJevModal();
       } else if (!el('follow-modal').classList.contains('hidden')) {
         void closeFollowModal();
       } else if (!el('edit-modal').classList.contains('hidden')) {
@@ -2547,6 +2857,11 @@ async function bootstrap(): Promise<void> {
     renderTabBar();
   });
 
+  omniApi.onJevUpdated((snap) => {
+    state.jev = snap;
+    renderJevUi();
+  });
+
   omniApi.onShortcut((payload) => {
     if (payload.action === 'open-catalog') {
       void openCatalogModal();
@@ -2571,6 +2886,7 @@ async function bootstrap(): Promise<void> {
   state.gmailOpen = Boolean(data.gmailOpen);
   state.gmailRuntime = data.gmailRuntime ?? null;
   state.runtimeMap = new Map(data.runtimeStates.map((rt) => [rt.instanceId, rt]));
+  state.jev = await omniApi.getJevState().catch(() => null);
 
   el<HTMLSpanElement>('app-version').textContent = `v${data.appVersion} · Windows`;
 
