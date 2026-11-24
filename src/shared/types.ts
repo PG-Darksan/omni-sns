@@ -115,6 +115,8 @@ export interface TabRuntimeState {
   loadError: string | null;
   activeTabId: string;
   tabs: BrowserTabInfo[];
+  crossSiteService?: string | null;
+  crossSiteHandle?: string | null;
 }
 
 export type GestureShape =

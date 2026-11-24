@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::webview::{NewWindowResponse, PermissionKind, PermissionResponse, WebviewBuilder};
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Rect, Webview, WebviewUrl,
-    WebviewWindowBuilder,
+    AppHandle, Emitter, EventTarget, LogicalPosition, LogicalSize, Manager, Rect, Webview,
+    WebviewUrl, WebviewWindowBuilder,
 };
 
 use crate::follow_sync::{FollowSyncSettings, UpdateFollowSyncPatch};
@@ -19,15 +19,15 @@ use crate::models::{
 use crate::store::ConfigStore;
 use crate::url_utils::{
     build_user_agent, detect_platform_service_from_url, is_auth_popup_for_site, is_auth_popup_url,
-    is_http_url, is_same_site_url, normalize_service_url, parse_unread_count_from_title,
-    service_group_key,
+    is_http_url, is_internal_tauri_url, is_same_site_url, normalize_service_url,
+    parse_unread_count_from_title, service_group_key,
 };
 
 /// 同一プロファイルを共有する全タブ WebView2 へ統一指定する高速起動フラグ。
 /// バックグラウンド・オフスクリーン生成時の Chromium スロットリングとウィンドウ遮蔽判定を抑止し、
 /// Instagram / Threads 等の重い SPA が別タブで瞬時にハイドレーション完了するようにする。
 #[cfg(windows)]
-const WEBVIEW2_FAST_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
+const WEBVIEW2_FAST_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
 
 const BG_WARM_MAX_SECS: u64 = 8;
 const BG_WARM_POST_LOAD_MS: u64 = 2500;
@@ -182,7 +182,11 @@ impl ServiceTabs {
         self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
     }
 
-    fn to_runtime_state(&self, inst: &ServiceInstance) -> TabRuntimeState {
+    fn to_runtime_state(
+        &self,
+        inst: &ServiceInstance,
+        cross_site: Option<&(String, String)>,
+    ) -> TabRuntimeState {
         let active = self.active_tab();
         let total_unread: u32 = self
             .tabs
@@ -212,6 +216,8 @@ impl ServiceTabs {
                 .map(|t| t.tab_id.clone())
                 .unwrap_or_else(|| self.active_tab_id.clone()),
             tabs: self.tabs.iter().map(|t| t.to_info()).collect(),
+            cross_site_service: cross_site.map(|(svc, _)| svc.clone()),
+            cross_site_handle: cross_site.map(|(_, h)| h.clone()),
         }
     }
 }
@@ -234,8 +240,10 @@ pub enum ClosedEntry {
 pub struct AppStateInner {
     pub store: ConfigStore,
     pub services: HashMap<String, ServiceTabs>,
-    /// `tab_id -> pending_webview_label`（`win.add_child` 実行中の重複生成防止および孤立判定用）
-    pub creating_tabs: HashMap<String, String>,
+    /// `tab_id -> (pending_webview_label, creation_epoch)`（`win.add_child` 実行中の重複生成防止および孤立・旧エポック判定用）
+    pub creating_tabs: HashMap<String, (String, u64)>,
+    /// `tab_id -> desired_url`（WebView2 生成中に届いた遷移／再生成要求を取りこぼさないための保留キュー）
+    pub pending_tab_nav: HashMap<String, String>,
     pub last_active_by_group: HashMap<String, String>,
     pub cross_site_identities: HashMap<String, (String, String)>,
     pub closed_tabs: Vec<ClosedEntry>,
@@ -251,6 +259,10 @@ pub struct AppStateInner {
     pub chrome_version: String,
     pub main_hwnd: isize,
     pub cloud_sync_gen: Arc<AtomicU64>,
+    pub cloud_sync_config_gen: Arc<AtomicU64>,
+    pub cloud_sync_worker_running: Arc<AtomicBool>,
+    pub bounds_persist_gen: Arc<AtomicU64>,
+    pub bounds_persist_worker_running: Arc<AtomicBool>,
     #[cfg(windows)]
     pub gesture_host: Option<crate::gesture_win::GestureWinHost>,
 }
@@ -258,6 +270,8 @@ pub struct AppStateInner {
 #[derive(Clone)]
 pub struct SharedState {
     pub inner: Arc<Mutex<AppStateInner>>,
+    /// GitHub Gist 同期を直列化するための専用ロック（`inner` ロック外で取得する）
+    pub cloud_sync_lock: Arc<Mutex<()>>,
 }
 
 impl SharedState {
@@ -280,6 +294,7 @@ impl SharedState {
                 store,
                 services,
                 creating_tabs: HashMap::new(),
+                pending_tab_nav: HashMap::new(),
                 last_active_by_group: HashMap::new(),
                 cross_site_identities: HashMap::new(),
                 closed_tabs: Vec::new(),
@@ -300,9 +315,14 @@ impl SharedState {
                 chrome_version,
                 main_hwnd: 0,
                 cloud_sync_gen: Arc::new(AtomicU64::new(0)),
+                cloud_sync_config_gen: Arc::new(AtomicU64::new(0)),
+                cloud_sync_worker_running: Arc::new(AtomicBool::new(false)),
+                bounds_persist_gen: Arc::new(AtomicU64::new(0)),
+                bounds_persist_worker_running: Arc::new(AtomicBool::new(false)),
                 #[cfg(windows)]
                 gesture_host: None,
             })),
+            cloud_sync_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -310,7 +330,8 @@ impl SharedState {
         let mut out = Vec::new();
         for inst in guard.store.get_instances() {
             if let Some(st) = guard.services.get(&inst.instance_id) {
-                out.push(st.to_runtime_state(&inst));
+                let cross = guard.cross_site_identities.get(&inst.instance_id);
+                out.push(st.to_runtime_state(&inst, cross));
             }
         }
         out
@@ -353,22 +374,19 @@ fn active_tab_count(guard: &AppStateInner) -> usize {
 
 fn persist_service_tabs(guard: &mut AppStateInner, instance_id: &str) {
     let snapshot = guard.services.get(instance_id).map(|svc| {
-        let active_idx = svc
-            .tabs
-            .iter()
-            .position(|t| t.tab_id == svc.active_tab_id)
-            .unwrap_or(0);
-        let saved: Vec<SavedSubTab> = svc
-            .tabs
-            .iter()
-            .filter_map(|t| {
-                let url = normalize_service_url(&t.current_url)?;
-                Some(SavedSubTab {
+        let mut saved: Vec<SavedSubTab> = Vec::with_capacity(svc.tabs.len());
+        let mut active_idx: usize = 0;
+        for t in &svc.tabs {
+            if let Some(url) = normalize_service_url(&t.current_url) {
+                if t.tab_id == svc.active_tab_id {
+                    active_idx = saved.len();
+                }
+                saved.push(SavedSubTab {
                     url,
                     title: t.title.clone(),
-                })
-            })
-            .collect();
+                });
+            }
+        }
         (saved, active_idx)
     });
     if let Some((saved, active_idx)) = snapshot {
@@ -499,25 +517,24 @@ pub fn emit_state_updated(app: &AppHandle, shared: &SharedState) {
         }
     };
 
-    if let Some(shell) = app.get_webview("shell") {
-        let _ = shell.emit("app:state-updated", payload);
-    }
+    let _ = app.emit_to(EventTarget::webview("shell"), "app:state-updated", payload);
     update_window_title(app, shared);
 }
 
 pub fn emit_runtime_updated(app: &AppHandle, shared: &SharedState, instance_id: &str) {
     let state_opt = {
         let guard = shared.inner.lock().unwrap();
-        guard
-            .store
-            .get_instance(instance_id)
-            .and_then(|inst| guard.services.get(instance_id).map(|s| s.to_runtime_state(&inst)))
+        let cross = guard.cross_site_identities.get(instance_id);
+        guard.store.get_instance(instance_id).and_then(|inst| {
+            guard
+                .services
+                .get(instance_id)
+                .map(|s| s.to_runtime_state(&inst, cross))
+        })
     };
 
     if let Some(state) = state_opt {
-        if let Some(shell) = app.get_webview("shell") {
-            let _ = shell.emit("tab:runtime-updated", state);
-        }
+        let _ = app.emit_to(EventTarget::webview("shell"), "tab:runtime-updated", state);
     }
     update_window_title(app, shared);
 }
@@ -556,10 +573,160 @@ pub fn sync_sleeping_instance_metadata(shared: &SharedState, inst: &ServiceInsta
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileActivityState {
+    /// 稼働中 WebView または現行エポックの生成タスクが存在（プロファイル削除を中止すべき）
+    Active,
+    /// 無効化（旧エポック）済みの生成タスクが終了処理中（削除中止せずリトライ待機すべき）
+    ObsoleteCreating,
+    /// 完全に非アクティブ（即座にリネーム・削除可能）
+    Idle,
+}
+
+fn instance_profile_activity(guard: &AppStateInner, instance_id: &str) -> ProfileActivityState {
+    let mut has_obsolete = false;
+    if let Some(svc) = guard.services.get(instance_id) {
+        for tab in &svc.tabs {
+            if tab.webview_label.is_some() {
+                return ProfileActivityState::Active;
+            }
+            if let Some((_, creating_epoch)) = guard.creating_tabs.get(&tab.tab_id) {
+                if *creating_epoch == tab.creation_epoch {
+                    return ProfileActivityState::Active;
+                }
+                has_obsolete = true;
+            }
+        }
+    }
+    if has_obsolete {
+        ProfileActivityState::ObsoleteCreating
+    } else {
+        ProfileActivityState::Idle
+    }
+}
+
+fn spawn_profile_dir_cleanup(
+    shared: &SharedState,
+    entries: Vec<(Option<String>, PathBuf, bool)>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+
+    // ロックされていないディレクトリは SharedState ロック下で非アクティブを確認した上で
+    // 同期的に一意な退避名へリネームして切り離す。
+    // これにより、直後にユーザーが同一アカウントを再アクティブ化して新しいプロファイルを作成しても
+    // バックグラウンド削除スレッドが稼働中のプロファイルを消す競合を根本防止できる。
+    static CLEANUP_SEQ: AtomicU64 = AtomicU64::new(1);
+    let mut deferred: Vec<(Option<String>, PathBuf, bool, bool)> = Vec::new();
+    for (instance_id_opt, dir, had_live_webview) in entries {
+        if !dir.exists() {
+            continue;
+        }
+        let mut renamed_to_trash = false;
+        let mut target_dir = dir.clone();
+        if !had_live_webview {
+            let guard = shared.inner.lock().unwrap();
+            let activity = match instance_id_opt.as_deref() {
+                Some(inst_id) => instance_profile_activity(&guard, inst_id),
+                None => ProfileActivityState::Idle,
+            };
+            match activity {
+                ProfileActivityState::Active => continue,
+                ProfileActivityState::ObsoleteCreating => {}
+                ProfileActivityState::Idle => {
+                    if let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) {
+                        let seq = CLEANUP_SEQ.fetch_add(1, Ordering::Relaxed);
+                        let trash = parent.join(format!(
+                            "{}.deleting-{}-{seq}",
+                            name.to_string_lossy(),
+                            crate::follow_sync::now_unix_secs()
+                        ));
+                        if fs::rename(&dir, &trash).is_ok() {
+                            target_dir = trash;
+                            renamed_to_trash = true;
+                        }
+                    }
+                }
+            }
+        }
+        deferred.push((instance_id_opt, target_dir, had_live_webview, renamed_to_trash));
+    }
+
+    if deferred.is_empty() {
+        return;
+    }
+
+    let shared_bg = shared.clone();
+    std::thread::Builder::new()
+        .name("omnisns-profile-cleanup".to_string())
+        .spawn(move || {
+            for (instance_id_opt, mut dir, had_live_webview, mut renamed_to_trash) in deferred {
+                if had_live_webview {
+                    std::thread::sleep(Duration::from_millis(700));
+                }
+                for attempt in 0..6u64 {
+                    if !dir.exists() {
+                        break;
+                    }
+                    // 元のパスを直接消す場合は、リトライ直前にロック下で再アクティブ化を確認し、
+                    // O(1) リネームで切り離してからロック外で remove_dir_all を実行する。
+                    // 旧エポックの生成タスクがまだ終了待ちの場合は削除を中止せず待機リトライする。
+                    if !renamed_to_trash {
+                        if let Some(ref inst_id) = instance_id_opt {
+                            let step = {
+                                let guard = shared_bg.inner.lock().unwrap();
+                                match instance_profile_activity(&guard, inst_id) {
+                                    ProfileActivityState::Active => None, // 再アクティブ化済みのため中止
+                                    ProfileActivityState::ObsoleteCreating => Some(None), // 待機リトライ
+                                    ProfileActivityState::Idle => {
+                                        if let (Some(parent), Some(name)) =
+                                            (dir.parent(), dir.file_name())
+                                        {
+                                            let seq = CLEANUP_SEQ.fetch_add(1, Ordering::Relaxed);
+                                            let trash = parent.join(format!(
+                                                "{}.deleting-{}-{seq}",
+                                                name.to_string_lossy(),
+                                                crate::follow_sync::now_unix_secs()
+                                            ));
+                                            if fs::rename(&dir, &trash).is_ok() {
+                                                Some(Some(trash))
+                                            } else {
+                                                Some(None)
+                                            }
+                                        } else {
+                                            Some(None)
+                                        }
+                                    }
+                                }
+                            };
+                            match step {
+                                None => break,
+                                Some(Some(trash)) => {
+                                    dir = trash;
+                                    renamed_to_trash = true;
+                                }
+                                Some(None) => {
+                                    std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if fs::remove_dir_all(&dir).is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500 * (attempt + 1)));
+                }
+            }
+        })
+        .ok();
+}
+
 /// ConfigStore のインスタンス一覧に合わせて ServiceTabs / 削除済みWebview を同期する。
 /// `purge_profile` が false の場合は閉じたタブ復元のためディスク上のプロファイルを保持する。
 pub fn sync_instances_ex(app: &AppHandle, shared: &SharedState, purge_profiles: bool) {
-    let to_close: Vec<(String, Option<PathBuf>)> = {
+    let (to_close_labels, dirs_to_purge): (Vec<String>, Vec<(Option<String>, PathBuf, bool)>) = {
         let mut guard = shared.inner.lock().unwrap();
         let instances = guard.store.get_instances();
         let valid_ids: HashSet<String> = instances.iter().map(|i| i.instance_id.clone()).collect();
@@ -571,25 +738,32 @@ pub fn sync_instances_ex(app: &AppHandle, shared: &SharedState, purge_profiles: 
             .cloned()
             .collect();
 
-        let mut close_list = Vec::new();
+        let mut close_labels = Vec::new();
+        let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut purge_list: Vec<(Option<String>, PathBuf, bool)> = Vec::new();
         for id in &removed_ids {
+            guard.cross_site_identities.remove(id);
             let prof = if purge_profiles {
                 Some(profile_dir_for(&guard.profiles_root, id))
             } else {
                 None
             };
+            let mut had_live = false;
             if let Some(svc) = guard.services.remove(id) {
-                let mut had_open = false;
                 for tab in svc.tabs {
+                    guard.pending_tab_nav.remove(&tab.tab_id);
+                    if guard.creating_tabs.contains_key(&tab.tab_id) {
+                        had_live = true;
+                    }
                     if let Some(label) = tab.webview_label {
-                        had_open = true;
-                        close_list.push((label, prof.clone()));
+                        had_live = true;
+                        close_labels.push(label);
                     }
                 }
-                if !had_open {
-                    if let Some(dir) = prof {
-                        let _ = fs::remove_dir_all(dir);
-                    }
+            }
+            if let Some(dir) = prof {
+                if seen_dirs.insert(dir.clone()) {
+                    purge_list.push((Some(id.clone()), dir, had_live));
                 }
             }
             if guard.active_instance_id.as_deref() == Some(id.as_str()) {
@@ -604,20 +778,16 @@ pub fn sync_instances_ex(app: &AppHandle, shared: &SharedState, purge_profiles: 
                 .or_insert_with(|| ServiceTabs::new_initial(inst));
         }
 
-        close_list
+        (close_labels, purge_list)
     };
 
-    for (label, maybe_profile_dir) in to_close {
+    for label in to_close_labels {
         if let Some(wv) = app.get_webview(&label) {
             close_webview_cleanly(&wv);
         }
-        if let Some(profile_dir) = maybe_profile_dir {
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(600));
-                let _ = fs::remove_dir_all(profile_dir);
-            });
-        }
     }
+    // ディスク I/O（Chromium プロファイル削除）はロック外・別スレッドで重複排除＆リトライ実行
+    spawn_profile_dir_cleanup(shared, dirs_to_purge);
 }
 
 pub fn sync_instances(app: &AppHandle, shared: &SharedState) {
@@ -732,7 +902,11 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
                 }
             }
         }
-        let mut creating: HashSet<String> = guard.creating_tabs.values().cloned().collect();
+        let mut creating: HashSet<String> = guard
+            .creating_tabs
+            .values()
+            .map(|(l, _)| l.clone())
+            .collect();
         if let Some(ref gl) = guard.gmail_creating_label {
             creating.insert(gl.clone());
         }
@@ -835,8 +1009,22 @@ pub fn activate_tab(app: &AppHandle, shared: &SharedState, instance_id: Option<S
                             tab.webview_label.is_some(),
                         )
                     };
-                    if !has_webview && !guard.creating_tabs.contains_key(&tab_id) {
-                        Some((inst, tab_id, target_url))
+                    if !has_webview {
+                        if guard.creating_tabs.contains_key(&tab_id) {
+                            guard
+                                .pending_tab_nav
+                                .entry(tab_id.clone())
+                                .or_insert_with(|| {
+                                    if target_url.is_empty() {
+                                        inst.url.clone()
+                                    } else {
+                                        target_url.clone()
+                                    }
+                                });
+                            None
+                        } else {
+                            Some((inst, tab_id, target_url))
+                        }
                     } else {
                         None
                     }
@@ -869,21 +1057,35 @@ pub fn activate_subtab(app: &AppHandle, shared: &SharedState, instance_id: &str,
             active_instance_id: Some(Some(instance_id.to_string())),
             ..Default::default()
         });
-        let tab_info = {
-            let is_creating = guard.creating_tabs.contains_key(tab_id);
+        let (has_webview, tab_url) = {
             let Some(svc) = guard.services.get_mut(instance_id) else {
                 return;
             };
             let Some(tab) = svc.tabs.iter().find(|t| t.tab_id == tab_id) else {
                 return;
             };
-            let res = if tab.webview_label.is_none() && !is_creating {
-                Some((inst, tab.tab_id.clone(), tab.current_url.clone()))
-            } else {
-                None
-            };
+            let info = (tab.webview_label.is_some(), tab.current_url.clone());
             svc.active_tab_id = tab_id.to_string();
-            res
+            info
+        };
+        let tab_info = if !has_webview {
+            if guard.creating_tabs.contains_key(tab_id) {
+                guard
+                    .pending_tab_nav
+                    .entry(tab_id.to_string())
+                    .or_insert_with(|| {
+                        if tab_url.is_empty() {
+                            inst.url.clone()
+                        } else {
+                            tab_url.clone()
+                        }
+                    });
+                None
+            } else {
+                Some((inst, tab_id.to_string(), tab_url))
+            }
+        } else {
+            None
         };
         persist_service_tabs(&mut guard, instance_id);
         tab_info
@@ -912,6 +1114,12 @@ pub fn create_subtab_with_options(
             .get_instance(instance_id)
             .ok_or_else(|| "対象サービスが見つかりません".to_string())?;
         let (tid, target_url, total_tabs) = {
+            let first_creating = guard
+                .services
+                .get(instance_id)
+                .and_then(|s| s.tabs.first())
+                .map(|t| guard.creating_tabs.contains_key(&t.tab_id))
+                .unwrap_or(false);
             let svc = guard
                 .services
                 .entry(instance_id.to_string())
@@ -927,7 +1135,8 @@ pub fn create_subtab_with_options(
             let reuse_first = activate
                 && svc.tabs.len() == 1
                 && svc.tabs[0].is_sleeping
-                && svc.tabs[0].webview_label.is_none();
+                && svc.tabs[0].webview_label.is_none()
+                && !first_creating;
             if reuse_first {
                 let initial_title = if url_override.is_some() {
                     url::Url::parse(&target_url)
@@ -1024,7 +1233,7 @@ pub fn navigate_subtab(
             .store
             .get_instance(instance_id)
             .ok_or_else(|| "対象サービスが見つかりません".to_string())?;
-        let res = {
+        let (active_tab_id, existing_lbl) = {
             let svc = guard
                 .services
                 .entry(instance_id.to_string())
@@ -1044,11 +1253,19 @@ pub fn navigate_subtab(
             let tab = &mut svc.tabs[active_idx];
             tab.current_url = target_url.clone();
             tab.load_error = None;
-            if let Some(label) = tab.webview_label.clone() {
-                (Some(label), None)
-            } else {
-                (None, Some((inst, tab.tab_id.clone(), target_url.clone())))
-            }
+            (tab.tab_id.clone(), tab.webview_label.clone())
+        };
+        let res = if let Some(label) = existing_lbl {
+            guard.pending_tab_nav.remove(&active_tab_id);
+            (Some(label), None)
+        } else if guard.creating_tabs.contains_key(&active_tab_id) {
+            // 生成中の WebView2 が完了次第、この URL へ遷移または再生成する
+            guard
+                .pending_tab_nav
+                .insert(active_tab_id.clone(), target_url.clone());
+            (None, None)
+        } else {
+            (None, Some((inst, active_tab_id, target_url.clone())))
         };
         persist_service_tabs(&mut guard, instance_id);
         res
@@ -1254,10 +1471,16 @@ pub fn close_other_subtabs(
     instance_id: &str,
     keep_tab_id: &str,
 ) -> usize {
-    let closed_labels: Vec<String> = {
+    let (closed_labels, closed_count, wake_kept): (
+        Vec<String>,
+        usize,
+        Option<(ServiceInstance, String, String)>,
+    ) = {
         let mut guard = shared.inner.lock().unwrap();
         let mut labels = Vec::new();
         let mut closed_entries = Vec::new();
+        let mut closed_tab_ids = Vec::new();
+        let mut kept_sleeping_info: Option<(String, String)> = None;
         if let Some(svc) = guard.services.get_mut(instance_id) {
             if svc.tabs.len() <= 1 || !svc.tabs.iter().any(|t| t.tab_id == keep_tab_id) {
                 return 0;
@@ -1267,6 +1490,7 @@ pub fn close_other_subtabs(
                 if tab.tab_id == keep_tab_id {
                     kept.push(tab);
                 } else {
+                    closed_tab_ids.push(tab.tab_id.clone());
                     if let Some(l) = tab.webview_label {
                         labels.push(l);
                     }
@@ -1279,6 +1503,13 @@ pub fn close_other_subtabs(
             }
             svc.tabs = kept;
             svc.active_tab_id = svc.tabs[0].tab_id.clone();
+            if svc.tabs[0].webview_label.is_none() {
+                kept_sleeping_info =
+                    Some((svc.tabs[0].tab_id.clone(), svc.tabs[0].current_url.clone()));
+            }
+        }
+        for tid in closed_tab_ids {
+            guard.pending_tab_nav.remove(&tid);
         }
         let closed_count = closed_entries.len();
         for entry in closed_entries {
@@ -1287,19 +1518,33 @@ pub fn close_other_subtabs(
         if closed_count == 0 {
             return 0;
         }
+        let wake_info = kept_sleeping_info.and_then(|(tid, url)| {
+            if guard.active_instance_id.as_deref() == Some(instance_id)
+                && !guard.creating_tabs.contains_key(&tid)
+            {
+                guard.store.get_instance(instance_id).map(|inst| {
+                    let target = if url.is_empty() { inst.url.clone() } else { url };
+                    (inst, tid, target)
+                })
+            } else {
+                None
+            }
+        });
         persist_service_tabs(&mut guard, instance_id);
-        labels
+        (labels, closed_count, wake_info)
     };
 
-    let closed_num = closed_labels.len();
     for label in closed_labels {
         if let Some(wv) = app.get_webview(&label) {
             close_webview_cleanly(&wv);
         }
     }
+    if let Some((inst, tid, url)) = wake_kept {
+        create_tab_webview(app, shared, inst, tid, url);
+    }
     update_bounds_from_window(app, shared);
     emit_state_updated(app, shared);
-    closed_num.max(1)
+    closed_count
 }
 
 pub fn restore_closed_tab(app: &AppHandle, shared: &SharedState) -> Result<String, String> {
@@ -1322,15 +1567,30 @@ pub fn restore_closed_tab(app: &AppHandle, shared: &SharedState) -> Result<Strin
                 let guard = shared.inner.lock().unwrap();
                 guard.store.get_instance(&instance_id).is_some()
             };
-            if exists {
-                create_subtab(app, shared, &instance_id, Some(url))?;
-                Ok(format!("「{title}」を復元しました"))
+            let res = if exists {
+                create_subtab(app, shared, &instance_id, Some(url.clone()))
             } else {
                 // 親サービスが消えていた場合は現在のアクティブサービスに復元
-                let fallback = ensure_safe_active_instance(shared)
-                    .ok_or_else(|| "復元先のサービスがありません".to_string())?;
-                create_subtab(app, shared, &fallback, Some(url))?;
-                Ok(format!("「{title}」を復元しました"))
+                match ensure_safe_active_instance(shared) {
+                    Some(fallback) => create_subtab(app, shared, &fallback, Some(url.clone())),
+                    None => Err("復元先のサービスがありません".to_string()),
+                }
+            };
+            match res {
+                Ok(_) => Ok(format!("「{title}」を復元しました")),
+                Err(err) => {
+                    // 復元失敗時（タブ上限など）は履歴を失わないよう戻す
+                    let mut guard = shared.inner.lock().unwrap();
+                    push_closed_entry(
+                        &mut guard,
+                        ClosedEntry::SubTab {
+                            instance_id,
+                            url,
+                            title,
+                        },
+                    );
+                    Err(err)
+                }
             }
         }
         ClosedEntry::Service {
@@ -1564,7 +1824,9 @@ fn create_tab_webview(
                         .map(|s| s.active_tab_id == tab_id)
                         .unwrap_or(false);
                 let start_offscreen = guard.overlay_visible || !is_active_tab;
-                guard.creating_tabs.insert(tab_id.clone(), label.clone());
+                guard
+                    .creating_tabs
+                    .insert(tab_id.clone(), (label.clone(), epoch));
                 Some((
                     guard.bounds,
                     profile_dir_for(&guard.profiles_root, &instance.instance_id),
@@ -1602,34 +1864,39 @@ fn create_tab_webview(
     let name_for_popup = instance_name.clone();
     let fallback_url_for_popup = instance_url.clone();
 
+    #[cfg(windows)]
+    let bridge_token = crate::platform_win::generate_bridge_token();
+    let initial_target_url_str = parsed_url.to_string();
+    #[cfg(windows)]
+    let builder_initial_url = url::Url::parse("about:blank").unwrap();
+    #[cfg(not(windows))]
+    let builder_initial_url = parsed_url;
+
     #[allow(unused_mut)]
-    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
+    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(builder_initial_url))
         .data_directory(profile_dir)
         .user_agent(&ua)
         .disable_drag_drop_handler()
-        .enable_clipboard_access()
         .zoom_hotkeys_enabled(true)
-        .focused(false);
+        .focused(false)
+        .on_navigation(|url| {
+            matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data")
+                && !is_internal_tauri_url(url)
+        });
 
     #[cfg(windows)]
     {
         builder = builder
             .additional_browser_args(WEBVIEW2_FAST_BROWSER_ARGS)
-            .initialization_script(crate::platform_win::FOLLOW_TRACKER_JS)
-            .initialization_script(crate::platform_win::PROFILE_STATS_JS);
+            .initialization_script(crate::platform_win::build_follow_tracker_js(&bridge_token))
+            .initialization_script(crate::platform_win::build_profile_stats_js(&bridge_token));
     }
 
     let builder = builder
         .on_permission_request(|_wv, kind| match kind {
-            PermissionKind::Notifications
-            | PermissionKind::Camera
-            | PermissionKind::Microphone
-            | PermissionKind::ClipboardRead
-            | PermissionKind::Geolocation
-            | PermissionKind::DisplayCapture
-            | PermissionKind::WindowManagement
-            | PermissionKind::PointerLock
-            | PermissionKind::MediaKeySystemAccess => PermissionResponse::Allow,
+            PermissionKind::Notifications | PermissionKind::MediaKeySystemAccess => {
+                PermissionResponse::Allow
+            }
             _ => PermissionResponse::Default,
         })
         .on_document_title_changed(move |_wv, title| {
@@ -1668,6 +1935,9 @@ fn create_tab_webview(
             }
         })
         .on_new_window(move |target_url, features| {
+            if is_internal_tauri_url(&target_url) {
+                return NewWindowResponse::Deny;
+            }
             let (is_alive, current_url, latest_ua) = {
                 let guard = shared_for_popup.inner.lock().unwrap();
                 let tab_opt = guard
@@ -1717,6 +1987,12 @@ fn create_tab_webview(
                 .title(format!("{name_for_popup} - 認証 / ウィンドウ"))
                 .inner_size(560.0, 760.0)
                 .user_agent(&latest_ua)
+                .disable_drag_drop_handler()
+                .on_navigation(|url| {
+                    matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data")
+                        && !is_internal_tauri_url(url)
+                })
+                .on_permission_request(|_, _| PermissionResponse::Default)
                 .window_features(features)
                 .on_document_title_changed(|win, title| {
                     if !title.trim().is_empty() {
@@ -1728,7 +2004,7 @@ fn create_tab_webview(
                     if let Some(icon) = app_for_popup.default_window_icon().cloned() {
                         match popup_builder.icon(icon) {
                             Ok(b) => b,
-                            Err(_) => return NewWindowResponse::Allow,
+                            Err(_) => return NewWindowResponse::Deny,
                         }
                     } else {
                         popup_builder
@@ -1736,7 +2012,7 @@ fn create_tab_webview(
 
                 match popup_builder.build() {
                     Ok(window) => NewWindowResponse::Create { window },
-                    Err(_) => NewWindowResponse::Allow,
+                    Err(_) => NewWindowResponse::Deny,
                 }
             } else if is_user_new_tab && is_http_url(target_str) {
                 // Ctrl+クリック / 中クリック / Ctrl+クリックジェスチャー時は、
@@ -1810,12 +2086,14 @@ fn create_tab_webview(
     let Ok(webview) = win.add_child(builder, init_pos, init_size) else {
         let mut guard = shared.inner.lock().unwrap();
         guard.creating_tabs.remove(&tab_id);
+        guard.pending_tab_nav.remove(&tab_id);
         return;
     };
 
-    let (committed, started_warming, should_hide_immediately) = {
+    let (committed, started_warming, should_hide_immediately, final_nav_url, recreate_after_abort) = {
         let mut guard = shared.inner.lock().unwrap();
         guard.creating_tabs.remove(&tab_id);
+        let pending_url = guard.pending_tab_nav.remove(&tab_id);
         let is_active_now = !guard.gmail_open
             && guard.active_instance_id.as_deref() == Some(instance_id.as_str())
             && guard
@@ -1824,8 +2102,9 @@ fn create_tab_webview(
                 .map(|s| s.active_tab_id == tab_id)
                 .unwrap_or(false);
         let overlay = guard.overlay_visible;
+        let inst_latest = guard.store.get_instance(&instance_id);
         if guard.is_quitting {
-            (false, false, true)
+            (false, false, true, initial_target_url_str.clone(), None)
         } else if let Some(tab) = guard
             .services
             .get_mut(&instance_id)
@@ -1836,6 +2115,7 @@ fn create_tab_webview(
                 tab.is_sleeping = false;
                 tab.is_loading = true;
                 tab.load_error = None;
+                let nav_url = pending_url.unwrap_or_else(|| initial_target_url_str.clone());
                 let warm = !overlay && !is_active_now;
                 tab.warming_until = if warm {
                     Some(Instant::now() + Duration::from_secs(BG_WARM_MAX_SECS))
@@ -1845,18 +2125,43 @@ fn create_tab_webview(
                 // モーダル表示中のみ即座に非表示化。アクティブタブや画面外ウォーム中の
                 // バックグラウンドタブは hide() せず描画優先度を維持する。
                 let hide_now = overlay || (!is_active_now && !warm);
-                (true, warm, hide_now)
+                (true, warm, hide_now, nav_url, None)
             } else {
-                (false, false, true)
+                // 生成中に sleep/close -> 再アクティブ化または遷移要求が届いていた場合は
+                // 破棄後に最新 URL で再生成してタブの永久休止化を防ぐ
+                let need_recreate = if tab.webview_label.is_none()
+                    && (pending_url.is_some() || (is_active_now && !tab.is_sleeping))
+                {
+                    let next_url = pending_url
+                        .or_else(|| {
+                            if tab.current_url.is_empty() {
+                                None
+                            } else {
+                                Some(tab.current_url.clone())
+                            }
+                        })
+                        .unwrap_or_else(|| instance.url.clone());
+                    inst_latest.map(|inst_l| (inst_l, tab_id.clone(), next_url))
+                } else {
+                    None
+                };
+                (false, false, true, initial_target_url_str.clone(), need_recreate)
             }
         } else {
-            (false, false, true)
+            (false, false, true, initial_target_url_str.clone(), None)
         }
     };
 
     if !committed {
         // 生成中にタブが削除・休止・置換されていた場合は即座に破棄してゾンビWebViewを防ぐ
         close_webview_cleanly(&webview);
+        if let Some((inst_next, tid_next, url_next)) = recreate_after_abort {
+            let app_re = app.clone();
+            let shared_re = shared.clone();
+            tauri::async_runtime::spawn(async move {
+                create_tab_webview(&app_re, &shared_re, inst_next, tid_next, url_next);
+            });
+        }
         refresh_attached_view(app, shared);
         return;
     }
@@ -1867,7 +2172,21 @@ fn create_tab_webview(
 
     #[cfg(windows)]
     {
-        attach_windows_handlers(app, shared, &webview, &instance, &tab_id, &label, &ua);
+        attach_windows_handlers(
+            app,
+            shared,
+            &webview,
+            &instance,
+            &tab_id,
+            &label,
+            &ua,
+            bridge_token,
+            Some(final_nav_url),
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = final_nav_url;
     }
 
     if started_warming {
@@ -1885,6 +2204,7 @@ fn create_tab_webview(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn attach_windows_handlers(
     app: &AppHandle,
     shared: &SharedState,
@@ -1893,6 +2213,8 @@ fn attach_windows_handlers(
     tab_id: &str,
     webview_label: &str,
     ua: &str,
+    bridge_token: String,
+    initial_navigate_url: Option<String>,
 ) {
     let instance_id = instance.instance_id.clone();
     let tid = tab_id.to_string();
@@ -2214,60 +2536,83 @@ fn attach_windows_handlers(
             }
         }),
         on_account_identity: Arc::new(move |service_hint, handle, following, followers| {
-            let target_id = {
-                let mut guard = shared_ident.inner.lock().unwrap();
-                let tab_url = guard
-                    .services
-                    .get(&id_ident)
-                    .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_ident))
-                    .and_then(|t| {
-                        if t.webview_label.as_deref() == Some(label_ident.as_str()) {
-                            Some(t.current_url.clone())
-                        } else {
-                            None
-                        }
-                    });
-                if let Some(url) = tab_url {
-                    if let Some(ref svc) = service_hint {
-                        let source_svc = guard
-                            .store
-                            .get_instance(&id_ident)
-                            .map(|i| i.service_id);
-                        if source_svc.as_deref() != Some(svc.as_str()) {
-                            if let Some(norm) = crate::follow_sync::normalize_account_handle(&handle) {
-                                guard
-                                    .cross_site_identities
-                                    .insert(id_ident.clone(), (svc.clone(), norm));
+                let (target_id, cross_site_changed) = {
+                    let mut guard = shared_ident.inner.lock().unwrap();
+                    let tab_url = guard
+                        .services
+                        .get(&id_ident)
+                        .and_then(|s| s.tabs.iter().find(|t| t.tab_id == tid_ident))
+                        .and_then(|t| {
+                            if t.webview_label.as_deref() == Some(label_ident.as_str()) {
+                                Some(t.current_url.clone())
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(url) = tab_url {
+                        let mut cs_changed = false;
+                        if let Some(ref svc) = service_hint {
+                            let source_svc = guard
+                                .store
+                                .get_instance(&id_ident)
+                                .map(|i| i.service_id);
+                            if source_svc.as_deref() != Some(svc.as_str()) {
+                                if let Some(norm) =
+                                    crate::follow_sync::normalize_account_handle(&handle)
+                                {
+                                    let next_pair = (svc.clone(), norm);
+                                    if guard.cross_site_identities.get(&id_ident)
+                                        != Some(&next_pair)
+                                    {
+                                        guard
+                                            .cross_site_identities
+                                            .insert(id_ident.clone(), next_pair);
+                                        cs_changed = true;
+                                    }
+                                }
                             }
                         }
+                        let tid = resolve_counter_target_instance_id(
+                            &guard,
+                            &id_ident,
+                            Some(url.as_str()),
+                            service_hint.as_deref(),
+                            Some(handle.as_str()),
+                        );
+                        (tid, cs_changed)
+                    } else {
+                        (None, false)
                     }
-                    resolve_counter_target_instance_id(
-                        &guard,
-                        &id_ident,
-                        Some(url.as_str()),
-                        service_hint.as_deref(),
-                        Some(handle.as_str()),
-                    )
-                } else {
-                    None
+                };
+                if cross_site_changed {
+                    emit_runtime_updated(&app_ident, &shared_ident, &id_ident);
                 }
-            };
-            if let Some(tid) = target_id {
-                handle_account_identity(
-                    &app_ident,
-                    &shared_ident,
-                    &tid,
-                    &handle,
-                    following,
-                    followers,
-                );
-            }
-        }),
+                if let Some(tid) = target_id {
+                    handle_account_identity(
+                        &app_ident,
+                        &shared_ident,
+                        &tid,
+                        &handle,
+                        following,
+                        followers,
+                    );
+                }
+            }),
     };
 
+    let instance_home_url = fallback_url.clone();
     let _ = webview.with_webview(move |platform_wv| {
         let controller = platform_wv.controller();
-        crate::platform_win::attach_tab_handlers(&controller, muted, zoom, &ua_owned, callbacks);
+        crate::platform_win::attach_tab_handlers(
+            &controller,
+            muted,
+            zoom,
+            &ua_owned,
+            bridge_token,
+            instance_home_url,
+            initial_navigate_url,
+            callbacks,
+        );
     });
 }
 
@@ -2301,18 +2646,19 @@ pub fn handle_shortcut_from_child(
         _ => {}
     }
 
-    if let Some(shell) = app.get_webview("shell") {
-        let _ = shell.emit(
-            "app:shortcut",
-            crate::models::ShortcutEventPayload {
-                action: action.to_string(),
-                payload,
-            },
-        );
-        if action == "open-catalog"
-            || action == "open-gesture-settings"
-            || action == "focus-address-bar"
-        {
+    let _ = app.emit_to(
+        EventTarget::webview("shell"),
+        "app:shortcut",
+        crate::models::ShortcutEventPayload {
+            action: action.to_string(),
+            payload,
+        },
+    );
+    if action == "open-catalog"
+        || action == "open-gesture-settings"
+        || action == "focus-address-bar"
+    {
+        if let Some(shell) = app.get_webview("shell") {
             let _ = shell.set_focus();
         }
     }
@@ -2334,8 +2680,10 @@ pub fn sleep_tab(app: &AppHandle, shared: &SharedState, instance_id: &str) {
     let labels: Vec<String> = {
         let mut guard = shared.inner.lock().unwrap();
         let mut out = Vec::new();
+        let mut tab_ids = Vec::new();
         if let Some(svc) = guard.services.get_mut(instance_id) {
             for tab in &mut svc.tabs {
+                tab_ids.push(tab.tab_id.clone());
                 tab.creation_epoch = tab.creation_epoch.wrapping_add(1);
                 if let Some(l) = tab.webview_label.take() {
                     out.push(l);
@@ -2345,6 +2693,9 @@ pub fn sleep_tab(app: &AppHandle, shared: &SharedState, instance_id: &str) {
                 tab.unread_count = 0;
                 tab.load_error = None;
             }
+        }
+        for tid in tab_ids {
+            guard.pending_tab_nav.remove(&tid);
         }
         out
     };
@@ -2365,6 +2716,7 @@ pub fn destroy_all_views(app: &AppHandle, shared: &SharedState) {
         guard.gmail_open = false;
         guard.gmail_creating_label = None;
         guard.creating_tabs.clear();
+        guard.pending_tab_nav.clear();
         let mut out = Vec::new();
         if let Some(ref mut gt) = guard.gmail_tab {
             gt.creation_epoch = gt.creation_epoch.wrapping_add(1);
@@ -2390,6 +2742,12 @@ pub fn destroy_all_views(app: &AppHandle, shared: &SharedState) {
     for (label, wv) in app.webviews() {
         if label != "shell" && wv.window().label() == "main" {
             close_webview_cleanly(&wv);
+        }
+    }
+    // 認証用 OAuth ポップアップ（popup-*）が残っているとプロセス終了を妨げるため確実に閉じる
+    for (label, win) in app.webview_windows() {
+        if label.starts_with("popup-") {
+            let _ = win.close();
         }
     }
 }
@@ -2574,14 +2932,23 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
     let label_for_popup = label.clone();
     let ua_for_popup = ua.clone();
 
+    let gmail_target_url_str = parsed_url.to_string();
+    #[cfg(windows)]
+    let gmail_builder_url = url::Url::parse("about:blank").unwrap();
+    #[cfg(not(windows))]
+    let gmail_builder_url = parsed_url;
+
     #[allow(unused_mut)]
-    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
+    let mut builder = WebviewBuilder::new(&label, WebviewUrl::External(gmail_builder_url))
         .data_directory(profile_dir)
         .user_agent(&ua)
         .disable_drag_drop_handler()
-        .enable_clipboard_access()
         .zoom_hotkeys_enabled(true)
-        .focused(false);
+        .focused(false)
+        .on_navigation(|url| {
+            matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data")
+                && !is_internal_tauri_url(url)
+        });
 
     #[cfg(windows)]
     {
@@ -2590,9 +2957,7 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
 
     let builder = builder
         .on_permission_request(|_wv, kind| match kind {
-            PermissionKind::Notifications
-            | PermissionKind::ClipboardRead
-            | PermissionKind::WindowManagement => PermissionResponse::Allow,
+            PermissionKind::Notifications => PermissionResponse::Allow,
             _ => PermissionResponse::Default,
         })
         .on_document_title_changed(move |_wv, title| {
@@ -2619,6 +2984,9 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
             }
         })
         .on_new_window(move |target_url, features| {
+            if is_internal_tauri_url(&target_url) {
+                return NewWindowResponse::Deny;
+            }
             let (is_alive, current_url) = {
                 let guard = shared_for_popup.inner.lock().unwrap();
                 let alive = guard
@@ -2653,19 +3021,25 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
                 .title("Gmail - 認証 / ウィンドウ")
                 .inner_size(560.0, 760.0)
                 .user_agent(&ua_for_popup)
+                .disable_drag_drop_handler()
+                .on_navigation(|url| {
+                    matches!(url.scheme(), "http" | "https" | "about" | "blob" | "data")
+                        && !is_internal_tauri_url(url)
+                })
+                .on_permission_request(|_, _| PermissionResponse::Default)
                 .window_features(features);
                 let popup_builder =
                     if let Some(icon) = app_for_popup.default_window_icon().cloned() {
                         match popup_builder.icon(icon) {
                             Ok(b) => b,
-                            Err(_) => return NewWindowResponse::Allow,
+                            Err(_) => return NewWindowResponse::Deny,
                         }
                     } else {
                         popup_builder
                     };
                 match popup_builder.build() {
                     Ok(window) => NewWindowResponse::Create { window },
-                    Err(_) => NewWindowResponse::Allow,
+                    Err(_) => NewWindowResponse::Deny,
                 }
             } else if is_same_site_url(target_str, &current_url) {
                 let app_bg = app_for_popup.clone();
@@ -2856,8 +3230,21 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
 
         let _ = webview.with_webview(move |platform_wv| {
             let controller = platform_wv.controller();
-            crate::platform_win::attach_tab_handlers(&controller, false, 1.0, &ua_owned, callbacks);
+            crate::platform_win::attach_tab_handlers(
+                &controller,
+                false,
+                1.0,
+                &ua_owned,
+                String::new(),
+                String::new(),
+                Some(gmail_target_url_str),
+                callbacks,
+            );
         });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = gmail_target_url_str;
     }
 
     emit_state_updated(app, shared);
@@ -3102,19 +3489,84 @@ pub fn perform_tab_action(app: &AppHandle, shared: &SharedState, instance_id: &s
             emit_state_updated(app, shared);
         }
         "clear-session" => {
-            if let Some(wv) = get_active_webview_for_service(app, shared, instance_id) {
-                let home = instance.url.clone();
-                #[cfg(windows)]
-                let _ = wv.with_webview(move |pwv| {
-                    crate::platform_win::clear_browsing_data_and_navigate(&pwv.controller(), home)
-                });
-            } else {
-                let profile_dir = {
-                    let guard = shared.inner.lock().unwrap();
-                    profile_dir_for(&guard.profiles_root, instance_id)
+            let (keep_active_label, close_labels, purge_dir_opt) = {
+                let mut guard = shared.inner.lock().unwrap();
+                guard.cross_site_identities.remove(instance_id);
+                guard.store.clear_instance_identity(instance_id);
+
+                let active_label = guard
+                    .services
+                    .get(instance_id)
+                    .and_then(|s| s.active_tab())
+                    .and_then(|t| t.webview_label.clone());
+
+                let mut to_close = Vec::new();
+                let mut had_live_or_creating = false;
+                let mut cleared_tab_ids = Vec::new();
+                let creating_tab_ids: HashSet<String> =
+                    guard.creating_tabs.keys().cloned().collect();
+                if let Some(svc) = guard.services.get_mut(instance_id) {
+                    let active_tid = svc.active_tab_id.clone();
+                    for tab in &mut svc.tabs {
+                        let is_kept_active =
+                            active_label.is_some() && tab.tab_id == active_tid;
+                        if is_kept_active {
+                            continue;
+                        }
+                        cleared_tab_ids.push(tab.tab_id.clone());
+                        if creating_tab_ids.contains(&tab.tab_id) {
+                            had_live_or_creating = true;
+                        }
+                        tab.creation_epoch = tab.creation_epoch.wrapping_add(1);
+                        if let Some(l) = tab.webview_label.take() {
+                            had_live_or_creating = true;
+                            to_close.push(l);
+                        }
+                        tab.is_sleeping = true;
+                        tab.is_loading = false;
+                        tab.unread_count = 0;
+                        tab.load_error = None;
+                    }
+                }
+                for tid in cleared_tab_ids {
+                    guard.pending_tab_nav.remove(&tid);
+                }
+
+                let purge = if active_label.is_none() {
+                    Some((
+                        profile_dir_for(&guard.profiles_root, instance_id),
+                        had_live_or_creating,
+                    ))
+                } else {
+                    None
                 };
-                let _ = fs::remove_dir_all(profile_dir);
+                (active_label, to_close, purge)
+            };
+
+            for label in close_labels {
+                if let Some(wv) = app.get_webview(&label) {
+                    close_webview_cleanly(&wv);
+                }
             }
+            if let Some(label) = keep_active_label {
+                if let Some(wv) = app.get_webview(&label) {
+                    let home = instance.url.clone();
+                    #[cfg(windows)]
+                    let _ = wv.with_webview(move |pwv| {
+                        crate::platform_win::clear_browsing_data_and_navigate(
+                            &pwv.controller(),
+                            home,
+                        )
+                    });
+                }
+            } else if let Some((profile_dir, had_live)) = purge_dir_opt {
+                spawn_profile_dir_cleanup(
+                    shared,
+                    vec![(Some(instance_id.to_string()), profile_dir, had_live)],
+                );
+            }
+            refresh_attached_view(app, shared);
+            emit_state_updated(app, shared);
         }
         "devtools" => {
             #[cfg(windows)]
@@ -3409,7 +3861,7 @@ fn resolve_counter_target_instance_id(
         return None;
     }
 
-    // 1. 明示または直近検出したクロスサイトハンドル一致
+    // 1. 判明しているハンドル（明示/クロスサイト検出ハンドルを優先、無ければ元インスタンスのハンドル）
     let effective_handle = handle_hint
         .and_then(crate::follow_sync::normalize_account_handle)
         .or_else(|| {
@@ -3419,7 +3871,14 @@ fn resolve_counter_target_instance_id(
                 .filter(|(svc, _)| svc == &effective_service)
                 .map(|(_, h)| h.clone())
         });
-    if let Some(ref h) = effective_handle {
+    let known_handle = effective_handle.or_else(|| {
+        source
+            .detected_handle
+            .as_deref()
+            .and_then(crate::follow_sync::normalize_account_handle)
+    });
+
+    if let Some(ref h) = known_handle {
         if let Some(matched) = candidates
             .iter()
             .find(|c| c.detected_handle.as_deref() == Some(h.as_str()))
@@ -3428,19 +3887,26 @@ fn resolve_counter_target_instance_id(
         }
     }
 
-    // 2. 元インスタンスと同じ @handle（Threads ↔ Instagram 連携アカウント）
-    if let Some(ref sh) = source.detected_handle {
-        if let Some(matched) = candidates
+    // クロスサイト時に別ハンドルが既に紐付いている既存アカウントへ誤ってフォールバック・上書きしない
+    let fallback_candidates: Vec<&ServiceInstance> = if known_handle.is_some() {
+        candidates
             .iter()
-            .find(|c| c.detected_handle.as_deref() == Some(sh.as_str()))
-        {
-            return Some(matched.instance_id.clone());
-        }
+            .copied()
+            .filter(|c| c.detected_handle.is_none())
+            .collect()
+    } else {
+        candidates
+    };
+    if fallback_candidates.is_empty() {
+        return None;
     }
 
-    // 3. 対象サービスで直近アクティブだったアカウント
+    // 2. 対象サービスで直近アクティブだったアカウント
     if let Some(last_id) = guard.last_active_by_group.get(&effective_service) {
-        if let Some(matched) = candidates.iter().find(|c| &c.instance_id == last_id) {
+        if let Some(matched) = fallback_candidates
+            .iter()
+            .find(|c| &c.instance_id == last_id)
+        {
             return Some(matched.instance_id.clone());
         }
     }
@@ -3449,7 +3915,7 @@ fn resolve_counter_target_instance_id(
     if let Some(ref lbl) = source.account_label {
         let trimmed = lbl.trim();
         if !trimmed.is_empty() {
-            if let Some(matched) = candidates
+            if let Some(matched) = fallback_candidates
                 .iter()
                 .find(|c| c.account_label.as_deref().map(str::trim) == Some(trimmed))
             {
@@ -3458,7 +3924,7 @@ fn resolve_counter_target_instance_id(
         }
     }
 
-    Some(candidates[0].instance_id.clone())
+    Some(fallback_candidates[0].instance_id.clone())
 }
 
 pub fn adjust_follow_count(
@@ -3569,22 +4035,63 @@ pub fn set_instance_handle(
 }
 
 pub fn notify_follow_ledger_changed(app: &AppHandle, shared: &SharedState) {
-    let (token, gen_arc) = {
+    let (token, gen_arc, worker_running) = {
         let guard = shared.inner.lock().unwrap();
         let fs = guard.store.get_follow_sync_settings();
-        (fs.github_token, guard.cloud_sync_gen.clone())
+        (
+            fs.github_token,
+            guard.cloud_sync_gen.clone(),
+            guard.cloud_sync_worker_running.clone(),
+        )
     };
 
-    if !token.trim().is_empty() {
-        let my_gen = gen_arc.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
-        let app_bg = app.clone();
-        let shared_bg = shared.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(2000));
-            if gen_arc.load(Ordering::SeqCst) == my_gen {
+    if token.trim().is_empty() {
+        return;
+    }
+
+    gen_arc.fetch_add(1, Ordering::SeqCst);
+    // 単一のデバウンスワーカーのみ起動し、連続イベントによる無制限スレッド生成（panic=abort）を防ぐ
+    if worker_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let app_bg = app.clone();
+    let shared_bg = shared.clone();
+    let worker_bg = worker_running.clone();
+    if std::thread::Builder::new()
+        .name("omnisns-cloud-debounce".to_string())
+        .spawn(move || {
+            loop {
+                let target_gen = gen_arc.load(Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(2000));
+                if shared_bg.inner.lock().unwrap().is_quitting {
+                    worker_bg.store(false, Ordering::SeqCst);
+                    return;
+                }
+                if gen_arc.load(Ordering::SeqCst) != target_gen {
+                    continue;
+                }
                 let _ = sync_cloud_gist_once_blocking(&app_bg, &shared_bg);
+                if gen_arc.load(Ordering::SeqCst) == target_gen {
+                    worker_bg.store(false, Ordering::SeqCst);
+                    // クリア直前に新たな更新が割り込んだ場合はもう一度だけ再確認して取りこぼしを防ぐ
+                    if gen_arc.load(Ordering::SeqCst) != target_gen
+                        && worker_bg
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        continue;
+                    }
+                    break;
+                }
             }
-        });
+        })
+        .is_err()
+    {
+        worker_running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -3592,10 +4099,24 @@ pub fn sync_cloud_gist_once_blocking(
     app: &AppHandle,
     shared: &SharedState,
 ) -> Result<FollowSyncSettings, String> {
-    let (token, gist_id, local_ledger) = {
+    // 定期同期・デバウンス同期・手動同期を直列化し、重複 Gist 作成や GET->PATCH 競合を防止
+    let _sync_guard = shared
+        .cloud_sync_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let (token, gist_id, local_ledger, config_gen_before, config_gen_arc) = {
         let guard = shared.inner.lock().unwrap();
         let fs = guard.store.get_follow_sync_settings();
-        (fs.github_token, fs.gist_id, guard.store.get_follow_ledger())
+        let cfg_arc = guard.cloud_sync_config_gen.clone();
+        let cfg_gen = cfg_arc.load(Ordering::SeqCst);
+        (
+            fs.github_token,
+            fs.gist_id,
+            guard.store.get_follow_ledger(),
+            cfg_gen,
+            cfg_arc,
+        )
     };
 
     if token.trim().is_empty() {
@@ -3608,6 +4129,10 @@ pub fn sync_cloud_gist_once_blocking(
             let now = crate::follow_sync::now_unix_secs();
             let updated_settings = {
                 let mut guard = shared.inner.lock().unwrap();
+                // 同期実行中にユーザーが Token / Gist ID を変更した場合は古い結果を破棄する
+                if config_gen_arc.load(Ordering::SeqCst) != config_gen_before {
+                    return Ok(guard.store.get_follow_sync_settings());
+                }
                 let _ = guard.store.merge_follow_ledger(&merged_ledger);
                 guard.store.set_follow_sync_status(
                     Some(resolved_gist_id),
@@ -3621,9 +4146,11 @@ pub fn sync_cloud_gist_once_blocking(
         Err(err) => {
             {
                 let mut guard = shared.inner.lock().unwrap();
-                guard
-                    .store
-                    .set_follow_sync_status(None, format!("同期エラー: {err}"), None);
+                if config_gen_arc.load(Ordering::SeqCst) == config_gen_before {
+                    guard
+                        .store
+                        .set_follow_sync_status(None, format!("同期エラー: {err}"), None);
+                }
             }
             emit_state_updated(app, shared);
             Err(err)
@@ -3638,6 +4165,7 @@ pub fn update_follow_sync_settings(
 ) -> FollowSyncSettings {
     let updated = {
         let mut guard = shared.inner.lock().unwrap();
+        guard.cloud_sync_config_gen.fetch_add(1, Ordering::SeqCst);
         guard.store.update_follow_sync_settings(patch)
     };
     emit_state_updated(app, shared);

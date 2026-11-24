@@ -90,7 +90,7 @@ impl Point {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct GestureSettings {
     pub enabled: bool,
     pub wrap_tabs: bool,

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -153,6 +153,7 @@ pub fn create_default_settings() -> AppSettings {
         follow_sync: FollowSyncSettings {
             device_id: format!("win-{}", next_short_hex_id()),
             github_token: String::new(),
+            github_token_encrypted: None,
             gist_id: String::new(),
             last_sync_at: None,
             last_sync_status: None,
@@ -265,29 +266,70 @@ struct RawInstance {
 pub struct ConfigStore {
     file_path: PathBuf,
     config: AppConfig,
+    /// 起動時の読み込みロック等で既存ファイルを保護中の場合 true。
+    /// バックアップ退避が完了するまでディスク上の設定ファイルを上書きしない。
+    preserve_existing_on_disk: AtomicBool,
 }
 
 impl ConfigStore {
     pub fn new(file_path: PathBuf) -> Self {
-        let config = Self::load(&file_path);
-        Self { file_path, config }
+        let (config, preserve_existing) = Self::load(&file_path);
+        Self {
+            file_path,
+            config,
+            preserve_existing_on_disk: AtomicBool::new(preserve_existing),
+        }
     }
 
-    fn load(file_path: &PathBuf) -> AppConfig {
+    fn sanitize_profile_key(id: &str) -> String {
+        let s: String = id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if s.is_empty() {
+            "default".to_string()
+        } else {
+            s.to_ascii_lowercase()
+        }
+    }
+
+    fn load(file_path: &PathBuf) -> (AppConfig, bool) {
         if !file_path.exists() {
             let initial = create_default_config();
             let _ = Self::save_atomic(file_path, &initial);
-            return initial;
+            return (initial, false);
         }
 
-        let parsed = fs::read_to_string(file_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<RawConfig>(&raw).ok());
+        // 一時的なファイルロック（AVスキャン・クラウド同期等）で読み取り失敗した場合、
+        // 最大約1.35秒バックオフリトライし、なお失敗すれば既存設定の上書きを禁止する。
+        let retry_delays_ms = [25u64, 50, 75, 100, 150, 200, 250, 250, 250];
+        let mut raw_text_opt = fs::read_to_string(file_path).ok();
+        if raw_text_opt.is_none() {
+            for &delay_ms in &retry_delays_ms {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                if let Ok(s) = fs::read_to_string(file_path) {
+                    raw_text_opt = Some(s);
+                    break;
+                }
+            }
+        }
+        let Some(raw_text) = raw_text_opt else {
+            return (create_default_config(), true);
+        };
 
-        let Some(raw) = parsed else {
-            let fallback = create_default_config();
-            let _ = Self::save_atomic(file_path, &fallback);
-            return fallback;
+        let raw = match serde_json::from_str::<RawConfig>(&raw_text) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                // 破損ファイルは上書き前に必ずバックアップへ退避する。退避失敗時は上書き禁止。
+                let backup_name = format!(
+                    "omni-sns-config.corrupt-{}-{}.bak",
+                    now_unix_secs(),
+                    next_short_hex_id()
+                );
+                let backup_path = file_path.with_file_name(backup_name);
+                let backed_up = fs::copy(file_path, &backup_path).is_ok();
+                return (create_default_config(), !backed_up);
+            }
         };
 
         let defaults = create_default_config();
@@ -322,14 +364,42 @@ impl ConfigStore {
             settings.follow_sync.device_id = format!("win-{}", next_short_hex_id());
         }
 
-        let today = local_today_ymd();
         let mut migrated = false;
+        #[cfg(windows)]
+        {
+            if let Some(enc) = settings.follow_sync.github_token_encrypted.take() {
+                if let Some(decrypted) = crate::platform_win::dpapi_unprotect_secret(&enc) {
+                    if !decrypted.trim().is_empty() {
+                        if !settings.follow_sync.github_token.trim().is_empty() {
+                            // 平文コピーが残っている場合は暗号化版のみに統一して再保存
+                            migrated = true;
+                        }
+                        settings.follow_sync.github_token = decrypted;
+                    }
+                }
+            } else if !settings.follow_sync.github_token.trim().is_empty() {
+                // 旧バージョンの平文 PAT を Windows DPAPI 暗号化形式へ自動移行する
+                migrated = true;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            settings.follow_sync.github_token_encrypted = None;
+        }
+
+        let today = local_today_ymd();
         let instances: Vec<ServiceInstance> = if let Some(raw_list) = raw.instances {
+            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_profile_keys: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            seen_profile_keys.insert("gmail".to_string());
+            seen_profile_keys.insert("shell".to_string());
+
             let mut list: Vec<ServiceInstance> = raw_list
                 .into_iter()
                 .enumerate()
                 .filter_map(|(idx, item)| {
-                    let instance_id = item.instance_id?.trim().to_string();
+                    let mut instance_id = item.instance_id?.trim().to_string();
                     let raw_url = item.url?;
                     if instance_id.is_empty() || raw_url.trim().is_empty() {
                         return None;
@@ -343,6 +413,32 @@ impl ConfigStore {
                         migrated = true;
                         return None;
                     }
+                    // 重複IDや予約プロファイル名（gmail/shell等）によるセッション衝突を防止
+                    let mut profile_key = Self::sanitize_profile_key(&instance_id);
+                    if seen_ids.contains(&instance_id) || seen_profile_keys.contains(&profile_key) {
+                        let safe_prefix: String = service_id
+                            .chars()
+                            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                            .collect();
+                        let prefix = if safe_prefix.is_empty() {
+                            "custom"
+                        } else {
+                            safe_prefix.as_str()
+                        };
+                        loop {
+                            let candidate = format!("svc-{prefix}-{}", next_short_hex_id());
+                            let ckey = Self::sanitize_profile_key(&candidate);
+                            if !seen_ids.contains(&candidate) && !seen_profile_keys.contains(&ckey) {
+                                instance_id = candidate;
+                                profile_key = ckey;
+                                break;
+                            }
+                        }
+                        migrated = true;
+                    }
+                    seen_ids.insert(instance_id.clone());
+                    seen_profile_keys.insert(profile_key);
+
                     let name = item
                         .name
                         .filter(|n| !n.trim().is_empty())
@@ -491,26 +587,107 @@ impl ConfigStore {
         if migrated {
             let _ = Self::save_atomic(file_path, &loaded);
         }
-        loaded
+        (loaded, false)
     }
 
     fn save_atomic(file_path: &PathBuf, data: &AppConfig) -> std::io::Result<()> {
+        use std::io::Write;
         if let Some(dir) = file_path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let temp_path = file_path.with_extension("json.tmp");
+        let temp_name = format!(
+            ".{}.{}.{}.tmp",
+            file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("omni-sns-config.json"),
+            std::process::id(),
+            ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let temp_path = file_path.with_file_name(temp_name);
+
+        #[cfg(windows)]
+        let serialized = {
+            let mut disk_data = data.clone();
+            let raw_token = disk_data.settings.follow_sync.github_token.trim().to_string();
+            if raw_token.is_empty() {
+                disk_data.settings.follow_sync.github_token.clear();
+                disk_data.settings.follow_sync.github_token_encrypted = None;
+            } else if let Some(enc) = crate::platform_win::dpapi_protect_secret(&raw_token) {
+                disk_data.settings.follow_sync.github_token.clear();
+                disk_data.settings.follow_sync.github_token_encrypted = Some(enc);
+            } else {
+                // DPAPI 暗号化に失敗した場合、平文 PAT を誤ってディスクへ書き出さない
+                disk_data.settings.follow_sync.github_token.clear();
+                disk_data.settings.follow_sync.github_token_encrypted = None;
+            }
+            serde_json::to_string_pretty(&disk_data)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        };
+        #[cfg(not(windows))]
         let serialized = serde_json::to_string_pretty(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        fs::write(&temp_path, serialized)?;
-        // Windowsではrename先が存在すると失敗する場合があるためフォールバック
-        if fs::rename(&temp_path, file_path).is_err() {
-            let _ = fs::remove_file(file_path);
-            fs::rename(&temp_path, file_path)?;
+
+        let write_res = (|| -> std::io::Result<()> {
+            let mut file = fs::File::create(&temp_path)?;
+            file.write_all(serialized.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e);
         }
-        Ok(())
+
+        #[cfg(windows)]
+        {
+            use windows::Win32::Storage::FileSystem::{
+                MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            };
+            use windows_core::HSTRING;
+            let src = HSTRING::from(temp_path.as_os_str());
+            let dst = HSTRING::from(file_path.as_os_str());
+            let moved = unsafe {
+                MoveFileExW(
+                    &src,
+                    &dst,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if moved.is_err() {
+                let _ = fs::remove_file(&temp_path);
+                return Err(std::io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(windows))]
+        {
+            if let Err(e) = fs::rename(&temp_path, file_path) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(e);
+            }
+            Ok(())
+        }
     }
 
     fn persist(&self) {
+        if self.preserve_existing_on_disk.load(Ordering::SeqCst) {
+            if self.file_path.exists() {
+                let backup_name = format!(
+                    "omni-sns-config.unreadable-{}-{}.bak",
+                    now_unix_secs(),
+                    next_short_hex_id()
+                );
+                let backup_path = self.file_path.with_file_name(backup_name);
+                if fs::copy(&self.file_path, &backup_path).is_err() {
+                    // 元の設定ファイルをまだ退避できていないため、上書きせず保護を継続する
+                    return;
+                }
+            }
+            self.preserve_existing_on_disk
+                .store(false, Ordering::SeqCst);
+        }
         let _ = Self::save_atomic(&self.file_path, &self.config);
     }
 
@@ -585,8 +762,21 @@ impl ConfigStore {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let instance_id = loop {
+            let candidate = format!("svc-{safe_prefix}-{}", next_short_hex_id());
+            let ckey = Self::sanitize_profile_key(&candidate);
+            let exists = ckey == "gmail"
+                || ckey == "shell"
+                || self.config.instances.iter().any(|i| {
+                    i.instance_id == candidate || Self::sanitize_profile_key(&i.instance_id) == ckey
+                });
+            if !exists {
+                break candidate;
+            }
+        };
+
         let instance = ServiceInstance {
-            instance_id: format!("svc-{safe_prefix}-{}", next_short_hex_id()),
+            instance_id,
             service_id: if payload.service_id.is_empty() {
                 "custom".to_string()
             } else {
@@ -894,10 +1084,10 @@ impl ConfigStore {
                         || prev_unfollow_total > 0)
                 {
                     (
-                        prev_today as i32,
-                        prev_total as i32,
-                        prev_unfollow_today as i32,
-                        prev_unfollow_total as i32,
+                        prev_today.min(i32::MAX as u32) as i32,
+                        prev_total.min(i32::MAX as u32) as i32,
+                        prev_unfollow_today.min(i32::MAX as u32) as i32,
+                        prev_unfollow_total.min(i32::MAX as u32) as i32,
                     )
                 } else {
                     (0, 0, 0, 0)
@@ -934,8 +1124,14 @@ impl ConfigStore {
                 entry.today = entry.today.saturating_add(delta);
                 entry.total = entry.total.saturating_add(delta);
             } else {
-                let dec_today = delta.unsigned_abs().min(cur_sum_today) as i32;
-                let dec_total = delta.unsigned_abs().min(cur_sum_total) as i32;
+                let dec_today = delta
+                    .unsigned_abs()
+                    .min(cur_sum_today)
+                    .min(i32::MAX as u32) as i32;
+                let dec_total = delta
+                    .unsigned_abs()
+                    .min(cur_sum_total)
+                    .min(i32::MAX as u32) as i32;
                 entry.today = entry.today.saturating_sub(dec_today);
                 entry.total = entry.total.saturating_sub(dec_total);
             }
@@ -977,6 +1173,7 @@ impl ConfigStore {
             .instances
             .iter()
             .position(|i| i.instance_id == instance_id)?;
+        normalize_follow_for_today(&mut self.config.instances[idx], &today);
 
         let sync_key = self.config.instances[idx]
             .detected_handle
@@ -984,7 +1181,13 @@ impl ConfigStore {
             .and_then(|h| make_account_sync_key(&self.config.instances[idx].service_id, h));
 
         if let Some(key) = sync_key {
+            let device_id = self.config.settings.follow_sync.device_id.clone();
             let now = now_unix_secs();
+            let prev_today = self.config.instances[idx].follow_count_today;
+            let prev_total = self.config.instances[idx].follow_count_total;
+            let prev_uf_today = self.config.instances[idx].unfollow_count_today;
+            let prev_uf_total = self.config.instances[idx].unfollow_count_total;
+
             let acc = self
                 .config
                 .follow_ledger
@@ -995,19 +1198,41 @@ impl ConfigStore {
                     ..Default::default()
                 });
             acc.roll_date(&today);
-            acc.reset_epoch = acc.reset_epoch.saturating_add(1);
-            for entry in acc.devices.values_mut() {
-                entry.today = 0;
-                entry.today_epoch = acc.reset_epoch;
-                entry.updated_at = now.max(entry.updated_at.saturating_add(1));
+
+            // レジャーが空の状態で「今日のみリセット」した場合に累計やアンフォロー数を失わないよう先にシードする
+            if acc.devices.is_empty()
+                && (prev_today > 0 || prev_total > 0 || prev_uf_today > 0 || prev_uf_total > 0)
+            {
+                acc.devices.insert(
+                    device_id.clone(),
+                    DeviceFollowEntry {
+                        today: prev_today.min(i32::MAX as u32) as i32,
+                        total: prev_total.min(i32::MAX as u32) as i32,
+                        today_epoch: acc.reset_epoch,
+                        total_epoch: acc.total_reset_epoch,
+                        unfollow_today: prev_uf_today.min(i32::MAX as u32) as i32,
+                        unfollow_total: prev_uf_total.min(i32::MAX as u32) as i32,
+                        unfollow_today_epoch: acc.unfollow_reset_epoch,
+                        unfollow_total_epoch: acc.unfollow_total_reset_epoch,
+                        updated_at: now,
+                    },
+                );
             }
+
+            // エポックのみ進める。他デバイスのエントリ・updated_at は絶対に書き換えない
+            // （書き換えると他デバイスの同時加算分を古いスナップショットで上書き消去してしまう）。
+            acc.reset_epoch = acc.reset_epoch.saturating_add(1);
             if reset_total {
                 acc.total_reset_epoch = acc.total_reset_epoch.saturating_add(1);
-                for entry in acc.devices.values_mut() {
-                    entry.total = 0;
-                    entry.total_epoch = acc.total_reset_epoch;
-                    entry.updated_at = now.max(entry.updated_at.saturating_add(1));
+            }
+            if let Some(local_entry) = acc.devices.get_mut(&device_id) {
+                local_entry.today = 0;
+                local_entry.today_epoch = acc.reset_epoch;
+                if reset_total {
+                    local_entry.total = 0;
+                    local_entry.total_epoch = acc.total_reset_epoch;
                 }
+                local_entry.updated_at = now.max(local_entry.updated_at.saturating_add(1));
             }
             project_ledger_to_instances_inner(
                 &mut self.config.instances,
@@ -1069,12 +1294,28 @@ impl ConfigStore {
                 acc.devices.insert(
                     device_id.clone(),
                     DeviceFollowEntry {
-                        today: if seed { prev_today as i32 } else { 0 },
-                        total: if seed { prev_total as i32 } else { 0 },
+                        today: if seed {
+                            prev_today.min(i32::MAX as u32) as i32
+                        } else {
+                            0
+                        },
+                        total: if seed {
+                            prev_total.min(i32::MAX as u32) as i32
+                        } else {
+                            0
+                        },
                         today_epoch: acc.reset_epoch,
                         total_epoch: acc.total_reset_epoch,
-                        unfollow_today: if seed { prev_uf_today as i32 } else { 0 },
-                        unfollow_total: if seed { prev_uf_total as i32 } else { 0 },
+                        unfollow_today: if seed {
+                            prev_uf_today.min(i32::MAX as u32) as i32
+                        } else {
+                            0
+                        },
+                        unfollow_total: if seed {
+                            prev_uf_total.min(i32::MAX as u32) as i32
+                        } else {
+                            0
+                        },
                         unfollow_today_epoch: acc.unfollow_reset_epoch,
                         unfollow_total_epoch: acc.unfollow_total_reset_epoch,
                         updated_at: now,
@@ -1098,8 +1339,14 @@ impl ConfigStore {
                 entry.unfollow_today = entry.unfollow_today.saturating_add(delta);
                 entry.unfollow_total = entry.unfollow_total.saturating_add(delta);
             } else {
-                let dec_today = delta.unsigned_abs().min(cur_sum_today) as i32;
-                let dec_total = delta.unsigned_abs().min(cur_sum_total) as i32;
+                let dec_today = delta
+                    .unsigned_abs()
+                    .min(cur_sum_today)
+                    .min(i32::MAX as u32) as i32;
+                let dec_total = delta
+                    .unsigned_abs()
+                    .min(cur_sum_total)
+                    .min(i32::MAX as u32) as i32;
                 entry.unfollow_today = entry.unfollow_today.saturating_sub(dec_today);
                 entry.unfollow_total = entry.unfollow_total.saturating_sub(dec_total);
             }
@@ -1141,6 +1388,7 @@ impl ConfigStore {
             .instances
             .iter()
             .position(|i| i.instance_id == instance_id)?;
+        normalize_follow_for_today(&mut self.config.instances[idx], &today);
 
         let sync_key = self.config.instances[idx]
             .detected_handle
@@ -1148,7 +1396,13 @@ impl ConfigStore {
             .and_then(|h| make_account_sync_key(&self.config.instances[idx].service_id, h));
 
         if let Some(key) = sync_key {
+            let device_id = self.config.settings.follow_sync.device_id.clone();
             let now = now_unix_secs();
+            let prev_today = self.config.instances[idx].follow_count_today;
+            let prev_total = self.config.instances[idx].follow_count_total;
+            let prev_uf_today = self.config.instances[idx].unfollow_count_today;
+            let prev_uf_total = self.config.instances[idx].unfollow_count_total;
+
             let acc = self
                 .config
                 .follow_ledger
@@ -1159,19 +1413,38 @@ impl ConfigStore {
                     ..Default::default()
                 });
             acc.roll_date(&today);
-            acc.unfollow_reset_epoch = acc.unfollow_reset_epoch.saturating_add(1);
-            for entry in acc.devices.values_mut() {
-                entry.unfollow_today = 0;
-                entry.unfollow_today_epoch = acc.unfollow_reset_epoch;
-                entry.updated_at = now.max(entry.updated_at.saturating_add(1));
+
+            if acc.devices.is_empty()
+                && (prev_today > 0 || prev_total > 0 || prev_uf_today > 0 || prev_uf_total > 0)
+            {
+                acc.devices.insert(
+                    device_id.clone(),
+                    DeviceFollowEntry {
+                        today: prev_today.min(i32::MAX as u32) as i32,
+                        total: prev_total.min(i32::MAX as u32) as i32,
+                        today_epoch: acc.reset_epoch,
+                        total_epoch: acc.total_reset_epoch,
+                        unfollow_today: prev_uf_today.min(i32::MAX as u32) as i32,
+                        unfollow_total: prev_uf_total.min(i32::MAX as u32) as i32,
+                        unfollow_today_epoch: acc.unfollow_reset_epoch,
+                        unfollow_total_epoch: acc.unfollow_total_reset_epoch,
+                        updated_at: now,
+                    },
+                );
             }
+
+            acc.unfollow_reset_epoch = acc.unfollow_reset_epoch.saturating_add(1);
             if reset_total {
                 acc.unfollow_total_reset_epoch = acc.unfollow_total_reset_epoch.saturating_add(1);
-                for entry in acc.devices.values_mut() {
-                    entry.unfollow_total = 0;
-                    entry.unfollow_total_epoch = acc.unfollow_total_reset_epoch;
-                    entry.updated_at = now.max(entry.updated_at.saturating_add(1));
+            }
+            if let Some(local_entry) = acc.devices.get_mut(&device_id) {
+                local_entry.unfollow_today = 0;
+                local_entry.unfollow_today_epoch = acc.unfollow_reset_epoch;
+                if reset_total {
+                    local_entry.unfollow_total = 0;
+                    local_entry.unfollow_total_epoch = acc.unfollow_total_reset_epoch;
                 }
+                local_entry.updated_at = now.max(local_entry.updated_at.saturating_add(1));
             }
             project_ledger_to_instances_inner(
                 &mut self.config.instances,
@@ -1230,6 +1503,15 @@ impl ConfigStore {
 
         if prev_handle.as_deref() != Some(norm_handle.as_str()) {
             self.config.instances[idx].detected_handle = Some(norm_handle.clone());
+            // 別アカウントへ切り替わった場合は旧アカウントの実数・表示値をクリアして混入を防ぐ
+            if prev_handle.is_some() {
+                self.config.instances[idx].sns_following_count = None;
+                self.config.instances[idx].sns_followers_count = None;
+                self.config.instances[idx].follow_count_today = 0;
+                self.config.instances[idx].follow_count_total = 0;
+                self.config.instances[idx].unfollow_count_today = 0;
+                self.config.instances[idx].unfollow_count_total = 0;
+            }
             ui_changed = true;
         }
         if let Some(flwng) = following {
@@ -1265,22 +1547,52 @@ impl ConfigStore {
 
             if prev_handle.is_none()
                 && (prev_today > 0 || prev_total > 0 || prev_uf_today > 0 || prev_uf_total > 0)
-                && !acc.devices.contains_key(&device_id)
             {
-                acc.devices.insert(
-                    device_id,
-                    DeviceFollowEntry {
-                        today: prev_today as i32,
-                        total: prev_total as i32,
-                        today_epoch: acc.reset_epoch,
-                        total_epoch: acc.total_reset_epoch,
-                        unfollow_today: prev_uf_today as i32,
-                        unfollow_total: prev_uf_total as i32,
-                        unfollow_today_epoch: acc.unfollow_reset_epoch,
-                        unfollow_total_epoch: acc.unfollow_total_reset_epoch,
-                        updated_at: now,
-                    },
-                );
+                let add_today = prev_today.min(i32::MAX as u32) as i32;
+                let add_total = prev_total.min(i32::MAX as u32) as i32;
+                let add_uf_today = prev_uf_today.min(i32::MAX as u32) as i32;
+                let add_uf_total = prev_uf_total.min(i32::MAX as u32) as i32;
+                match acc.devices.get_mut(&device_id) {
+                    Some(entry) => {
+                        if entry.today_epoch < acc.reset_epoch {
+                            entry.today = 0;
+                            entry.today_epoch = acc.reset_epoch;
+                        }
+                        if entry.total_epoch < acc.total_reset_epoch {
+                            entry.total = 0;
+                            entry.total_epoch = acc.total_reset_epoch;
+                        }
+                        if entry.unfollow_today_epoch < acc.unfollow_reset_epoch {
+                            entry.unfollow_today = 0;
+                            entry.unfollow_today_epoch = acc.unfollow_reset_epoch;
+                        }
+                        if entry.unfollow_total_epoch < acc.unfollow_total_reset_epoch {
+                            entry.unfollow_total = 0;
+                            entry.unfollow_total_epoch = acc.unfollow_total_reset_epoch;
+                        }
+                        entry.today = entry.today.saturating_add(add_today);
+                        entry.total = entry.total.saturating_add(add_total);
+                        entry.unfollow_today = entry.unfollow_today.saturating_add(add_uf_today);
+                        entry.unfollow_total = entry.unfollow_total.saturating_add(add_uf_total);
+                        entry.updated_at = now.max(entry.updated_at.saturating_add(1));
+                    }
+                    None => {
+                        acc.devices.insert(
+                            device_id,
+                            DeviceFollowEntry {
+                                today: add_today,
+                                total: add_total,
+                                today_epoch: acc.reset_epoch,
+                                total_epoch: acc.total_reset_epoch,
+                                unfollow_today: add_uf_today,
+                                unfollow_total: add_uf_total,
+                                unfollow_today_epoch: acc.unfollow_reset_epoch,
+                                unfollow_total_epoch: acc.unfollow_total_reset_epoch,
+                                updated_at: now,
+                            },
+                        );
+                    }
+                }
                 ledger_changed = true;
             }
 
@@ -1309,6 +1621,35 @@ impl ConfigStore {
         (ui_changed || projected, ledger_changed)
     }
 
+    /// セッション初期化（ログアウト）時に検出済みアカウントID・SNS実数・投影カウントをクリアする。
+    /// クリア後の未紐付け状態から別アカウントを紐付けても旧アカウントの合算値が汚染しないようにする。
+    pub fn clear_instance_identity(&mut self, instance_id: &str) -> bool {
+        let Some(idx) = self
+            .config
+            .instances
+            .iter()
+            .position(|i| i.instance_id == instance_id)
+        else {
+            return false;
+        };
+        let inst = &mut self.config.instances[idx];
+        let had_identity = inst.detected_handle.is_some()
+            || inst.sns_following_count.is_some()
+            || inst.sns_followers_count.is_some();
+        if !had_identity {
+            return false;
+        }
+        inst.detected_handle = None;
+        inst.sns_following_count = None;
+        inst.sns_followers_count = None;
+        inst.follow_count_today = 0;
+        inst.follow_count_total = 0;
+        inst.unfollow_count_today = 0;
+        inst.unfollow_count_total = 0;
+        self.persist();
+        true
+    }
+
     /// ユーザーが手動で同期用ハンドル名（`@username`）を指定／クリアする。
     pub fn set_instance_handle(
         &mut self,
@@ -1323,7 +1664,17 @@ impl ConfigStore {
                 .iter()
                 .position(|i| i.instance_id == instance_id)
                 .ok_or_else(|| "対象アカウントが見つかりません".to_string())?;
+            let had_handle = self.config.instances[idx].detected_handle.is_some();
             self.config.instances[idx].detected_handle = None;
+            self.config.instances[idx].sns_following_count = None;
+            self.config.instances[idx].sns_followers_count = None;
+            if had_handle {
+                // 旧アカウントの合算投影値が次アカウントへ誤シードされるのを防ぐ
+                self.config.instances[idx].follow_count_today = 0;
+                self.config.instances[idx].follow_count_total = 0;
+                self.config.instances[idx].unfollow_count_today = 0;
+                self.config.instances[idx].unfollow_count_total = 0;
+            }
             let updated = self.config.instances[idx].clone();
             self.persist();
             return Ok((updated, false));
@@ -1426,6 +1777,14 @@ impl ConfigStore {
 
     pub fn update_window_bounds(&mut self, bounds: WindowBounds) {
         self.config.window_bounds = Some(bounds);
+        self.persist();
+    }
+
+    pub fn set_window_bounds_in_memory(&mut self, bounds: WindowBounds) {
+        self.config.window_bounds = Some(bounds);
+    }
+
+    pub fn flush(&self) {
         self.persist();
     }
 }
@@ -1810,6 +2169,203 @@ mod tests {
         assert_eq!(persisted.follow_count_today, 0);
         assert_eq!(persisted.follow_count_total, 15);
         assert_eq!(persisted.sns_following_count, Some(156));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn reset_does_not_overwrite_remote_device_concurrent_updates() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-reset-crdt-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+
+        let mut store = ConfigStore::new(config_path.clone());
+        let ig = store
+            .get_instances()
+            .into_iter()
+            .find(|i| i.service_id == "instagram")
+            .unwrap();
+        let today = local_today_ymd();
+
+        let _ = store.record_account_identity(&ig.instance_id, "alice", None, None);
+
+        // Initial synced state from Android at t=1000
+        let mut initial_remote = FollowSyncLedger::default();
+        let mut acc1 = AccountFollowLedger {
+            date: today.clone(),
+            ..Default::default()
+        };
+        acc1.devices.insert(
+            "and-phone".to_string(),
+            DeviceFollowEntry {
+                today: 5,
+                total: 20,
+                unfollow_today: 0,
+                unfollow_total: 0,
+                updated_at: 1000,
+                ..Default::default()
+            },
+        );
+        initial_remote
+            .accounts
+            .insert("instagram:alice".to_string(), acc1);
+        store.merge_follow_ledger(&initial_remote);
+
+        // PC resets ONLY today's follow count (must NOT bump and-phone's updated_at!)
+        let after_reset = store.reset_follow_count(&ig.instance_id, false).unwrap();
+        assert_eq!(after_reset.follow_count_today, 0);
+        assert_eq!(after_reset.follow_count_total, 20);
+        let pc_ledger = store.get_follow_ledger();
+        let and_in_pc = pc_ledger
+            .accounts
+            .get("instagram:alice")
+            .unwrap()
+            .devices
+            .get("and-phone")
+            .unwrap();
+        assert_eq!(and_in_pc.updated_at, 1000);
+
+        // Meanwhile Android recorded +3 follows and +4 unfollows at t=1005
+        let mut android_newer = FollowSyncLedger::default();
+        let mut acc2 = AccountFollowLedger {
+            date: today.clone(),
+            ..Default::default()
+        };
+        acc2.devices.insert(
+            "and-phone".to_string(),
+            DeviceFollowEntry {
+                today: 8,
+                total: 23,
+                unfollow_today: 4,
+                unfollow_total: 4,
+                updated_at: 1005,
+                ..Default::default()
+            },
+        );
+        android_newer
+            .accounts
+            .insert("instagram:alice".to_string(), acc2);
+
+        // Merge in both directions: Android's total (+3) & unfollows (+4) MUST survive!
+        store.merge_follow_ledger(&android_newer);
+        let merged = store.get_instance(&ig.instance_id).unwrap();
+        assert_eq!(merged.follow_count_today, 0);
+        assert_eq!(merged.follow_count_total, 23);
+        assert_eq!(merged.unfollow_count_today, 4);
+        assert_eq!(merged.unfollow_count_total, 4);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn corrupt_config_is_backed_up_and_not_silently_overwritten() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-corrupt-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("omni-sns-config.json");
+        let corrupt_payload = "{ broken json :::";
+        fs::write(&config_path, corrupt_payload).unwrap();
+
+        let store = ConfigStore::new(config_path.clone());
+        assert!(!store.get_instances().is_empty());
+
+        // Original corrupt file was NOT silently overwritten and a backup was created
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), corrupt_payload);
+        let has_backup = fs::read_dir(&tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("omni-sns-config.corrupt-")
+            });
+        assert!(has_backup);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn clearing_handle_prevents_contaminating_next_account_and_deduplicates_reserved_ids() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-handle-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("omni-sns-config.json");
+        fs::write(
+            &config_path,
+            r#"{
+                "version": 1,
+                "instances": [
+                    {"instanceId": "gmail", "serviceId": "instagram", "name": "IG1", "url": "https://www.instagram.com/"},
+                    {"instanceId": "dup-id", "serviceId": "instagram", "name": "IG2", "url": "https://www.instagram.com/"},
+                    {"instanceId": "dup-id", "serviceId": "instagram", "name": "IG3", "url": "https://www.instagram.com/"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut store = ConfigStore::new(config_path.clone());
+        let instances = store.get_instances();
+        assert_eq!(instances.len(), 3);
+        let unique_ids: std::collections::HashSet<&str> =
+            instances.iter().map(|i| i.instance_id.as_str()).collect();
+        assert_eq!(unique_ids.len(), 3);
+        assert!(!unique_ids.contains("gmail"));
+
+        let ig_id = instances[0].instance_id.clone();
+        let _ = store.record_account_identity(&ig_id, "alice", Some(100), Some(200));
+        let _ = store.adjust_follow_count(&ig_id, 5).unwrap();
+        assert_eq!(store.get_instance(&ig_id).unwrap().follow_count_total, 5);
+
+        // Clear @alice and bind @bob -> @bob must NOT inherit @alice's counts or SNS stats
+        let (cleared, _) = store.set_instance_handle(&ig_id, "").unwrap();
+        assert_eq!(cleared.detected_handle, None);
+        assert_eq!(cleared.follow_count_total, 0);
+        assert_eq!(cleared.sns_following_count, None);
+
+        let (bob, _) = store.set_instance_handle(&ig_id, "bob").unwrap();
+        assert_eq!(bob.detected_handle.as_deref(), Some("bob"));
+        assert_eq!(bob.follow_count_total, 0);
+        assert_eq!(bob.sns_following_count, None);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_config_is_not_silently_overwritten_on_persist() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-unreadable-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("omni-sns-config.json");
+        let original_content = r#"{"version":1,"settings":{"followSync":{"githubToken":"ghp_keepme"}}}"#;
+        fs::write(&config_path, original_content).unwrap();
+
+        // Simulate unreadable file (locked / inaccessible during startup)
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let store = ConfigStore::new(config_path.clone());
+        assert!(store.preserve_existing_on_disk.load(Ordering::SeqCst));
+        // Even when flush() runs while unreadable, existing file must not be replaced
+        store.flush();
+
+        // Restore read permission: original content must remain completely intact
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original_content);
+
+        // Once readable again, flush() creates an .unreadable-*.bak backup before saving
+        store.flush();
+        let has_backup = fs::read_dir(&tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("omni-sns-config.unreadable-")
+            });
+        assert!(has_backup);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

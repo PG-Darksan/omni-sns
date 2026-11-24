@@ -31,11 +31,24 @@ use store::ConfigStore;
 use url_utils::is_http_url;
 use view_manager::SharedState;
 
+/// すべてのカスタム Tauri コマンドは UI シェル WebView (`shell`) からのみ呼び出しを許可する。
+/// (build.rs に AppManifest が無い場合、ローカルオリジンへ到達した非 shell WebView は capabilities を
+///  経由せずカスタムコマンドを直接呼べるため、コマンド境界で明示的に検証する)
+fn ensure_shell_webview(webview: &tauri::Webview) -> Result<(), String> {
+    if webview.label() == "shell" {
+        Ok(())
+    } else {
+        Err("unauthorized webview caller".to_string())
+    }
+}
+
 #[tauri::command]
 async fn app_get_bootstrap(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
 ) -> Result<BootstrapPayload, String> {
+    ensure_shell_webview(&webview)?;
     {
         let mut guard = shared.inner.lock().unwrap();
         guard.bootstrapped = true;
@@ -78,10 +91,12 @@ async fn app_get_bootstrap(
 
 #[tauri::command]
 async fn tab_activate(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: Option<String>,
 ) -> Result<AppConfig, String> {
+    ensure_shell_webview(&webview)?;
     let next_id = {
         let mut guard = shared.inner.lock().unwrap();
         if let Some(ref id) = instance_id {
@@ -116,10 +131,12 @@ async fn tab_activate(
 
 #[tauri::command]
 async fn tab_add(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     payload: AddInstancePayload,
 ) -> Result<AddTabResponse, String> {
+    ensure_shell_webview(&webview)?;
     let (created, config) = {
         let mut guard = shared.inner.lock().unwrap();
         let created = guard.store.add_instance(payload)?;
@@ -135,10 +152,12 @@ async fn tab_add(
 
 #[tauri::command]
 async fn tab_remove(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
 ) -> Result<AppConfig, String> {
+    ensure_shell_webview(&webview)?;
     let prev_active = {
         let mut guard = shared.inner.lock().unwrap();
         let prev = guard.active_instance_id.clone();
@@ -161,10 +180,12 @@ async fn tab_remove(
 
 #[tauri::command]
 async fn tab_remove_many(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
+    ensure_shell_webview(&webview)?;
     let prev_active = {
         let mut guard = shared.inner.lock().unwrap();
         let prev = guard.active_instance_id.clone();
@@ -187,11 +208,13 @@ async fn tab_remove_many(
 
 #[tauri::command]
 async fn tab_update(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     patch: UpdateInstancePatch,
 ) -> Result<Option<ServiceInstance>, String> {
+    ensure_shell_webview(&webview)?;
     let updated = {
         let mut guard = shared.inner.lock().unwrap();
         guard.store.update_instance(&instance_id, patch)
@@ -206,10 +229,12 @@ async fn tab_update(
 
 #[tauri::command]
 async fn tab_reorder(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     ordered_ids: Vec<String>,
 ) -> Result<AppConfig, String> {
+    ensure_shell_webview(&webview)?;
     {
         let mut guard = shared.inner.lock().unwrap();
         guard.store.reorder_instances(&ordered_ids);
@@ -223,166 +248,200 @@ async fn tab_reorder(
 
 #[tauri::command]
 async fn tab_action(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     action: String,
 ) -> Result<(), String> {
+    ensure_shell_webview(&webview)?;
     view_manager::perform_tab_action(&app, &shared, &instance_id, &action);
     Ok(())
 }
 
 #[tauri::command]
 async fn subtab_create(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     url: Option<String>,
 ) -> Result<String, String> {
+    ensure_shell_webview(&webview)?;
     view_manager::create_subtab(&app, &shared, &instance_id, url)
 }
 
 #[tauri::command]
 async fn subtab_activate(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     tab_id: String,
 ) -> Result<(), String> {
+    ensure_shell_webview(&webview)?;
     view_manager::activate_subtab(&app, &shared, &instance_id, &tab_id);
     Ok(())
 }
 
 #[tauri::command]
 async fn subtab_close(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     tab_id: String,
 ) -> Result<Option<String>, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::close_subtab(&app, &shared, &instance_id, &tab_id))
 }
 
 #[tauri::command]
 async fn subtab_close_others(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     tab_id: String,
 ) -> Result<usize, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::close_other_subtabs(&app, &shared, &instance_id, &tab_id))
 }
 
 #[tauri::command]
 async fn subtab_duplicate(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     tab_id: String,
 ) -> Result<String, String> {
+    ensure_shell_webview(&webview)?;
     view_manager::duplicate_subtab(&app, &shared, &instance_id, &tab_id)
 }
 
 #[tauri::command]
 async fn subtab_restore_closed(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
 ) -> Result<String, String> {
+    ensure_shell_webview(&webview)?;
     view_manager::restore_closed_tab(&app, &shared)
 }
 
 #[tauri::command]
 async fn subtab_navigate(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     url: String,
 ) -> Result<String, String> {
+    ensure_shell_webview(&webview)?;
     view_manager::navigate_subtab(&app, &shared, &instance_id, &url)
 }
 
 #[tauri::command]
 async fn gesture_update_settings(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     gesture: GestureSettings,
 ) -> Result<GestureSettings, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::update_gesture_settings(&app, &shared, gesture))
 }
 
 #[tauri::command]
 async fn follow_adjust(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     delta: i32,
 ) -> Result<Option<ServiceInstance>, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::adjust_follow_count(&app, &shared, &instance_id, delta))
 }
 
 #[tauri::command]
 async fn follow_reset(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     reset_total: bool,
 ) -> Result<Option<ServiceInstance>, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::reset_follow_count(&app, &shared, &instance_id, reset_total))
 }
 
 #[tauri::command]
 async fn unfollow_adjust(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     delta: i32,
 ) -> Result<Option<ServiceInstance>, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::adjust_unfollow_count(&app, &shared, &instance_id, delta))
 }
 
 #[tauri::command]
 async fn unfollow_reset(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     reset_total: bool,
 ) -> Result<Option<ServiceInstance>, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::reset_unfollow_count(&app, &shared, &instance_id, reset_total))
 }
 
 #[tauri::command]
 async fn follow_set_handle(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     instance_id: String,
     handle: String,
 ) -> Result<ServiceInstance, String> {
+    ensure_shell_webview(&webview)?;
     view_manager::set_instance_handle(&app, &shared, &instance_id, &handle)
 }
 
 #[tauri::command]
 async fn follow_sync_update_settings(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     patch: UpdateFollowSyncPatch,
 ) -> Result<FollowSyncSettings, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::update_follow_sync_settings(&app, &shared, patch))
 }
 
 #[tauri::command]
 async fn follow_sync_now(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
 ) -> Result<FollowSyncSettings, String> {
+    ensure_shell_webview(&webview)?;
     view_manager::trigger_follow_sync_now(&app, &shared).await
 }
 
 #[tauri::command]
 async fn settings_update(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     patch: UpdateSettingsPatch,
 ) -> Result<AppSettings, String> {
+    ensure_shell_webview(&webview)?;
     let explicit_active_change = patch.active_instance_id.is_some();
     let (prev_active, updated) = {
         let mut guard = shared.inner.lock().unwrap();
@@ -412,53 +471,65 @@ async fn settings_update(
 
 #[tauri::command]
 async fn ui_set_overlay(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     visible: bool,
 ) -> Result<(), String> {
+    ensure_shell_webview(&webview)?;
     view_manager::set_overlay_visible(&app, &shared, visible);
     Ok(())
 }
 
 #[tauri::command]
-fn ui_copy_text(text: String) {
+fn ui_copy_text(webview: tauri::Webview, text: String) -> Result<(), String> {
+    ensure_shell_webview(&webview)?;
     #[cfg(windows)]
     platform_win::copy_text_to_clipboard(&text);
+    Ok(())
 }
 
 #[tauri::command]
-fn app_open_external_url(url: String) {
+fn app_open_external_url(webview: tauri::Webview, url: String) -> Result<(), String> {
+    ensure_shell_webview(&webview)?;
     if is_http_url(&url) {
         #[cfg(windows)]
         platform_win::open_external_url(&url);
     }
+    Ok(())
 }
 
 #[tauri::command]
 async fn gmail_toggle(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     open: Option<bool>,
 ) -> Result<bool, String> {
+    ensure_shell_webview(&webview)?;
     Ok(view_manager::set_gmail_open(&app, &shared, open))
 }
 
 #[tauri::command]
 async fn gmail_action(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     action: String,
 ) -> Result<(), String> {
+    ensure_shell_webview(&webview)?;
     view_manager::perform_gmail_action(&app, &shared, &action);
     Ok(())
 }
 
 #[tauri::command]
 async fn gmail_navigate(
+    webview: tauri::Webview,
     app: AppHandle,
     shared: State<'_, SharedState>,
     url: String,
 ) -> Result<String, String> {
+    ensure_shell_webview(&webview)?;
     view_manager::navigate_gmail(&app, &shared, &url)
 }
 
@@ -479,61 +550,137 @@ fn shutdown_gesture_host(shared: &SharedState) {
     }
 }
 
-fn save_window_bounds(win: &tauri::Window, shared: &SharedState) {
+fn save_window_bounds(win: &tauri::Window, shared: &SharedState, immediate: bool) {
+    // Win32 / Tauri のウィンドウクエリは shared.inner ロック外で実行してデッドロックを防ぐ
     let is_minimized = win.is_minimized().unwrap_or(false);
     if is_minimized {
         return;
     }
     let is_maximized = win.is_maximized().unwrap_or(false);
     let scale = win.scale_factor().unwrap_or(1.0);
+    let size = if is_maximized {
+        None
+    } else {
+        win.inner_size()
+            .map(|s| s.to_logical::<f64>(scale))
+            .ok()
+    };
+    let pos = if is_maximized {
+        None
+    } else {
+        win.outer_position()
+            .map(|p| p.to_logical::<f64>(scale))
+            .ok()
+    };
 
-    let mut guard = shared.inner.lock().unwrap();
-    let prev = guard
-        .store
-        .get_config()
-        .window_bounds
-        .unwrap_or(WindowBounds {
-            x: None,
-            y: None,
-            width: 1380,
-            height: 880,
-            is_maximized: Some(false),
-        });
+    let debounce_info = {
+        let mut guard = shared.inner.lock().unwrap();
+        let prev = guard
+            .store
+            .get_config()
+            .window_bounds
+            .unwrap_or_default();
 
-    if is_maximized {
-        guard.store.update_window_bounds(WindowBounds {
-            x: prev.x,
-            y: prev.y,
-            width: prev.width,
-            height: prev.height,
-            is_maximized: Some(true),
-        });
-        return;
+        let next = if is_maximized {
+            WindowBounds {
+                x: prev.x,
+                y: prev.y,
+                width: prev.width,
+                height: prev.height,
+                is_maximized: Some(true),
+            }
+        } else {
+            let width = size
+                .map(|s| (s.width.round() as u32).max(960))
+                .unwrap_or(prev.width);
+            let height = size
+                .map(|s| (s.height.round() as u32).max(620))
+                .unwrap_or(prev.height);
+            WindowBounds {
+                x: pos.map(|p| p.x.round() as i32).or(prev.x),
+                y: pos.map(|p| p.y.round() as i32).or(prev.y),
+                width,
+                height,
+                is_maximized: Some(false),
+            }
+        };
+
+        if immediate {
+            guard
+                .bounds_persist_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            guard.store.update_window_bounds(next);
+            None
+        } else {
+            guard.store.set_window_bounds_in_memory(next);
+            let gen_arc = guard.bounds_persist_gen.clone();
+            let running_arc = guard.bounds_persist_worker_running.clone();
+            gen_arc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if running_arc
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                Some((gen_arc, running_arc))
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some((gen_arc, running_arc)) = debounce_info {
+        let shared_bg = shared.clone();
+        let running_bg = running_arc.clone();
+        let spawn_res = std::thread::Builder::new()
+            .name("omnisns-bounds-flush".to_string())
+            .spawn(move || {
+                loop {
+                    let target_gen = gen_arc.load(std::sync::atomic::Ordering::SeqCst);
+                    for _ in 0..8 {
+                        std::thread::sleep(Duration::from_millis(50));
+                        if shared_bg.inner.lock().unwrap().is_quitting {
+                            running_bg.store(false, std::sync::atomic::Ordering::Release);
+                            return;
+                        }
+                        if gen_arc.load(std::sync::atomic::Ordering::SeqCst) != target_gen {
+                            break;
+                        }
+                    }
+                    if gen_arc.load(std::sync::atomic::Ordering::SeqCst) != target_gen {
+                        continue;
+                    }
+                    {
+                        let guard = shared_bg.inner.lock().unwrap();
+                        if !guard.is_quitting
+                            && gen_arc.load(std::sync::atomic::Ordering::SeqCst) == target_gen
+                        {
+                            guard.store.flush();
+                        }
+                    }
+                    running_bg.store(false, std::sync::atomic::Ordering::Release);
+                    if gen_arc.load(std::sync::atomic::Ordering::SeqCst) != target_gen
+                        && running_bg
+                            .compare_exchange(
+                                false,
+                                true,
+                                std::sync::atomic::Ordering::AcqRel,
+                                std::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        continue;
+                    }
+                    break;
+                }
+            });
+        if spawn_res.is_err() {
+            running_arc.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
-
-    let size = win
-        .inner_size()
-        .map(|s| s.to_logical::<f64>(scale))
-        .ok();
-    let pos = win
-        .outer_position()
-        .map(|p| p.to_logical::<f64>(scale))
-        .ok();
-
-    let width = size
-        .map(|s| (s.width.round() as u32).max(960))
-        .unwrap_or(prev.width);
-    let height = size
-        .map(|s| (s.height.round() as u32).max(620))
-        .unwrap_or(prev.height);
-
-    guard.store.update_window_bounds(WindowBounds {
-        x: pos.map(|p| p.x.round() as i32).or(prev.x),
-        y: pos.map(|p| p.y.round() as i32).or(prev.y),
-        width,
-        height,
-        is_maximized: Some(false),
-    });
 }
 
 fn resolve_config_path(app: &AppHandle) -> PathBuf {
@@ -684,6 +831,9 @@ pub fn run() {
                 let shared_act = shared.clone();
                 let app_scroll = app_handle.clone();
                 let shared_scroll = shared.clone();
+                let pending_scroll: Arc<std::sync::Mutex<Option<(f64, f64, f64, f64)>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let scroll_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let host = gesture_win::GestureWinHost::start(
                     raw_hwnd,
                     initial_config.settings.gesture.clone(),
@@ -702,14 +852,72 @@ pub fn run() {
                             });
                         }),
                         on_live_scroll: Arc::new(move |ox, oy, dx, dy| {
-                            view_manager::dispatch_live_scroll(
-                                &app_scroll,
-                                &shared_scroll,
-                                ox,
-                                oy,
-                                dx,
-                                dy,
-                            );
+                            // WH_MOUSE_LL スレッド上で shared.inner ロックや WebView2 COM 呼び出しを行わないよう非同期合算ディスパッチ
+                            {
+                                if let Ok(mut pending) = pending_scroll.lock() {
+                                    if let Some((_, _, pdx, pdy)) = pending.as_mut() {
+                                        *pdx += dx;
+                                        *pdy += dy;
+                                    } else {
+                                        *pending = Some((ox, oy, dx, dy));
+                                    }
+                                }
+                            }
+                            if scroll_in_flight
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    std::sync::atomic::Ordering::AcqRel,
+                                    std::sync::atomic::Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
+                                let app_bg = app_scroll.clone();
+                                let shared_bg = shared_scroll.clone();
+                                let pending_bg = pending_scroll.clone();
+                                let in_flight_bg = scroll_in_flight.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    loop {
+                                        let batch = pending_bg
+                                            .lock()
+                                            .ok()
+                                            .and_then(|mut slot| slot.take());
+                                        if let Some((bx, by, bdx, bdy)) = batch {
+                                            view_manager::dispatch_live_scroll(
+                                                &app_bg,
+                                                &shared_bg,
+                                                bx,
+                                                by,
+                                                bdx,
+                                                bdy,
+                                            );
+                                            continue;
+                                        }
+                                        in_flight_bg.store(
+                                            false,
+                                            std::sync::atomic::Ordering::Release,
+                                        );
+                                        let has_more = pending_bg
+                                            .lock()
+                                            .ok()
+                                            .map(|slot| slot.is_some())
+                                            .unwrap_or(false);
+                                        if has_more
+                                            && in_flight_bg
+                                                .compare_exchange(
+                                                    false,
+                                                    true,
+                                                    std::sync::atomic::Ordering::AcqRel,
+                                                    std::sync::atomic::Ordering::Acquire,
+                                                )
+                                                .is_ok()
+                                        {
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                });
+                            }
                         }),
                     },
                 );
@@ -730,7 +938,11 @@ pub fn run() {
                 .disable_drag_drop_handler()
                 .on_navigation(|url| {
                     let scheme = url.scheme();
-                    if scheme == "tauri" || url.host_str() == Some("tauri.localhost") {
+                    if scheme == "tauri"
+                        || (matches!(scheme, "http" | "https")
+                            && url.host_str() == Some("tauri.localhost")
+                            && url.port().is_none())
+                    {
                         return true;
                     }
                     if is_http_url(url.as_str()) {
@@ -758,18 +970,18 @@ pub fn run() {
                 WindowEvent::Resized(size) => {
                     if size.width > 0 && size.height > 0 {
                         view_manager::update_bounds_from_window(&app_for_win, &shared_for_win);
-                        save_window_bounds(&win_for_events, &shared_for_win);
+                        save_window_bounds(&win_for_events, &shared_for_win, false);
                     }
                 }
                 WindowEvent::ScaleFactorChanged { .. } => {
                     view_manager::update_bounds_from_window(&app_for_win, &shared_for_win);
                 }
                 WindowEvent::Moved(_) => {
-                    save_window_bounds(&win_for_events, &shared_for_win);
+                    save_window_bounds(&win_for_events, &shared_for_win, false);
                     view_manager::sync_gesture_host_state(&app_for_win, &shared_for_win);
                 }
                 WindowEvent::CloseRequested { api, .. } => {
-                    save_window_bounds(&win_for_events, &shared_for_win);
+                    save_window_bounds(&win_for_events, &shared_for_win, true);
                     let (quitting, minimize_to_tray) = {
                         let guard = shared_for_win.inner.lock().unwrap();
                         (guard.is_quitting, guard.store.get_settings().minimize_to_tray)
@@ -778,13 +990,23 @@ pub fn run() {
                         api.prevent_close();
                         let _ = win_for_events.hide();
                     } else {
+                        {
+                            let mut guard = shared_for_win.inner.lock().unwrap();
+                            guard.is_quitting = true;
+                        }
                         shutdown_gesture_host(&shared_for_win);
                         view_manager::destroy_all_views(&app_for_win, &shared_for_win);
+                        let _ = app_for_win.remove_tray_by_id("main-tray");
                     }
                 }
                 WindowEvent::Destroyed => {
+                    {
+                        let mut guard = shared_for_win.inner.lock().unwrap();
+                        guard.is_quitting = true;
+                    }
                     shutdown_gesture_host(&shared_for_win);
                     view_manager::destroy_all_views(&app_for_win, &shared_for_win);
+                    let _ = app_for_win.remove_tray_by_id("main-tray");
                 }
                 _ => {}
             });

@@ -31,8 +31,8 @@ pub struct CategoryMeta {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SavedSubTab {
     pub url: String,
     pub title: String,
@@ -111,6 +111,10 @@ pub struct TabRuntimeState {
     pub load_error: Option<String>,
     pub active_tab_id: String,
     pub tabs: Vec<BrowserTabInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_site_service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_site_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,7 +133,7 @@ pub struct AppSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct WindowBounds {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x: Option<i32>,
@@ -139,6 +143,18 @@ pub struct WindowBounds {
     pub height: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_maximized: Option<bool>,
+}
+
+impl Default for WindowBounds {
+    fn default() -> Self {
+        Self {
+            x: None,
+            y: None,
+            width: 1380,
+            height: 880,
+            is_maximized: Some(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

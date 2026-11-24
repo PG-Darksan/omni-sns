@@ -82,9 +82,158 @@ pub struct AccountFollowLedger {
     pub sns_updated_at: u64,
 }
 
+pub fn is_valid_ymd(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    if !(b[0..4].iter().all(|c| c.is_ascii_digit())
+        && b[5..7].iter().all(|c| c.is_ascii_digit())
+        && b[8..10].iter().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    let Ok(year) = s[0..4].parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = s[5..7].parse::<u32>() else {
+        return false;
+    };
+    let Ok(day) = s[8..10].parse::<u32>() else {
+        return false;
+    };
+    if year < 1970 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let max_day = days_in_month(year, month);
+    (1..=max_day).contains(&day)
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+pub fn next_ymd(ymd: &str) -> Option<String> {
+    if !is_valid_ymd(ymd) {
+        return None;
+    }
+    let mut year: u32 = ymd[0..4].parse().ok()?;
+    let mut month: u32 = ymd[5..7].parse().ok()?;
+    let mut day: u32 = ymd[8..10].parse().ok()?;
+    day += 1;
+    if day > days_in_month(year, month) {
+        day = 1;
+        month += 1;
+        if month > 12 {
+            month = 1;
+            year = year.checked_add(1)?;
+        }
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+/// GitHub Personal Access Token の形式検証（CRLF ヘッダインジェクション・不正文字防止）。
+/// エラーメッセージにトークン本体を含めない。
+pub fn validate_github_token(raw: &str) -> Result<&str, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("GitHub Personal Access Token（gist 権限）を入力してください".to_string());
+    }
+    if trimmed.len() > 512
+        || trimmed
+            .bytes()
+            .any(|b| !b.is_ascii() || b <= 0x20 || b >= 0x7F)
+    {
+        return Err(
+            "GitHub Token に使用できない文字（改行・空白・全角文字など）が含まれています"
+                .to_string(),
+        );
+    }
+    Ok(trimmed)
+}
+
+/// GitHub Gist ID の形式検証（パストラバーサル / 任意 API エンドポイント送信防止）。
+/// 空文字列は新規自動作成として許可する。
+pub fn validate_gist_id(raw: &str) -> Result<&str, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok("");
+    }
+    if trimmed.len() > 64
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("Gist ID の形式が不正です（半角英数字のみ指定してください）".to_string());
+    }
+    Ok(trimmed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteGistFileState {
+    Missing,
+    Content(String),
+    Truncated { raw_url: Option<String> },
+}
+
+pub fn extract_remote_gist_file(get_resp: &str) -> Result<RemoteGistFileState, String> {
+    let remote_val: serde_json::Value =
+        serde_json::from_str(get_resp).map_err(|e| format!("Gist応答の解析に失敗: {e}"))?;
+    let Some(file_obj) = remote_val
+        .get("files")
+        .and_then(|f| f.get(GIST_FILENAME))
+        .and_then(|f| f.as_object())
+    else {
+        return Ok(RemoteGistFileState::Missing);
+    };
+
+    if file_obj
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let raw_url = file_obj
+            .get("raw_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        return Ok(RemoteGistFileState::Truncated { raw_url });
+    }
+
+    match file_obj.get("content").and_then(|c| c.as_str()) {
+        Some(content) => Ok(RemoteGistFileState::Content(content.to_string())),
+        None => Ok(RemoteGistFileState::Missing),
+    }
+}
+
+pub fn parse_remote_ledger_content(content: &str) -> Result<FollowSyncLedger, String> {
+    if content.trim().is_empty() {
+        return Ok(FollowSyncLedger::default());
+    }
+    serde_json::from_str::<FollowSyncLedger>(content).map_err(|_| {
+        "リモート Gist の同期データが破損しているため上書きを中断しました（データ保護）"
+            .to_string()
+    })
+}
+
 impl AccountFollowLedger {
     pub fn roll_date(&mut self, today: &str) {
-        if self.date.as_str() < today {
+        let max_allowed = next_ymd(today).unwrap_or_else(|| today.to_string());
+        if !is_valid_ymd(&self.date)
+            || self.date.as_str() < today
+            || self.date.as_str() > max_allowed.as_str()
+        {
             self.date = today.to_string();
             for entry in self.devices.values_mut() {
                 entry.today = 0;
@@ -92,13 +241,16 @@ impl AccountFollowLedger {
                 entry.unfollow_today = 0;
                 entry.unfollow_today_epoch = self.unfollow_reset_epoch;
             }
-        } else if self.date.is_empty() {
-            self.date = today.to_string();
         }
     }
 
     pub fn effective_counts(&self, today: &str) -> (u32, u32) {
-        let same_day = self.date == today;
+        // タイムゾーン差や数分の時計ズレ（+1日以内）で当日カウントを凍結させない一方、
+        // 異常な未来日付（> today+1日）による永続汚染は無効化する。
+        let max_allowed = next_ymd(today).unwrap_or_else(|| today.to_string());
+        let same_day = is_valid_ymd(&self.date)
+            && self.date.as_str() >= today
+            && self.date.as_str() <= max_allowed.as_str();
         let mut sum_today: i64 = 0;
         let mut sum_total: i64 = 0;
         for entry in self.devices.values() {
@@ -116,7 +268,10 @@ impl AccountFollowLedger {
     }
 
     pub fn effective_unfollow_counts(&self, today: &str) -> (u32, u32) {
-        let same_day = self.date == today;
+        let max_allowed = next_ymd(today).unwrap_or_else(|| today.to_string());
+        let same_day = is_valid_ymd(&self.date)
+            && self.date.as_str() >= today
+            && self.date.as_str() <= max_allowed.as_str();
         let mut sum_today: i64 = 0;
         let mut sum_total: i64 = 0;
         for entry in self.devices.values() {
@@ -137,18 +292,42 @@ impl AccountFollowLedger {
     pub fn merge_from(&mut self, other: &AccountFollowLedger, today: &str) -> bool {
         let mut changed = false;
 
-        let target_date = [self.date.as_str(), other.date.as_str(), today]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .max()
-            .unwrap_or(today)
-            .to_string();
+        // 異常な未来日付による永続汚染を防ぐため、許可する最大日付を today + 1日 に制限する
+        let max_allowed = next_ymd(today).unwrap_or_else(|| today.to_string());
+        let valid_self_date = is_valid_ymd(&self.date) && self.date.as_str() <= max_allowed.as_str();
+        let valid_other_date =
+            is_valid_ymd(&other.date) && other.date.as_str() <= max_allowed.as_str();
+
+        let target_date = [
+            if valid_self_date {
+                Some(self.date.as_str())
+            } else {
+                None
+            },
+            if valid_other_date {
+                Some(other.date.as_str())
+            } else {
+                None
+            },
+            if is_valid_ymd(today) {
+                Some(today)
+            } else {
+                None
+            },
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(today)
+        .to_string();
 
         if self.date != target_date {
-            if self.date.as_str() < target_date.as_str() {
+            if !valid_self_date || self.date.as_str() < target_date.as_str() {
                 for entry in self.devices.values_mut() {
                     entry.today = 0;
+                    entry.today_epoch = self.reset_epoch;
                     entry.unfollow_today = 0;
+                    entry.unfollow_today_epoch = self.unfollow_reset_epoch;
                 }
             }
             self.date = target_date.clone();
@@ -199,7 +378,7 @@ impl AccountFollowLedger {
             changed = true;
         }
 
-        let other_same_day = other.date == target_date;
+        let other_same_day = valid_other_date && other.date == target_date;
         for (dev_id, remote_entry) in &other.devices {
             let mut normalized = remote_entry.clone();
             if !other_same_day || normalized.today_epoch < self.reset_epoch {
@@ -221,15 +400,52 @@ impl AccountFollowLedger {
 
             match self.devices.get_mut(dev_id) {
                 Some(local_entry) => {
-                    let remote_newer = normalized.updated_at > local_entry.updated_at
-                        || (normalized.updated_at == local_entry.updated_at
-                            && (normalized.total > local_entry.total
-                                || normalized.today > local_entry.today
-                                || normalized.unfollow_total > local_entry.unfollow_total
-                                || normalized.unfollow_today > local_entry.unfollow_today));
-                    if remote_newer && *local_entry != normalized {
-                        *local_entry = normalized;
-                        changed = true;
+                    if normalized.updated_at > local_entry.updated_at {
+                        if *local_entry != normalized {
+                            *local_entry = normalized;
+                            changed = true;
+                        }
+                    } else if normalized.updated_at == local_entry.updated_at {
+                        // 同一秒タイムスタンプのタイブレークはフィールド単位で大きい側を採用し、他フィールドの後退を防ぐ
+                        let mut merged_entry = local_entry.clone();
+                        if normalized.today_epoch > merged_entry.today_epoch {
+                            merged_entry.today_epoch = normalized.today_epoch;
+                            merged_entry.today = normalized.today;
+                        } else if normalized.today_epoch == merged_entry.today_epoch
+                            && normalized.today > merged_entry.today
+                        {
+                            merged_entry.today = normalized.today;
+                        }
+                        if normalized.total_epoch > merged_entry.total_epoch {
+                            merged_entry.total_epoch = normalized.total_epoch;
+                            merged_entry.total = normalized.total;
+                        } else if normalized.total_epoch == merged_entry.total_epoch
+                            && normalized.total > merged_entry.total
+                        {
+                            merged_entry.total = normalized.total;
+                        }
+                        if normalized.unfollow_today_epoch > merged_entry.unfollow_today_epoch {
+                            merged_entry.unfollow_today_epoch = normalized.unfollow_today_epoch;
+                            merged_entry.unfollow_today = normalized.unfollow_today;
+                        } else if normalized.unfollow_today_epoch
+                            == merged_entry.unfollow_today_epoch
+                            && normalized.unfollow_today > merged_entry.unfollow_today
+                        {
+                            merged_entry.unfollow_today = normalized.unfollow_today;
+                        }
+                        if normalized.unfollow_total_epoch > merged_entry.unfollow_total_epoch {
+                            merged_entry.unfollow_total_epoch = normalized.unfollow_total_epoch;
+                            merged_entry.unfollow_total = normalized.unfollow_total;
+                        } else if normalized.unfollow_total_epoch
+                            == merged_entry.unfollow_total_epoch
+                            && normalized.unfollow_total > merged_entry.unfollow_total
+                        {
+                            merged_entry.unfollow_total = normalized.unfollow_total;
+                        }
+                        if *local_entry != merged_entry {
+                            *local_entry = merged_entry;
+                            changed = true;
+                        }
                     }
                 }
                 None => {
@@ -294,9 +510,9 @@ impl FollowSyncLedger {
                     }
                 }
                 None => {
-                    let mut cloned = remote_acc.clone();
-                    cloned.roll_date(today);
-                    self.accounts.insert(key.clone(), cloned);
+                    let mut fresh = AccountFollowLedger::default();
+                    fresh.merge_from(remote_acc, today);
+                    self.accounts.insert(key.clone(), fresh);
                     changed = true;
                 }
             }
@@ -318,6 +534,8 @@ pub struct FollowSyncSettings {
     pub device_id: String,
     #[serde(default)]
     pub github_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_token_encrypted: Option<String>,
     #[serde(default)]
     pub gist_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,10 +560,8 @@ pub fn sync_with_github_gist(
     local_ledger: &FollowSyncLedger,
     today: &str,
 ) -> Result<(String, FollowSyncLedger, bool), String> {
-    let token_trimmed = token.trim();
-    if token_trimmed.is_empty() {
-        return Err("GitHub Personal Access Token（gist 権限）を入力してください".to_string());
-    }
+    let token_trimmed = validate_github_token(token)?;
+    let trimmed_id = validate_gist_id(gist_id)?;
     let auth_header = format!("Bearer {token_trimmed}");
     let base_headers = [
         ("Authorization", auth_header.as_str()),
@@ -355,7 +571,6 @@ pub fn sync_with_github_gist(
     ];
 
     let mut merged = local_ledger.clone();
-    let trimmed_id = gist_id.trim();
 
     if trimmed_id.is_empty() {
         let content_str = serde_json::to_string_pretty(&merged)
@@ -383,8 +598,11 @@ pub fn sync_with_github_gist(
         let created_id = parsed
             .get("id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "作成された Gist ID を取得できませんでした".to_string())?
-            .to_string();
+            .ok_or_else(|| "作成された Gist ID を取得できませんでした".to_string())?;
+        let created_id = validate_gist_id(created_id)?.to_string();
+        if created_id.is_empty() {
+            return Err("作成された Gist ID を取得できませんでした".to_string());
+        }
         return Ok((created_id, merged, false));
     }
 
@@ -404,25 +622,61 @@ pub fn sync_with_github_gist(
         return Err(format!("GitHub Gist の取得に失敗しました (HTTP {get_status})"));
     }
 
-    let remote_val: serde_json::Value =
-        serde_json::from_str(&get_resp).map_err(|e| format!("Gist応答の解析に失敗: {e}"))?;
-    let remote_content = remote_val
-        .get("files")
-        .and_then(|f| f.get(GIST_FILENAME))
-        .and_then(|file| file.get("content"))
-        .and_then(|c| c.as_str());
+    let file_state = extract_remote_gist_file(&get_resp)?;
+    let (remote_missing, remote_content_opt) = match file_state {
+        RemoteGistFileState::Missing => (true, None),
+        RemoteGistFileState::Content(c) => (false, Some(c)),
+        RemoteGistFileState::Truncated { raw_url } => {
+            // GitHub Gist のファイルが大きすぎて API 応答が省略された場合、raw_url から全文取得を試みる。
+            // 取得できなければ既存データ保護のため絶対に PATCH 上書きせずエラーで中断する。
+            let Some(url_str) = raw_url else {
+                return Err(
+                    "リモート Gist が省略されたためデータ保護のため同期を中断しました".to_string(),
+                );
+            };
+            let parsed_raw = url::Url::parse(&url_str)
+                .map_err(|_| "リモート Gist raw_url の解析に失敗しました".to_string())?;
+            let expected_raw_segment = format!("/{trimmed_id}/raw/");
+            if parsed_raw.scheme() != "https"
+                || parsed_raw.host_str() != Some("gist.githubusercontent.com")
+                || parsed_raw.port().is_some()
+                || !parsed_raw.username().is_empty()
+                || parsed_raw.password().is_some()
+                || !parsed_raw.path().contains(&expected_raw_segment)
+            {
+                return Err("信頼できない raw_url ホストまたはパスのため同期を中断しました".to_string());
+            }
+            let raw_path = match parsed_raw.query() {
+                Some(q) => format!("{}?{q}", parsed_raw.path()),
+                None => parsed_raw.path().to_string(),
+            };
+            // gist.githubusercontent.com の raw_url は署名済み/機能 URL であり API トークン不要。
+            // CDN ドメインへ GitHub PAT を送信しない。
+            let (raw_status, raw_body) = crate::platform_win::winhttp_json_request(
+                "GET",
+                "gist.githubusercontent.com",
+                &raw_path,
+                &[],
+                None,
+            )?;
+            if !(200..300).contains(&raw_status) {
+                return Err(format!(
+                    "省略された Gist 本文の取得に失敗しました (HTTP {raw_status})"
+                ));
+            }
+            (false, Some(raw_body))
+        }
+    };
 
     let mut remote_ledger = FollowSyncLedger::default();
     let mut local_changed = false;
-    if let Some(content) = remote_content {
-        if let Ok(parsed_ledger) = serde_json::from_str::<FollowSyncLedger>(content) {
-            remote_ledger = parsed_ledger;
-            local_changed = merged.merge_from(&remote_ledger, today);
-        }
+    if let Some(content) = remote_content_opt {
+        remote_ledger = parse_remote_ledger_content(&content)?;
+        local_changed = merged.merge_from(&remote_ledger, today);
     }
 
     // 2. ローカル側にリモートより新しいデータがあれば PATCH で反映
-    if merged.has_newer_data_than(&remote_ledger, today) || remote_content.is_none() {
+    if merged.has_newer_data_than(&remote_ledger, today) || remote_missing {
         let content_str = serde_json::to_string_pretty(&merged)
             .map_err(|e| format!("JSON生成に失敗しました: {e}"))?;
         let patch_body = serde_json::json!({
@@ -450,11 +704,13 @@ pub fn sync_with_github_gist(
 
 #[cfg(not(windows))]
 pub fn sync_with_github_gist(
-    _token: &str,
-    _gist_id: &str,
+    token: &str,
+    gist_id: &str,
     _local_ledger: &FollowSyncLedger,
     _today: &str,
 ) -> Result<(String, FollowSyncLedger, bool), String> {
+    let _ = validate_github_token(token)?;
+    let _ = validate_gist_id(gist_id)?;
     Err("このOSではWinHTTPクラウド同期は未対応です".to_string())
 }
 
@@ -575,5 +831,171 @@ mod tests {
         assert_eq!(acc.effective_counts("2026-11-23"), (3, 65));
         // Next day rollover zeroes today but keeps total
         assert_eq!(acc.effective_counts("2026-11-24"), (0, 65));
+    }
+
+    #[test]
+    fn token_and_gist_id_validation_blocks_injection() {
+        assert_eq!(validate_github_token("  ghp_abc123XYZ  "), Ok("ghp_abc123XYZ"));
+        assert!(validate_github_token("").is_err());
+        assert!(validate_github_token("ghp_abc\r\nX-Injected: 1").is_err());
+        assert!(validate_github_token("ghp_abc\nfoo").is_err());
+        assert!(validate_github_token("ghp_日本語").is_err());
+        // Error message must never leak the token itself
+        let err = validate_github_token("ghp_SECRET123\r\nEvil: 1").unwrap_err();
+        assert!(!err.contains("ghp_SECRET123"));
+
+        assert_eq!(validate_gist_id(""), Ok(""));
+        assert_eq!(validate_gist_id("0123456789abcdef"), Ok("0123456789abcdef"));
+        assert_eq!(validate_gist_id("gist_abc-123"), Ok("gist_abc-123"));
+        assert!(validate_gist_id("../user").is_err());
+        assert!(validate_gist_id("abc/comments").is_err());
+        assert!(validate_gist_id("abc?foo=bar").is_err());
+        assert!(validate_gist_id("abc#frag").is_err());
+        assert!(validate_gist_id("abc def").is_err());
+    }
+
+    #[test]
+    fn remote_gist_parsing_fails_closed_on_truncation_or_corruption() {
+        let truncated_resp = r#"{"files":{"omnisns-follow-sync.json":{"truncated":true,"raw_url":"https://gist.githubusercontent.com/u/id/raw/omnisns-follow-sync.json","content":"{partial"}}}"#;
+        assert_eq!(
+            extract_remote_gist_file(truncated_resp).unwrap(),
+            RemoteGistFileState::Truncated {
+                raw_url: Some(
+                    "https://gist.githubusercontent.com/u/id/raw/omnisns-follow-sync.json"
+                        .to_string()
+                )
+            }
+        );
+
+        assert!(parse_remote_ledger_content("{corrupt json").is_err());
+        assert_eq!(
+            parse_remote_ledger_content("   ").unwrap(),
+            FollowSyncLedger::default()
+        );
+    }
+
+    #[test]
+    fn crdt_date_validation_prevents_poisoning_and_timezone_freeze() {
+        let mut local = AccountFollowLedger {
+            date: "2026-11-23".to_string(),
+            ..Default::default()
+        };
+        local.devices.insert(
+            "win-1".to_string(),
+            DeviceFollowEntry {
+                today: 4,
+                total: 10,
+                updated_at: 100,
+                ..Default::default()
+            },
+        );
+
+        // Corrupt or far-future date must NOT poison local.date
+        let corrupt = AccountFollowLedger {
+            date: "not-a-date".to_string(),
+            ..Default::default()
+        };
+        local.merge_from(&corrupt, "2026-11-23");
+        assert_eq!(local.date, "2026-11-23");
+        assert_eq!(local.effective_counts("2026-11-23"), (4, 10));
+
+        let far_future = AccountFollowLedger {
+            date: "2099-12-31".to_string(),
+            ..Default::default()
+        };
+        local.merge_from(&far_future, "2026-11-23");
+        assert_eq!(local.date, "2026-11-23");
+        assert_eq!(local.effective_counts("2026-11-23"), (4, 10));
+
+        // +1 day timezone skew from peer must NOT freeze local today at 0
+        let mut ahead_peer = AccountFollowLedger {
+            date: "2026-11-24".to_string(),
+            ..Default::default()
+        };
+        ahead_peer.devices.insert(
+            "and-2".to_string(),
+            DeviceFollowEntry {
+                today: 2,
+                total: 5,
+                updated_at: 200,
+                ..Default::default()
+            },
+        );
+        local.merge_from(&ahead_peer, "2026-11-23");
+        assert_eq!(local.date, "2026-11-24");
+        assert_eq!(local.effective_counts("2026-11-23"), (2, 15));
+    }
+
+    #[test]
+    fn crdt_same_timestamp_tiebreak_does_not_regress_other_fields() {
+        let mut local = AccountFollowLedger {
+            date: "2026-11-23".to_string(),
+            ..Default::default()
+        };
+        local.devices.insert(
+            "win-1".to_string(),
+            DeviceFollowEntry {
+                today: 5,
+                total: 20,
+                unfollow_today: 1,
+                unfollow_total: 3,
+                updated_at: 500,
+                ..Default::default()
+            },
+        );
+        let mut remote = AccountFollowLedger {
+            date: "2026-11-23".to_string(),
+            ..Default::default()
+        };
+        remote.devices.insert(
+            "win-1".to_string(),
+            DeviceFollowEntry {
+                today: 4,
+                total: 19,
+                unfollow_today: 2,
+                unfollow_total: 4,
+                updated_at: 500,
+                ..Default::default()
+            },
+        );
+        assert!(local.merge_from(&remote, "2026-11-23"));
+        let entry = local.devices.get("win-1").unwrap();
+        assert_eq!(entry.today, 5);
+        assert_eq!(entry.total, 20);
+        assert_eq!(entry.unfollow_today, 2);
+        assert_eq!(entry.unfollow_total, 4);
+    }
+
+    #[test]
+    fn crdt_new_remote_account_far_future_date_sanitized_no_patch_loop() {
+        let mut poisoned_acc = AccountFollowLedger {
+            date: "2099-12-31".to_string(),
+            ..Default::default()
+        };
+        poisoned_acc.devices.insert(
+            "bad-dev".to_string(),
+            DeviceFollowEntry {
+                today: 7,
+                total: 12,
+                updated_at: 300,
+                ..Default::default()
+            },
+        );
+        // Directly calling effective_counts on a poisoned future date must treat today as 0
+        assert_eq!(poisoned_acc.effective_counts("2026-11-23"), (0, 12));
+
+        let mut remote = FollowSyncLedger::default();
+        remote
+            .accounts
+            .insert("instagram:alice".to_string(), poisoned_acc);
+
+        let mut local = FollowSyncLedger::default();
+        assert!(local.merge_from(&remote, "2026-11-23"));
+        let acc = local.accounts.get("instagram:alice").unwrap();
+        assert_eq!(acc.date, "2026-11-23");
+        assert_eq!(acc.effective_counts("2026-11-23"), (0, 12));
+
+        // Once sanitized, merging local again with itself must NOT keep reporting changes
+        assert!(!local.has_newer_data_than(&local, "2026-11-23"));
     }
 }

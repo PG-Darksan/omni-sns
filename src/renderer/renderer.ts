@@ -15,9 +15,13 @@ import {
   detectPlatformServiceFromUrl,
   getAccountDisplayLabel,
   getServiceGroupKey,
+  isSafeFaviconUrl,
+  isValidGistId,
+  isValidGitHubToken,
   makeBadgeText,
   nextDefaultAccountLabel,
-  normalizeServiceUrl
+  normalizeServiceUrl,
+  parseSharedSyncConfig
 } from '../shared/url-utils';
 
 interface ServiceGroup {
@@ -410,10 +414,11 @@ function renderSidebar(): void {
     const avatar = document.createElement('div');
     avatar.className = 'service-avatar';
     avatar.style.background = primary.color;
-    const groupFavicon =
+    const rawFavicon =
       primaryRt?.faviconUrl ??
       group.accounts.map((a) => state.runtimeMap.get(a.instanceId)?.faviconUrl).find(Boolean) ??
       null;
+    const groupFavicon = rawFavicon && isSafeFaviconUrl(rawFavicon) ? rawFavicon : null;
     if (groupFavicon) {
       const img = document.createElement('img');
       img.src = groupFavicon;
@@ -562,7 +567,7 @@ function renderAccountBar(): void {
   const activeRt = state.runtimeMap.get(active.instanceId);
   avatarEl.innerHTML = '';
   avatarEl.style.background = active.color;
-  if (activeRt?.faviconUrl) {
+  if (activeRt?.faviconUrl && isSafeFaviconUrl(activeRt.faviconUrl)) {
     const img = document.createElement('img');
     img.src = activeRt.faviconUrl;
     img.alt = '';
@@ -786,17 +791,28 @@ function getCounterTargetInfo(): CounterTargetInfo {
     return { target: undefined, isCrossSite: true, effectiveService: detectedService };
   }
 
-  // 1. 同一 @handle（Threads ↔ Instagram 連携アカウント）
-  if (active.detectedHandle) {
-    const byHandle = candidates.find((c) => c.detectedHandle === active.detectedHandle);
+  // 1. 判明しているハンドル（クロスサイト検出ハンドルを優先、無ければ元インスタンスのハンドル）
+  const crossSiteHandle =
+    rt?.crossSiteService === detectedService && rt?.crossSiteHandle
+      ? rt.crossSiteHandle
+      : null;
+  const knownHandle = crossSiteHandle || active.detectedHandle || null;
+  let fallbackPool = candidates;
+  if (knownHandle) {
+    const byHandle = candidates.find((c) => c.detectedHandle === knownHandle);
     if (byHandle) {
       return { target: byHandle, isCrossSite: true, effectiveService: detectedService };
+    }
+    // すでに別アカウントのハンドルが紐づいている候補へ誤帰属しないよう未設定候補のみに限定
+    fallbackPool = candidates.filter((c) => !c.detectedHandle);
+    if (fallbackPool.length === 0) {
+      return { target: undefined, isCrossSite: true, effectiveService: detectedService };
     }
   }
   // 2. 対象サービスで直近アクティブだったアカウント
   const remembered = state.lastActiveByGroup.get(detectedService);
   if (remembered) {
-    const byLast = candidates.find((c) => c.instanceId === remembered);
+    const byLast = fallbackPool.find((c) => c.instanceId === remembered);
     if (byLast) {
       return { target: byLast, isCrossSite: true, effectiveService: detectedService };
     }
@@ -804,12 +820,12 @@ function getCounterTargetInfo(): CounterTargetInfo {
   // 3. 同一アカウントラベル
   const activeLbl = active.accountLabel?.trim();
   if (activeLbl) {
-    const byLbl = candidates.find((c) => c.accountLabel?.trim() === activeLbl);
+    const byLbl = fallbackPool.find((c) => c.accountLabel?.trim() === activeLbl);
     if (byLbl) {
       return { target: byLbl, isCrossSite: true, effectiveService: detectedService };
     }
   }
-  return { target: candidates[0], isCrossSite: true, effectiveService: detectedService };
+  return { target: fallbackPool[0], isCrossSite: true, effectiveService: detectedService };
 }
 
 function renderToolbarAndViewport(): void {
@@ -1285,23 +1301,15 @@ function formatSyncTime(unixSecs?: number): string {
   return `${hh}:${mm}`;
 }
 
-function parseSharedSyncConfig(raw: string): { token: string; gistId: string } | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const jsonPart = trimmed.startsWith('OMNISNS_SYNC_V1:')
-    ? trimmed.slice('OMNISNS_SYNC_V1:'.length).trim()
-    : trimmed;
-  if (!jsonPart.startsWith('{')) return null;
-  try {
-    const parsed = JSON.parse(jsonPart) as { token?: unknown; gistId?: unknown };
-    const token = typeof parsed.token === 'string' ? parsed.token.trim() : '';
-    const gistId = typeof parsed.gistId === 'string' ? parsed.gistId.trim() : '';
-    if (!token && !gistId) return null;
-    return { token, gistId };
-  } catch {
-    return null;
-  }
-}
+const followModalDraft = {
+  targetInstanceId: null as string | null,
+  lastHydratedHandle: '',
+  lastHydratedToken: '',
+  lastHydratedGist: '',
+  handleDirty: false,
+  tokenDirty: false,
+  gistDirty: false
+};
 
 function renderFollowModal(): void {
   const counterInfo = getCounterTargetInfo();
@@ -1349,13 +1357,24 @@ function renderFollowModal(): void {
     snsLiveBar.classList.add('hidden');
   }
 
-  // 同期用ハンドル入力（入力中は上書きしない）
+  // 同期用ハンドル入力（ユーザー編集中や未保存入力は背景更新で上書きしない）
   const handleInput = el<HTMLInputElement>('follow-handle-input');
-  if (document.activeElement !== handleInput) {
-    handleInput.value = active.detectedHandle ?? '';
+  const persistedHandle = active.detectedHandle ?? '';
+  const switchedTarget = followModalDraft.targetInstanceId !== active.instanceId;
+  if (
+    switchedTarget ||
+    (!followModalDraft.handleDirty &&
+      document.activeElement !== handleInput &&
+      (handleInput.value !== persistedHandle ||
+        followModalDraft.lastHydratedHandle !== persistedHandle))
+  ) {
+    handleInput.value = persistedHandle;
+    followModalDraft.targetInstanceId = active.instanceId;
+    followModalDraft.lastHydratedHandle = persistedHandle;
+    followModalDraft.handleDirty = false;
   }
 
-  // PC・スマホ同期設定
+  // PC・スマホ同期設定（背景 tab:runtime-updated で貼付済み・編集中の値を消さない）
   const fs = state.config.settings.followSync;
   if (fs) {
     const tokenInput = el<HTMLInputElement>('follow-sync-token');
@@ -1363,11 +1382,27 @@ function renderFollowModal(): void {
     const badge = el<HTMLSpanElement>('follow-sync-badge');
     const statusEl = el<HTMLDivElement>('follow-sync-status');
 
-    if (document.activeElement !== tokenInput) {
-      tokenInput.value = fs.githubToken ?? '';
+    const persistedToken = fs.githubToken ?? '';
+    const persistedGist = fs.gistId ?? '';
+    if (
+      !followModalDraft.tokenDirty &&
+      document.activeElement !== tokenInput &&
+      (switchedTarget ||
+        tokenInput.value !== persistedToken ||
+        followModalDraft.lastHydratedToken !== persistedToken)
+    ) {
+      tokenInput.value = persistedToken;
+      followModalDraft.lastHydratedToken = persistedToken;
     }
-    if (document.activeElement !== gistInput) {
-      gistInput.value = fs.gistId ?? '';
+    if (
+      !followModalDraft.gistDirty &&
+      document.activeElement !== gistInput &&
+      (switchedTarget ||
+        gistInput.value !== persistedGist ||
+        followModalDraft.lastHydratedGist !== persistedGist)
+    ) {
+      gistInput.value = persistedGist;
+      followModalDraft.lastHydratedGist = persistedGist;
     }
 
     const hasCloud = Boolean(fs.githubToken?.trim());
@@ -1425,6 +1460,10 @@ function renderFollowModal(): void {
 
 async function openFollowModal(): Promise<void> {
   if (!getCounterTargetInfo().target) return;
+  followModalDraft.targetInstanceId = null;
+  followModalDraft.handleDirty = false;
+  followModalDraft.tokenDirty = false;
+  followModalDraft.gistDirty = false;
   renderFollowModal();
   el('follow-modal').classList.remove('hidden');
   await syncOverlayToMain();
@@ -1522,7 +1561,7 @@ function renderTabBar(): void {
     const icon = document.createElement('span');
     icon.className = 'browser-tab-icon';
     icon.style.background = active.color;
-    if (tab.faviconUrl) {
+    if (tab.faviconUrl && isSafeFaviconUrl(tab.faviconUrl)) {
       const img = document.createElement('img');
       img.src = tab.faviconUrl;
       img.alt = '';
@@ -1935,6 +1974,10 @@ function bindEvents(): void {
     const raw = el<HTMLInputElement>('follow-handle-input').value.trim();
     try {
       const updated = await omniApi.setFollowHandle(target.instanceId, raw);
+      const resolvedHandle = updated.detectedHandle ?? '';
+      el<HTMLInputElement>('follow-handle-input').value = resolvedHandle;
+      followModalDraft.handleDirty = false;
+      followModalDraft.lastHydratedHandle = resolvedHandle;
       showToast(
         updated.detectedHandle
           ? `同期アカウントを @${updated.detectedHandle} に設定しました`
@@ -1945,6 +1988,9 @@ function bindEvents(): void {
     }
   };
   el<HTMLButtonElement>('btn-follow-save-handle').addEventListener('click', () => void saveFollowHandle());
+  el<HTMLInputElement>('follow-handle-input').addEventListener('input', () => {
+    followModalDraft.handleDirty = true;
+  });
   el<HTMLInputElement>('follow-handle-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -1960,23 +2006,44 @@ function bindEvents(): void {
 
   el<HTMLInputElement>('follow-sync-token').addEventListener('input', (e) => {
     const inp = e.target as HTMLInputElement;
+    followModalDraft.tokenDirty = true;
     const parsed = parseSharedSyncConfig(inp.value);
     if (parsed) {
       inp.value = parsed.token;
       el<HTMLInputElement>('follow-sync-gist').value = parsed.gistId;
+      followModalDraft.gistDirty = true;
       showToast('コピーした同期設定を自動入力しました');
     }
+  });
+  el<HTMLInputElement>('follow-sync-gist').addEventListener('input', () => {
+    followModalDraft.gistDirty = true;
   });
 
   el<HTMLButtonElement>('btn-follow-sync-now').addEventListener('click', async () => {
     const btn = el<HTMLButtonElement>('btn-follow-sync-now');
     const githubToken = el<HTMLInputElement>('follow-sync-token').value.trim();
     const gistId = el<HTMLInputElement>('follow-sync-gist').value.trim();
+    if (githubToken && !isValidGitHubToken(githubToken)) {
+      showToast('GitHub Token の形式が不正です（空白や改行を含めないでください）');
+      return;
+    }
+    if (!isValidGistId(gistId)) {
+      showToast('Gist ID の形式が不正です（半角英数字・ハイフン・アンダースコアのみ有効）');
+      return;
+    }
     btn.disabled = true;
     btn.textContent = '同期中...';
     try {
       await omniApi.updateFollowSyncSettings({ githubToken, gistId });
       const res = await omniApi.syncFollowNow();
+      const resolvedToken = res.githubToken ?? githubToken;
+      const resolvedGist = res.gistId ?? gistId;
+      el<HTMLInputElement>('follow-sync-token').value = resolvedToken;
+      el<HTMLInputElement>('follow-sync-gist').value = resolvedGist;
+      followModalDraft.tokenDirty = false;
+      followModalDraft.gistDirty = false;
+      followModalDraft.lastHydratedToken = resolvedToken;
+      followModalDraft.lastHydratedGist = resolvedGist;
       showToast(res.lastSyncStatus || '同期が完了しました');
     } catch (err) {
       showToast(String(err));
@@ -1991,6 +2058,10 @@ function bindEvents(): void {
     const gistId = el<HTMLInputElement>('follow-sync-gist').value.trim();
     if (!token) {
       showToast('先に GitHub Token を入力・同期してからコピーしてください');
+      return;
+    }
+    if (!isValidGitHubToken(token) || !isValidGistId(gistId)) {
+      showToast('GitHub Token または Gist ID の形式が不正です');
       return;
     }
     const payload = `OMNISNS_SYNC_V1:${JSON.stringify({ token, gistId })}`;
@@ -2008,11 +2079,21 @@ function bindEvents(): void {
       }
       el<HTMLInputElement>('follow-sync-token').value = parsed.token;
       el<HTMLInputElement>('follow-sync-gist').value = parsed.gistId;
+      followModalDraft.tokenDirty = true;
+      followModalDraft.gistDirty = true;
       await omniApi.updateFollowSyncSettings({
         githubToken: parsed.token,
         gistId: parsed.gistId
       });
       const res = await omniApi.syncFollowNow();
+      const resolvedToken = res.githubToken ?? parsed.token;
+      const resolvedGist = res.gistId ?? parsed.gistId;
+      el<HTMLInputElement>('follow-sync-token').value = resolvedToken;
+      el<HTMLInputElement>('follow-sync-gist').value = resolvedGist;
+      followModalDraft.tokenDirty = false;
+      followModalDraft.gistDirty = false;
+      followModalDraft.lastHydratedToken = resolvedToken;
+      followModalDraft.lastHydratedGist = resolvedGist;
       showToast(res.lastSyncStatus || '同期設定を適用しました');
     } catch (err) {
       showToast(`貼付に失敗しました: ${String(err)}`);
