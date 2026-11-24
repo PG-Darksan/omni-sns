@@ -662,6 +662,11 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
     }
     try {
+      if (typeof window.__omniOnFollowAction === 'function') {
+        window.__omniOnFollowAction(action, targetKey || '');
+      }
+    } catch (_) {}
+    try {
       if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
         window.chrome.webview.postMessage(JSON.stringify({
           type: action === 'unfollow' ? 'omnisns:unfollow' : 'omnisns:follow',
@@ -1061,8 +1066,11 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
   }, true);
 })();"#;
 
-/// Instagram / Threads / Bluesky 等で表示されたアカウント（フォロワー一覧・フィード等）に、
-/// ページ遷移なしでフォロー数・フォロワー数・投稿数・非公開状態をインライン可視化するスクリプト。
+/// 全SNS（Instagram / Threads / Bluesky / TikTok / Mastodon / Misskey / mixi2 / Facebook / pixiv 等およびカスタムSNS）で
+/// 表示されたアカウントに対し、ページ遷移なしで以下をインライン可視化するスクリプト:
+/// - 相互フォロー判定（⇄ 相互 / → 片思い / ← フォロワー）
+/// - フォロー数・フォロワー数・投稿数・非公開状態
+/// - フォロー中の方がフォロワーより多いユーザー（following > followers）の強調色分け
 /// またログイン中アカウント自身のハンドルと実フォロー数・フォロワー数もホストへ通知する。
 pub const PROFILE_STATS_JS: &str = r#"(function() {
   if (window !== window.top) return;
@@ -1070,50 +1078,125 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   window.__omniProfileStatsInstalled = true;
 
   var host = (window.location && window.location.hostname || '').toLowerCase();
-  var platform = '';
-  if (host === 'instagram.com' || host.endsWith('.instagram.com')) {
-    platform = 'instagram';
-  } else if (host === 'threads.com' || host.endsWith('.threads.com') || host === 'threads.net' || host.endsWith('.threads.net')) {
-    platform = 'threads';
-  } else if (host === 'bsky.app' || host.endsWith('.bsky.app')) {
-    platform = 'bluesky';
-  } else {
+  if (!host || host === 'localhost' || host === '127.0.0.1') return;
+
+  // 認証・メール・決済系ホストでは動作させない
+  if (/^(?:mail|accounts|login|auth|oauth|sso|id|signin|signup|checkout|pay)\./i.test(host) ||
+      /(?:^|\.)(?:google\.com|googleapis\.com|gstatic\.com|appleid\.apple\.com|microsoftonline\.com|live\.com|recaptcha\.net|hcaptcha\.com|stripe\.com|paypal\.com|cloudflare\.com)$/i.test(host)) {
     return;
   }
+
+  function detectPlatform(h) {
+    if (h === 'instagram.com' || h.endsWith('.instagram.com')) return 'instagram';
+    if (h === 'threads.com' || h.endsWith('.threads.com') || h === 'threads.net' || h.endsWith('.threads.net')) return 'threads';
+    if (h === 'bsky.app' || h.endsWith('.bsky.app')) return 'bluesky';
+    if (h === 'tiktok.com' || h.endsWith('.tiktok.com')) return 'tiktok';
+    if (h === 'facebook.com' || h.endsWith('.facebook.com') || h === 'messenger.com' || h.endsWith('.messenger.com')) return 'facebook';
+    if (h === 'mixi.social' || h.endsWith('.mixi.social')) return 'mixi2';
+    if (h === 'mixi.jp' || h.endsWith('.mixi.jp')) return 'mixi';
+    if (h === 'reddit.com' || h.endsWith('.reddit.com')) return 'reddit';
+    if (/(?:^|\.)pinterest\.[a-z.]+$/i.test(h)) return 'pinterest';
+    if (h === 'tumblr.com' || h.endsWith('.tumblr.com')) return 'tumblr';
+    if (h === 'weibo.com' || h.endsWith('.weibo.com') || h === 'weibo.cn' || h.endsWith('.weibo.cn')) return 'weibo';
+    if (h === 'vk.com' || h.endsWith('.vk.com')) return 'vk';
+    if (h === 'pixiv.net' || h.endsWith('.pixiv.net')) return 'pixiv';
+    if (h === 'twitch.tv' || h.endsWith('.twitch.tv')) return 'twitch';
+    if (h === 'linkedin.com' || h.endsWith('.linkedin.com')) return 'linkedin';
+    if (h === 'behance.net' || h.endsWith('.behance.net')) return 'behance';
+    if (h === 'dribbble.com' || h.endsWith('.dribbble.com')) return 'dribbble';
+    if (h === 'deviantart.com' || h.endsWith('.deviantart.com')) return 'deviantart';
+    if (h === 'ameblo.jp' || h.endsWith('.ameblo.jp') || h === 'ameba.jp' || h.endsWith('.ameba.jp')) return 'ameba';
+    if (h === 'x.com' || h.endsWith('.x.com') || h === 'twitter.com' || h.endsWith('.twitter.com')) return 'x';
+    if (/mastodon|mstdn|pawoo\.net|fedibird\.com|baraag\.net/i.test(h)) return 'mastodon';
+    if (/misskey/i.test(h)) return 'misskey';
+    return 'generic';
+  }
+
+  var platform = detectPlatform(host);
+  var isChatOnlyPlatform = /(?:^|\.)(?:discord\.com|telegram\.org|whatsapp\.com|slack\.com|teams\.microsoft\.com|chatwork\.com|element\.io|steamcommunity\.com|tinder\.com|bumble\.com|okcupid\.com|badoo\.com|pof\.com)$/i.test(host);
 
   var RESERVED_SEGMENTS = {
     explore: 1, direct: 1, reels: 1, reel: 1, p: 1, tv: 1, stories: 1, accounts: 1,
     about: 1, legal: 1, developer: 1, developers: 1, settings: 1, search: 1, activity: 1,
-    notifications: 1, messages: 1, home: 1, login: 1, signup: 1, hashtag: 1, tags: 1,
-    profile: 1, lists: 1, feeds: 1, moderation: 1, post: 1, intent: 1, challenge: 1,
+    notifications: 1, messages: 1, messaging: 1, home: 1, login: 1, signup: 1, hashtag: 1, tags: 1,
+    profile: 1, profiles: 1, lists: 1, feeds: 1, moderation: 1, post: 1, posts: 1, intent: 1, challenge: 1,
     privacy: 1, terms: 1, help: 1, support: 1, download: 1, apps: 1, api: 1, graphql: 1,
     web: 1, static: 1, assets: 1, following: 1, followers: 1, saved: 1, tagged: 1,
-    channel: 1, audio: 1, locations: 1, directory: 1, nametag: 1, session: 1, oauth: 1
+    channel: 1, audio: 1, locations: 1, directory: 1, nametag: 1, session: 1, oauth: 1,
+    watch: 1, video: 1, videos: 1, live: 1, groups: 1, marketplace: 1, events: 1, pages: 1,
+    friends: 1, bookmarks: 1, discover: 1, trending: 1, topics: 1, news: 1, jobs: 1,
+    feed: 1, inbox: 1, chat: 1, channels: 1, community: 1, communities: 1, notes: 1,
+    my: 1, me: 1, dashboard: 1, create: 1, edit: 1, upload: 1, share: 1, status: 1,
+    artworks: 1, novels: 1, manga: 1, illustrations: 1, ranking: 1, contest: 1,
+    shots: 1, galleries: 1, projects: 1, work: 1, hire: 1, pro: 1, premium: 1,
+    r: 1, comments: 1, submit: 1, wiki: 1, prefs: 1, im: 1, photo: 1, photos: 1, music: 1
   };
 
-  var CACHE_KEY = 'omnisns_ff_cache_v2_' + platform;
+  var CACHE_KEY = 'omnisns_ff_cache_v3_' + platform + '_' + host.replace(/[^a-z0-9.-]/g, '');
+  var REL_SET_KEY = 'omnisns_rel_sets_v1_' + platform + '_' + host.replace(/[^a-z0-9.-]/g, '');
   var CACHE_TTL_MS = 6 * 60 * 60 * 1000;
-  var MAX_CACHE_ENTRIES = 600;
+  var MAX_CACHE_ENTRIES = 800;
   var statsMap = Object.create(null);
   var userIdMap = Object.create(null);
+  var idToHandleMap = Object.create(null);
   var privateMap = Object.create(null);
   var failedMap = Object.create(null);
   var inFlight = Object.create(null);
+  var relQueriedMap = Object.create(null);
+  var selfFollowersSet = Object.create(null);
+  var selfFollowingSet = Object.create(null);
   var queue = [];
   var queuedSet = Object.create(null);
-  var queueRunning = false;
+  var activeWorkers = 0;
+  var igConcurrency = 2;
   var queueStartTimer = null;
+  var relBatchTimer = null;
+  var relBatchRunning = false;
   var backoffUntil = 0;
   var consecutiveFailures = 0;
   var preferredIgRoute = '';
+  var routeFailCount = Object.create(null);
+  var deadRouteUntil = Object.create(null);
   var selfHandle = '';
+  var selfDid = '';
   var selfIdFetchStarted = false;
+  var selfDidFetchStarted = false;
   var lastPostedIdentityKey = '';
   var persistTimer = null;
+  var relSetPersistTimer = null;
   var renderTimer = null;
+  var appliedThemeMode = '';
+  var pageBooted = false;
+  var lastScrollScanAt = 0;
 
   var capturedHeaders = Object.create(null);
   var capturedProfileGql = null;
+  var capturedMisskeyToken = '';
+
+  function runWhenIdle(fn, timeoutMs) {
+    if (typeof window.requestIdleCallback === 'function') {
+      window.requestIdleCallback(fn, { timeout: timeoutMs || 600 });
+    } else {
+      setTimeout(fn, 16);
+    }
+  }
+
+  function injectInstagramPreconnects() {
+    if (platform !== 'instagram') return;
+    try {
+      var head = document.head || document.documentElement;
+      if (!head || document.getElementById('omni-ig-preconnect')) return;
+      var hosts = ['https://static.cdninstagram.com', 'https://scontent.cdninstagram.com', 'https://i.instagram.com'];
+      for (var i = 0; i < hosts.length; i++) {
+        var link = document.createElement('link');
+        if (i === 0) link.id = 'omni-ig-preconnect';
+        link.rel = 'preconnect';
+        link.href = hosts[i];
+        link.crossOrigin = 'anonymous';
+        head.appendChild(link);
+      }
+    } catch (_) {}
+  }
 
   function getCookieValue(name) {
     try {
@@ -1142,22 +1225,39 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   function loadCache() {
     try {
       var st = getStorage();
-      var raw = st && st.getItem(CACHE_KEY);
-      if (!raw) return;
-      var parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') return;
-      var now = Date.now();
-      for (var k in parsed) {
-        var e = parsed[k];
-        if (e && typeof e === 'object' && now - (e.ts || 0) < CACHE_TTL_MS) {
-          statsMap[k] = {
-            followers: typeof e.followers === 'number' ? e.followers : null,
-            following: typeof e.following === 'number' ? e.following : null,
-            posts: typeof e.posts === 'number' ? e.posts : null,
-            isPrivate: typeof e.isPrivate === 'boolean' ? e.isPrivate : null,
-            ts: e.ts || now
-          };
-          if (typeof e.isPrivate === 'boolean') privateMap[k] = e.isPrivate;
+      if (!st) return;
+      var raw = st.getItem(CACHE_KEY);
+      if (raw) {
+        var parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          var now = Date.now();
+          for (var k in parsed) {
+            var e = parsed[k];
+            if (e && typeof e === 'object' && now - (e.ts || 0) < CACHE_TTL_MS) {
+              statsMap[k] = {
+                followers: typeof e.followers === 'number' ? e.followers : null,
+                following: typeof e.following === 'number' ? e.following : null,
+                posts: typeof e.posts === 'number' ? e.posts : null,
+                isPrivate: typeof e.isPrivate === 'boolean' ? e.isPrivate : null,
+                iFollow: typeof e.iFollow === 'boolean' ? e.iFollow : null,
+                followsMe: typeof e.followsMe === 'boolean' ? e.followsMe : null,
+                ts: e.ts || now
+              };
+              if (typeof e.isPrivate === 'boolean') privateMap[k] = e.isPrivate;
+            }
+          }
+        }
+      }
+      var rawSets = st.getItem(REL_SET_KEY);
+      if (rawSets) {
+        var ps = JSON.parse(rawSets);
+        if (ps && typeof ps === 'object') {
+          if (Array.isArray(ps.followers)) {
+            for (var fi = 0; fi < ps.followers.length; fi++) selfFollowersSet[ps.followers[fi]] = true;
+          }
+          if (Array.isArray(ps.following)) {
+            for (var gi = 0; gi < ps.following.length; gi++) selfFollowingSet[ps.following[gi]] = true;
+          }
         }
       }
     } catch (_) {}
@@ -1182,21 +1282,96 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     }, 1500);
   }
 
+  function schedulePersistRelSets() {
+    if (relSetPersistTimer) return;
+    relSetPersistTimer = setTimeout(function() {
+      relSetPersistTimer = null;
+      try {
+        var st = getStorage();
+        if (!st) return;
+        var followers = Object.keys(selfFollowersSet).slice(-1500);
+        var following = Object.keys(selfFollowingSet).slice(-1500);
+        st.setItem(REL_SET_KEY, JSON.stringify({ followers: followers, following: following }));
+      } catch (_) {}
+    }, 2000);
+  }
+
+  function rememberSelfFollower(handle) {
+    if (!handle || handle === selfHandle) return;
+    if (!selfFollowersSet[handle]) {
+      selfFollowersSet[handle] = true;
+      schedulePersistRelSets();
+    }
+  }
+
+  function rememberSelfFollowing(handle, isFollowing) {
+    if (!handle || handle === selfHandle) return;
+    if (isFollowing) {
+      if (!selfFollowingSet[handle]) {
+        selfFollowingSet[handle] = true;
+        schedulePersistRelSets();
+      }
+    } else if (selfFollowingSet[handle]) {
+      delete selfFollowingSet[handle];
+      schedulePersistRelSets();
+    }
+  }
+
+  function detectDynamicPlatformFromDom() {
+    if (platform !== 'generic') return;
+    try {
+      var gen = document.querySelector('meta[name="generator"]');
+      var genContent = gen ? (gen.getAttribute('content') || '').toLowerCase() : '';
+      var appName = document.querySelector('meta[name="application-name"]');
+      var appContent = appName ? (appName.getAttribute('content') || '').toLowerCase() : '';
+      if (genContent.indexOf('mastodon') >= 0 || document.getElementById('mastodon') ||
+          document.querySelector('script#initial-state[type="application/json"]')) {
+        platform = 'mastodon';
+        return;
+      }
+      if (appContent.indexOf('misskey') >= 0 || genContent.indexOf('misskey') >= 0 ||
+          document.getElementById('misskey_app') || document.querySelector('meta[name="misskey"]')) {
+        platform = 'misskey';
+      }
+    } catch (_) {}
+  }
+
   function isValidHandle(h) {
     if (!h || typeof h !== 'string') return false;
     var clean = h.replace(/^@+/, '').trim().toLowerCase();
-    if (!clean || clean.length > 64) return false;
+    if (!clean || clean.length > 80) return false;
     if (RESERVED_SEGMENTS[clean]) return false;
     if (platform === 'bluesky') {
       return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(clean) || /^did:[a-z0-9:._-]+$/.test(clean);
     }
-    return /^[a-z0-9._]{1,35}$/.test(clean);
+    if (platform === 'mastodon' || platform === 'misskey') {
+      return /^[a-z0-9._-]{1,40}(?:@[a-z0-9.-]+\.[a-z]{2,})?$/.test(clean);
+    }
+    if (platform === 'pixiv' || platform === 'weibo' || platform === 'mixi') {
+      return /^[a-z0-9._-]{1,48}$/.test(clean);
+    }
+    if (platform === 'instagram' || platform === 'threads' || platform === 'tiktok') {
+      return /^[a-z0-9._]{1,35}$/.test(clean);
+    }
+    return /^[a-z0-9._-]{1,48}$/.test(clean);
   }
 
   function normalizeHandle(h) {
     if (!h || typeof h !== 'string') return '';
     var clean = h.replace(/^@+/, '').trim().toLowerCase();
     return isValidHandle(clean) ? clean : '';
+  }
+
+  function bindUserId(handle, rawId) {
+    if (!handle || rawId === undefined || rawId === null) return;
+    var idStr = String(rawId).trim();
+    if (!idStr) return;
+    if (/^\d{3,24}$/.test(idStr) || /^did:[a-z0-9:._-]+$/i.test(idStr) ||
+        ((platform === 'mastodon' || platform === 'misskey') && /^[a-z0-9_-]{4,36}$/i.test(idStr))) {
+      userIdMap[handle] = idStr;
+      idToHandleMap[idStr] = handle;
+      idToHandleMap[idStr.toLowerCase()] = handle;
+    }
   }
 
   function formatCompactCount(n) {
@@ -1245,6 +1420,30 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     } catch (_) {}
   }
 
+  function fetchBlueskySelfDid(handle) {
+    if (platform !== 'bluesky' || selfDid || selfDidFetchStarted || !handle) return;
+    if (/^did:/i.test(handle)) {
+      selfDid = handle;
+      return;
+    }
+    selfDidFetchStarted = true;
+    internalFetch('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' + encodeURIComponent(handle), {
+      method: 'GET'
+    }).then(function(res) {
+      if (!res || !res.ok) return;
+      return res.json().then(function(p) {
+        if (p && typeof p.did === 'string' && p.did) {
+          selfDid = p.did;
+          bindUserId(handle, p.did);
+        }
+        if (p && p.handle) {
+          recordStats(p.handle, p.followersCount, p.followsCount, p.postsCount, null, null, null);
+        }
+        scheduleRelBatch();
+      }).catch(function() {});
+    }).catch(function() {});
+  }
+
   function setSelfHandle(raw) {
     var h = normalizeHandle(raw);
     if (!h) return;
@@ -1252,8 +1451,15 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     selfHandle = h;
     var cached = statsMap[h];
     postIdentityToHost(h, cached ? cached.following : null, cached ? cached.followers : null);
+    if (platform === 'bluesky' && !selfDid) {
+      if (userIdMap[h] && /^did:/i.test(userIdMap[h])) {
+        selfDid = userIdMap[h];
+      } else {
+        fetchBlueskySelfDid(h);
+      }
+    }
     if (changed && (!cached || (cached.following === null && cached.followers === null))) {
-      enqueueFetch(h, true);
+      enqueueFetch(h, true, false);
     }
   }
 
@@ -1261,32 +1467,57 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     return !!(entry && (typeof entry.followers === 'number' || typeof entry.following === 'number'));
   }
 
-  function recordStats(rawHandle, followers, following, posts, isPrivate) {
+  function computeRelation(entry, handle) {
+    if (!handle || handle === selfHandle) return '';
+    var iFollow = entry && typeof entry.iFollow === 'boolean' ? entry.iFollow : (selfFollowingSet[handle] ? true : null);
+    var followsMe = entry && typeof entry.followsMe === 'boolean' ? entry.followsMe : (selfFollowersSet[handle] ? true : null);
+    if (iFollow === true && followsMe === true) return 'mutual';
+    if (iFollow === true && followsMe === false) return 'oneway';
+    if (iFollow === false && followsMe === true) return 'follower';
+    if (iFollow === null && followsMe === true) return 'follower';
+    return '';
+  }
+
+  function hasAnyDisplayData(entry, handle) {
+    return hasUsableStats(entry) || !!computeRelation(entry, handle);
+  }
+
+  function recordStats(rawHandle, followers, following, posts, isPrivate, iFollow, followsMe) {
     var h = normalizeHandle(rawHandle);
     if (!h) return false;
     var f1 = typeof followers === 'number' && isFinite(followers) && followers >= 0 ? Math.round(followers) : null;
     var f2 = typeof following === 'number' && isFinite(following) && following >= 0 ? Math.round(following) : null;
     var p = typeof posts === 'number' && isFinite(posts) && posts >= 0 ? Math.round(posts) : null;
     var priv = typeof isPrivate === 'boolean' ? isPrivate : (typeof privateMap[h] === 'boolean' ? privateMap[h] : null);
+    var relOut = typeof iFollow === 'boolean' ? iFollow : null;
+    var relIn = typeof followsMe === 'boolean' ? followsMe : null;
     if (typeof isPrivate === 'boolean') privateMap[h] = isPrivate;
-    if (f1 === null && f2 === null) return false;
+    if (relIn === true) rememberSelfFollower(h);
+    if (relOut !== null) rememberSelfFollowing(h, relOut);
+    if (f1 === null && f2 === null && relOut === null && relIn === null) return false;
 
-    delete failedMap[h];
+    if (f1 !== null || f2 !== null) delete failedMap[h];
     var prev = statsMap[h];
     var nextFollowers = f1 !== null ? f1 : (prev ? prev.followers : null);
     var nextFollowing = f2 !== null ? f2 : (prev ? prev.following : null);
     var nextPosts = p !== null ? p : (prev ? prev.posts : null);
     var nextPriv = priv !== null ? priv : (prev ? prev.isPrivate : null);
+    var nextIFollow = relOut !== null ? relOut : (prev ? prev.iFollow : null);
+    var nextFollowsMe = relIn !== null ? relIn : (prev ? prev.followsMe : null);
     var changed = !prev ||
       prev.followers !== nextFollowers ||
       prev.following !== nextFollowing ||
       prev.posts !== nextPosts ||
-      prev.isPrivate !== nextPriv;
+      prev.isPrivate !== nextPriv ||
+      prev.iFollow !== nextIFollow ||
+      prev.followsMe !== nextFollowsMe;
     statsMap[h] = {
       followers: nextFollowers,
       following: nextFollowing,
       posts: nextPosts,
       isPrivate: nextPriv,
+      iFollow: nextIFollow,
+      followsMe: nextFollowsMe,
       ts: Date.now()
     };
     if (changed) {
@@ -1299,12 +1530,121 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     return true;
   }
 
+  function recordRelation(rawHandle, iFollow, followsMe) {
+    return recordStats(rawHandle, null, null, null, null, iFollow, followsMe);
+  }
+
+  // フォロー／アンフォロー操作を即座にバッジへ反映するフック
+  window.__omniOnFollowAction = function(action, targetKey) {
+    try {
+      var isFollow = action === 'follow';
+      var key = String(targetKey || '').trim().toLowerCase();
+      var h = '';
+      if (key) {
+        if (idToHandleMap[key]) h = idToHandleMap[key];
+        else h = normalizeHandle(key);
+      }
+      if (!h) h = getCurrentProfileHandleFromUrl();
+      if (h && h !== selfHandle) {
+        recordRelation(h, isFollow, null);
+      }
+    } catch (_) {}
+  };
+
+  function extractRelationFromObject(obj) {
+    var iFollow = null;
+    var followsMe = null;
+    if (!obj || typeof obj !== 'object') return { iFollow: null, followsMe: null };
+
+    // Instagram / Threads friendship_status
+    var fs = obj.friendship_status || obj.friendshipStatus || obj.relationship;
+    if (fs && typeof fs === 'object') {
+      if (typeof fs.following === 'boolean') iFollow = fs.following;
+      else if (typeof fs.is_following === 'boolean') iFollow = fs.is_following;
+      else if (typeof fs.isFollowing === 'boolean') iFollow = fs.isFollowing;
+
+      if (typeof fs.followed_by === 'boolean') followsMe = fs.followed_by;
+      else if (typeof fs.followedBy === 'boolean') followsMe = fs.followedBy;
+      else if (typeof fs.is_followed_by === 'boolean') followsMe = fs.is_followed_by;
+      else if (typeof fs.isFollowedBy === 'boolean') followsMe = fs.isFollowedBy;
+      else if (typeof fs.is_followed === 'boolean') followsMe = fs.is_followed;
+      else if (typeof fs.isFollowed === 'boolean') followsMe = fs.isFollowed;
+    }
+
+    // Bluesky viewer object
+    if (obj.viewer && typeof obj.viewer === 'object') {
+      if ('following' in obj.viewer) iFollow = !!obj.viewer.following;
+      if ('followedBy' in obj.viewer) followsMe = !!obj.viewer.followedBy;
+      if (typeof obj.viewer.isFollowing === 'boolean') iFollow = obj.viewer.isFollowing;
+      if (typeof obj.viewer.isFollowedBy === 'boolean') followsMe = obj.viewer.isFollowedBy;
+    }
+
+    // Direct flags across Instagram / Threads / Misskey / Mastodon / mixi2 / Weibo / pixiv / X / Generic
+    if (iFollow === null) {
+      if (typeof obj.followed_by_viewer === 'boolean') iFollow = obj.followed_by_viewer;
+      else if (typeof obj.followedByViewer === 'boolean') iFollow = obj.followedByViewer;
+      else if (typeof obj.is_following === 'boolean') iFollow = obj.is_following;
+      else if (typeof obj.isFollowing === 'boolean') iFollow = obj.isFollowing;
+      else if (typeof obj.following === 'boolean') iFollow = obj.following;
+      else if (typeof obj.viewer_is_following === 'boolean') iFollow = obj.viewer_is_following;
+      else if (typeof obj.text_post_app_is_following === 'boolean') iFollow = obj.text_post_app_is_following;
+      else if (typeof obj.is_followed_by_viewer === 'boolean') iFollow = obj.is_followed_by_viewer;
+    }
+    if (followsMe === null) {
+      if (typeof obj.follows_viewer === 'boolean') followsMe = obj.follows_viewer;
+      else if (typeof obj.followsViewer === 'boolean') followsMe = obj.followsViewer;
+      else if (typeof obj.followed_by === 'boolean') followsMe = obj.followed_by;
+      else if (typeof obj.followedBy === 'boolean') followsMe = obj.followedBy;
+      else if (typeof obj.is_followed === 'boolean') followsMe = obj.is_followed;
+      else if (typeof obj.isFollowed === 'boolean') followsMe = obj.isFollowed;
+      else if (typeof obj.is_followed_by === 'boolean') followsMe = obj.is_followed_by;
+      else if (typeof obj.isFollowedBy === 'boolean') followsMe = obj.isFollowedBy;
+      else if (typeof obj.follow_me === 'boolean') followsMe = obj.follow_me;
+      else if (typeof obj.follows_me === 'boolean') followsMe = obj.follows_me;
+      else if (typeof obj.followsMe === 'boolean') followsMe = obj.followsMe;
+      else if (typeof obj.is_following_viewer === 'boolean') followsMe = obj.is_following_viewer;
+    }
+
+    // TikTok numeric relation / followStatus / followerStatus
+    if (typeof obj.relation === 'number') {
+      if (obj.relation === 2) { iFollow = true; followsMe = true; }
+      else if (obj.relation === 1) { iFollow = true; followsMe = false; }
+      else if (obj.relation === 3) { iFollow = false; followsMe = true; }
+      else if (obj.relation === 0) { iFollow = false; followsMe = false; }
+    }
+    if (typeof obj.followStatus === 'number') {
+      if (obj.followStatus === 2) { iFollow = true; followsMe = true; }
+      else if (obj.followStatus === 1) { iFollow = true; }
+      else if (obj.followStatus === 0 && iFollow === null) { iFollow = false; }
+    }
+    if (typeof obj.followerStatus === 'number') {
+      if (obj.followerStatus === 1) followsMe = true;
+      else if (obj.followerStatus === 0 && followsMe === null) followsMe = false;
+    }
+
+    // Explicit mutual / friend indicators (Facebook / VK / Generic)
+    if (obj.is_mutual === true || obj.isMutual === true || obj.mutual_follow === true ||
+        obj.is_viewer_friend === true || obj.are_friends === true ||
+        obj.friendship_status === 'ARE_FRIENDS' || obj.friend_status === 3) {
+      iFollow = true;
+      followsMe = true;
+    } else if (obj.friend_status === 1 && iFollow === null) {
+      iFollow = true;
+      followsMe = false;
+    } else if (obj.friend_status === 2 && followsMe === null) {
+      iFollow = false;
+      followsMe = true;
+    }
+
+    return { iFollow: iFollow, followsMe: followsMe };
+  }
+
   function extractFromJsonObject(root) {
     if (!root || typeof root !== 'object') return false;
     var foundStats = false;
     var stack = [{ node: root, depth: 0 }];
     var visited = 0;
-    while (stack.length > 0 && visited < 2200) {
+    while (stack.length > 0 && visited < 1600) {
       var cur = stack.pop();
       var obj = cur.node;
       var depth = cur.depth;
@@ -1319,44 +1659,101 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         continue;
       }
 
+      // Instagram friendships/show_many map: { friendship_statuses: { "<pk>": { following, followed_by } } }
+      if (obj.friendship_statuses && typeof obj.friendship_statuses === 'object' && !Array.isArray(obj.friendship_statuses)) {
+        var fMap = obj.friendship_statuses;
+        var fKeys = Object.keys(fMap);
+        for (var fi = 0; fi < fKeys.length && fi < 200; fi++) {
+          var pk = fKeys[fi];
+          var stObj = fMap[pk];
+          var mappedHandle = idToHandleMap[pk];
+          if (mappedHandle && stObj && typeof stObj === 'object') {
+            var rMany = extractRelationFromObject(stObj);
+            if (rMany.iFollow !== null || rMany.followsMe !== null) {
+              if (recordRelation(mappedHandle, rMany.iFollow, rMany.followsMe)) foundStats = true;
+            }
+          }
+        }
+      }
+
+      // Bluesky app.bsky.graph.getRelationships response item: { did, following, followedBy }
+      if (typeof obj.did === 'string' && obj.did.indexOf('did:') === 0 &&
+          ('following' in obj || 'followedBy' in obj) && !obj.handle) {
+        var bskyHandle = idToHandleMap[obj.did] || idToHandleMap[obj.did.toLowerCase()];
+        if (bskyHandle) {
+          var bOut = typeof obj.following === 'string' ? true : (obj.following === undefined ? false : !!obj.following);
+          var bIn = typeof obj.followedBy === 'string' ? true : (obj.followedBy === undefined ? false : !!obj.followedBy);
+          if (recordRelation(bskyHandle, bOut, bIn)) foundStats = true;
+        }
+      }
+
+      // Mastodon /api/v1/accounts/relationships item: { id, following: bool, followed_by: bool }
+      if (typeof obj.id === 'string' && typeof obj.following === 'boolean' && typeof obj.followed_by === 'boolean' && !obj.username) {
+        var mHandle = idToHandleMap[obj.id] || idToHandleMap[obj.id.toLowerCase()];
+        if (mHandle) {
+          if (recordRelation(mHandle, obj.following, obj.followed_by)) foundStats = true;
+        }
+      }
+
       var candidateHandle =
         (typeof obj.username === 'string' && obj.username) ||
         (typeof obj.handle === 'string' && obj.handle) ||
+        (typeof obj.uniqueId === 'string' && obj.uniqueId) ||
+        (typeof obj.acct === 'string' && obj.acct) ||
+        (typeof obj.screen_name === 'string' && obj.screen_name) ||
+        (typeof obj.screenName === 'string' && obj.screenName) ||
+        (typeof obj.userName === 'string' && obj.userName) ||
+        (platform === 'pixiv' && typeof obj.userId === 'string' && obj.userId) ||
         '';
       if (candidateHandle) {
         var normH = normalizeHandle(candidateHandle);
         if (normH) {
-          var rawId = obj.pk || obj.pk_id || obj.id || obj.fbid_v2;
-          if (rawId !== undefined && rawId !== null) {
-            var idStr = String(rawId).trim();
-            if (/^\d{5,24}$/.test(idStr)) {
-              userIdMap[normH] = idStr;
-            }
+          var rawId = obj.pk || obj.pk_id || obj.did || obj.id || obj.fbid_v2 || obj.userId;
+          bindUserId(normH, rawId);
+          var privFlag = typeof obj.is_private === 'boolean' ? obj.is_private
+            : (typeof obj.locked === 'boolean' ? obj.locked
+            : (typeof obj.isLocked === 'boolean' ? obj.isLocked
+            : (typeof obj.privateAccount === 'boolean' ? obj.privateAccount : null)));
+          if (typeof privFlag === 'boolean') {
+            privateMap[normH] = privFlag;
           }
-          if (typeof obj.is_private === 'boolean') {
-            privateMap[normH] = obj.is_private;
-          }
+
+          var statsSrc = (obj.stats && typeof obj.stats === 'object') ? obj.stats
+            : ((obj.authorStats && typeof obj.authorStats === 'object') ? obj.authorStats : null);
 
           var flwrs = null;
           var flwng = null;
           var posts = null;
+
           if (typeof obj.follower_count === 'number') flwrs = obj.follower_count;
+          else if (typeof obj.followers_count === 'number') flwrs = obj.followers_count;
           else if (typeof obj.text_post_app_follower_count === 'number') flwrs = obj.text_post_app_follower_count;
           else if (typeof obj.followersCount === 'number') flwrs = obj.followersCount;
+          else if (typeof obj.followerCount === 'number') flwrs = obj.followerCount;
           else if (obj.edge_followed_by && typeof obj.edge_followed_by.count === 'number') flwrs = obj.edge_followed_by.count;
+          else if (statsSrc && typeof statsSrc.followerCount === 'number') flwrs = statsSrc.followerCount;
 
           if (typeof obj.following_count === 'number') flwng = obj.following_count;
+          else if (typeof obj.follows_count === 'number') flwng = obj.follows_count;
+          else if (typeof obj.followingCount === 'number') flwng = obj.followingCount;
           else if (typeof obj.followsCount === 'number') flwng = obj.followsCount;
+          else if (typeof obj.following === 'number') flwng = obj.following;
           else if (obj.edge_follow && typeof obj.edge_follow.count === 'number') flwng = obj.edge_follow.count;
+          else if (statsSrc && typeof statsSrc.followingCount === 'number') flwng = statsSrc.followingCount;
 
           if (typeof obj.media_count === 'number') posts = obj.media_count;
+          else if (typeof obj.statuses_count === 'number') posts = obj.statuses_count;
+          else if (typeof obj.notesCount === 'number') posts = obj.notesCount;
           else if (typeof obj.postsCount === 'number') posts = obj.postsCount;
           else if (obj.edge_owner_to_timeline_media && typeof obj.edge_owner_to_timeline_media.count === 'number') {
             posts = obj.edge_owner_to_timeline_media.count;
+          } else if (statsSrc && typeof statsSrc.videoCount === 'number') {
+            posts = statsSrc.videoCount;
           }
 
-          if (flwrs !== null || flwng !== null) {
-            if (recordStats(normH, flwrs, flwng, posts, typeof obj.is_private === 'boolean' ? obj.is_private : null)) {
+          var rel = extractRelationFromObject(obj);
+          if (flwrs !== null || flwng !== null || rel.iFollow !== null || rel.followsMe !== null) {
+            if (recordStats(normH, flwrs, flwng, posts, privFlag, rel.iFollow, rel.followsMe)) {
               foundStats = true;
             }
           }
@@ -1386,22 +1783,45 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     var following = null;
     var posts = null;
     var isPrivate = null;
+    var iFollow = null;
+    var followsMe = null;
 
     var m1 = /"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/.exec(html) ||
              /"follower_count"\s*:\s*(\d+)/.exec(html) ||
+             /"followers_count"\s*:\s*(\d+)/.exec(html) ||
+             /"followersCount"\s*:\s*(\d+)/.exec(html) ||
+             /"followerCount"\s*:\s*(\d+)/.exec(html) ||
              /"text_post_app_follower_count"\s*:\s*(\d+)/.exec(html);
     if (m1) followers = parseInt(m1[1], 10);
 
     var m2 = /"edge_follow"\s*:\s*\{\s*"count"\s*:\s*(\d+)/.exec(html) ||
-             /"following_count"\s*:\s*(\d+)/.exec(html);
+             /"following_count"\s*:\s*(\d+)/.exec(html) ||
+             /"followingCount"\s*:\s*(\d+)/.exec(html) ||
+             /"followsCount"\s*:\s*(\d+)/.exec(html);
     if (m2) following = parseInt(m2[1], 10);
 
     var m3 = /"edge_owner_to_timeline_media"\s*:\s*\{\s*"count"\s*:\s*(\d+)/.exec(html) ||
-             /"media_count"\s*:\s*(\d+)/.exec(html);
+             /"media_count"\s*:\s*(\d+)/.exec(html) ||
+             /"videoCount"\s*:\s*(\d+)/.exec(html);
     if (m3) posts = parseInt(m3[1], 10);
 
-    var mPriv = /"is_private"\s*:\s*(true|false)/.exec(html);
+    var mPriv = /"(?:is_private|privateAccount|locked)"\s*:\s*(true|false)/.exec(html);
     if (mPriv) isPrivate = mPriv[1] === 'true';
+
+    var mOut = /"(?:followed_by_viewer|followedByViewer|is_following|isFollowing)"\s*:\s*(true|false)/.exec(html);
+    if (mOut) iFollow = mOut[1] === 'true';
+    var mIn = /"(?:follows_viewer|followsViewer|followed_by|followedBy|is_followed_by|isFollowedBy)"\s*:\s*(true|false)/.exec(html);
+    if (mIn) followsMe = mIn[1] === 'true';
+    if (platform === 'tiktok') {
+      var mRel = /"relation"\s*:\s*([0-3])/.exec(html);
+      if (mRel) {
+        var rv = parseInt(mRel[1], 10);
+        if (rv === 2) { iFollow = true; followsMe = true; }
+        else if (rv === 1) { iFollow = true; followsMe = false; }
+        else if (rv === 3) { iFollow = false; followsMe = true; }
+        else if (rv === 0) { iFollow = false; followsMe = false; }
+      }
+    }
 
     if (followers === null || following === null || posts === null) {
       var metaMatch = /<meta[^>]+(?:name|property)=["'](?:og:description|description)["'][^>]+content=["']([^"']+)["']/i.exec(html) ||
@@ -1409,22 +1829,22 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       if (metaMatch && metaMatch[1]) {
         var desc = metaMatch[1];
         if (followers === null) {
-          var mf = /([0-9.,]+[KMB]?)\s+Followers/i.exec(desc) || /フォロワー\s*([0-9.,]+[万千億KMB]?)\s*人/.exec(desc);
+          var mf = /([0-9.,]+[KMB]?)\s+Followers/i.exec(desc) || /フォロワー\s*([0-9.,]+[万千億KMB]?)\s*人?/.exec(desc);
           if (mf) followers = parseHumanNumber(mf[1]);
         }
         if (following === null) {
-          var mg = /([0-9.,]+[KMB]?)\s+Following/i.exec(desc) || /フォロー中\s*([0-9.,]+[万千億KMB]?)\s*人/.exec(desc);
+          var mg = /([0-9.,]+[KMB]?)\s+Following/i.exec(desc) || /フォロー中\s*([0-9.,]+[万千億KMB]?)\s*人?/.exec(desc);
           if (mg) following = parseHumanNumber(mg[1]);
         }
         if (posts === null) {
-          var mp = /([0-9.,]+[KMB]?)\s+Posts/i.exec(desc) || /投稿\s*([0-9.,]+[万千億KMB]?)\s*件/.exec(desc);
+          var mp = /([0-9.,]+[KMB]?)\s+Posts/i.exec(desc) || /投稿\s*([0-9.,]+[万千億KMB]?)\s*件?/.exec(desc);
           if (mp) posts = parseHumanNumber(mp[1]);
         }
       }
     }
 
-    if (followers !== null || following !== null) {
-      return recordStats(targetHandle, followers, following, posts, isPrivate);
+    if (followers !== null || following !== null || iFollow !== null || followsMe !== null) {
+      return recordStats(targetHandle, followers, following, posts, isPrivate, iFollow, followsMe);
     }
     return false;
   }
@@ -1433,7 +1853,8 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     if (!key || !val) return;
     var k = String(key).toLowerCase().trim();
     if (k === 'x-ig-app-id' || k === 'x-csrftoken' || k === 'x-ig-www-claim' ||
-        k === 'x-asbd-id' || k === 'x-fb-lsd' || k === 'x-bloks-version-id') {
+        k === 'x-asbd-id' || k === 'x-fb-lsd' || k === 'x-bloks-version-id' ||
+        k === 'authorization') {
       capturedHeaders[k] = String(val).trim();
     }
   }
@@ -1452,6 +1873,26 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         for (var j = 0; j < ks.length; j++) captureHeaderPair(ks[j], headers[ks[j]]);
       }
     } catch (_) {}
+  }
+
+  function captureRequestMeta(url, body) {
+    var u = String(url || '');
+    if (platform === 'generic') {
+      if (u.indexOf('/api/v1/accounts') >= 0 || u.indexOf('/api/v1/timelines') >= 0) {
+        platform = 'mastodon';
+      } else if (u.indexOf('/api/notes/') >= 0 || u.indexOf('/api/users/') >= 0) {
+        platform = 'misskey';
+      }
+    }
+    if (platform === 'misskey' && body && typeof body === 'string' && body.indexOf('"i"') >= 0 && body.length < 8192) {
+      try {
+        var parsed = JSON.parse(body);
+        if (parsed && typeof parsed.i === 'string' && parsed.i.length >= 8) {
+          capturedMisskeyToken = parsed.i;
+        }
+      } catch (_) {}
+    }
+    captureProfileGraphqlTemplate(url, body);
   }
 
   function captureProfileGraphqlTemplate(url, body) {
@@ -1495,31 +1936,54 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   function shouldSniffUrl(rawUrl) {
     var u = String(rawUrl || '').toLowerCase();
-    if (!u) return false;
+    if (!u || /\.(?:png|jpe?g|gif|webp|svg|ico|woff2?|ttf|mp4|webm|m3u8|ts|css)(?:\?|$)/i.test(u)) return false;
     if (platform === 'instagram' || platform === 'threads') {
+      if (u.indexOf('logging') >= 0 || u.indexOf('/ajax/bz') >= 0 || u.indexOf('/qp/') >= 0 ||
+          u.indexOf('telemetry') >= 0 || u.indexOf('metrics') >= 0 || u.indexOf('heartbeat') >= 0 ||
+          u.indexOf('presence') >= 0 || u.indexOf('push/') >= 0 || u.indexOf('direct_v2/threads') >= 0) {
+        return false;
+      }
       return u.indexOf('/graphql') >= 0 || u.indexOf('/api/v1/') >= 0;
     }
     if (platform === 'bluesky') {
       return u.indexOf('/xrpc/app.bsky.') >= 0;
     }
-    return false;
+    if (platform === 'mastodon') {
+      return u.indexOf('/api/v1/') >= 0 || u.indexOf('/api/v2/') >= 0;
+    }
+    if (platform === 'misskey') {
+      return u.indexOf('/api/') >= 0;
+    }
+    if (platform === 'pixiv') {
+      return u.indexOf('/ajax/') >= 0;
+    }
+    return u.indexOf('/api') >= 0 || u.indexOf('graphql') >= 0 || u.indexOf('/ajax') >= 0 ||
+           u.indexOf('user') >= 0 || u.indexOf('follow') >= 0 || u.indexOf('profile') >= 0 ||
+           u.indexOf('friend') >= 0 || u.indexOf('relation') >= 0;
   }
 
   function sniffJsonText(txt) {
-    if (!txt || txt.length > 3500000) return;
+    if (!txt || txt.length > 1800000) return;
     if (txt.indexOf('follower') < 0 && txt.indexOf('edge_followed_by') < 0 &&
         txt.indexOf('followersCount') < 0 && txt.indexOf('followsCount') < 0 &&
-        txt.indexOf('viewer_username') < 0 && txt.indexOf('"username"') < 0) {
+        txt.indexOf('followed_by') < 0 && txt.indexOf('followedBy') < 0 &&
+        txt.indexOf('friendship_status') < 0 && txt.indexOf('follows_viewer') < 0 &&
+        txt.indexOf('isFollowed') < 0 && txt.indexOf('is_followed') < 0 &&
+        txt.indexOf('viewer_username') < 0 && txt.indexOf('"username"') < 0 &&
+        txt.indexOf('"uniqueId"') < 0 && txt.indexOf('"acct"') < 0) {
       return;
     }
     try {
       var clean = txt.indexOf('for (;;);') === 0 ? txt.slice(9) : txt;
       var parsed = JSON.parse(clean);
       extractFromJsonObject(parsed);
+      if (platform === 'instagram' || platform === 'bluesky' || platform === 'mastodon') {
+        scheduleRelBatch(140);
+      }
     } catch (_) {
       try {
         var lines = txt.split('\n');
-        for (var i = 0; i < lines.length && i < 40; i++) {
+        for (var i = 0; i < lines.length && i < 30; i++) {
           var line = lines[i].trim();
           if (line.length > 2 && line[0] === '{') {
             extractFromJsonObject(JSON.parse(line));
@@ -1541,7 +2005,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         try {
           if (init && init.headers) captureRequestHeaders(init.headers);
           if (input && typeof input === 'object' && input.headers) captureRequestHeaders(input.headers);
-          if (init && init.body) captureProfileGraphqlTemplate(reqUrl, init.body);
+          captureRequestMeta(reqUrl, init && init.body ? init.body : null);
         } catch (_) {}
         var promise = origFetchRef.apply(this, arguments);
         if (shouldSniffUrl(reqUrl) && promise && typeof promise.then === 'function') {
@@ -1577,7 +2041,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       }
       XMLHttpRequest.prototype.send = function(body) {
         try {
-          if (body) captureProfileGraphqlTemplate(this.__omniStatsUrl, body);
+          captureRequestMeta(this.__omniStatsUrl, body);
           if (shouldSniffUrl(this.__omniStatsUrl)) {
             this.addEventListener('load', function() {
               try {
@@ -1642,21 +2106,36 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   function scanSsrScripts() {
     try {
-      var scripts = document.querySelectorAll('script[type="application/json"]');
-      for (var i = 0; i < scripts.length && i < 80; i++) {
-        var txt = scripts[i].textContent || '';
-        if (txt.length > 10 && txt.length < 1800000) {
-          sniffJsonText(txt);
+      var scripts = document.querySelectorAll('script[type="application/json"]:not([data-omni-ff-ssr]), script#__UNIVERSAL_DATA_FOR_REHYDRATION__:not([data-omni-ff-ssr]), script#SIGI_STATE:not([data-omni-ff-ssr])');
+      if (!scripts || scripts.length === 0) return;
+      var idx = 0;
+      var total = Math.min(scripts.length, 60);
+      function processChunk() {
+        var processed = 0;
+        while (idx < total && processed < 8) {
+          var sc = scripts[idx++];
+          sc.setAttribute('data-omni-ff-ssr', '1');
+          var txt = sc.textContent || '';
+          if (txt.length > 20 && txt.length < 650000) {
+            sniffJsonText(txt);
+            processed++;
+          }
+        }
+        if (idx < total) {
+          runWhenIdle(processChunk, 800);
         }
       }
+      runWhenIdle(processChunk, 800);
     } catch (_) {}
   }
 
   function detectSelfAccountFromDom() {
+    if (selfHandle) return;
     try {
       if (platform === 'instagram') {
-        var navLinks = document.querySelectorAll('nav a[href], [role="navigation"] a[href], div[class] a[href]');
-        for (var i = 0; i < navLinks.length && i < 240; i++) {
+        tryFetchSelfByCookie();
+        var navLinks = document.querySelectorAll('nav a[href], [role="navigation"] a[href]');
+        for (var i = 0; i < navLinks.length && i < 80; i++) {
           var a = navLinks[i];
           var href = a.getAttribute('href') || '';
           var m = /^\/([a-z0-9._]{1,35})\/?(?:\?.*)?$/i.exec(href);
@@ -1705,8 +2184,74 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
             return;
           }
         }
+      } else {
+        var gLinks = document.querySelectorAll('nav a[href], header a[href], [role="navigation"] a[href]');
+        for (var g = 0; g < gLinks.length && g < 100; g++) {
+          var ga = gLinks[g];
+          var gAria = (ga.getAttribute('aria-label') || '').trim();
+          var gTxt = (ga.innerText || ga.textContent || '').trim();
+          var gTestId = (ga.getAttribute('data-testid') || ga.getAttribute('data-e2e') || '').toLowerCase();
+          if (/^(プロフィール|マイページ|profile|my profile)$/i.test(gAria) ||
+              /^(プロフィール|マイページ|profile|my profile)$/i.test(gTxt) ||
+              gTestId.indexOf('profile') >= 0) {
+            var gh = extractHandleFromLink(ga);
+            if (gh) {
+              setSelfHandle(gh);
+              return;
+            }
+          }
+        }
       }
     } catch (_) {}
+  }
+
+  function extractHandleFromPath(path) {
+    if (!path) return '';
+    if (platform === 'instagram') {
+      var m = /^\/([a-z0-9._]{1,35})\/?$/i.exec(path);
+      return m ? normalizeHandle(m[1]) : '';
+    }
+    if (platform === 'threads' || platform === 'tiktok' || platform === 'mixi2') {
+      var tm = /^\/@([a-z0-9._]{1,35})\/?$/i.exec(path);
+      return tm ? normalizeHandle(tm[1]) : '';
+    }
+    if (platform === 'bluesky') {
+      var bm = /^\/profile\/([^\/?#]+)\/?$/i.exec(path);
+      return bm ? normalizeHandle(bm[1]) : '';
+    }
+    if (platform === 'mastodon' || platform === 'misskey') {
+      var mm = /^\/@([a-z0-9._-]+(?:@[a-z0-9.-]+\.[a-z]{2,})?)\/?$/i.exec(path);
+      return mm ? normalizeHandle(mm[1]) : '';
+    }
+    if (platform === 'pixiv') {
+      var pm = /^\/(?:en\/)?users\/(\d{1,16})\/?$/i.exec(path);
+      return pm ? normalizeHandle(pm[1]) : '';
+    }
+    if (platform === 'reddit') {
+      var rm = /^\/(?:u|user)\/([a-z0-9_-]{2,32})\/?$/i.exec(path);
+      return rm ? normalizeHandle(rm[1]) : '';
+    }
+    if (platform === 'linkedin') {
+      var lm = /^\/in\/([a-z0-9._-]{2,64})\/?$/i.exec(path);
+      return lm ? normalizeHandle(lm[1]) : '';
+    }
+    if (platform === 'weibo') {
+      var wm = /^\/(?:u|n)\/([a-z0-9._-]{2,32})\/?$/i.exec(path);
+      return wm ? normalizeHandle(wm[1]) : '';
+    }
+    if (platform === 'tumblr') {
+      var tbm = /^\/(?:blog\/view\/)?([a-z0-9-]{2,40})\/?$/i.exec(path);
+      return tbm ? normalizeHandle(tbm[1]) : '';
+    }
+    if (platform === 'facebook' || platform === 'vk' || platform === 'pinterest' ||
+        platform === 'twitch' || platform === 'behance' || platform === 'dribbble' ||
+        platform === 'deviantart' || platform === 'x' || platform === 'ameba') {
+      var sm = /^\/@?([a-z0-9._-]{2,40})\/?$/i.exec(path);
+      return sm ? normalizeHandle(sm[1]) : '';
+    }
+    // generic: /@handle, /users/handle, /u/handle, /profile/handle
+    var gm = /^\/(?:@|users\/|user\/|u\/|profile\/|profiles\/|in\/)([a-z0-9._-]{2,48})\/?$/i.exec(path);
+    return gm ? normalizeHandle(gm[1]) : '';
   }
 
   function extractHandleFromLink(a) {
@@ -1718,31 +2263,69 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       try {
         var u = new URL(href);
         if (u.hostname.toLowerCase() !== host) return '';
+        if (platform === 'facebook' && u.pathname === '/profile.php') {
+          var fbId = u.searchParams.get('id');
+          return fbId && /^\d{4,24}$/.test(fbId) ? normalizeHandle(fbId) : '';
+        }
         path = u.pathname;
       } catch (_) { return ''; }
     } else {
+      if (platform === 'facebook' && path.indexOf('/profile.php') === 0) {
+        var fbM = /[?&]id=(\d{4,24})/i.exec(path);
+        return fbM ? normalizeHandle(fbM[1]) : '';
+      }
       var qIdx = path.indexOf('?');
       if (qIdx >= 0) path = path.slice(0, qIdx);
       var hIdx = path.indexOf('#');
       if (hIdx >= 0) path = path.slice(0, hIdx);
     }
+    return extractHandleFromPath(path);
+  }
 
-    if (platform === 'instagram') {
-      var m = /^\/([a-z0-9._]{1,35})\/?$/i.exec(path);
-      return m ? normalizeHandle(m[1]) : '';
-    }
-    if (platform === 'threads') {
-      var tm = /^\/@([a-z0-9._]{1,35})\/?$/i.exec(path);
-      return tm ? normalizeHandle(tm[1]) : '';
-    }
-    if (platform === 'bluesky') {
-      var bm = /^\/profile\/([^\/?#]+)\/?$/i.exec(path);
-      return bm ? normalizeHandle(bm[1]) : '';
-    }
+  function getCurrentProfileHandleFromUrl() {
+    try {
+      var p = (window.location && window.location.pathname) || '';
+      var h = extractHandleFromPath(p);
+      if (h) return h;
+      // サブパス付き (/handle/followers, /@handle/following, /profile/handle/followers 等)
+      var stripped = p.replace(/\/(?:followers|following|follows|friends|posts|replies|media|likes|reels|tagged|mutuals|about|notes|bookmarks)(?:\/.*)?$/i, '');
+      if (stripped && stripped !== p) {
+        return extractHandleFromPath(stripped);
+      }
+    } catch (_) {}
     return '';
   }
 
+  function detectSelfListPageContext() {
+    try {
+      var p = ((window.location && window.location.pathname) || '').toLowerCase();
+      var full = p + ' ' + ((window.location && window.location.search) || '').toLowerCase();
+      var owner = getCurrentProfileHandleFromUrl();
+      var isSelfPage = !!(selfHandle && owner && owner === selfHandle);
+      var isFollowersPath = /\/followers(?:\/|\?|$)|[?&]tab=followers/i.test(full);
+      var isFollowingPath = /\/(?:following|follows)(?:\/|\?|$)|[?&]tab=following/i.test(full);
+      if (isSelfPage && isFollowersPath) return 'self-followers';
+      if (isSelfPage && isFollowingPath) return 'self-following';
+      // モーダル（Instagram / Threads のフォロワー一覧ダイアログ等）判定
+      var dlg = document.querySelector('[role="dialog"]');
+      if (dlg && isSelfPage) {
+        var headEl = dlg.querySelector('h1, h2, [role="heading"], header');
+        var headTxt = headEl ? (headEl.textContent || '').trim() : '';
+        if (/^(?:フォロワー|followers)$/i.test(headTxt)) return 'self-followers';
+        if (/^(?:フォロー中|フォロー|following)$/i.test(headTxt)) return 'self-following';
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function canActiveFetchPlatform() {
+    return platform === 'instagram' || platform === 'threads' || platform === 'bluesky' ||
+           platform === 'mastodon' || platform === 'misskey' || platform === 'tiktok' ||
+           platform === 'pixiv';
+  }
+
   function enqueueFetch(rawHandle, priority, forceRetry) {
+    if (!canActiveFetchPlatform()) return;
     var h = normalizeHandle(rawHandle);
     if (!h) return;
     if (forceRetry) {
@@ -1753,8 +2336,14 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       if (failedMap[h] && Date.now() - failedMap[h] < 45000) return;
     }
     var existing = statsMap[h];
-    if (!forceRetry && hasUsableStats(existing) && (Date.now() - existing.ts) < CACHE_TTL_MS) {
+    var needRel = h !== selfHandle && (!existing || existing.followsMe === null);
+    if (!forceRetry && hasUsableStats(existing) && !needRel && (Date.now() - existing.ts) < CACHE_TTL_MS) {
       return;
+    }
+    if (!forceRetry && hasUsableStats(existing) && needRel) {
+      scheduleRelBatch();
+      if (platform !== 'instagram' && platform !== 'bluesky' && platform !== 'mastodon') return;
+      if (userIdMap[h]) return;
     }
     if (inFlight[h]) return;
     if (queuedSet[h]) {
@@ -1774,11 +2363,148 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var dropped = queue.pop();
       if (dropped) delete queuedSet[dropped];
     }
-    if (!queueRunning && !queueStartTimer) {
+    var maxW = platform === 'instagram' ? igConcurrency : 1;
+    if (activeWorkers < maxW && !queueStartTimer) {
       queueStartTimer = setTimeout(function() {
         queueStartTimer = null;
         processQueue();
       }, platform === 'bluesky' ? 30 : 20);
+    }
+  }
+
+  // Instagram / Bluesky / Mastodon の相互関係バッチ照会
+  function scheduleRelBatch(delayOverride) {
+    if (platform !== 'instagram' && platform !== 'bluesky' && platform !== 'mastodon') return;
+    if (relBatchTimer || relBatchRunning) return;
+    relBatchTimer = setTimeout(function() {
+      relBatchTimer = null;
+      runRelBatch();
+    }, typeof delayOverride === 'number' ? delayOverride : 220);
+  }
+
+  function runRelBatch() {
+    if (relBatchRunning || Date.now() < backoffUntil) return;
+    var now = Date.now();
+    var maxBatch = platform === 'instagram' ? 50 : 25;
+    var targetHandles = [];
+    var scopeRoot = document.querySelector('[role="dialog"]') || document;
+    var rows = scopeRoot.querySelectorAll('[data-omni-ff-row], a[data-omni-ff-target="1"]');
+    var seen = Object.create(null);
+    for (var i = 0; i < rows.length && targetHandles.length < maxBatch; i++) {
+      var h = rows[i].getAttribute('data-omni-ff-row') || rows[i].getAttribute('data-omni-ff-handle') || '';
+      if (!h || h === selfHandle || seen[h]) continue;
+      seen[h] = true;
+      var e = statsMap[h];
+      if (e && e.followsMe !== null && e.iFollow !== null) continue;
+      if (relQueriedMap[h] && now - relQueriedMap[h] < 120000) continue;
+      if (!userIdMap[h]) continue;
+      targetHandles.push(h);
+    }
+    var curH = getCurrentProfileHandleFromUrl();
+    if (curH && curH !== selfHandle && !seen[curH] && userIdMap[curH]) {
+      var ce = statsMap[curH];
+      if ((!ce || ce.followsMe === null || ce.iFollow === null) && (!relQueriedMap[curH] || now - relQueriedMap[curH] >= 120000)) {
+        targetHandles.unshift(curH);
+      }
+    }
+    if (targetHandles.length === 0) return;
+
+    if (platform === 'bluesky') {
+      if (!selfDid) {
+        if (selfHandle) fetchBlueskySelfDid(selfHandle);
+        return;
+      }
+      var dids = [];
+      for (var bi = 0; bi < targetHandles.length; bi++) {
+        var d = userIdMap[targetHandles[bi]];
+        if (d && d.indexOf('did:') === 0 && d !== selfDid) {
+          dids.push(d);
+          relQueriedMap[targetHandles[bi]] = now;
+        }
+      }
+      if (dids.length === 0) return;
+      relBatchRunning = true;
+      var qs = 'actor=' + encodeURIComponent(selfDid) + '&' + dids.map(function(x) { return 'others=' + encodeURIComponent(x); }).join('&');
+      internalFetch('https://public.api.bsky.app/xrpc/app.bsky.graph.getRelationships?' + qs, {
+        method: 'GET'
+      }).then(function(res) {
+        if (!res || !res.ok) return;
+        return res.json().then(function(data) {
+          if (data && Array.isArray(data.relationships)) {
+            for (var r = 0; r < data.relationships.length; r++) {
+              var rel = data.relationships[r];
+              if (rel && rel.did) {
+                var bh = idToHandleMap[rel.did] || idToHandleMap[rel.did.toLowerCase()];
+                if (bh) {
+                  recordRelation(bh, !!rel.following, !!rel.followedBy);
+                }
+              }
+            }
+          }
+        }).catch(function() {});
+      }).catch(function() {}).then(function() {
+        relBatchRunning = false;
+      });
+      return;
+    }
+
+    if (platform === 'instagram') {
+      var pks = [];
+      for (var ii = 0; ii < targetHandles.length; ii++) {
+        var pk = userIdMap[targetHandles[ii]];
+        if (pk && /^\d{5,24}$/.test(pk)) {
+          pks.push(pk);
+          relQueriedMap[targetHandles[ii]] = now;
+        }
+      }
+      if (pks.length === 0) return;
+      relBatchRunning = true;
+      var headers = buildIgHeaders();
+      headers['content-type'] = 'application/x-www-form-urlencoded';
+      internalFetch('/api/v1/friendships/show_many/', {
+        method: 'POST',
+        credentials: 'include',
+        headers: headers,
+        body: 'user_ids=' + encodeURIComponent(pks.join(','))
+      }).then(function(res) {
+        if (!res) return;
+        if (res.status === 429) { backoffUntil = Date.now() + 45000; return; }
+        if (!res.ok) return;
+        return res.json().then(function(data) {
+          extractFromJsonObject(data);
+        }).catch(function() {});
+      }).catch(function() {}).then(function() {
+        setTimeout(function() { relBatchRunning = false; }, 600);
+      });
+      return;
+    }
+
+    if (platform === 'mastodon') {
+      var mids = [];
+      for (var mi = 0; mi < targetHandles.length; mi++) {
+        var mid = userIdMap[targetHandles[mi]];
+        if (mid) {
+          mids.push(mid);
+          relQueriedMap[targetHandles[mi]] = now;
+        }
+      }
+      if (mids.length === 0) return;
+      relBatchRunning = true;
+      var mHeaders = { 'accept': 'application/json' };
+      if (capturedHeaders['authorization']) mHeaders['authorization'] = capturedHeaders['authorization'];
+      var mQs = mids.map(function(id) { return 'id[]=' + encodeURIComponent(id); }).join('&');
+      internalFetch('/api/v1/accounts/relationships?' + mQs, {
+        method: 'GET',
+        credentials: 'include',
+        headers: mHeaders
+      }).then(function(res) {
+        if (!res || !res.ok) return;
+        return res.json().then(function(data) {
+          extractFromJsonObject(data);
+        }).catch(function() {});
+      }).catch(function() {}).then(function() {
+        setTimeout(function() { relBatchRunning = false; }, 500);
+      });
     }
   }
 
@@ -1845,7 +2571,8 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       return res.json().then(function(data) {
         extractFromJsonObject(data);
         var u = data && data.data && data.data.user;
-        if (u && !hasUsableStats(statsMap[handle])) {
+        if (u) {
+          bindUserId(handle, u.id || u.pk);
           var flwrs = u.edge_followed_by && typeof u.edge_followed_by.count === 'number'
             ? u.edge_followed_by.count
             : (typeof u.follower_count === 'number' ? u.follower_count : null);
@@ -1855,7 +2582,9 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           var posts = u.edge_owner_to_timeline_media && typeof u.edge_owner_to_timeline_media.count === 'number'
             ? u.edge_owner_to_timeline_media.count
             : (typeof u.media_count === 'number' ? u.media_count : null);
-          recordStats(handle, flwrs, flwng, posts, typeof u.is_private === 'boolean' ? u.is_private : null);
+          var iFlw = typeof u.followed_by_viewer === 'boolean' ? u.followed_by_viewer : null;
+          var flwsMe = typeof u.follows_viewer === 'boolean' ? u.follows_viewer : null;
+          recordStats(handle, flwrs, flwng, posts, typeof u.is_private === 'boolean' ? u.is_private : null, iFlw, flwsMe);
         }
         return { ok: hasUsableStats(statsMap[handle]), rateLimited: false };
       }).catch(function() { return { ok: false, rateLimited: false }; });
@@ -1881,13 +2610,19 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   function fetchInstagramProfile(handle) {
     var primaryAppId = capturedHeaders['x-ig-app-id'] || '936619743392459';
     var altAppId = primaryAppId === '1217981644879628' ? '936619743392459' : '1217981644879628';
-    var routes = [];
-    if (userIdMap[handle] && capturedProfileGql) routes.push({ name: 'gql', fn: function() { return fetchIgViaCapturedGql(handle); } });
-    if (userIdMap[handle]) routes.push({ name: 'user_info', fn: function() { return fetchIgViaUserInfo(handle); } });
-    routes.push({ name: 'web_info_1', fn: function() { return fetchIgViaWebProfileInfo(handle, primaryAppId); } });
-    routes.push({ name: 'web_info_2', fn: function() { return fetchIgViaWebProfileInfo(handle, altAppId); } });
-    routes.push({ name: 'html_inc', fn: function() { return fetchIgViaHtml(handle, true); } });
-    routes.push({ name: 'html_omit', fn: function() { return fetchIgViaHtml(handle, false); } });
+    var now = Date.now();
+    var allRoutes = [];
+    if (userIdMap[handle] && capturedProfileGql) allRoutes.push({ name: 'gql', fn: function() { return fetchIgViaCapturedGql(handle); } });
+    if (userIdMap[handle]) allRoutes.push({ name: 'user_info', fn: function() { return fetchIgViaUserInfo(handle); } });
+    allRoutes.push({ name: 'web_info_1', fn: function() { return fetchIgViaWebProfileInfo(handle, primaryAppId); } });
+    allRoutes.push({ name: 'web_info_2', fn: function() { return fetchIgViaWebProfileInfo(handle, altAppId); } });
+    allRoutes.push({ name: 'html_inc', fn: function() { return fetchIgViaHtml(handle, true); } });
+    allRoutes.push({ name: 'html_omit', fn: function() { return fetchIgViaHtml(handle, false); } });
+
+    var routes = allRoutes.filter(function(r) {
+      return !deadRouteUntil[r.name] || now >= deadRouteUntil[r.name];
+    });
+    if (routes.length === 0) routes = allRoutes;
 
     if (preferredIgRoute) {
       routes.sort(function(a, b) {
@@ -1913,14 +2648,25 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       return r.fn().then(function(res) {
         if (res && res.ok) {
           preferredIgRoute = r.name;
+          routeFailCount[r.name] = 0;
+          delete deadRouteUntil[r.name];
           consecutiveFailures = 0;
+          if (handle !== selfHandle && statsMap[handle] && statsMap[handle].followsMe === null && userIdMap[handle]) {
+            scheduleRelBatch(120);
+          }
           return;
         }
         if (res && res.rateLimited) {
-          backoffUntil = Date.now() + 50000;
+          igConcurrency = 1;
+          backoffUntil = Date.now() + 45000;
           failedMap[handle] = Date.now();
           scheduleRenderBadges();
           return;
+        }
+        routeFailCount[r.name] = (routeFailCount[r.name] || 0) + 1;
+        if (routeFailCount[r.name] >= 2) {
+          deadRouteUntil[r.name] = Date.now() + 180000;
+          routeFailCount[r.name] = 0;
         }
         return nextRoute();
       });
@@ -1974,24 +2720,138 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       }
       if (!res.ok) return;
       return res.json().then(function(data) {
+        var dids = [];
         if (data && Array.isArray(data.profiles)) {
           for (var i = 0; i < data.profiles.length; i++) {
             var p = data.profiles[i];
             if (p && p.handle) {
-              recordStats(p.handle, p.followersCount, p.followsCount, p.postsCount, null);
+              var nh = normalizeHandle(p.handle);
+              if (nh && p.did) {
+                bindUserId(nh, p.did);
+                if (nh === selfHandle) selfDid = p.did;
+                else dids.push(p.did);
+              }
+              recordStats(p.handle, p.followersCount, p.followsCount, p.postsCount, null, null, null);
             }
           }
+        }
+        if (selfDid && dids.length > 0) {
+          var rQs = 'actor=' + encodeURIComponent(selfDid) + '&' + dids.slice(0, 25).map(function(d) { return 'others=' + encodeURIComponent(d); }).join('&');
+          return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.graph.getRelationships?' + rQs, {
+            method: 'GET'
+          }).then(function(rRes) {
+            if (!rRes || !rRes.ok) return;
+            return rRes.json().then(function(rData) {
+              if (rData && Array.isArray(rData.relationships)) {
+                for (var r = 0; r < rData.relationships.length; r++) {
+                  var rel = rData.relationships[r];
+                  if (rel && rel.did) {
+                    var bh = idToHandleMap[rel.did] || idToHandleMap[rel.did.toLowerCase()];
+                    if (bh) recordRelation(bh, !!rel.following, !!rel.followedBy);
+                  }
+                }
+              }
+            }).catch(function() {});
+          }).catch(function() {});
+        } else if (selfHandle && !selfDid) {
+          fetchBlueskySelfDid(selfHandle);
         }
       });
     }).catch(function() {});
   }
 
+  function fetchMastodonProfile(handle) {
+    var headers = { 'accept': 'application/json' };
+    if (capturedHeaders['authorization']) headers['authorization'] = capturedHeaders['authorization'];
+    return internalFetch('/api/v1/accounts/lookup?acct=' + encodeURIComponent(handle), {
+      method: 'GET',
+      credentials: 'include',
+      headers: headers
+    }).then(function(res) {
+      if (res.status === 429) { backoffUntil = Date.now() + 45000; return; }
+      if (!res.ok) { failedMap[handle] = Date.now(); return; }
+      return res.json().then(function(acc) {
+        if (acc && acc.id) {
+          bindUserId(handle, acc.id);
+          recordStats(handle, acc.followers_count, acc.following_count, acc.statuses_count, typeof acc.locked === 'boolean' ? acc.locked : null, null, null);
+          scheduleRelBatch();
+        }
+      }).catch(function() {});
+    }).catch(function() { failedMap[handle] = Date.now(); });
+  }
+
+  function fetchMisskeyProfile(handle) {
+    var parts = handle.split('@');
+    var payload = { username: parts[0], host: parts.length > 1 ? parts[1] : null };
+    if (capturedMisskeyToken) payload.i = capturedMisskeyToken;
+    return internalFetch('/api/users/show', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json', 'accept': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function(res) {
+      if (res.status === 429) { backoffUntil = Date.now() + 45000; return; }
+      if (!res.ok) { failedMap[handle] = Date.now(); return; }
+      return res.json().then(function(u) {
+        if (u && u.id) {
+          bindUserId(handle, u.id);
+          recordStats(
+            handle,
+            u.followersCount,
+            u.followingCount,
+            u.notesCount,
+            typeof u.isLocked === 'boolean' ? u.isLocked : null,
+            typeof u.isFollowing === 'boolean' ? u.isFollowing : null,
+            typeof u.isFollowed === 'boolean' ? u.isFollowed : null
+          );
+        }
+      }).catch(function() {});
+    }).catch(function() { failedMap[handle] = Date.now(); });
+  }
+
+  function fetchTikTokProfile(handle) {
+    return internalFetch('/@' + encodeURIComponent(handle), {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'accept': 'text/html,application/xhtml+xml' }
+    }).then(function(res) {
+      if (res.status === 429) { backoffUntil = Date.now() + 45000; return; }
+      if (!res.ok) { failedMap[handle] = Date.now(); return; }
+      return res.text().then(function(html) {
+        if (!extractFromHtmlForHandle(html, handle)) {
+          failedMap[handle] = Date.now();
+        }
+      });
+    }).catch(function() { failedMap[handle] = Date.now(); });
+  }
+
+  function fetchPixivProfile(handle) {
+    if (!/^\d{1,16}$/.test(handle)) return Promise.resolve();
+    return internalFetch('/ajax/user/' + encodeURIComponent(handle) + '?full=1', {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'accept': 'application/json' }
+    }).then(function(res) {
+      if (res.status === 429) { backoffUntil = Date.now() + 45000; return; }
+      if (!res.ok) { failedMap[handle] = Date.now(); return; }
+      return res.json().then(function(data) {
+        var b = data && data.body;
+        if (b && typeof b === 'object') {
+          var flwng = typeof b.following === 'number' ? b.following : null;
+          var iFlw = typeof b.isFollowed === 'boolean' ? b.isFollowed : null;
+          var flwsMe = typeof b.isMypixiv === 'boolean' && b.isMypixiv ? true : null;
+          recordStats(handle, null, flwng, null, null, iFlw, flwsMe);
+        }
+      }).catch(function() {});
+    }).catch(function() { failedMap[handle] = Date.now(); });
+  }
+
   function processQueue() {
-    if (queueRunning || queue.length === 0) return;
-    if (Date.now() < backoffUntil) return;
-    queueRunning = true;
+    if (queue.length === 0 || Date.now() < backoffUntil) return;
 
     if (platform === 'bluesky') {
+      if (activeWorkers > 0) return;
+      activeWorkers++;
       var batch = queue.splice(0, 20);
       for (var i = 0; i < batch.length; i++) {
         delete queuedSet[batch[i]];
@@ -2000,87 +2860,279 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       fetchBlueskyBatch(batch).then(function() {
         for (var j = 0; j < batch.length; j++) delete inFlight[batch[j]];
         setTimeout(function() {
-          queueRunning = false;
+          activeWorkers = Math.max(0, activeWorkers - 1);
           processQueue();
-        }, 280);
+        }, 220);
       });
       return;
     }
 
-    var handle = queue.shift();
-    delete queuedSet[handle];
-    inFlight[handle] = true;
-    scheduleRenderBadges();
-    var req = platform === 'instagram' ? fetchInstagramProfile(handle) : fetchThreadsProfile(handle);
-    var delayMs = platform === 'instagram' ? 620 : 820;
-    req.then(function() {
-      delete inFlight[handle];
-      setTimeout(function() {
-        queueRunning = false;
-        processQueue();
-      }, delayMs);
-    });
+    var maxW = platform === 'instagram' ? igConcurrency : 1;
+    while (activeWorkers < maxW && queue.length > 0 && Date.now() >= backoffUntil) {
+      (function() {
+        var handle = queue.shift();
+        delete queuedSet[handle];
+        inFlight[handle] = true;
+        activeWorkers++;
+        scheduleRenderBadges();
+        var req;
+        var delayMs = 420;
+        if (platform === 'instagram') { req = fetchInstagramProfile(handle); delayMs = 240; }
+        else if (platform === 'threads') { req = fetchThreadsProfile(handle); delayMs = 520; }
+        else if (platform === 'mastodon') { req = fetchMastodonProfile(handle); delayMs = 240; }
+        else if (platform === 'misskey') { req = fetchMisskeyProfile(handle); delayMs = 260; }
+        else if (platform === 'tiktok') { req = fetchTikTokProfile(handle); delayMs = 680; }
+        else if (platform === 'pixiv') { req = fetchPixivProfile(handle); delayMs = 320; }
+        else { req = Promise.resolve(); delayMs = 300; }
+        req.then(function() {
+          delete inFlight[handle];
+          setTimeout(function() {
+            activeWorkers = Math.max(0, activeWorkers - 1);
+            processQueue();
+          }, delayMs);
+        });
+      })();
+    }
+  }
+
+  function detectPageTheme() {
+    try {
+      var bg = window.getComputedStyle(document.body || document.documentElement).backgroundColor || '';
+      var m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(bg);
+      var mode = 'dark';
+      if (m) {
+        var r = parseInt(m[1], 10);
+        var g = parseInt(m[2], 10);
+        var b = parseInt(m[3], 10);
+        var aMatch = /rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([0-9.]+)/.exec(bg);
+        var alpha = aMatch ? parseFloat(aMatch[1]) : 1;
+        if (alpha > 0.1) {
+          var lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+          mode = lum >= 0.5 ? 'light' : 'dark';
+        }
+      } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+        mode = 'light';
+      }
+      if (mode !== appliedThemeMode) {
+        appliedThemeMode = mode;
+        document.documentElement.setAttribute('data-omni-ff-theme', mode);
+      }
+    } catch (_) {}
   }
 
   function ensureStyles() {
+    detectPageTheme();
     if (document.getElementById('omni-ff-style')) return;
     var style = document.createElement('style');
     style.id = 'omni-ff-style';
     style.textContent =
+      '.omni-ff-wrap{' +
+      'display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px;margin-left:5px;' +
+      'vertical-align:middle;line-height:1.3;user-select:none;letter-spacing:0;' +
+      '}' +
+      '.omni-ff-wrap.is-row{' +
+      'display:flex;margin:3px 0 0 0;max-width:100%;width:fit-content;' +
+      '}' +
+      '.omni-ff-wrap.is-profile-banner{' +
+      'display:inline-flex;margin:4px 0 4px 8px;' +
+      '}' +
       '.omni-ff-badge{' +
-      'display:inline-flex;align-items:center;gap:3px;margin-left:5px;padding:1px 6px;' +
+      'display:inline-flex;align-items:center;gap:3px;padding:1.5px 7px;' +
       'border-radius:999px;font-size:10.5px;font-weight:600;line-height:1.35;' +
-      'background:rgba(21,156,171,0.16);border:1px solid rgba(21,156,171,0.42);' +
-      'color:inherit;white-space:nowrap;user-select:none;vertical-align:middle;' +
-      'opacity:0.94;letter-spacing:0;pointer-events:none;' +
+      'background:rgba(21,156,171,0.16);border:1px solid rgba(21,156,171,0.46);' +
+      'color:inherit;white-space:nowrap;opacity:0.95;pointer-events:none;' +
       '}' +
-      '.omni-ff-badge-row{' +
-      'display:inline-flex;align-items:center;flex-wrap:wrap;gap:3px;margin:3px 0 0 0;padding:1.5px 7px;' +
-      'border-radius:999px;font-size:10.5px;font-weight:600;line-height:1.35;' +
-      'background:rgba(21,156,171,0.18);border:1px solid rgba(21,156,171,0.45);' +
-      'color:inherit;max-width:100%;width:fit-content;user-select:none;letter-spacing:0;' +
-      'pointer-events:auto;cursor:pointer;' +
+      '.omni-ff-wrap.is-row .omni-ff-badge{pointer-events:auto;cursor:pointer;}' +
+      '.omni-ff-badge.is-pending{' +
+      'background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.32);opacity:0.72;' +
       '}' +
-      '.omni-ff-badge-row.is-pending{' +
-      'background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.3);opacity:0.72;' +
+      '.omni-ff-badge.is-retry{' +
+      'background:rgba(148,163,184,0.16);border:1px dashed rgba(148,163,184,0.55);opacity:0.86;' +
       '}' +
-      '.omni-ff-badge-row.is-retry{' +
-      'background:rgba(245,158,11,0.14);border-color:rgba(245,158,11,0.42);opacity:0.88;' +
+      '.omni-ff-badge.is-following-heavy{' +
+      'background:rgba(245,158,11,0.24);border:1.5px solid rgba(245,158,11,0.9);' +
+      'color:#fcd34d;font-weight:700;opacity:1;' +
+      '}' +
+      'html[data-omni-ff-theme="light"] .omni-ff-badge.is-following-heavy{' +
+      'background:rgba(245,158,11,0.20);border-color:#d97706;color:#92400e;' +
+      '}' +
+      '.omni-ff-rel{' +
+      'display:inline-flex;align-items:center;gap:2px;padding:1.5px 7px;' +
+      'border-radius:999px;font-size:10.5px;font-weight:700;line-height:1.35;' +
+      'white-space:nowrap;pointer-events:none;' +
+      '}' +
+      '.omni-ff-rel.is-mutual{' +
+      'background:rgba(16,185,129,0.22);border:1px solid rgba(16,185,129,0.82);color:#34d399;' +
+      '}' +
+      'html[data-omni-ff-theme="light"] .omni-ff-rel.is-mutual{' +
+      'background:rgba(16,185,129,0.16);border-color:#059669;color:#047857;' +
+      '}' +
+      '.omni-ff-rel.is-oneway{' +
+      'background:rgba(244,63,94,0.22);border:1px solid rgba(244,63,94,0.8);color:#fda4af;' +
+      '}' +
+      'html[data-omni-ff-theme="light"] .omni-ff-rel.is-oneway{' +
+      'background:rgba(244,63,94,0.14);border-color:#e11d48;color:#be123c;' +
+      '}' +
+      '.omni-ff-rel.is-follower{' +
+      'background:rgba(99,102,241,0.22);border:1px solid rgba(129,140,248,0.8);color:#a5b4fc;' +
+      '}' +
+      'html[data-omni-ff-theme="light"] .omni-ff-rel.is-follower{' +
+      'background:rgba(99,102,241,0.14);border-color:#4f46e5;color:#3730a3;' +
+      '}' +
+      '[data-omni-ff-heavy="1"]{' +
+      'box-shadow:inset 3px 0 0 rgba(245,158,11,0.9) !important;' +
+      'background-color:rgba(245,158,11,0.06) !important;' +
       '}';
     (document.head || document.documentElement).appendChild(style);
   }
 
-  function formatBadgeDisplay(entry, includePosts) {
-    if (!hasUsableStats(entry)) return null;
-    var hasFollowing = typeof entry.following === 'number';
-    var hasFollowers = typeof entry.followers === 'number';
-    var hasPosts = includePosts && typeof entry.posts === 'number';
-    var parts = [];
-    var titleParts = [];
-    if (entry.isPrivate === true) {
-      parts.push('🔒');
-      titleParts.push('非公開アカウント');
+  function formatBadgeDisplay(entry, handle, includePosts) {
+    var relKind = computeRelation(entry, handle);
+    var relText = '';
+    var relTitle = '';
+    if (relKind === 'mutual') {
+      relText = '⇄ 相互';
+      relTitle = '相互フォロー中（お互いにフォローしています）';
+    } else if (relKind === 'oneway') {
+      relText = '→ 片思い';
+      relTitle = '片思い中（相手からフォローバックされていません）';
+    } else if (relKind === 'follower') {
+      relText = '← フォロワー';
+      relTitle = '相手があなたをフォローしています（未フォローバック）';
     }
-    if (hasFollowing) {
-      parts.push('フォロー ' + formatCompactCount(entry.following));
-      titleParts.push('フォロー中: ' + entry.following.toLocaleString('ja-JP') + '人');
+
+    var statsText = '';
+    var statsTitle = '';
+    var isFollowingHeavy = false;
+
+    if (hasUsableStats(entry)) {
+      var hasFollowing = typeof entry.following === 'number';
+      var hasFollowers = typeof entry.followers === 'number';
+      var hasPosts = includePosts && typeof entry.posts === 'number';
+      isFollowingHeavy = hasFollowing && hasFollowers && entry.following > entry.followers;
+
+      var parts = [];
+      var titleParts = [];
+      if (entry.isPrivate === true) {
+        parts.push('🔒');
+        titleParts.push('非公開アカウント');
+      }
+      if (hasFollowing) {
+        parts.push('フォロー ' + formatCompactCount(entry.following));
+        titleParts.push('フォロー中: ' + entry.following.toLocaleString('ja-JP') + '人');
+      }
+      if (hasFollowers) {
+        parts.push('フォロワー ' + formatCompactCount(entry.followers));
+        titleParts.push('フォロワー: ' + entry.followers.toLocaleString('ja-JP') + '人');
+      }
+      if (hasPosts) {
+        parts.push('投稿 ' + formatCompactCount(entry.posts));
+        titleParts.push('投稿: ' + entry.posts.toLocaleString('ja-JP') + '件');
+      }
+      if (isFollowingHeavy) {
+        titleParts.push('★ フォロー中の方がフォロワーより多いユーザー');
+      }
+      if (parts.length > 0) {
+        var lockPrefix = parts[0] === '🔒' ? '🔒 ' : '';
+        var heavyPrefix = isFollowingHeavy ? '▲ ' : '';
+        var body = (lockPrefix ? parts.slice(1) : parts).join(' · ');
+        statsText = heavyPrefix + lockPrefix + body;
+        statsTitle = titleParts.join(' / ');
+      }
     }
-    if (hasFollowers) {
-      parts.push('フォロワー ' + formatCompactCount(entry.followers));
-      titleParts.push('フォロワー: ' + entry.followers.toLocaleString('ja-JP') + '人');
-    }
-    if (hasPosts) {
-      parts.push('投稿 ' + formatCompactCount(entry.posts));
-      titleParts.push('投稿: ' + entry.posts.toLocaleString('ja-JP') + '件');
-    }
-    if (parts.length === 0) return null;
-    var prefix = parts[0] === '🔒' ? '🔒 ' : '';
-    var body = (prefix ? parts.slice(1) : parts).join(' · ');
-    return { text: prefix + body, title: titleParts.join(' / ') };
+
+    if (!relText && !statsText) return null;
+    return {
+      relKind: relKind,
+      relText: relText,
+      relTitle: relTitle,
+      statsText: statsText,
+      statsTitle: statsTitle,
+      isFollowingHeavy: isFollowingHeavy
+    };
   }
 
-  var NON_USER_TEXT_RE = /^(?:フォロー|フォロー中|フォローする|フォローバック|フォロワー|投稿|返信|いいね|もっと見る|すべて見る|メッセージ|削除|リクエスト済|リクエスト中|承認待ち|follow|follow\s+back|following|followers|posts|replies|likes|more|message|remove|requested|\d+(?:秒|分|時間|日|週間|[smhdw])?)$/i;
-  var FOLLOW_LIST_BTN_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォロー中|フォロー済|リクエスト済|リクエスト中|承認待ち|follow|follow\s+back|following|requested)$/i;
+  function findChildWrapByUser(container, handle) {
+    var wraps = container.querySelectorAll('.omni-ff-wrap');
+    for (var i = 0; i < wraps.length; i++) {
+      if (wraps[i].getAttribute('data-omni-ff-user') === handle) return wraps[i];
+    }
+    return null;
+  }
+
+  function renderWrapContents(wrap, display, handle, isRow) {
+    // 関係ピル更新
+    var relEl = wrap.querySelector('.omni-ff-rel');
+    if (display && display.relText) {
+      if (!relEl) {
+        relEl = document.createElement('span');
+        wrap.insertBefore(relEl, wrap.firstChild);
+      }
+      var relCls = 'omni-ff-rel is-' + display.relKind;
+      if (relEl.className !== relCls) relEl.className = relCls;
+      if (relEl.textContent !== display.relText) relEl.textContent = display.relText;
+      if (relEl.title !== display.relTitle) relEl.title = display.relTitle;
+    } else if (relEl) {
+      relEl.remove();
+    }
+
+    // 人数ピル更新
+    var statEl = wrap.querySelector('.omni-ff-badge');
+    if (display && display.statsText) {
+      if (!statEl) {
+        statEl = document.createElement('span');
+        if (isRow) {
+          statEl.addEventListener('click', function(ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            enqueueFetch(handle, true, true);
+            scheduleRenderBadges();
+          });
+        }
+        wrap.appendChild(statEl);
+      }
+      var statCls = 'omni-ff-badge' + (display.isFollowingHeavy ? ' is-following-heavy' : '');
+      if (statEl.className !== statCls) statEl.className = statCls;
+      if (statEl.textContent !== display.statsText) statEl.textContent = display.statsText;
+      var tip = isRow ? display.statsTitle + '（クリックで再取得）' : display.statsTitle;
+      if (statEl.title !== tip) statEl.title = tip;
+    } else if (isRow && canActiveFetchPlatform()) {
+      if (!statEl) {
+        statEl = document.createElement('span');
+        statEl.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          enqueueFetch(handle, true, true);
+          scheduleRenderBadges();
+        });
+        wrap.appendChild(statEl);
+      }
+      if (inFlight[handle] || queuedSet[handle]) {
+        statEl.className = 'omni-ff-badge is-pending';
+        if (statEl.textContent !== '人数を取得中…') statEl.textContent = '人数を取得中…';
+        statEl.title = 'フォロー数・フォロワー数を取得中';
+      } else if (failedMap[handle] || Date.now() < backoffUntil) {
+        statEl.className = 'omni-ff-badge is-retry';
+        if (statEl.textContent !== '人数を取得 ↻') statEl.textContent = '人数を取得 ↻';
+        statEl.title = 'クリックしてフォロー数・フォロワー数を取得';
+      } else {
+        statEl.className = 'omni-ff-badge is-pending';
+        if (statEl.textContent !== '人数を取得中…') statEl.textContent = '人数を取得中…';
+        statEl.title = 'クリックして優先取得';
+      }
+    } else if (statEl) {
+      statEl.remove();
+    }
+  }
+
+  var NON_USER_TEXT_RE = /^(?:フォロー|フォロー中|フォローする|フォローバック|フォロワー|相互フォロー|友達|投稿|返信|いいね|もっと見る|すべて見る|メッセージ|削除|リクエスト済|リクエスト中|承認待ち|follow|follow\s+back|following|followers|friends|mutual|posts|replies|likes|more|message|remove|requested|\d+(?:秒|分|時間|日|週間|[smhdw])?)$/i;
+  var FOLLOW_LIST_BTN_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォローを返す|フォロー中|フォロー済|フォロー済み|相互フォロー|友達|リクエスト済|リクエスト中|承認待ち|follow|follow\s+back|following|friends|mutual|requested|connected|connect|つながり申請)$/i;
+  var BTN_IS_MUTUAL_RE = /^(?:相互フォロー|相互|友達|friends|mutual|mutual\s+follow|connected|つながり済み)$/i;
+  var BTN_IS_FOLLOW_BACK_RE = /^(?:[+＋]\s*)?(?:フォローバック|フォローバックする|フォローを返す|follow\s+back)$/i;
+  var BTN_IS_FOLLOWING_RE = /^(?:フォロー中|フォロー済|フォロー済み|following)$/i;
+  var BTN_IS_UNFOLLOWED_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|follow)$/i;
+  var FOLLOWS_YOU_BADGE_RE = /^(?:フォローされています|あなたをフォローしています|follows\s+you|相互フォロー(?:中)?|友達|friends)$/i;
+  var FOLLOWS_YOU_TEXT_RE = /(?:フォローされています|あなたをフォローしています|follows\s+you)/i;
 
   function isInViewport(el) {
     try {
@@ -2099,8 +3151,8 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var txt = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
       if (!txt || txt.length > 48) return false;
       if (NON_USER_TEXT_RE.test(txt)) return false;
-      var curPath = (window.location && window.location.pathname || '').toLowerCase().replace(/^\/@?/, '').replace(/\/.*$/, '');
-      if (curPath === handle && a.closest('header')) return false;
+      var curH = getCurrentProfileHandleFromUrl();
+      if (curH === handle && a.closest('header')) return false;
       return true;
     } catch (_) {
       return false;
@@ -2117,7 +3169,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var imgs = row.querySelectorAll('img[alt]');
       for (var j = 0; j < imgs.length; j++) {
         var alt = (imgs[j].getAttribute('alt') || '').trim();
-        var am = /^@?([a-z0-9._]{1,35})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
+        var am = /^@?([a-z0-9._-]{1,40})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
         if (am) {
           var ah = normalizeHandle(am[1]);
           if (ah) return ah;
@@ -2127,11 +3179,11 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       for (var k = 0; k < spans.length && k < 40; k++) {
         var s = spans[k];
         if (s.children && s.children.length > 0) continue;
-        if (s.closest('button, [role="button"]')) continue;
+        if (s.closest('button, [role="button"], .omni-ff-wrap')) continue;
         var t = (s.textContent || '').trim();
-        if (!t || t.length > 36 || /\s/.test(t) || NON_USER_TEXT_RE.test(t)) continue;
+        if (!t || t.length > 40 || /\s/.test(t) || NON_USER_TEXT_RE.test(t)) continue;
         var nh = normalizeHandle(t);
-        if (nh && (userIdMap[nh] || /[._0-9]/.test(nh) || /^[a-z][a-z0-9._]{2,30}$/.test(nh))) {
+        if (nh && (userIdMap[nh] || t[0] === '@' || /[._0-9]/.test(nh) || /^[a-z][a-z0-9._]{2,30}$/.test(nh))) {
           return nh;
         }
       }
@@ -2154,7 +3206,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         for (var j = 0; j < leaves.length && j < 40; j++) {
           var el = leaves[j];
           if (el.children && el.children.length > 0) continue;
-          if (el.closest('button, [role="button"]')) continue;
+          if (el.closest('button, [role="button"], .omni-ff-wrap')) continue;
           var txt = (el.textContent || '').trim().replace(/^@+/, '').toLowerCase();
           if (txt === handle) {
             anchor = el;
@@ -2171,7 +3223,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         if (p.contains(btn)) break;
         if (p.querySelector('img[width], canvas')) break;
         var r = p.getBoundingClientRect();
-        if (r.width >= 90 && r.height >= 24 && r.height <= 120) {
+        if (r.width >= 90 && r.height >= 24 && r.height <= 130) {
           best = p;
         }
         cur = p;
@@ -2182,95 +3234,217 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     }
   }
 
-  function upsertRowBadge(container, handle) {
+  function inferRelationFromRowDom(row, btnText, handle, listContext) {
+    if (!handle || handle === selfHandle) return;
+    var iFollow = null;
+    var followsMe = null;
+
+    if (BTN_IS_MUTUAL_RE.test(btnText)) {
+      iFollow = true;
+      followsMe = true;
+    } else if (BTN_IS_FOLLOW_BACK_RE.test(btnText)) {
+      iFollow = false;
+      followsMe = true;
+    } else if (BTN_IS_FOLLOWING_RE.test(btnText)) {
+      iFollow = true;
+    } else if (BTN_IS_UNFOLLOWED_RE.test(btnText)) {
+      iFollow = false;
+    }
+
+    if (listContext === 'self-followers') {
+      followsMe = true;
+    } else if (listContext === 'self-following' && iFollow === null) {
+      iFollow = true;
+    }
+
+    // 行内の「フォローされています / Follows you」表示を検出（自前バッジ除外）
+    if (followsMe === null) {
+      var nodes = row.querySelectorAll('span, div');
+      for (var i = 0; i < nodes.length && i < 30; i++) {
+        var n = nodes[i];
+        if (n.children && n.children.length > 0) continue;
+        if (n.closest('.omni-ff-wrap, button, [role="button"]')) continue;
+        var t = (n.textContent || '').trim();
+        if (t && t.length <= 28 && FOLLOWS_YOU_BADGE_RE.test(t)) {
+          followsMe = true;
+          break;
+        }
+      }
+    }
+
+    if (iFollow !== null || followsMe !== null) {
+      recordRelation(handle, iFollow, followsMe);
+    }
+  }
+
+  function upsertRowBadge(row, container, handle) {
     ensureStyles();
     var entry = statsMap[handle];
-    var display = formatBadgeDisplay(entry, true);
-    var badge = container.querySelector('.omni-ff-badge-row[data-omni-ff-user="' + handle + '"]');
-    if (!badge) {
-      badge = document.createElement('div');
-      badge.className = 'omni-ff-badge-row';
-      badge.setAttribute('data-omni-ff-user', handle);
-      badge.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        enqueueFetch(handle, true, true);
-        upsertRowBadge(container, handle);
-      });
+    var display = formatBadgeDisplay(entry, handle, true);
+
+    if (display && display.isFollowingHeavy) {
+      if (row.getAttribute('data-omni-ff-heavy') !== '1') row.setAttribute('data-omni-ff-heavy', '1');
+    } else if (row.hasAttribute('data-omni-ff-heavy')) {
+      row.removeAttribute('data-omni-ff-heavy');
+    }
+
+    if (!display && !canActiveFetchPlatform()) return;
+
+    var wrap = findChildWrapByUser(container, handle);
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.className = 'omni-ff-wrap is-row';
+      wrap.setAttribute('data-omni-ff-user', handle);
       try {
-        container.appendChild(badge);
+        container.appendChild(wrap);
       } catch (_) {
         return;
       }
     }
-
-    if (display) {
-      badge.className = 'omni-ff-badge-row';
-      if (badge.textContent !== display.text) badge.textContent = display.text;
-      if (badge.title !== display.title) badge.title = display.title + '（クリックで再取得）';
-    } else if (inFlight[handle] || queuedSet[handle]) {
-      badge.className = 'omni-ff-badge-row is-pending';
-      if (badge.textContent !== '人数を取得中…') badge.textContent = '人数を取得中…';
-      badge.title = 'フォロー数・フォロワー数を取得中';
-    } else if (failedMap[handle] || Date.now() < backoffUntil) {
-      badge.className = 'omni-ff-badge-row is-retry';
-      if (badge.textContent !== '人数を取得 ↻') badge.textContent = '人数を取得 ↻';
-      badge.title = 'クリックしてフォロー数・フォロワー数を取得';
-    } else {
-      badge.className = 'omni-ff-badge-row is-pending';
-      if (badge.textContent !== '人数を取得中…') badge.textContent = '人数を取得中…';
-      badge.title = 'クリックして優先取得';
-    }
+    renderWrapContents(wrap, display, handle, true);
   }
 
-  function scanFollowListRows() {
-    var handledRows = [];
+  function scanFollowListRows(rootScope) {
+    var listContext = detectSelfListPageContext();
+    var scope = rootScope || document;
     try {
-      var btns = document.querySelectorAll('button, [role="button"]');
-      for (var i = 0; i < btns.length && i < 600; i++) {
+      var btns = scope.querySelectorAll('button, [role="button"]');
+      var maxBtns = rootScope ? 320 : 280;
+      for (var i = 0; i < btns.length && i < maxBtns; i++) {
         var btn = btns[i];
-        if (btn.closest('nav, [role="navigation"]')) continue;
+        if (btn.closest('nav, [role="navigation"], .omni-ff-wrap')) continue;
         var bTxt = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
-        if (!bTxt || bTxt.length > 20 || !FOLLOW_LIST_BTN_RE.test(bTxt)) continue;
+        if (!bTxt || bTxt.length > 22 || !FOLLOW_LIST_BTN_RE.test(bTxt)) continue;
 
-        var row = null;
-        var cur = btn.parentElement;
-        for (var depth = 0; depth < 7 && cur && cur !== document.body; depth++) {
-          var rect = cur.getBoundingClientRect();
-          if (rect.height >= 42 && rect.height <= 190 && rect.width >= 210) {
-            var followBtnCount = 0;
-            var subBtns = cur.querySelectorAll('button, [role="button"]');
-            for (var sb = 0; sb < subBtns.length; sb++) {
-              var st = (subBtns[sb].innerText || subBtns[sb].textContent || '').replace(/\s+/g, ' ').trim();
-              if (st && st.length <= 20 && FOLLOW_LIST_BTN_RE.test(st)) followBtnCount++;
-            }
-            if (followBtnCount === 1) {
-              var hCand = extractHandleFromRow(cur);
-              if (hCand) {
-                row = cur;
-                break;
+        // すでに特定済みの行はレイアウト計算(getBoundingClientRect)をスキップして高速更新
+        var row = btn.closest('[data-omni-ff-row]');
+        var handle = row ? (row.getAttribute('data-omni-ff-row') || '') : '';
+        if (!row || !handle) {
+          row = null;
+          var cur = btn.parentElement;
+          for (var depth = 0; depth < 7 && cur && cur !== document.body; depth++) {
+            var rect = cur.getBoundingClientRect();
+            if (rect.height >= 40 && rect.height <= 200 && rect.width >= 200) {
+              var followBtnCount = 0;
+              var subBtns = cur.querySelectorAll('button, [role="button"]');
+              for (var sb = 0; sb < subBtns.length; sb++) {
+                var st = (subBtns[sb].innerText || subBtns[sb].textContent || '').replace(/\s+/g, ' ').trim();
+                if (st && st.length <= 22 && FOLLOW_LIST_BTN_RE.test(st)) followBtnCount++;
+              }
+              if (followBtnCount === 1) {
+                var hCand = extractHandleFromRow(cur);
+                if (hCand) {
+                  row = cur;
+                  handle = hCand;
+                  break;
+                }
               }
             }
+            cur = cur.parentElement;
           }
-          cur = cur.parentElement;
+          if (!row || !handle) continue;
+          row.setAttribute('data-omni-ff-row', handle);
         }
-        if (!row) continue;
 
-        var handle = extractHandleFromRow(row);
-        if (!handle) continue;
         var col = findRowTextColumn(row, btn, handle);
         if (!col) continue;
 
-        row.setAttribute('data-omni-ff-row', handle);
-        handledRows.push(row);
-        var visible = isInViewport(row);
-        if (!hasUsableStats(statsMap[handle]) && visible) {
-          enqueueFetch(handle, false, false);
+        inferRelationFromRowDom(row, bTxt, handle, listContext);
+
+        var ent = statsMap[handle];
+        var needStats = !hasUsableStats(ent);
+        var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && !!userIdMap[handle];
+        if ((needStats || needRel) && isInViewport(row)) {
+          if (needStats) {
+            enqueueFetch(handle, false, false);
+          } else if (needRel) {
+            scheduleRelBatch(160);
+          }
         }
-        upsertRowBadge(col, handle);
+        upsertRowBadge(row, col, handle);
       }
     } catch (_) {}
-    return handledRows;
+  }
+
+  // 現在開いているプロフィールページのDOMから人数＆相互状態を読み取り、ヘッダーにインライン表示する（全SNS対応）
+  function scanCurrentProfilePage() {
+    try {
+      var curHandle = getCurrentProfileHandleFromUrl();
+      if (!curHandle) return;
+      var root = document.querySelector('main, header, [role="main"]') || document.body;
+      if (!root) return;
+
+      var headerScope = root.querySelector('header') || root;
+      var textSample = (headerScope.innerText || '').slice(0, 2500);
+      var followers = null;
+      var following = null;
+      var iFollow = null;
+      var followsMe = null;
+
+      // 日本語・英語・中国語・韓国語の人数パターン抽出
+      var mFlwng = /([0-9.,]+\s*[KMB万千億]?)\s*(?:フォロー中|フォロー(?!ワー)|Following|Follows|关注|팔로잉)/i.exec(textSample) ||
+                   /(?:フォロー中|Following|关注|팔로잉)\s*[:：]?\s*([0-9.,]+\s*[KMB万千億]?)/i.exec(textSample);
+      if (mFlwng) following = parseHumanNumber(mFlwng[1]);
+
+      var mFlwrs = /([0-9.,]+\s*[KMB万千億]?)\s*(?:フォロワー|Followers|粉丝|팔로워)/i.exec(textSample) ||
+                   /(?:フォロワー|Followers|粉丝|팔로워)\s*[:：]?\s*([0-9.,]+\s*[KMB万千億]?)/i.exec(textSample);
+      if (mFlwrs) followers = parseHumanNumber(mFlwrs[1]);
+
+      if (curHandle !== selfHandle) {
+        if (FOLLOWS_YOU_TEXT_RE.test(textSample)) {
+          followsMe = true;
+        }
+        var headerBtns = headerScope.querySelectorAll('button, [role="button"]');
+        for (var i = 0; i < headerBtns.length && i < 30; i++) {
+          var bt = (headerBtns[i].innerText || headerBtns[i].textContent || '').replace(/\s+/g, ' ').trim();
+          if (!bt || bt.length > 22) continue;
+          if (BTN_IS_MUTUAL_RE.test(bt)) { iFollow = true; followsMe = true; break; }
+          if (BTN_IS_FOLLOW_BACK_RE.test(bt)) { iFollow = false; followsMe = true; break; }
+          if (BTN_IS_FOLLOWING_RE.test(bt)) { iFollow = true; break; }
+          if (BTN_IS_UNFOLLOWED_RE.test(bt)) { iFollow = false; break; }
+        }
+      }
+
+      if (followers !== null || following !== null || iFollow !== null || followsMe !== null) {
+        recordStats(curHandle, followers, following, null, null, iFollow, followsMe);
+      }
+
+      if (curHandle === selfHandle) return;
+
+      var entry = statsMap[curHandle];
+      if (!hasUsableStats(entry) || (entry && entry.followsMe === null)) {
+        enqueueFetch(curHandle, true, false);
+        scheduleRelBatch();
+      }
+
+      var display = formatBadgeDisplay(entry, curHandle, false);
+      if (!display || (!display.relText && !display.isFollowingHeavy)) return;
+
+      var heading = headerScope.querySelector('h1, h2');
+      if (!heading || !heading.parentElement) return;
+      ensureStyles();
+      var existing = findChildWrapByUser(heading.parentElement, curHandle);
+      if (!existing) {
+        existing = document.createElement('span');
+        existing.className = 'omni-ff-wrap is-profile-banner';
+        existing.setAttribute('data-omni-ff-user', curHandle);
+        try {
+          heading.insertAdjacentElement('afterend', existing);
+        } catch (_) {
+          return;
+        }
+      }
+      // プロフィール画面では相互ピルとフォロー多め強調のみ簡潔に表示（元の人数表示と重複しすぎないよう）
+      var bannerDisplay = {
+        relKind: display.relKind,
+        relText: display.relText,
+        relTitle: display.relTitle,
+        statsText: display.isFollowingHeavy ? '▲ フォロー多め' : '',
+        statsTitle: display.statsTitle,
+        isFollowingHeavy: display.isFollowingHeavy
+      };
+      renderWrapContents(existing, bannerDisplay, curHandle, false);
+    } catch (_) {}
   }
 
   var io = null;
@@ -2290,80 +3464,113 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   function applyBadgeToLink(a, handle) {
     var entry = statsMap[handle];
-    var display = formatBadgeDisplay(entry, false);
+    var display = formatBadgeDisplay(entry, handle, false);
     if (!display) return;
 
     var next = a.nextElementSibling;
-    if (next && next.classList && next.classList.contains('omni-ff-badge') &&
+    if (next && next.classList && next.classList.contains('omni-ff-wrap') &&
         next.getAttribute('data-omni-ff-user') === handle) {
-      if (next.textContent !== display.text) next.textContent = display.text;
-      if (next.title !== display.title) next.title = display.title;
+      renderWrapContents(next, display, handle, false);
       return;
     }
 
     var scope = a.closest('[data-omni-ff-row], header, [role="listitem"], li') || a.parentElement;
     if (scope) {
-      var existing = scope.querySelector('.omni-ff-badge[data-omni-ff-user="' + handle + '"], .omni-ff-badge-row[data-omni-ff-user="' + handle + '"]');
+      var existing = findChildWrapByUser(scope, handle);
       if (existing) {
-        if (!existing.classList.contains('omni-ff-badge-row') && existing.textContent !== display.text) {
-          existing.textContent = display.text;
+        if (!existing.classList.contains('is-row') && !existing.classList.contains('is-profile-banner')) {
+          renderWrapContents(existing, display, handle, false);
         }
         return;
       }
     }
 
     ensureStyles();
-    var span = document.createElement('span');
-    span.className = 'omni-ff-badge';
-    span.setAttribute('data-omni-ff-user', handle);
-    span.textContent = display.text;
-    span.title = display.title;
+    var wrap = document.createElement('span');
+    wrap.className = 'omni-ff-wrap';
+    wrap.setAttribute('data-omni-ff-user', handle);
+    renderWrapContents(wrap, display, handle, false);
     try {
-      a.insertAdjacentElement('afterend', span);
+      a.insertAdjacentElement('afterend', wrap);
     } catch (_) {}
   }
 
   function scanAndRender() {
+    detectDynamicPlatformFromDom();
+    detectPageTheme();
+    if (isChatOnlyPlatform) return;
     detectSelfAccountFromDom();
-    scanFollowListRows();
+
+    // フォロワー/フォロー一覧モーダルが開いている場合はダイアログ内のみ優先スキャン（背景ページの過剰走査を防止）
+    var activeDialog = document.querySelector('[role="dialog"]');
+    if (activeDialog && activeDialog.querySelector('a[href], button, [role="button"]')) {
+      scanFollowListRows(activeDialog);
+      scheduleRelBatch(160);
+      return;
+    }
+
+    scanCurrentProfilePage();
+    scanFollowListRows(null);
+
     var links = document.querySelectorAll('a[href]');
-    for (var i = 0; i < links.length && i < 3000; i++) {
+    var maxLinks = platform === 'instagram' ? 600 : 1200;
+    for (var i = 0; i < links.length && i < maxLinks; i++) {
       var a = links[i];
-      if (a.closest('[data-omni-ff-row]')) continue;
+      if (a.closest('[data-omni-ff-row], .omni-ff-wrap')) continue;
       var handle = a.getAttribute('data-omni-ff-handle');
-      if (!handle) {
+      if (handle === '') continue;
+      if (handle === null) {
         handle = extractHandleFromLink(a);
+        a.setAttribute('data-omni-ff-handle', handle || '');
         if (handle) {
-          a.setAttribute('data-omni-ff-handle', handle);
           (function(linkEl, h) {
             linkEl.addEventListener('pointerenter', function() {
               enqueueFetch(h, true, false);
+              scheduleRelBatch(120);
             }, { passive: true });
           })(a, handle);
         }
       }
       if (handle) {
-        if (a.getAttribute('data-omni-ff-target') !== '1' && isBadgeTargetLink(a, handle)) {
-          a.setAttribute('data-omni-ff-target', '1');
-          if (io) io.observe(a);
+        var targetState = a.getAttribute('data-omni-ff-target');
+        if (targetState === null) {
+          if (isBadgeTargetLink(a, handle)) {
+            a.setAttribute('data-omni-ff-target', '1');
+            targetState = '1';
+            if (io) io.observe(a);
+          } else {
+            a.setAttribute('data-omni-ff-target', '0');
+            targetState = '0';
+          }
         }
-        if (a.getAttribute('data-omni-ff-target') === '1') {
-          if (hasUsableStats(statsMap[handle])) {
+        if (targetState === '1') {
+          var ent = statsMap[handle];
+          if (hasAnyDisplayData(ent, handle)) {
             applyBadgeToLink(a, handle);
-          } else if (isInViewport(a)) {
-            enqueueFetch(handle, false, false);
+          }
+          var needStats = !hasUsableStats(ent);
+          var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && !!userIdMap[handle];
+          if ((needStats || needRel) && isInViewport(a)) {
+            if (needStats) {
+              enqueueFetch(handle, false, false);
+            } else if (needRel) {
+              scheduleRelBatch(160);
+            }
           }
         }
       }
     }
+    scheduleRelBatch();
   }
 
-  function scheduleRenderBadges() {
+  function scheduleRenderBadges(delayMs) {
+    if (!pageBooted) return;
     if (renderTimer) return;
+    var wait = typeof delayMs === 'number' ? delayMs : (platform === 'instagram' ? 300 : 200);
     renderTimer = setTimeout(function() {
       renderTimer = null;
-      scanAndRender();
-    }, 150);
+      runWhenIdle(scanAndRender, 500);
+    }, wait);
   }
 
   loadCache();
@@ -2375,51 +3582,85 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       if (typeof origPush === 'function') {
         history.pushState = function() {
           var r = origPush.apply(this, arguments);
-          setTimeout(scheduleRenderBadges, 250);
+          scheduleRenderBadges(320);
           return r;
         };
       }
       if (typeof origReplace === 'function') {
         history.replaceState = function() {
           var r = origReplace.apply(this, arguments);
-          setTimeout(scheduleRenderBadges, 250);
+          scheduleRenderBadges(320);
           return r;
         };
       }
-      window.addEventListener('popstate', function() { setTimeout(scheduleRenderBadges, 250); }, { passive: true });
+      window.addEventListener('popstate', function() { scheduleRenderBadges(320); }, { passive: true });
     } catch (_) {}
   }
 
-  function boot() {
-    hookHistory();
-    scanSsrScripts();
-    scanAndRender();
+  function isOwnMutationNode(node) {
+    if (!node || node.nodeType !== 1) return false;
+    var cl = node.classList;
+    return !!(cl && (cl.contains('omni-ff-wrap') || cl.contains('omni-ff-badge') || cl.contains('omni-ff-rel')));
+  }
+
+  function startAfterInitialPaint() {
+    if (pageBooted) return;
+    pageBooted = true;
+    runWhenIdle(function() {
+      scanSsrScripts();
+      scanAndRender();
+    }, 900);
     try {
-      window.addEventListener('scroll', scheduleRenderBadges, true);
+      window.addEventListener('scroll', function() {
+        var now = Date.now();
+        if (now - lastScrollScanAt < 260) return;
+        lastScrollScanAt = now;
+        scheduleRenderBadges(260);
+      }, { capture: true, passive: true });
     } catch (_) {}
     try {
       if (typeof MutationObserver === 'function' && document.body) {
         var mo = new MutationObserver(function(mutations) {
           for (var i = 0; i < mutations.length; i++) {
-            if (mutations[i].addedNodes && mutations[i].addedNodes.length > 0) {
-              scheduleRenderBadges();
-              return;
+            var added = mutations[i].addedNodes;
+            if (added && added.length > 0) {
+              for (var j = 0; j < added.length; j++) {
+                if (!isOwnMutationNode(added[j])) {
+                  scheduleRenderBadges();
+                  return;
+                }
+              }
             }
           }
         });
         mo.observe(document.body, { childList: true, subtree: true });
       }
     } catch (_) {}
-    setTimeout(function() { scanSsrScripts(); scanAndRender(); }, 1000);
-    setTimeout(function() { scanAndRender(); }, 3000);
+    setTimeout(function() { scanSsrScripts(); scheduleRenderBadges(100); }, 2200);
     setInterval(function() {
       if (document.visibilityState === 'visible') {
-        scanAndRender();
-        if (!queueRunning && queue.length > 0 && Date.now() >= backoffUntil) {
+        runWhenIdle(scanAndRender, 800);
+        var maxW = platform === 'instagram' ? igConcurrency : 1;
+        if (activeWorkers < maxW && queue.length > 0 && Date.now() >= backoffUntil) {
           processQueue();
         }
       }
-    }, 2800);
+    }, 5000);
+  }
+
+  function boot() {
+    injectInstagramPreconnects();
+    detectDynamicPlatformFromDom();
+    hookHistory();
+    // 初回ページ読み込み・ハイドレーションをブロックしないよう load 完了後または最大 1200ms 後にスキャン開始
+    if (document.readyState === 'complete') {
+      setTimeout(startAfterInitialPaint, platform === 'instagram' ? 350 : 120);
+    } else {
+      window.addEventListener('load', function() {
+        setTimeout(startAfterInitialPaint, platform === 'instagram' ? 280 : 80);
+      }, { once: true });
+      setTimeout(startAfterInitialPaint, platform === 'instagram' ? 1200 : 700);
+    }
   }
 
   if (document.readyState === 'loading') {

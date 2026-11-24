@@ -44,6 +44,9 @@ export interface OmniApi {
   addTab: (payload: AddInstancePayload) => Promise<{ created: ServiceInstance; config: AppConfig }>;
   removeTab: (instanceId: string) => Promise<AppConfig>;
   removeTabs: (instanceIds: string[]) => Promise<AppConfig>;
+  restoreArchivedTab: (instanceId: string) => Promise<ServiceInstance>;
+  purgeArchivedTab: (instanceId: string) => Promise<boolean>;
+  purgeAllArchivedTabs: () => Promise<number>;
   updateTab: (
     instanceId: string,
     patch: Partial<
@@ -108,6 +111,9 @@ export const omniApi: OmniApi = {
     invoke<{ created: ServiceInstance; config: AppConfig }>('tab_add', { payload }),
   removeTab: (instanceId) => invoke<AppConfig>('tab_remove', { instanceId }),
   removeTabs: (instanceIds) => invoke<AppConfig>('tab_remove_many', { instanceIds }),
+  restoreArchivedTab: (instanceId) => invoke<ServiceInstance>('archived_restore', { instanceId }),
+  purgeArchivedTab: (instanceId) => invoke<boolean>('archived_purge', { instanceId }),
+  purgeAllArchivedTabs: () => invoke<number>('archived_purge_all'),
   updateTab: (instanceId, patch) =>
     invoke<ServiceInstance | null>('tab_update', { instanceId, patch }),
   reorderTabs: (orderedIds) => invoke<AppConfig>('tab_reorder', { orderedIds }),

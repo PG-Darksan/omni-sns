@@ -27,7 +27,7 @@ use crate::url_utils::{
 /// バックグラウンド・オフスクリーン生成時の Chromium スロットリングとウィンドウ遮蔽判定を抑止し、
 /// Instagram / Threads 等の重い SPA が別タブで瞬時にハイドレーション完了するようにする。
 #[cfg(windows)]
-const WEBVIEW2_FAST_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
+const WEBVIEW2_FAST_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion,TranslateUI --enable-quic --enable-gpu-rasterization --enable-zero-copy --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
 
 const BG_WARM_MAX_SECS: u64 = 8;
 const BG_WARM_POST_LOAD_MS: u64 = 2500;
@@ -620,8 +620,97 @@ pub fn sync_instances_ex(app: &AppHandle, shared: &SharedState, purge_profiles: 
     }
 }
 
+/// タブ削除時もログイン記憶（WebView2 プロファイル）をディスク上に保持し、
+/// あとからいつでも再呼び出しできるようにするため、既定ではプロファイルを消去しない。
 pub fn sync_instances(app: &AppHandle, shared: &SharedState) {
-    sync_instances_ex(app, shared, true);
+    sync_instances_ex(app, shared, false);
+}
+
+fn spawn_remove_profile_dir(profile_dir: PathBuf) {
+    std::thread::spawn(move || {
+        for delay_ms in [150u64, 600, 1500] {
+            if !profile_dir.exists() {
+                return;
+            }
+            if fs::remove_dir_all(&profile_dir).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        let _ = fs::remove_dir_all(&profile_dir);
+    });
+}
+
+/// 削除時に保持しておいたログイン記憶（アーカイブ済みインスタンス）を元のプロファイルのまま復元して開く。
+pub fn restore_archived_instance(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+) -> Result<ServiceInstance, String> {
+    let restored = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard
+            .store
+            .restore_archived_instance(instance_id)
+            .ok_or_else(|| "指定されたログイン記憶が見つかりません".to_string())?
+    };
+
+    sync_instances_ex(app, shared, false);
+    activate_tab(app, shared, Some(restored.instance_id.clone()));
+    emit_state_updated(app, shared);
+    Ok(restored)
+}
+
+/// 保存済みログイン記憶を1件完全削除し、ディスク上の WebView2 プロファイルも消去する。
+pub fn purge_archived_instance(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+) -> Result<bool, String> {
+    let profile_to_delete = {
+        let mut guard = shared.inner.lock().unwrap();
+        let removed = guard.store.purge_archived_instance(instance_id);
+        let still_active = guard.store.get_instance(instance_id).is_some();
+        if removed.is_some() && !still_active {
+            Some(profile_dir_for(&guard.profiles_root, instance_id))
+        } else if removed.is_some() {
+            None
+        } else {
+            return Ok(false);
+        }
+    };
+
+    if let Some(dir) = profile_to_delete {
+        spawn_remove_profile_dir(dir);
+    }
+    emit_state_updated(app, shared);
+    Ok(true)
+}
+
+/// 保存済みログイン記憶をすべて完全削除し、ディスク上の WebView2 プロファイルも一括消去する。
+pub fn purge_all_archived_instances(
+    app: &AppHandle,
+    shared: &SharedState,
+) -> Result<usize, String> {
+    let (count, dirs) = {
+        let mut guard = shared.inner.lock().unwrap();
+        let removed = guard.store.purge_all_archived_instances();
+        let mut dirs = Vec::new();
+        for inst in &removed {
+            if guard.store.get_instance(&inst.instance_id).is_none() {
+                dirs.push(profile_dir_for(&guard.profiles_root, &inst.instance_id));
+            }
+        }
+        (removed.len(), dirs)
+    };
+
+    for dir in dirs {
+        spawn_remove_profile_dir(dir);
+    }
+    if count > 0 {
+        emit_state_updated(app, shared);
+    }
+    Ok(count)
 }
 
 pub fn update_bounds_from_window(app: &AppHandle, shared: &SharedState) {

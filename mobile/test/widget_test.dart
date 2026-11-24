@@ -576,4 +576,86 @@ void main() {
     await tester.pump();
     expect(latest?.enabled, isFalse);
   });
+
+  testWidgets('ArchivedInstance roundtrips JSON and CatalogScreen displays saved logins tab for restore', (tester) async {
+    const inst = ServiceInstance(
+      instanceId: 'svc-instagram-sub01',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      accountLabel: 'サブ垢',
+      profileName: 'omnisns_svc-instagram-sub01',
+      category: 'major-sns',
+      url: 'https://www.instagram.com/direct/inbox/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 1,
+      detectedHandle: 'sub_user',
+    );
+    const archived = ArchivedInstance(instance: inst, archivedAt: 1764000000);
+    final roundtripped = ArchivedInstance.fromJson(archived.toJson(), 0);
+    expect(roundtripped, isNotNull);
+    expect(roundtripped!.instance.instanceId, 'svc-instagram-sub01');
+    expect(roundtripped.instance.effectiveProfileName, 'omnisns_svc-instagram-sub01');
+    expect(roundtripped.instance.detectedHandle, 'sub_user');
+    expect(roundtripped.archivedAt, 1764000000);
+
+    const svc = CatalogService(
+      id: 'instagram',
+      name: 'Instagram',
+      aliases: ['ig'],
+      category: 'major-sns',
+      url: 'https://www.instagram.com/direct/inbox/',
+      homeUrl: 'https://www.instagram.com/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      description: 'Instagram DM',
+    );
+
+    NewInstanceRequest? result;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (ctx) => Scaffold(
+            body: Center(
+              child: ElevatedButton(
+                onPressed: () async {
+                  result = await Navigator.of(ctx).push<NewInstanceRequest>(
+                    MaterialPageRoute(
+                      builder: (_) => const CatalogScreen(
+                        categories: [
+                          CategoryMeta(
+                            id: 'major-sns',
+                            label: 'メジャーSNS',
+                            description: '',
+                          ),
+                        ],
+                        catalog: [svc],
+                        existingInstances: [],
+                        multiProfileSupported: true,
+                        archivedInstances: [archived],
+                        initialCategory: 'archived',
+                      ),
+                    ),
+                  );
+                },
+                child: const Text('OPEN'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('OPEN'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('ログイン記憶 (1)'), findsOneWidget);
+    expect(find.text('Instagram · サブ垢 (@sub_user)'), findsOneWidget);
+    await tester.tap(find.text('呼び出す'));
+    await tester.pumpAndSettle();
+
+    expect(result, isNotNull);
+    expect(result!.restoreArchivedInstanceId, 'svc-instagram-sub01');
+  });
 }

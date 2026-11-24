@@ -61,6 +61,7 @@ class _HomeScreenState extends State<HomeScreen> {
   List<CategoryMeta> _categories = const [];
   List<CatalogService> _catalog = const [];
   List<ServiceInstance> _instances = [];
+  List<ArchivedInstance> _archivedInstances = [];
   AppSettings _settings = const AppSettings();
   FollowSyncSettings _followSyncSettings = const FollowSyncSettings();
   FollowSyncLedger _followLedger = FollowSyncLedger();
@@ -96,6 +97,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final catalogData = await widget.store.loadCatalog();
     final (settings, loadedInstances) =
         await widget.store.loadState(catalogData.services);
+    final archivedInstances =
+        await widget.store.loadArchivedInstances(loadedInstances);
     final (followSyncSettings, followLedger) =
         await widget.store.loadFollowSyncState();
     final today = formatLocalYmd(DateTime.now());
@@ -117,6 +120,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _catalog = catalogData.services;
       _settings = settings;
       _instances = instances;
+      _archivedInstances = archivedInstances;
       _followSyncSettings = followSyncSettings;
       _followLedger = followLedger;
       _multiProfileSupported = multiProfile;
@@ -236,6 +240,121 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _persist() async {
     await widget.store.saveState(_settings, _instances);
+  }
+
+  Future<void> _persistArchived() async {
+    await widget.store.saveArchivedInstances(_archivedInstances);
+  }
+
+  String _formatArchivedDisplayTitle(ServiceInstance inst) {
+    final label = inst.accountLabel?.trim();
+    final base = (label != null && label.isNotEmpty && label != inst.name)
+        ? '${inst.name} · $label'
+        : inst.name;
+    final h = inst.detectedHandle?.trim();
+    return (h != null && h.isNotEmpty) ? '$base (@$h)' : base;
+  }
+
+  Future<void> _archiveInstances(List<ServiceInstance> removed) async {
+    if (removed.isEmpty) return;
+    final nowSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    setState(() {
+      for (final inst in removed.reversed) {
+        _archivedInstances.removeWhere(
+          (a) => a.instance.instanceId == inst.instanceId,
+        );
+        _archivedInstances.insert(
+          0,
+          ArchivedInstance(instance: inst, archivedAt: nowSecs),
+        );
+      }
+      if (_archivedInstances.length > 100) {
+        _archivedInstances = _archivedInstances.sublist(0, 100);
+      }
+    });
+    await _persistArchived();
+  }
+
+  Future<void> _restoreArchivedInstance(String instanceId) async {
+    final idx = _archivedInstances
+        .indexWhere((a) => a.instance.instanceId == instanceId);
+    if (idx == -1) return;
+    final entry = _archivedInstances[idx];
+    final inst = entry.instance;
+
+    final existingIdx =
+        _instances.indexWhere((i) => i.instanceId == inst.instanceId);
+    if (existingIdx != -1) {
+      setState(() {
+        _archivedInstances.removeAt(idx);
+      });
+      await _persistArchived();
+      _activateInstance(_instances[existingIdx]);
+      return;
+    }
+
+    final groupKey = serviceGroupKey(inst);
+    final lastSiblingIdx = _instances.lastIndexWhere(
+      (i) => serviceGroupKey(i) == groupKey,
+    );
+    final insertAt =
+        lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
+
+    _lastActiveByGroup[groupKey] = inst.instanceId;
+    setState(() {
+      _archivedInstances.removeAt(idx);
+      _instances.insert(insertAt, inst);
+      _runtimeMap[inst.instanceId] = TabRuntimeState(
+        currentUrl: inst.url,
+        title: inst.name,
+        isSleeping: true,
+      );
+      _isGmailOpen = false;
+      _settings = _settings.copyWith(activeInstanceId: inst.instanceId);
+    });
+    _ensureController(inst);
+    await _persist();
+    await _persistArchived();
+    _showSnack('「${_formatArchivedDisplayTitle(inst)}」をログイン記憶から呼び出しました');
+  }
+
+  Future<void> _purgeArchivedInstance(String instanceId) async {
+    final idx = _archivedInstances
+        .indexWhere((a) => a.instance.instanceId == instanceId);
+    if (idx == -1) return;
+    final removed = _archivedInstances[idx].instance;
+    setState(() {
+      _archivedInstances.removeAt(idx);
+    });
+    await _persistArchived();
+    final stillActive = _instances.any((i) => i.instanceId == instanceId);
+    if (!stillActive &&
+        _multiProfileSupported &&
+        removed.effectiveProfileName != defaultWebViewProfileName) {
+      await OmniWebViewManager.deleteProfile(removed.effectiveProfileName);
+    }
+    _showSnack('「${_formatArchivedDisplayTitle(removed)}」のログイン記憶を完全削除しました');
+  }
+
+  Future<void> _purgeAllArchivedInstances() async {
+    if (_archivedInstances.isEmpty) return;
+    final removed = List<ArchivedInstance>.from(_archivedInstances);
+    setState(() {
+      _archivedInstances.clear();
+    });
+    await _persistArchived();
+    if (_multiProfileSupported) {
+      for (final entry in removed) {
+        final inst = entry.instance;
+        final stillActive =
+            _instances.any((i) => i.instanceId == inst.instanceId);
+        if (!stillActive &&
+            inst.effectiveProfileName != defaultWebViewProfileName) {
+          await OmniWebViewManager.deleteProfile(inst.effectiveProfileName);
+        }
+      }
+    }
+    _showSnack('ログイン記憶 ${removed.length} 件を完全削除しました');
   }
 
   OmniWebViewController _ensureController(ServiceInstance instance) {
@@ -1887,6 +2006,87 @@ class _HomeScreenState extends State<HomeScreen> {
     final group = _activeGroup;
     if (active == null || group == null) return;
 
+    final archivedForGroup = _archivedInstances
+        .where((a) => serviceGroupKey(a.instance) == group.key)
+        .toList();
+    if (archivedForGroup.isNotEmpty) {
+      final selected = await showModalBottomSheet<String>(
+        context: context,
+        showDragHandle: true,
+        builder: (ctx) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '「${group.displayName}」にアカウントを追加',
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '保存済みのログイン記憶が ${archivedForGroup.length} 件あります。ログイン済みのまま呼び出すか、新規作成できます。',
+                  style: Theme.of(ctx).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 12),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 240),
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: archivedForGroup.length,
+                    separatorBuilder: (_, _) => const SizedBox(height: 6),
+                    itemBuilder: (_, idx) {
+                      final entry = archivedForGroup[idx];
+                      return ListTile(
+                        dense: true,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          side: BorderSide(
+                            color: Theme.of(ctx)
+                                .dividerColor
+                                .withValues(alpha: 0.4),
+                          ),
+                        ),
+                        title: Text(
+                          _formatArchivedDisplayTitle(entry.instance),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        trailing: FilledButton(
+                          style: FilledButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: () =>
+                              Navigator.of(ctx).pop(entry.instance.instanceId),
+                          child: const Text('呼び出す'),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: () => Navigator.of(ctx).pop('__NEW__'),
+                  icon: const Icon(Icons.add),
+                  label: const Text('新規アカウントを作成'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      if (selected == null) return;
+      if (selected != '__NEW__') {
+        await _restoreArchivedInstance(selected);
+        return;
+      }
+    }
+
     final existingLabels = List.generate(
       group.accounts.length,
       (idx) => accountDisplayLabel(
@@ -1991,7 +2191,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _showSnack('ログイン情報を消去しました');
   }
 
-  Future<void> _openCatalog() async {
+  Future<void> _openCatalog({String initialCategory = 'all'}) async {
     final req = await Navigator.of(context).push<NewInstanceRequest>(
       MaterialPageRoute(
         builder: (_) => CatalogScreen(
@@ -1999,10 +2199,19 @@ class _HomeScreenState extends State<HomeScreen> {
           catalog: _catalog,
           existingInstances: _instances,
           multiProfileSupported: _multiProfileSupported,
+          archivedInstances: _archivedInstances,
+          initialCategory: initialCategory,
+          onPurgeArchived: _purgeArchivedInstance,
+          onPurgeAllArchived: _purgeAllArchivedInstances,
         ),
       ),
     );
     if (req == null) return;
+
+    if (req.restoreArchivedInstanceId != null) {
+      await _restoreArchivedInstance(req.restoreArchivedInstanceId!);
+      return;
+    }
 
     if (req.openExistingInstanceId != null) {
       final existing = _instances.cast<ServiceInstance?>().firstWhere(
@@ -2463,7 +2672,9 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text(_multiProfileSupported ? 'アカウントを削除' : 'サービスを削除'),
-        content: Text('「$displayTitle」を削除しますか？'),
+        content: Text(
+          '「$displayTitle」を一覧から削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
@@ -2497,11 +2708,8 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     _ensureSafeActiveAndLoad();
     await _persist();
-    if (_multiProfileSupported &&
-        inst.effectiveProfileName != defaultWebViewProfileName) {
-      await OmniWebViewManager.deleteProfile(inst.effectiveProfileName);
-    }
-    _showSnack('「$displayTitle」を削除しました');
+    await _archiveInstances([inst]);
+    _showSnack('「$displayTitle」を削除しました（ログイン記憶は保持）');
   }
 
   Future<void> _removeGroup(_ServiceGroup group) async {
@@ -2514,7 +2722,7 @@ class _HomeScreenState extends State<HomeScreen> {
       builder: (ctx) => AlertDialog(
         title: const Text('サービスを削除'),
         content: Text(
-          '「${group.displayName}」（全${group.accounts.length}アカウント）を削除しますか？',
+          '「${group.displayName}」（全${group.accounts.length}アカウント）を一覧から削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。',
         ),
         actions: [
           TextButton(
@@ -2530,26 +2738,20 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     if (ok != true) return;
 
-    final profilesToDelete = <String>[];
+    final archivedBatch = List<ServiceInstance>.from(group.accounts);
     final ids = group.accounts.map((a) => a.instanceId).toSet();
     for (final acc in group.accounts) {
       final ctrl = _controllers.remove(acc.instanceId);
       ctrl?.dispose();
       _runtimeMap.remove(acc.instanceId);
-      if (_multiProfileSupported &&
-          acc.effectiveProfileName != defaultWebViewProfileName) {
-        profilesToDelete.add(acc.effectiveProfileName);
-      }
     }
     setState(() {
       _instances.removeWhere((i) => ids.contains(i.instanceId));
     });
     _ensureSafeActiveAndLoad();
     await _persist();
-    for (final profile in profilesToDelete) {
-      await OmniWebViewManager.deleteProfile(profile);
-    }
-    _showSnack('「${group.displayName}」を削除しました');
+    await _archiveInstances(archivedBatch);
+    _showSnack('「${group.displayName}」を削除しました（ログイン記憶は保持）');
   }
 
   void _showSnack(String message) {
@@ -2883,6 +3085,8 @@ class _HomeScreenState extends State<HomeScreen> {
                                 : active.url;
                             await _openExternalUrlSafely(url);
                           }
+                        case 'archived-logins':
+                          await _openCatalog(initialCategory: 'archived');
                         case 'gesture-settings':
                           await _openGestureSettings();
                         case 'settings':
@@ -2950,6 +3154,14 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                         const PopupMenuDivider(),
                       ],
+                      PopupMenuItem(
+                        value: 'archived-logins',
+                        child: Text(
+                          _archivedInstances.isNotEmpty
+                              ? '🔑 ログイン記憶を呼び出す (${_archivedInstances.length})'
+                              : '🔑 ログイン記憶',
+                        ),
+                      ),
                       const PopupMenuItem(
                         value: 'gesture-settings',
                         child: Text('✦ タッチジェスチャー設定'),

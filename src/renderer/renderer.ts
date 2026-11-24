@@ -3,6 +3,7 @@ import { omniApi } from './omni-api';
 import {
   AddInstancePayload,
   AppConfig,
+  ArchivedInstance,
   BrowserTabInfo,
   CatalogService,
   CategoryMeta,
@@ -38,7 +39,7 @@ interface UiState {
   closedTabsCount: number;
   gmailOpen: boolean;
   gmailRuntime: BrowserTabInfo | null;
-  selectedCatalogCategory: ServiceCategory | 'all';
+  selectedCatalogCategory: ServiceCategory | 'all' | 'archived';
   catalogSearchQuery: string;
   sidebarFilterQuery: string;
   editingMode: 'create' | 'edit' | null;
@@ -97,6 +98,7 @@ function isAnyModalOpen(): boolean {
     !el('settings-modal').classList.contains('hidden') ||
     !el('gesture-modal').classList.contains('hidden') ||
     !el('follow-modal').classList.contains('hidden') ||
+    !el('archived-pick-modal').classList.contains('hidden') ||
     !el('confirm-modal').classList.contains('hidden')
   );
 }
@@ -334,6 +336,15 @@ function renderSidebar(): void {
     totalBadge.classList.add('hidden');
   }
 
+  const archivedCount = state.config?.archivedInstances?.length ?? 0;
+  const archivedBadge = el<HTMLSpanElement>('sidebar-archived-badge');
+  if (archivedCount > 0) {
+    archivedBadge.textContent = archivedCount > 99 ? '99+' : String(archivedCount);
+    archivedBadge.classList.remove('hidden');
+  } else {
+    archivedBadge.classList.add('hidden');
+  }
+
   listEl.innerHTML = '';
 
   if (visibleGroups.length === 0) {
@@ -508,8 +519,8 @@ function renderSidebar(): void {
       e.stopPropagation();
       const msg =
         group.accounts.length >= 2
-          ? `「${group.displayName}」（全${group.accounts.length}アカウント）を一覧から削除しますか？\n※ 特定のアカウントだけ消す場合はヘッダーのアカウントタブから ✕ を押してください。`
-          : `「${group.displayName}」を一覧から削除しますか？`;
+          ? `「${group.displayName}」（全${group.accounts.length}アカウント）を一覧から削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。\n※ 特定のアカウントだけ消す場合はヘッダーのアカウントタブから ✕ を押してください。`
+          : `「${group.displayName}」を一覧から削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。`;
       const ok = await openConfirmDialog({
         title: 'サービスを削除',
         message: msg,
@@ -524,7 +535,7 @@ function renderSidebar(): void {
       } else {
         await omniApi.removeTabs(group.accounts.map((a) => a.instanceId));
       }
-      showToast(`「${group.displayName}」を削除しました`);
+      showToast(`「${group.displayName}」を削除しました（ログイン記憶は保持）`);
     });
 
     actions.appendChild(editBtn);
@@ -690,7 +701,7 @@ function renderAccountBar(): void {
         e.stopPropagation();
         const ok = await openConfirmDialog({
           title: 'アカウントを削除',
-          message: `「${group.displayName} / ${label}」を削除しますか？\n（このアカウントのログインセッションも削除されます）`,
+          message: `「${group.displayName} / ${label}」を削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。`,
           confirmLabel: '削除する',
           danger: true,
           anchorEl: delBtn,
@@ -698,7 +709,7 @@ function renderAccountBar(): void {
         });
         if (!ok) return;
         await omniApi.removeTab(inst.instanceId);
-        showToast(`「${group.displayName} / ${label}」を削除しました`);
+        showToast(`「${group.displayName} / ${label}」を削除しました（ログイン記憶は保持）`);
       });
       actions.appendChild(delBtn);
     }
@@ -708,7 +719,87 @@ function renderAccountBar(): void {
   });
 }
 
-async function addAccountForActiveService(): Promise<void> {
+let pendingNewAccountAction: (() => Promise<void>) | null = null;
+
+function formatArchivedTimestamp(unixSecs: number): string {
+  if (!unixSecs) return '';
+  const d = new Date(unixSecs * 1000);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${y}/${m}/${day} ${hh}:${mm}`;
+}
+
+function getArchivedDisplayTitle(inst: ServiceInstance): string {
+  const label = inst.accountLabel?.trim();
+  const base = label && label !== inst.name ? `${inst.name} · ${label}` : inst.name;
+  return inst.detectedHandle ? `${base} (@${inst.detectedHandle})` : base;
+}
+
+async function closeArchivedPickModal(): Promise<void> {
+  pendingNewAccountAction = null;
+  el('archived-pick-modal').classList.add('hidden');
+  await syncOverlayToMain();
+}
+
+async function openArchivedPickModal(
+  serviceName: string,
+  candidates: ArchivedInstance[],
+  onCreateNew: () => Promise<void>
+): Promise<void> {
+  pendingNewAccountAction = onCreateNew;
+  el<HTMLHeadingElement>('archived-pick-title').textContent = `「${serviceName}」にアカウントを追加`;
+  el<HTMLParagraphElement>('archived-pick-desc').textContent =
+    `「${serviceName}」の保存済みログイン記憶が ${candidates.length} 件あります。ログイン済みのまま呼び出すか、新規アカウントを作成できます。`;
+
+  const list = el<HTMLDivElement>('archived-pick-list');
+  list.innerHTML = '';
+  for (const entry of candidates) {
+    const inst = entry.instance;
+    const row = document.createElement('div');
+    row.className = 'archived-pick-row';
+
+    const info = document.createElement('div');
+    info.className = 'archived-pick-row-info';
+
+    const title = document.createElement('div');
+    title.className = 'archived-pick-row-title';
+    title.textContent = getArchivedDisplayTitle(inst);
+
+    const sub = document.createElement('div');
+    sub.className = 'archived-pick-row-sub';
+    const timeStr = formatArchivedTimestamp(entry.archivedAt);
+    sub.textContent = timeStr ? `保存: ${timeStr}` : inst.url;
+
+    info.appendChild(title);
+    info.appendChild(sub);
+
+    const restoreBtn = document.createElement('button');
+    restoreBtn.type = 'button';
+    restoreBtn.className = 'btn-primary btn-xs';
+    restoreBtn.textContent = '呼び出す';
+    restoreBtn.addEventListener('click', async () => {
+      try {
+        await omniApi.restoreArchivedTab(inst.instanceId);
+        await closeArchivedPickModal();
+        showToast(`「${getArchivedDisplayTitle(inst)}」をログイン記憶から呼び出しました`);
+      } catch (err) {
+        showToast(String(err));
+      }
+    });
+
+    row.appendChild(info);
+    row.appendChild(restoreBtn);
+    list.appendChild(row);
+  }
+
+  el('archived-pick-modal').classList.remove('hidden');
+  await syncOverlayToMain();
+}
+
+async function createNewAccountForActiveService(): Promise<void> {
   const active = getActiveInstance();
   const group = getActiveGroup();
   if (!active || !group) return;
@@ -735,6 +826,22 @@ async function addAccountForActiveService(): Promise<void> {
     uaMode: active.uaMode
   });
   showToast(`「${group.displayName} / ${nextLabel}」を追加しました（独立セッション）`);
+}
+
+async function addAccountForActiveService(): Promise<void> {
+  const active = getActiveInstance();
+  const group = getActiveGroup();
+  if (!active || !group) return;
+
+  const archivedForGroup = (state.config?.archivedInstances ?? []).filter(
+    (a) => getServiceGroupKey(a.instance) === group.key
+  );
+  if (archivedForGroup.length > 0) {
+    await openArchivedPickModal(group.displayName, archivedForGroup, createNewAccountForActiveService);
+    return;
+  }
+
+  await createNewAccountForActiveService();
 }
 
 const ICON_VOLUME_ON =
@@ -1000,10 +1107,116 @@ function renderToolbarAndViewport(): void {
   }
 }
 
+function renderArchivedLoginsPanel(): void {
+  const listEl = el<HTMLDivElement>('archived-logins-list');
+  const purgeAllBtn = el<HTMLButtonElement>('btn-purge-all-archived');
+  const allArchived = state.config?.archivedInstances ?? [];
+
+  purgeAllBtn.classList.toggle('hidden', allArchived.length === 0);
+
+  const q = state.catalogSearchQuery.trim().toLowerCase();
+  const filtered = allArchived.filter((entry) => {
+    if (!q) return true;
+    const inst = entry.instance;
+    return (
+      inst.name.toLowerCase().includes(q) ||
+      (inst.accountLabel ?? '').toLowerCase().includes(q) ||
+      (inst.detectedHandle ?? '').toLowerCase().includes(q) ||
+      inst.serviceId.toLowerCase().includes(q) ||
+      inst.url.toLowerCase().includes(q)
+    );
+  });
+
+  listEl.innerHTML = '';
+  if (filtered.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'archived-empty';
+    empty.textContent =
+      allArchived.length === 0
+        ? '保存済みのログイン記憶はまだありません。\nサイドバーやヘッダーからタブ／アカウントを削除すると、ログイン状態が自動的にここへ保存されます。'
+        : '検索条件に一致するログイン記憶が見つかりません。';
+    listEl.appendChild(empty);
+    return;
+  }
+
+  for (const entry of filtered) {
+    const inst = entry.instance;
+    const card = document.createElement('div');
+    card.className = 'archived-card';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'catalog-card-avatar';
+    avatar.style.background = inst.color;
+    avatar.textContent = inst.badge;
+
+    const meta = document.createElement('div');
+    meta.className = 'archived-card-meta';
+
+    const title = document.createElement('div');
+    title.className = 'archived-card-title';
+    title.textContent = getArchivedDisplayTitle(inst);
+    title.title = `${getArchivedDisplayTitle(inst)}\n${inst.url}`;
+
+    const sub = document.createElement('div');
+    sub.className = 'archived-card-sub';
+    const timeStr = formatArchivedTimestamp(entry.archivedAt);
+    sub.textContent = timeStr ? `保存: ${timeStr} · ${inst.url}` : inst.url;
+
+    meta.appendChild(title);
+    meta.appendChild(sub);
+
+    const actions = document.createElement('div');
+    actions.className = 'archived-card-actions';
+
+    const restoreBtn = document.createElement('button');
+    restoreBtn.type = 'button';
+    restoreBtn.className = 'btn-primary btn-xs';
+    restoreBtn.textContent = '呼び出す';
+    restoreBtn.title = 'ログイン記憶を保ったまま一覧へ復元して開く';
+    restoreBtn.addEventListener('click', async () => {
+      try {
+        await omniApi.restoreArchivedTab(inst.instanceId);
+        await closeCatalogModal();
+        showToast(`「${getArchivedDisplayTitle(inst)}」を呼び出しました`);
+      } catch (err) {
+        showToast(String(err));
+      }
+    });
+
+    const purgeBtn = document.createElement('button');
+    purgeBtn.type = 'button';
+    purgeBtn.className = 'btn-secondary btn-xs danger-text';
+    purgeBtn.textContent = '完全削除';
+    purgeBtn.title = 'このログイン記憶（Cookie・プロファイル）を完全に消去';
+    purgeBtn.addEventListener('click', async (e) => {
+      const ok = await openConfirmDialog({
+        title: 'ログイン記憶を完全削除',
+        message: `「${getArchivedDisplayTitle(inst)}」のログイン記憶（Cookie・セッション）を完全に消去しますか？\n※ この操作は取り消せません。`,
+        confirmLabel: '完全削除する',
+        danger: true,
+        anchorEl: purgeBtn,
+        anchorPoint: { x: e.clientX, y: e.clientY }
+      });
+      if (!ok) return;
+      await omniApi.purgeArchivedTab(inst.instanceId);
+      showToast(`「${getArchivedDisplayTitle(inst)}」のログイン記憶を完全削除しました`);
+    });
+
+    actions.appendChild(restoreBtn);
+    actions.appendChild(purgeBtn);
+    card.appendChild(avatar);
+    card.appendChild(meta);
+    card.appendChild(actions);
+    listEl.appendChild(card);
+  }
+}
+
 function renderCatalog(): void {
   const catTabs = el<HTMLDivElement>('catalog-categories');
   const grid = el<HTMLDivElement>('catalog-grid');
+  const archivedPanel = el<HTMLDivElement>('archived-logins-panel');
   const customForm = el<HTMLFormElement>('custom-service-form');
+  const archivedList = state.config?.archivedInstances ?? [];
 
   // Category tabs
   catTabs.innerHTML = '';
@@ -1016,6 +1229,20 @@ function renderCatalog(): void {
     renderCatalog();
   });
   catTabs.appendChild(allTab);
+
+  // 保存済みログイン記憶タブ
+  const archivedTab = document.createElement('button');
+  archivedTab.type = 'button';
+  archivedTab.className = `cat-tab archived-tab${archivedList.length > 0 ? ' has-items' : ''}${
+    state.selectedCatalogCategory === 'archived' ? ' active' : ''
+  }`;
+  archivedTab.textContent = `ログイン記憶 (${archivedList.length})`;
+  archivedTab.title = '削除したタブのログイン記憶を呼び出す・管理する';
+  archivedTab.addEventListener('click', () => {
+    state.selectedCatalogCategory = 'archived';
+    renderCatalog();
+  });
+  catTabs.appendChild(archivedTab);
 
   for (const cat of state.categories) {
     const count =
@@ -1035,13 +1262,23 @@ function renderCatalog(): void {
     catTabs.appendChild(btn);
   }
 
+  if (state.selectedCatalogCategory === 'archived') {
+    grid.classList.add('hidden');
+    customForm.classList.add('hidden');
+    archivedPanel.classList.remove('hidden');
+    renderArchivedLoginsPanel();
+    return;
+  }
+
   if (state.selectedCatalogCategory === 'custom') {
     grid.classList.add('hidden');
+    archivedPanel.classList.add('hidden');
     customForm.classList.remove('hidden');
     return;
   }
 
   grid.classList.remove('hidden');
+  archivedPanel.classList.add('hidden');
   customForm.classList.add('hidden');
 
   const q = state.catalogSearchQuery.trim().toLowerCase();
@@ -1058,10 +1295,16 @@ function renderCatalog(): void {
     );
   });
 
-  // Count how many times each service is already added
+  // Count how many times each service is already added / archived
   const addedCounts = new Map<string, number>();
   for (const inst of state.config?.instances ?? []) {
     addedCounts.set(inst.serviceId, (addedCounts.get(inst.serviceId) ?? 0) + 1);
+  }
+  const archivedByService = new Map<string, ArchivedInstance[]>();
+  for (const entry of archivedList) {
+    const arr = archivedByService.get(entry.instance.serviceId) ?? [];
+    arr.push(entry);
+    archivedByService.set(entry.instance.serviceId, arr);
   }
 
   grid.innerHTML = '';
@@ -1083,6 +1326,7 @@ function renderCatalog(): void {
 
   for (const svc of filtered) {
     const count = addedCounts.get(svc.id) ?? 0;
+    const svcArchived = archivedByService.get(svc.id) ?? [];
     const card = document.createElement('div');
     card.className = 'catalog-card';
     card.title = svc.note
@@ -1113,6 +1357,22 @@ function renderCatalog(): void {
       title.appendChild(chip);
     }
 
+    if (svcArchived.length > 0) {
+      const archChip = document.createElement('button');
+      archChip.type = 'button';
+      archChip.className = 'archived-chip';
+      archChip.textContent = svcArchived.length === 1 ? '記憶あり' : `記憶${svcArchived.length}`;
+      archChip.title = `削除済みのログイン記憶が ${svcArchived.length} 件あります（クリックで呼び出し）`;
+      archChip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        state.selectedCatalogCategory = 'archived';
+        state.catalogSearchQuery = svc.name;
+        el<HTMLInputElement>('catalog-search').value = svc.name;
+        renderCatalog();
+      });
+      title.appendChild(archChip);
+    }
+
     titleWrap.appendChild(title);
 
     const actions = document.createElement('div');
@@ -1124,25 +1384,33 @@ function renderCatalog(): void {
     addBtn.textContent = count > 0 ? '＋別垢' : '＋追加';
     addBtn.title = count > 0 ? `「${svc.name}」の別アカウントを追加して開く` : `「${svc.name}」を追加して開く`;
     addBtn.addEventListener('click', async () => {
-      const existingForSvc = (state.config?.instances ?? []).filter((i) => i.serviceId === svc.id);
-      const existingLabels = existingForSvc.map((acc, idx) =>
-        getAccountDisplayLabel(acc, idx, svc.name)
-      );
-      const nextLabel = nextDefaultAccountLabel(existingLabels);
-      if (svc.requiresCustomUrl) {
-        await openEditModalForTemplate(svc, count, nextLabel);
+      const doCreate = async () => {
+        const existingForSvc = (state.config?.instances ?? []).filter((i) => i.serviceId === svc.id);
+        const existingLabels = existingForSvc.map((acc, idx) =>
+          getAccountDisplayLabel(acc, idx, svc.name)
+        );
+        const nextLabel = nextDefaultAccountLabel(existingLabels);
+        if (svc.requiresCustomUrl) {
+          await openEditModalForTemplate(svc, count, nextLabel);
+          return;
+        }
+        await addServiceAndCloseCatalog({
+          serviceId: svc.id,
+          name: svc.name,
+          accountLabel: nextLabel,
+          category: svc.category,
+          url: svc.url,
+          color: svc.color,
+          badge: svc.badge,
+          uaMode: svc.defaultUa
+        });
+      };
+      if (svcArchived.length > 0) {
+        await closeCatalogModal();
+        await openArchivedPickModal(svc.name, svcArchived, doCreate);
         return;
       }
-      await addServiceAndCloseCatalog({
-        serviceId: svc.id,
-        name: svc.name,
-        accountLabel: nextLabel,
-        category: svc.category,
-        url: svc.url,
-        color: svc.color,
-        badge: svc.badge,
-        uaMode: svc.defaultUa
-      });
+      await doCreate();
     });
 
     const customizeBtn = document.createElement('button');
@@ -1186,7 +1454,16 @@ async function addServiceAndCloseCatalog(payload: AddInstancePayload): Promise<v
   }
 }
 
-async function openCatalogModal(): Promise<void> {
+async function openCatalogModal(
+  initialCategory?: ServiceCategory | 'all' | 'archived'
+): Promise<void> {
+  if (initialCategory) {
+    state.selectedCatalogCategory = initialCategory;
+    if (initialCategory === 'archived') {
+      state.catalogSearchQuery = '';
+      el<HTMLInputElement>('catalog-search').value = '';
+    }
+  }
   el('catalog-modal').classList.remove('hidden');
   await syncOverlayToMain();
   renderCatalog();
@@ -1579,9 +1856,49 @@ function bindEvents(): void {
     renderSidebar();
   });
 
-  el<HTMLButtonElement>('btn-open-catalog').addEventListener('click', () => void openCatalogModal());
-  el<HTMLButtonElement>('btn-empty-add').addEventListener('click', () => void openCatalogModal());
+  el<HTMLButtonElement>('btn-open-catalog').addEventListener('click', () => void openCatalogModal('all'));
+  el<HTMLButtonElement>('btn-empty-add').addEventListener('click', () => void openCatalogModal('all'));
+  el<HTMLButtonElement>('btn-open-archived').addEventListener('click', () =>
+    void openCatalogModal('archived')
+  );
   el<HTMLButtonElement>('btn-open-settings').addEventListener('click', () => void openSettingsModal());
+
+  // Archived logins modals & purge-all
+  el<HTMLButtonElement>('btn-purge-all-archived').addEventListener('click', async (e) => {
+    const count = state.config?.archivedInstances?.length ?? 0;
+    if (count === 0) return;
+    const btn = e.currentTarget as HTMLElement | null;
+    const ok = await openConfirmDialog({
+      title: 'ログイン記憶をすべて完全削除',
+      message: `保存されている ${count} 件のログイン記憶（Cookie・プロファイル）をすべて完全削除しますか？\n※ この操作は取り消せません。`,
+      confirmLabel: 'すべて完全削除',
+      danger: true,
+      anchorEl: btn,
+      anchorPoint: { x: e.clientX, y: e.clientY }
+    });
+    if (!ok) return;
+    const removed = await omniApi.purgeAllArchivedTabs();
+    showToast(`ログイン記憶 ${removed} 件を完全削除しました`);
+  });
+
+  el<HTMLButtonElement>('btn-close-archived-pick').addEventListener('click', () =>
+    void closeArchivedPickModal()
+  );
+  el<HTMLButtonElement>('btn-archived-pick-cancel').addEventListener('click', () =>
+    void closeArchivedPickModal()
+  );
+  el<HTMLDivElement>('archived-pick-modal').addEventListener('click', (e) => {
+    if (e.target === el('archived-pick-modal')) {
+      void closeArchivedPickModal();
+    }
+  });
+  el<HTMLButtonElement>('btn-archived-pick-new').addEventListener('click', async () => {
+    const action = pendingNewAccountAction;
+    await closeArchivedPickModal();
+    if (action) {
+      await action();
+    }
+  });
 
   // Header account switcher add button
   el<HTMLButtonElement>('btn-add-account').addEventListener('click', () => {
@@ -2064,6 +2381,8 @@ function bindEvents(): void {
     if (e.key === 'Escape') {
       if (!el('confirm-modal').classList.contains('hidden')) {
         void resolveConfirmDialog(false);
+      } else if (!el('archived-pick-modal').classList.contains('hidden')) {
+        void closeArchivedPickModal();
       } else if (!el('follow-modal').classList.contains('hidden')) {
         void closeFollowModal();
       } else if (!el('edit-modal').classList.contains('hidden')) {

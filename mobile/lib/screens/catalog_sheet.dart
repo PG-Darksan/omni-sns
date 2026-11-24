@@ -11,6 +11,7 @@ class NewInstanceRequest {
     required this.colorHex,
     required this.badge,
     this.openExistingInstanceId,
+    this.restoreArchivedInstanceId,
   });
 
   final String serviceId;
@@ -21,6 +22,7 @@ class NewInstanceRequest {
   final String colorHex;
   final String badge;
   final String? openExistingInstanceId;
+  final String? restoreArchivedInstanceId;
 }
 
 class CatalogScreen extends StatefulWidget {
@@ -30,24 +32,40 @@ class CatalogScreen extends StatefulWidget {
     required this.catalog,
     required this.existingInstances,
     required this.multiProfileSupported,
+    this.archivedInstances = const [],
+    this.initialCategory = 'all',
+    this.onPurgeArchived,
+    this.onPurgeAllArchived,
   });
 
   final List<CategoryMeta> categories;
   final List<CatalogService> catalog;
   final List<ServiceInstance> existingInstances;
   final bool multiProfileSupported;
+  final List<ArchivedInstance> archivedInstances;
+  final String initialCategory;
+  final Future<void> Function(String instanceId)? onPurgeArchived;
+  final Future<void> Function()? onPurgeAllArchived;
 
   @override
   State<CatalogScreen> createState() => _CatalogScreenState();
 }
 
 class _CatalogScreenState extends State<CatalogScreen> {
-  String _selectedCategory = 'all';
+  late String _selectedCategory;
+  late List<ArchivedInstance> _archived;
   String _searchQuery = '';
 
   final _customNameController = TextEditingController();
   final _customUrlController = TextEditingController();
   String _customCategory = 'custom';
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedCategory = widget.initialCategory;
+    _archived = List<ArchivedInstance>.from(widget.archivedInstances);
+  }
 
   @override
   void dispose() {
@@ -60,6 +78,190 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return widget.existingInstances
         .where((i) => i.serviceId == serviceId)
         .toList();
+  }
+
+  List<ArchivedInstance> _archivedFor(String serviceId) {
+    return _archived.where((a) => a.instance.serviceId == serviceId).toList();
+  }
+
+  String _formatArchivedTitle(ServiceInstance inst) {
+    final label = inst.accountLabel?.trim();
+    final base = (label != null && label.isNotEmpty && label != inst.name)
+        ? '${inst.name} · $label'
+        : inst.name;
+    final h = inst.detectedHandle?.trim();
+    return (h != null && h.isNotEmpty) ? '$base (@$h)' : base;
+  }
+
+  String _formatArchivedTime(int unixSecs) {
+    if (unixSecs <= 0) return '';
+    final dt = DateTime.fromMillisecondsSinceEpoch(unixSecs * 1000).toLocal();
+    final y = dt.year.toString().padLeft(4, '0');
+    final m = dt.month.toString().padLeft(2, '0');
+    final d = dt.day.toString().padLeft(2, '0');
+    final hh = dt.hour.toString().padLeft(2, '0');
+    final mm = dt.minute.toString().padLeft(2, '0');
+    return '$y/$m/$d $hh:$mm';
+  }
+
+  void _restoreArchived(ArchivedInstance entry) {
+    final inst = entry.instance;
+    Navigator.of(context).pop(
+      NewInstanceRequest(
+        serviceId: inst.serviceId,
+        name: inst.name,
+        accountLabel: inst.accountLabel,
+        category: inst.category,
+        url: inst.url,
+        colorHex: inst.colorHex,
+        badge: inst.badge,
+        restoreArchivedInstanceId: inst.instanceId,
+      ),
+    );
+  }
+
+  Future<void> _confirmPurgeArchived(ArchivedInstance entry) async {
+    final title = _formatArchivedTitle(entry.instance);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('ログイン記憶を完全削除'),
+        content: Text(
+          '「$title」のログイン記憶（Cookie・プロファイル）を完全に消去しますか？\n※ この操作は取り消せません。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('完全削除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await widget.onPurgeArchived?.call(entry.instance.instanceId);
+    if (!mounted) return;
+    setState(() {
+      _archived.removeWhere((a) => a.instance.instanceId == entry.instance.instanceId);
+    });
+  }
+
+  Future<void> _confirmPurgeAllArchived() async {
+    if (_archived.isEmpty) return;
+    final count = _archived.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('ログイン記憶をすべて完全削除'),
+        content: Text(
+          '保存されている $count 件のログイン記憶（Cookie・プロファイル）をすべて完全削除しますか？\n※ この操作は取り消せません。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('すべて完全削除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await widget.onPurgeAllArchived?.call();
+    if (!mounted) return;
+    setState(() {
+      _archived.clear();
+    });
+  }
+
+  Future<void> _openRestoreOrAddSheet(
+    CatalogService svc,
+    List<ArchivedInstance> saved,
+    VoidCallback onCreateNew,
+  ) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                '「${svc.name}」のログイン記憶があります',
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '削除時に保持したログイン状態のまま呼び出すか、新しく追加できます。',
+                style: Theme.of(ctx).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 12),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 260),
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: saved.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 6),
+                  itemBuilder: (_, idx) {
+                    final entry = saved[idx];
+                    final t = _formatArchivedTime(entry.archivedAt);
+                    return ListTile(
+                      dense: true,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        side: BorderSide(
+                          color: Theme.of(ctx).dividerColor.withValues(alpha: 0.4),
+                        ),
+                      ),
+                      title: Text(
+                        _formatArchivedTitle(entry.instance),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      subtitle: Text(
+                        t.isNotEmpty ? '保存: $t' : entry.instance.url,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: FilledButton(
+                        style: FilledButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        onPressed: () {
+                          Navigator.of(ctx).pop();
+                          _restoreArchived(entry);
+                        },
+                        child: const Text('呼び出す'),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  onCreateNew();
+                },
+                icon: const Icon(Icons.add),
+                label: const Text('新規アカウント（まっさらなログイン）を作成'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   String _nextAccountLabelFor(CatalogService svc) {
@@ -260,6 +462,23 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         setState(() => _selectedCategory = 'all'),
                   ),
                 ),
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: ChoiceChip(
+                    label: Text(
+                      'ログイン記憶 (${_archived.length})',
+                      style: _archived.isNotEmpty && _selectedCategory != 'archived'
+                          ? const TextStyle(
+                              color: Colors.amber,
+                              fontWeight: FontWeight.bold,
+                            )
+                          : null,
+                    ),
+                    selected: _selectedCategory == 'archived',
+                    onSelected: (_) =>
+                        setState(() => _selectedCategory = 'archived'),
+                  ),
+                ),
                 for (final cat in visibleCategories)
                   Padding(
                     padding: const EdgeInsets.only(right: 6),
@@ -279,9 +498,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
           ),
           const Divider(height: 1),
           Expanded(
-            child: _selectedCategory == 'custom'
-                ? _buildCustomForm()
-                : filtered.isEmpty
+            child: _selectedCategory == 'archived'
+                ? _buildArchivedList()
+                : _selectedCategory == 'custom'
+                    ? _buildCustomForm()
+                    : filtered.isEmpty
                     ? Center(
                         child: Padding(
                           padding: const EdgeInsets.all(24),
@@ -314,6 +535,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         itemBuilder: (context, index) {
                           final svc = filtered[index];
                           final existing = _existingFor(svc.id);
+                          final savedArchived = _archivedFor(svc.id);
                           final count = existing.length;
                           final color = parseHexColor(svc.colorHex);
                           final canAddAnother =
@@ -379,50 +601,99 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                                           .multiProfileSupported
                                                   ? '済'
                                                   : '$count垢',
-                                              style: const TextStyle(
-                                                color: Colors.green,
-                                                fontSize: 10,
-                                                fontWeight: FontWeight.bold,
+                                                style: const TextStyle(
+                                                  color: Colors.green,
+                                                  fontSize: 10,
+                                                  fontWeight: FontWeight.bold,
+                                                ),
                                               ),
                                             ),
-                                          ),
+                                          ],
+                                          if (savedArchived.isNotEmpty) ...[
+                                            const SizedBox(width: 4),
+                                            InkWell(
+                                              borderRadius:
+                                                  BorderRadius.circular(99),
+                                              onTap: () {
+                                                setState(() {
+                                                  _selectedCategory = 'archived';
+                                                  _searchQuery = svc.name;
+                                                });
+                                              },
+                                              child: Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 6,
+                                                  vertical: 1.5,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.amber
+                                                      .withValues(alpha: 0.2),
+                                                  borderRadius:
+                                                      BorderRadius.circular(99),
+                                                ),
+                                                child: Text(
+                                                  savedArchived.length == 1
+                                                      ? '記憶あり'
+                                                      : '記憶${savedArchived.length}',
+                                                  style: const TextStyle(
+                                                    color: Colors.amber,
+                                                    fontSize: 10,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ],
                                         ],
-                                      ],
+                                      ),
                                     ),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  canAddAnother
-                                      ? FilledButton(
-                                          style: FilledButton.styleFrom(
-                                            visualDensity:
-                                                VisualDensity.compact,
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 10,
-                                              vertical: 6,
-                                            ),
-                                            minimumSize: const Size(0, 32),
-                                            tapTargetSize: MaterialTapTargetSize
-                                                .shrinkWrap,
-                                          ),
-                                          onPressed: () {
-                                            if (svc.requiresCustomUrl) {
-                                              _openDetailedAddDialog(svc);
-                                              return;
-                                            }
-                                            final accLabel =
-                                                _nextAccountLabelFor(svc);
-                                            Navigator.of(context).pop(
-                                              NewInstanceRequest(
-                                                serviceId: svc.id,
-                                                name: svc.name,
-                                                accountLabel: accLabel,
-                                                category: svc.category,
-                                                url: svc.url,
-                                                colorHex: svc.colorHex,
-                                                badge: svc.badge,
+                                    const SizedBox(width: 6),
+                                    canAddAnother
+                                        ? FilledButton(
+                                            style: FilledButton.styleFrom(
+                                              visualDensity:
+                                                  VisualDensity.compact,
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                horizontal: 10,
+                                                vertical: 6,
                                               ),
-                                            );
-                                          },
+                                              minimumSize: const Size(0, 32),
+                                              tapTargetSize:
+                                                  MaterialTapTargetSize
+                                                      .shrinkWrap,
+                                            ),
+                                            onPressed: () {
+                                              void createNew() {
+                                                if (svc.requiresCustomUrl) {
+                                                  _openDetailedAddDialog(svc);
+                                                  return;
+                                                }
+                                                final accLabel =
+                                                    _nextAccountLabelFor(svc);
+                                                Navigator.of(context).pop(
+                                                  NewInstanceRequest(
+                                                    serviceId: svc.id,
+                                                    name: svc.name,
+                                                    accountLabel: accLabel,
+                                                    category: svc.category,
+                                                    url: svc.url,
+                                                    colorHex: svc.colorHex,
+                                                    badge: svc.badge,
+                                                  ),
+                                                );
+                                              }
+                                              if (savedArchived.isNotEmpty) {
+                                                _openRestoreOrAddSheet(
+                                                  svc,
+                                                  savedArchived,
+                                                  createNew,
+                                                );
+                                                return;
+                                              }
+                                              createNew();
+                                            },
                                           child: Text(
                                             count > 0 ? '＋別垢' : '＋追加',
                                             style:
@@ -485,6 +756,161 @@ class _CatalogScreenState extends State<CatalogScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildArchivedList() {
+    final q = _searchQuery.trim().toLowerCase();
+    final filtered = _archived.where((entry) {
+      if (q.isEmpty) return true;
+      final inst = entry.instance;
+      return inst.name.toLowerCase().contains(q) ||
+          (inst.accountLabel ?? '').toLowerCase().contains(q) ||
+          (inst.detectedHandle ?? '').toLowerCase().contains(q) ||
+          inst.serviceId.toLowerCase().contains(q) ||
+          inst.url.toLowerCase().contains(q);
+    }).toList();
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'タブを削除してもログイン状態をここに記憶しています。「呼び出す」でログイン済みのまま復元できます。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+              if (_archived.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: _confirmPurgeAllArchived,
+                  style: TextButton.styleFrom(
+                    foregroundColor: Colors.redAccent,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  child: const Text('全削除'),
+                ),
+              ],
+            ],
+          ),
+        ),
+        Expanded(
+          child: filtered.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      _archived.isEmpty
+                          ? '保存済みのログイン記憶はまだありません。\nアカウントやサービスを削除すると自動的にここへ保存されます。'
+                          : '検索条件に一致するログイン記憶がありません。',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                )
+              : ListView.separated(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  itemCount: filtered.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 6),
+                  itemBuilder: (_, idx) {
+                    final entry = filtered[idx];
+                    final inst = entry.instance;
+                    final color = parseHexColor(inst.colorHex);
+                    final timeStr = _formatArchivedTime(entry.archivedAt);
+                    return Card(
+                      margin: EdgeInsets.zero,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 32,
+                              height: 32,
+                              decoration: BoxDecoration(
+                                color: color,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              alignment: Alignment.center,
+                              child: Text(
+                                inst.badge,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 11.5,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    _formatArchivedTitle(inst),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 13.5,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    timeStr.isNotEmpty
+                                        ? '保存: $timeStr'
+                                        : inst.url,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context).textTheme.bodySmall,
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            FilledButton(
+                              style: FilledButton.styleFrom(
+                                visualDensity: VisualDensity.compact,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 6,
+                                ),
+                                minimumSize: const Size(0, 32),
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              ),
+                              onPressed: () => _restoreArchived(entry),
+                              child: const Text(
+                                '呼び出す',
+                                style: TextStyle(fontSize: 12),
+                              ),
+                            ),
+                            IconButton(
+                              icon: const Icon(
+                                Icons.delete_outline,
+                                size: 19,
+                                color: Colors.redAccent,
+                              ),
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(
+                                minWidth: 32,
+                                minHeight: 32,
+                              ),
+                              tooltip: 'ログイン記憶を完全削除',
+                              onPressed: () => _confirmPurgeArchived(entry),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 

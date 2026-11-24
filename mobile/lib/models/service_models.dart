@@ -318,6 +318,33 @@ class ServiceInstance {
   }
 }
 
+/// タブ削除後もログイン記憶（WebView Multi-Profile）を保持するための退避モデル
+class ArchivedInstance {
+  const ArchivedInstance({
+    required this.instance,
+    required this.archivedAt,
+  });
+
+  final ServiceInstance instance;
+  final int archivedAt;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'instance': instance.toJson(),
+      'archivedAt': archivedAt,
+    };
+  }
+
+  static ArchivedInstance? fromJson(Map<String, dynamic> json, int index) {
+    final rawInst = json['instance'];
+    if (rawInst is! Map<String, dynamic>) return null;
+    final inst = ServiceInstance.fromJson(rawInst, index);
+    final ts = (json['archivedAt'] as num?)?.toInt() ??
+        (DateTime.now().millisecondsSinceEpoch ~/ 1000);
+    return ArchivedInstance(instance: inst, archivedAt: ts);
+  }
+}
+
 class AppSettings {
   const AppSettings({
     this.isDarkMode = true,

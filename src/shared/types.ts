@@ -172,10 +172,19 @@ export interface AppSettings {
   followSync?: FollowSyncSettings;
 }
 
+export interface ArchivedInstance {
+  /** 削除時にログイン記憶（プロファイル）を保持したまま退避されたサービスインスタンス */
+  instance: ServiceInstance;
+  /** アーカイブ日時（UNIX秒） */
+  archivedAt: number;
+}
+
 export interface AppConfig {
   version: number;
   settings: AppSettings;
   instances: ServiceInstance[];
+  /** タブ削除後もログイン記憶を残している保存済みアカウント一覧 */
+  archivedInstances?: ArchivedInstance[];
   windowBounds?: {
     x?: number;
     y?: number;

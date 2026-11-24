@@ -143,10 +143,19 @@ pub struct WindowBounds {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ArchivedInstance {
+    pub instance: ServiceInstance,
+    pub archived_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub version: u32,
     pub settings: AppSettings,
     pub instances: Vec<ServiceInstance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_instances: Vec<ArchivedInstance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_bounds: Option<WindowBounds>,
     #[serde(default)]

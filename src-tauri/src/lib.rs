@@ -186,6 +186,32 @@ async fn tab_remove_many(
 }
 
 #[tauri::command]
+async fn archived_restore(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+) -> Result<ServiceInstance, String> {
+    view_manager::restore_archived_instance(&app, &shared, &instance_id)
+}
+
+#[tauri::command]
+async fn archived_purge(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+) -> Result<bool, String> {
+    view_manager::purge_archived_instance(&app, &shared, &instance_id)
+}
+
+#[tauri::command]
+async fn archived_purge_all(
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+) -> Result<usize, String> {
+    view_manager::purge_all_archived_instances(&app, &shared)
+}
+
+#[tauri::command]
 async fn tab_update(
     app: AppHandle,
     shared: State<'_, SharedState>,
@@ -877,6 +903,9 @@ pub fn run() {
             tab_add,
             tab_remove,
             tab_remove_many,
+            archived_restore,
+            archived_purge,
+            archived_purge_all,
             tab_update,
             tab_reorder,
             tab_action,

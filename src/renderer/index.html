@@ -52,6 +52,11 @@
           ＋ サービスを追加
         </button>
         <div class="sidebar-footer-actions">
+          <button id="btn-open-archived" class="btn-icon-label" title="削除したタブの保存済みログイン記憶を呼び出す" aria-label="ログイン記憶を呼び出す">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+            <span>ログイン記憶</span>
+            <span id="sidebar-archived-badge" class="sidebar-archived-badge hidden">0</span>
+          </button>
           <button id="btn-open-settings" class="btn-icon-label" title="アプリ設定" aria-label="アプリ設定">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             <span>アプリ設定</span>
@@ -263,6 +268,19 @@
 
       <div id="catalog-body" class="catalog-body">
         <div id="catalog-grid" class="catalog-grid"></div>
+
+        <!-- 保存済みログイン記憶パネル（削除したタブの再呼び出し・完全削除） -->
+        <div id="archived-logins-panel" class="archived-panel hidden">
+          <div class="archived-panel-header">
+            <p class="archived-panel-desc">
+              タブを削除してもログイン状態（Cookie・セッション）をここに保持しています。「呼び出す」でログイン済みのまま復元できます。
+            </p>
+            <button id="btn-purge-all-archived" type="button" class="btn-secondary btn-xs danger-text hidden">
+              すべて完全削除
+            </button>
+          </div>
+          <div id="archived-logins-list" class="archived-list"></div>
+        </div>
 
         <!-- カスタム追加フォーム -->
         <form id="custom-service-form" class="custom-form hidden">
@@ -611,6 +629,24 @@
         <p class="follow-hint">
           Instagram・Threads・Bluesky 等でフォロー／フォロー解除を実行すると自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。
         </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 保存済みログイン呼び出し / 新規アカウント追加 選択モーダル -->
+  <div id="archived-pick-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="archived-pick-title">
+    <div class="modal-dialog modal-sm">
+      <div class="modal-header">
+        <h2 id="archived-pick-title">アカウントを追加</h2>
+        <button id="btn-close-archived-pick" type="button" class="btn-icon" aria-label="閉じる">✕</button>
+      </div>
+      <div class="archived-pick-body">
+        <p id="archived-pick-desc" class="archived-pick-desc">削除済みのログイン記憶があります。ログイン済みのまま呼び出すか、新規アカウントを作成できます。</p>
+        <div id="archived-pick-list" class="archived-pick-list"></div>
+      </div>
+      <div class="modal-footer modal-footer-between">
+        <button id="btn-archived-pick-cancel" type="button" class="btn-secondary">キャンセル</button>
+        <button id="btn-archived-pick-new" type="button" class="btn-primary">＋ 新規アカウントを作成</button>
       </div>
     </div>
   </div>
