@@ -8,10 +8,12 @@ class SettingsScreen extends StatefulWidget {
     super.key,
     required this.settings,
     required this.onClearAllCookies,
+    this.onGestureChanged,
   });
 
   final AppSettings settings;
   final Future<void> Function() onClearAllCookies;
+  final ValueChanged<MobileGestureSettings>? onGestureChanged;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -74,7 +76,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   builder: (_) => GestureSettingsScreen(
                     initialSettings: _gesture,
                     onChanged: (next) {
-                      setState(() => _gesture = next);
+                      if (mounted) {
+                        setState(() => _gesture = next);
+                      } else {
+                        _gesture = next;
+                      }
+                      widget.onGestureChanged?.call(next);
                     },
                   ),
                 ),

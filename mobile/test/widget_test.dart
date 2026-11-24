@@ -7,9 +7,11 @@ import 'package:omni_sns_mobile/models/service_models.dart';
 import 'package:omni_sns_mobile/screens/catalog_sheet.dart';
 import 'package:omni_sns_mobile/screens/gesture_settings_screen.dart';
 import 'package:omni_sns_mobile/screens/home_screen.dart';
+import 'package:omni_sns_mobile/screens/settings_sheet.dart';
 import 'package:omni_sns_mobile/services/app_store.dart';
 import 'package:omni_sns_mobile/services/follow_sync_service.dart';
 import 'package:omni_sns_mobile/services/omni_webview.dart';
+import 'package:omni_sns_mobile/widgets/gesture_overlay.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -575,5 +577,460 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('gesture-enabled-switch')));
     await tester.pump();
     expect(latest?.enabled, isFalse);
+  });
+
+  test('CRDT guards far-future dates, timezone +1d skew, same-timestamp tie-break, and cross-site handle isolation', () {
+    const today = '2026-11-23';
+
+    // 1. 遠未来日付や破損日付によるレジャー汚染を拒否
+    final local = AccountFollowLedger(
+      date: today,
+      devices: {
+        'and-1': DeviceFollowEntry(today: 4, total: 10, updatedAt: 100),
+      },
+    );
+    final poisoned = AccountFollowLedger(
+      date: '9999-12-31',
+      devices: {
+        'win-evil': DeviceFollowEntry(today: 99, total: 99, updatedAt: 200),
+      },
+    );
+    local.mergeFrom(poisoned, today);
+    expect(local.date, today);
+    expect(local.effectiveCounts(today), (4, 109));
+
+    // 2. +1日タイムゾーン差でも当日分が 0 に凍結されない
+    final tzAhead = AccountFollowLedger(
+      date: '2026-11-24',
+      devices: {
+        'win-jp': DeviceFollowEntry(today: 5, total: 20, updatedAt: 300),
+      },
+    );
+    local.mergeFrom(tzAhead, today);
+    expect(local.date, '2026-11-24');
+    expect(local.effectiveCounts(today), (5, 129));
+    // さらに翌日（2026-11-25）にはロールオーバーで 0
+    expect(local.effectiveCounts('2026-11-25'), (0, 129));
+
+    // 3. 同一秒 updatedAt 衝突時はフィールド単位の最大値で結合し他フィールドを後退させない
+    final tieA = AccountFollowLedger(
+      date: today,
+      devices: {
+        'and-1': DeviceFollowEntry(
+          today: 5,
+          total: 10,
+          unfollowToday: 1,
+          unfollowTotal: 2,
+          updatedAt: 500,
+        ),
+      },
+    );
+    final tieB = AccountFollowLedger(
+      date: today,
+      devices: {
+        'and-1': DeviceFollowEntry(
+          today: 3,
+          total: 10,
+          unfollowToday: 4,
+          unfollowTotal: 6,
+          updatedAt: 500,
+        ),
+      },
+    );
+    tieA.mergeFrom(tieB, today);
+    expect(tieA.devices['and-1']!.today, 5);
+    expect(tieA.devices['and-1']!.unfollowToday, 4);
+    expect(tieA.devices['and-1']!.unfollowTotal, 6);
+
+    // 4. クロスサイトで別ハンドル候補のみ存在するときは誤帰属せず null
+    const threadsAlice = ServiceInstance(
+      instanceId: 'svc-th-alice',
+      serviceId: 'threads',
+      name: 'Threads',
+      category: 'major-sns',
+      url: 'https://www.threads.com/',
+      colorHex: '#18181B',
+      badge: 'TH',
+      notificationsEnabled: true,
+      order: 0,
+      detectedHandle: 'alice',
+    );
+    const igBob = ServiceInstance(
+      instanceId: 'svc-ig-bob',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      category: 'major-sns',
+      url: 'https://www.instagram.com/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 1,
+      detectedHandle: 'bob',
+    );
+    final crossResolved = resolveCounterTargetInstance(
+      source: threadsAlice,
+      instances: [threadsAlice, igBob],
+      currentUrl: 'https://www.instagram.com/alice/',
+    );
+    expect(crossResolved, isNull);
+  });
+
+  test('FollowSyncService validators reject injection, fail closed on corrupt JSON, and never leak PAT', () {
+    expect(isValidGitHubToken('ghp_validToken123456'), isTrue);
+    expect(isValidGitHubToken('ghp_bad\r\nX-Inject: 1'), isFalse);
+    expect(isValidGitHubToken('ghp_has space'), isFalse);
+    expect(isValidGistId(''), isTrue);
+    expect(isValidGistId('gist_abc-123'), isTrue);
+    expect(isValidGistId('../users/me'), isFalse);
+    expect(isValidGistId('abc?query=1'), isFalse);
+
+    expect(
+      parseSharedSyncConfig('OMNISNS_SYNC_V1:{"token":"ghp_a\\r\\nb","gistId":"abc"}'),
+      isNull,
+    );
+    expect(
+      parseSharedSyncConfig('OMNISNS_SYNC_V1:{"token":"ghp_valid","gistId":"../evil"}'),
+      isNull,
+    );
+
+    expect(
+      () => FollowSyncService.parseRemoteLedgerStrict('{corrupt json'),
+      throwsA(isA<SyncUserException>()),
+    );
+    expect(
+      () => FollowSyncService.parseRemoteLedgerStrict('[1, 2, 3]'),
+      throwsA(isA<SyncUserException>()),
+    );
+
+    final safeMsg = formatSafeSyncError(
+      const FormatException('Invalid header Bearer ghp_SUPER_SECRET_TOKEN_999'),
+    );
+    expect(safeMsg.contains('ghp_SUPER_SECRET_TOKEN_999'), isFalse);
+  });
+
+  test('AppStore preserves valid instances on per-item corruption and backs up broken JSON without wiping key', () async {
+    SharedPreferences.setMockInitialValues({
+      'omnisns_instances_v1': jsonEncode([
+        {
+          'instanceId': 'svc-ig-ok',
+          'serviceId': 'instagram',
+          'name': 'Instagram',
+          'category': 'major-sns',
+          'url': 'https://www.instagram.com/',
+          'colorHex': '#E1306C',
+          'badge': 'IG',
+          'notificationsEnabled': true,
+          'order': 0,
+        },
+        'corrupt-non-map-entry',
+      ]),
+    });
+
+    final store = AppStore();
+    final catalog = await store.loadCatalog();
+    final (_, partialInstances) = await store.loadState(catalog.services);
+    expect(partialInstances.length, 1);
+    expect(partialInstances.first.instanceId, 'svc-ig-ok');
+
+    // トップレベル破損時はバックアップ保存し、元のキーを自動上書きしない
+    const brokenRaw = '{not valid json';
+    SharedPreferences.setMockInitialValues({
+      'omnisns_instances_v1': brokenRaw,
+    });
+    final (_, fallbackInstances) = await store.loadState(catalog.services);
+    expect(fallbackInstances.isNotEmpty, isTrue);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('omnisns_instances_v1'), brokenRaw);
+    expect(prefs.getString('omnisns_instances_v1_corrupt_backup'), brokenRaw);
+  });
+
+  testWidgets('MobileGestureOverlay handles tiny landscape/split-screen viewports without ArgumentError', (tester) async {
+    for (final sz in const [Size(300, 40), Size(30, 300), Size(0, 0), Size(48, 56)]) {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Center(
+            child: SizedBox(
+              width: sz.width,
+              height: sz.height,
+              child: MobileGestureOverlay(
+                settings: const MobileGestureSettings(
+                  enabled: true,
+                  triggerSide: 'both',
+                ),
+                onAction: (_, _) {},
+                onLiveScroll: (_, _) {},
+                onHandleMoved: (_, _) {},
+                onOpenSettings: () {},
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(tester.takeException(), isNull);
+    }
+  });
+
+  testWidgets('SettingsScreen persists gesture changes immediately via onGestureChanged', (tester) async {
+    MobileGestureSettings? savedGesture;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SettingsScreen(
+          settings: const AppSettings(),
+          onClearAllCookies: () async {},
+          onGestureChanged: (g) => savedGesture = g,
+        ),
+      ),
+    );
+    await tester.tap(find.text('タッチジェスチャー設定'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('gesture-enabled-switch')));
+    await tester.pump();
+    expect(savedGesture?.enabled, isFalse);
+  });
+
+  test('CRDT mergeFrom couples epoch with count so Android resets never resurrect remote counts', () {
+    const today = '2026-04-08';
+    const key = 'instagram:alice';
+
+    // Desktop had today: 10, total: 20 at epoch 0, updatedAt 1000.
+    // Android initiated reset (incrementing resetEpoch to 1) WITHOUT mutating Desktop's device entry.
+    final androidLedger = FollowSyncLedger(
+      accounts: {
+        key: AccountFollowLedger(
+          date: today,
+          resetEpoch: 1,
+          totalResetEpoch: 1,
+          unfollowResetEpoch: 1,
+          unfollowTotalResetEpoch: 1,
+          devices: {
+            'win-pc': DeviceFollowEntry(
+              today: 10,
+              total: 20,
+              todayEpoch: 0,
+              totalEpoch: 0,
+              unfollowToday: 4,
+              unfollowTotal: 9,
+              unfollowTodayEpoch: 0,
+              unfollowTotalEpoch: 0,
+              updatedAt: 1000,
+            ),
+            'and-phone': DeviceFollowEntry(
+              today: 0,
+              total: 0,
+              todayEpoch: 1,
+              totalEpoch: 1,
+              unfollowToday: 0,
+              unfollowTotal: 0,
+              unfollowTodayEpoch: 1,
+              unfollowTotalEpoch: 1,
+              updatedAt: 1005,
+            ),
+          },
+        ),
+      },
+    );
+
+    // Remote Gist still has pre-reset epoch 0 with Desktop's identical updatedAt 1000.
+    final remoteGist = FollowSyncLedger(
+      accounts: {
+        key: AccountFollowLedger(
+          date: today,
+          resetEpoch: 0,
+          totalResetEpoch: 0,
+          unfollowResetEpoch: 0,
+          unfollowTotalResetEpoch: 0,
+          devices: {
+            'win-pc': DeviceFollowEntry(
+              today: 10,
+              total: 20,
+              todayEpoch: 0,
+              totalEpoch: 0,
+              unfollowToday: 4,
+              unfollowTotal: 9,
+              unfollowTodayEpoch: 0,
+              unfollowTotalEpoch: 0,
+              updatedAt: 1000,
+            ),
+          },
+        ),
+      },
+    );
+
+    androidLedger.mergeFrom(remoteGist, today);
+    final acc = androidLedger.accounts[key]!;
+    expect(acc.effectiveCounts(today), (0, 0));
+    expect(acc.effectiveUnfollowCounts(today), (0, 0));
+    final winDev = acc.devices['win-pc']!;
+    expect(winDev.today, 0);
+    expect(winDev.todayEpoch, 1);
+    expect(winDev.total, 0);
+    expect(winDev.totalEpoch, 1);
+    expect(winDev.unfollowToday, 0);
+    expect(winDev.unfollowTodayEpoch, 1);
+    expect(winDev.unfollowTotal, 0);
+    expect(winDev.unfollowTotalEpoch, 1);
+  });
+
+  test('DeviceFollowEntry.fromJson preserves signed negative PN-counter deltas across JSON roundtrip', () {
+    const today = '2026-04-08';
+    const key = 'instagram:alice';
+    final ledger = FollowSyncLedger(
+      accounts: {
+        key: AccountFollowLedger(
+          date: today,
+          devices: {
+            'win-pc': DeviceFollowEntry(
+              today: 10,
+              total: 10,
+              unfollowToday: 5,
+              unfollowTotal: 5,
+              updatedAt: 100,
+            ),
+            'and-phone': DeviceFollowEntry(
+              today: -3,
+              total: -3,
+              unfollowToday: -2,
+              unfollowTotal: -2,
+              updatedAt: 101,
+            ),
+          },
+        ),
+      },
+    );
+
+    final decoded = FollowSyncLedger.fromJson(
+      jsonDecode(jsonEncode(ledger.toJson())) as Map<String, dynamic>,
+    );
+    final acc = decoded.accounts[key]!;
+    expect(acc.devices['and-phone']!.today, -3);
+    expect(acc.devices['and-phone']!.total, -3);
+    expect(acc.devices['and-phone']!.unfollowToday, -2);
+    expect(acc.devices['and-phone']!.unfollowTotal, -2);
+    expect(acc.effectiveCounts(today), (7, 7));
+    expect(acc.effectiveUnfollowCounts(today), (3, 3));
+  });
+
+  test('resolveCounterTargetInstance refuses conflicting cross-site handleHint over source handle', () {
+    const threadsAlice = ServiceInstance(
+      instanceId: 'threads-alice',
+      serviceId: 'threads',
+      name: 'Threads',
+      category: 'social',
+      url: 'https://www.threads.com/',
+      colorHex: '#000000',
+      badge: 'TH',
+      notificationsEnabled: true,
+      order: 0,
+      detectedHandle: 'alice',
+    );
+    const igAlice = ServiceInstance(
+      instanceId: 'ig-alice',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      category: 'social',
+      url: 'https://www.instagram.com/',
+      colorHex: '#E4405F',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 1,
+      detectedHandle: 'alice',
+    );
+    const igCharlie = ServiceInstance(
+      instanceId: 'ig-charlie',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      category: 'social',
+      url: 'https://www.instagram.com/',
+      colorHex: '#E4405F',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 2,
+      detectedHandle: 'charlie',
+    );
+
+    // Explicit handleHint @charlie must NOT fall back to ig-alice even though source is @alice
+    final blocked = resolveCounterTargetInstance(
+      source: threadsAlice,
+      instances: const [threadsAlice, igAlice],
+      currentUrl: 'https://www.instagram.com/charlie/',
+      explicitService: 'instagram',
+      handleHint: 'charlie',
+    );
+    expect(blocked, isNull);
+
+    // When matching ig-charlie exists, it resolves directly to ig-charlie
+    final matched = resolveCounterTargetInstance(
+      source: threadsAlice,
+      instances: const [threadsAlice, igAlice, igCharlie],
+      currentUrl: 'https://www.instagram.com/charlie/',
+      explicitService: 'instagram',
+      handleHint: 'charlie',
+    );
+    expect(matched?.instanceId, 'ig-charlie');
+  });
+
+  test('AppStore encrypts GitHub PAT via native Keystore channel and migrates legacy plaintext tokens', () async {
+    const managerChannel = MethodChannel('com.pgdarksan.omnisns/webview_manager');
+    final keystoreVault = <String, String>{};
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(managerChannel, (call) async {
+      final args = call.arguments as Map? ?? const {};
+      switch (call.method) {
+        case 'secureSetSecret':
+          final k = args['key'] as String? ?? '';
+          final v = args['value'] as String? ?? '';
+          if (v.isEmpty) {
+            keystoreVault.remove(k);
+          } else {
+            keystoreVault[k] = v;
+          }
+          return true;
+        case 'secureGetSecret':
+          final k = args['key'] as String? ?? '';
+          return keystoreVault[k];
+        case 'secureDeleteSecret':
+          final k = args['key'] as String? ?? '';
+          keystoreVault.remove(k);
+          return true;
+        default:
+          return null;
+      }
+    });
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(managerChannel, null);
+    });
+
+    // Simulate legacy plaintext PAT in SharedPreferences
+    SharedPreferences.setMockInitialValues({
+      'omnisns_follow_sync_settings_v1': jsonEncode({
+        'deviceId': 'and-test0001',
+        'githubToken': 'ghp_legacyPlaintextToken123456',
+        'gistId': 'abc123def456',
+      }),
+    });
+
+    final store = AppStore();
+    final (loadedSettings, loadedLedger) = await store.loadFollowSyncState();
+    expect(loadedSettings.githubToken, 'ghp_legacyPlaintextToken123456');
+    expect(keystoreVault['follow_sync_github_token_v1'], 'ghp_legacyPlaintextToken123456');
+
+    // Legacy plaintext must have been scrubbed from SharedPreferences
+    final prefs = await SharedPreferences.getInstance();
+    final savedRaw = prefs.getString('omnisns_follow_sync_settings_v1') ?? '';
+    expect(savedRaw.contains('ghp_legacyPlaintextToken123456'), isFalse);
+
+    // Saving a new PAT stores it ONLY in Keystore, never in SharedPreferences JSON
+    await store.saveFollowSyncState(
+      loadedSettings.copyWith(githubToken: 'ghp_rotatedSecret999999'),
+      loadedLedger,
+    );
+    expect(keystoreVault['follow_sync_github_token_v1'], 'ghp_rotatedSecret999999');
+    final savedRaw2 = prefs.getString('omnisns_follow_sync_settings_v1') ?? '';
+    expect(savedRaw2.contains('ghp_rotatedSecret999999'), isFalse);
+
+    // Reloading retrieves the encrypted PAT transparently
+    final (reloadedSettings, _) = await store.loadFollowSyncState();
+    expect(reloadedSettings.githubToken, 'ghp_rotatedSecret999999');
   });
 }

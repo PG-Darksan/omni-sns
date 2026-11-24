@@ -1,18 +1,25 @@
 package com.pgdarksan.omni_sns_mobile
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.Dialog
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.text.InputType
+import android.text.TextUtils
+import android.util.Base64
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -39,8 +46,10 @@ import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import androidx.webkit.Profile
 import androidx.webkit.ProfileStore
+import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import io.flutter.embedding.android.FlutterView
@@ -50,7 +59,16 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
 import io.flutter.plugin.platform.PlatformViewFactory
+import org.json.JSONObject
+import java.security.KeyStore
+import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 /**
  * チャット・DM入力欄などパスワード入力欄以外では Android Autofill（Google パスワードマネージャー）を
@@ -74,7 +92,9 @@ class OmniWebView(context: Context) : WebView(context) {
 
         val applyUi = Runnable {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val targetFlag = if (allowed) {
+                // JSスレッドとUIスレッドの順序逆転を防ぐため、最新の揮発フラグを参照する
+                val currentAllowed = allowAutofillForCurrentFocus
+                val targetFlag = if (currentAllowed) {
                     View.IMPORTANT_FOR_AUTOFILL_YES
                 } else {
                     View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
@@ -82,7 +102,7 @@ class OmniWebView(context: Context) : WebView(context) {
                 if (importantForAutofill != targetFlag) {
                     importantForAutofill = targetFlag
                 }
-                if (!allowed) {
+                if (!currentAllowed && hasFocus()) {
                     try {
                         context.getSystemService(AutofillManager::class.java)?.cancel()
                     } catch (_: Throwable) {
@@ -147,30 +167,38 @@ class OmniWebView(context: Context) : WebView(context) {
     }
 }
 
-private class OmniAutofillBridge(private val webView: OmniWebView) {
+private class OmniAutofillBridge(
+    private val webView: OmniWebView,
+    private val expectedToken: String,
+) {
     @JavascriptInterface
-    fun setAutofillAllowed(allowed: Boolean) {
+    fun setAutofillAllowed(token: String?, allowed: Boolean) {
+        if (token != expectedToken) return
         webView.applyAutofillAllowed(allowed, fromJs = true)
     }
 }
 
 private class OmniFollowBridge(
+    private val expectedToken: String,
     private val onFollow: (String, String) -> Unit,
     private val onUnfollow: (String, String) -> Unit,
     private val onIdentity: (String, String, Int, Int) -> Unit,
 ) {
     @JavascriptInterface
-    fun onFollowDetected(source: String?, service: String?) {
+    fun onFollowDetected(token: String?, source: String?, service: String?) {
+        if (token != expectedToken) return
         onFollow(source?.ifEmpty { "auto" } ?: "auto", service?.trim().orEmpty())
     }
 
     @JavascriptInterface
-    fun onUnfollowDetected(source: String?, service: String?) {
+    fun onUnfollowDetected(token: String?, source: String?, service: String?) {
+        if (token != expectedToken) return
         onUnfollow(source?.ifEmpty { "auto" } ?: "auto", service?.trim().orEmpty())
     }
 
     @JavascriptInterface
-    fun onAccountIdentity(service: String?, handle: String?, following: Int, followers: Int) {
+    fun onAccountIdentity(token: String?, service: String?, handle: String?, following: Int, followers: Int) {
+        if (token != expectedToken) return
         val cleanHandle = handle?.trim().orEmpty()
         if (cleanHandle.isNotEmpty()) {
             onIdentity(service?.trim().orEmpty(), cleanHandle, following, followers)
@@ -189,7 +217,129 @@ class OmniWebViewManager(
         const val VIEW_TYPE = "com.pgdarksan.omnisns/webview"
         const val MANAGER_CHANNEL = "com.pgdarksan.omnisns/webview_manager"
         const val FILE_CHOOSER_REQUEST_CODE = 42071
+        const val PERMISSION_REQUEST_CODE = 42072
         private const val TAG = "OmniWebViewManager"
+        private const val SECURE_PREFS_NAME = "omnisns_secure_secrets_v1"
+        private const val KEYSTORE_ALIAS = "omnisns_secret_aes_gcm_v1"
+        private val secureRandom = SecureRandom()
+
+        val FOLLOW_ALLOWED_ORIGINS: Set<String> = setOf(
+            "https://instagram.com",
+            "https://*.instagram.com",
+            "https://threads.net",
+            "https://*.threads.net",
+            "https://threads.com",
+            "https://*.threads.com",
+            "https://bsky.app",
+            "https://*.bsky.app",
+            "https://bsky.social",
+            "https://*.bsky.social",
+            "https://x.com",
+            "https://*.x.com",
+            "https://twitter.com",
+            "https://*.twitter.com",
+            "https://mixi.social",
+            "https://*.mixi.social",
+            "https://tiktok.com",
+            "https://*.tiktok.com",
+            "https://facebook.com",
+            "https://*.facebook.com",
+            "https://messenger.com",
+            "https://*.messenger.com",
+            "https://note.com",
+            "https://*.note.com",
+            "https://youtube.com",
+            "https://*.youtube.com",
+            "https://twitch.tv",
+            "https://*.twitch.tv",
+            "https://reddit.com",
+            "https://*.reddit.com",
+            "https://pinterest.com",
+            "https://*.pinterest.com",
+            "https://pinterest.jp",
+            "https://*.pinterest.jp",
+            "https://linkedin.com",
+            "https://*.linkedin.com",
+            "https://tumblr.com",
+            "https://*.tumblr.com",
+            "https://pixiv.net",
+            "https://*.pixiv.net",
+            "https://mastodon.social",
+            "https://*.mastodon.social",
+            "https://misskey.io",
+            "https://*.misskey.io",
+        )
+
+        val PROFILE_STATS_ALLOWED_ORIGINS: Set<String> = setOf(
+            "https://instagram.com",
+            "https://*.instagram.com",
+            "https://threads.net",
+            "https://*.threads.net",
+            "https://threads.com",
+            "https://*.threads.com",
+            "https://bsky.app",
+            "https://*.bsky.app",
+            "https://bsky.social",
+            "https://*.bsky.social",
+        )
+
+        fun generateBridgeToken(): String {
+            val bytes = ByteArray(16)
+            secureRandom.nextBytes(bytes)
+            val sb = StringBuilder(32)
+            for (b in bytes) {
+                val v = b.toInt() and 0xFF
+                sb.append("0123456789abcdef"[v ushr 4])
+                sb.append("0123456789abcdef"[v and 0x0F])
+            }
+            return sb.toString()
+        }
+
+        fun detectPlatformServiceFromHost(rawHost: String?): String? {
+            val h = rawHost?.trim()?.lowercase().orEmpty()
+            if (h.isEmpty()) return null
+            fun matches(domain: String) = h == domain || h.endsWith(".$domain")
+            return when {
+                matches("instagram.com") -> "instagram"
+                matches("threads.net") || matches("threads.com") -> "threads"
+                matches("bsky.app") || matches("bsky.social") -> "bluesky"
+                matches("mixi.social") -> "mixi2"
+                matches("x.com") || matches("twitter.com") -> "x"
+                matches("tiktok.com") -> "tiktok"
+                matches("facebook.com") || matches("messenger.com") -> "facebook"
+                matches("note.com") -> "note"
+                matches("youtube.com") -> "youtube"
+                matches("twitch.tv") -> "twitch"
+                matches("reddit.com") -> "reddit"
+                matches("pinterest.com") || matches("pinterest.jp") -> "pinterest"
+                matches("linkedin.com") -> "linkedin"
+                matches("tumblr.com") -> "tumblr"
+                matches("pixiv.net") -> "pixiv"
+                matches("mastodon.social") -> "mastodon"
+                matches("misskey.io") -> "misskey"
+                else -> null
+            }
+        }
+
+        fun detectPlatformServiceFromHttpsUrl(rawUrl: String?): String? {
+            if (rawUrl.isNullOrBlank()) return null
+            return try {
+                val uri = Uri.parse(rawUrl.trim())
+                if (!uri.scheme.equals("https", ignoreCase = true)) return null
+                detectPlatformServiceFromHost(uri.host)
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
+        fun buildAutofillGuardJs(token: String): String =
+            AUTOFILL_GUARD_JS.replace("__OMNISNS_AUTOFILL_TOKEN__", token)
+
+        fun buildFollowTrackerJs(token: String): String =
+            FOLLOW_TRACKER_JS.replace("__OMNISNS_FOLLOW_TOKEN__", token)
+
+        fun buildProfileStatsJs(token: String): String =
+            PROFILE_STATS_JS.replace("__OMNISNS_FOLLOW_TOKEN__", token)
 
         /**
          * 全フレーム（iframe含む）のドキュメント開始前に注入する Autofill ガードスクリプト。
@@ -200,6 +350,8 @@ class OmniWebViewManager(
             (function() {
               if (window.__omniAutofillGuardInstalled) return;
               window.__omniAutofillGuardInstalled = true;
+              var __omniToken = "__OMNISNS_AUTOFILL_TOKEN__";
+              var __omniBridge = window.OmniAutofillBridge;
 
               var NON_AUTH_HINT_RE = /(message|msg|chat|dm|reply|comment|post|tweet|caption|bio|status|search|query|filter|compose|note|subject|body|メッセージ|チャット|返信|コメント|投稿|検索|送信|つぶやき|入力)/i;
               var AUTH_AUTOCOMPLETE_TOKENS = {
@@ -331,8 +483,9 @@ class OmniWebViewManager(
                 lastSent = allowed;
                 lastSentAt = now;
                 try {
-                  if (window.OmniAutofillBridge && typeof window.OmniAutofillBridge.setAutofillAllowed === 'function') {
-                    window.OmniAutofillBridge.setAutofillAllowed(!!allowed);
+                  var bridge = __omniBridge || window.OmniAutofillBridge;
+                  if (bridge && typeof bridge.setAutofillAllowed === 'function') {
+                    bridge.setAutofillAllowed(__omniToken, !!allowed);
                   }
                 } catch (_) {}
               }
@@ -373,8 +526,10 @@ class OmniWebViewManager(
                 }, 0);
               }, true);
 
-              // 初期状態は必ず無効
-              notifyNative(false, true);
+              // トップフレームのみ初期状態を無効化（背景広告iframe等が親フォームのAutofillを潰さないようにする）
+              if (window === window.top) {
+                notifyNative(false, true);
+              }
             })();
         """.trimIndent()
 
@@ -387,6 +542,9 @@ class OmniWebViewManager(
               if (window !== window.top) return;
               if (window.__omniFollowTrackerInstalled) return;
               window.__omniFollowTrackerInstalled = true;
+              var __omniFollowToken = "__OMNISNS_FOLLOW_TOKEN__";
+              var __omniFollowChannel = window.OmniFollowChannel;
+              var __omniFollowBridge = window.OmniFollowBridge;
 
               var NEGATIVE_FOLLOW_RE = /(フォロー中|フォロー済|フォロー解除|フォローをやめる|フォローを外す|フォロワー|リクエスト済|リクエスト中|承認待ち|解除|following|unfollow|followers|requested|pending|remove|cancel|block|mute)/i;
               var EXACT_FOLLOW_TEXT_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォローを返す|follow|follow\s+back)$/i;
@@ -454,13 +612,24 @@ class OmniWebViewManager(
               function detectCurrentService() {
                 try {
                   var h = (window.location && window.location.hostname ? window.location.hostname : '').toLowerCase();
-                  if (h === 'instagram.com' || h.slice(-14) === '.instagram.com') return 'instagram';
-                  if (h === 'threads.net' || h.slice(-12) === '.threads.net' || h === 'threads.com' || h.slice(-12) === '.threads.com') return 'threads';
-                  if (h === 'bsky.app' || h.slice(-9) === '.bsky.app') return 'bluesky';
-                  if (h === 'mixi.social' || h.slice(-12) === '.mixi.social') return 'mixi2';
-                  if (h === 'x.com' || h.slice(-6) === '.x.com' || h === 'twitter.com' || h.slice(-12) === '.twitter.com') return 'x';
-                  if (h === 'tiktok.com' || h.slice(-11) === '.tiktok.com') return 'tiktok';
-                  if (h === 'facebook.com' || h.slice(-13) === '.facebook.com') return 'facebook';
+                  function matchDom(d) { return h === d || (h.length > d.length && h.slice(-(d.length + 1)) === '.' + d); }
+                  if (matchDom('instagram.com')) return 'instagram';
+                  if (matchDom('threads.net') || matchDom('threads.com')) return 'threads';
+                  if (matchDom('bsky.app') || matchDom('bsky.social')) return 'bluesky';
+                  if (matchDom('mixi.social')) return 'mixi2';
+                  if (matchDom('x.com') || matchDom('twitter.com')) return 'x';
+                  if (matchDom('tiktok.com')) return 'tiktok';
+                  if (matchDom('facebook.com') || matchDom('messenger.com')) return 'facebook';
+                  if (matchDom('note.com')) return 'note';
+                  if (matchDom('youtube.com')) return 'youtube';
+                  if (matchDom('twitch.tv')) return 'twitch';
+                  if (matchDom('reddit.com')) return 'reddit';
+                  if (matchDom('pinterest.com') || matchDom('pinterest.jp')) return 'pinterest';
+                  if (matchDom('linkedin.com')) return 'linkedin';
+                  if (matchDom('tumblr.com')) return 'tumblr';
+                  if (matchDom('pixiv.net')) return 'pixiv';
+                  if (matchDom('mastodon.social')) return 'mastodon';
+                  if (matchDom('misskey.io')) return 'misskey';
                 } catch (_) {}
                 return '';
               }
@@ -512,11 +681,22 @@ class OmniWebViewManager(
                 }
                 try {
                   var svc = detectCurrentService();
-                  if (window.OmniFollowBridge) {
-                    if (action === 'unfollow' && typeof window.OmniFollowBridge.onUnfollowDetected === 'function') {
-                      window.OmniFollowBridge.onUnfollowDetected(source || 'auto', svc);
-                    } else if (action === 'follow' && typeof window.OmniFollowBridge.onFollowDetected === 'function') {
-                      window.OmniFollowBridge.onFollowDetected(source || 'auto', svc);
+                  var ch = __omniFollowChannel || window.OmniFollowChannel;
+                  if (ch && typeof ch.postMessage === 'function') {
+                    ch.postMessage(JSON.stringify({
+                      token: __omniFollowToken,
+                      type: action === 'unfollow' ? 'unfollow' : 'follow',
+                      source: source || 'auto',
+                      service: svc
+                    }));
+                  } else {
+                    var br = __omniFollowBridge || window.OmniFollowBridge;
+                    if (br) {
+                      if (action === 'unfollow' && typeof br.onUnfollowDetected === 'function') {
+                        br.onUnfollowDetected(__omniFollowToken, source || 'auto', svc);
+                      } else if (action === 'follow' && typeof br.onFollowDetected === 'function') {
+                        br.onFollowDetected(__omniFollowToken, source || 'auto', svc);
+                      }
                     }
                   }
                 } catch (_) {}
@@ -922,6 +1102,9 @@ class OmniWebViewManager(
               if (window !== window.top) return;
               if (window.__omniProfileStatsInstalled) return;
               window.__omniProfileStatsInstalled = true;
+              var __omniFollowToken = "__OMNISNS_FOLLOW_TOKEN__";
+              var __omniFollowChannel = window.OmniFollowChannel;
+              var __omniFollowBridge = window.OmniFollowBridge;
 
               var host = (window.location && window.location.hostname || '').toLowerCase();
               var platform = '';
@@ -1086,14 +1269,24 @@ class OmniWebViewManager(
                 var key = handle + '|' + (following === null ? '' : following) + '|' + (followers === null ? '' : followers);
                 if (key === lastPostedIdentityKey) return;
                 lastPostedIdentityKey = key;
+                var flwng = typeof following === 'number' ? Math.round(following) : -1;
+                var flwrs = typeof followers === 'number' ? Math.round(followers) : -1;
                 try {
-                  if (window.OmniFollowBridge && typeof window.OmniFollowBridge.onAccountIdentity === 'function') {
-                    window.OmniFollowBridge.onAccountIdentity(
-                      platform,
-                      handle,
-                      typeof following === 'number' ? Math.round(following) : -1,
-                      typeof followers === 'number' ? Math.round(followers) : -1
-                    );
+                  var ch = __omniFollowChannel || window.OmniFollowChannel;
+                  if (ch && typeof ch.postMessage === 'function') {
+                    ch.postMessage(JSON.stringify({
+                      token: __omniFollowToken,
+                      type: 'identity',
+                      service: platform,
+                      handle: handle,
+                      following: flwng,
+                      followers: flwrs
+                    }));
+                  } else {
+                    var br = __omniFollowBridge || window.OmniFollowBridge;
+                    if (br && typeof br.onAccountIdentity === 'function') {
+                      br.onAccountIdentity(__omniFollowToken, platform, handle, flwng, flwrs);
+                    }
                   }
                 } catch (_) {}
               }
@@ -1849,13 +2042,18 @@ class OmniWebViewManager(
                     delete queuedSet[batch[i]];
                     inFlight[batch[i]] = true;
                   }
-                  fetchBlueskyBatch(batch).then(function() {
+                  var doneBsky = function() {
                     for (var j = 0; j < batch.length; j++) delete inFlight[batch[j]];
                     setTimeout(function() {
                       queueRunning = false;
                       processQueue();
                     }, 280);
-                  });
+                  };
+                  try {
+                    Promise.resolve(fetchBlueskyBatch(batch)).then(doneBsky, doneBsky);
+                  } catch (_) {
+                    doneBsky();
+                  }
                   return;
                 }
 
@@ -1863,15 +2061,20 @@ class OmniWebViewManager(
                 delete queuedSet[handle];
                 inFlight[handle] = true;
                 scheduleRenderBadges();
-                var req = platform === 'instagram' ? fetchInstagramProfile(handle) : fetchThreadsProfile(handle);
                 var delayMs = platform === 'instagram' ? 620 : 820;
-                req.then(function() {
+                var doneOne = function() {
                   delete inFlight[handle];
                   setTimeout(function() {
                     queueRunning = false;
                     processQueue();
                   }, delayMs);
-                });
+                };
+                try {
+                  var req = platform === 'instagram' ? fetchInstagramProfile(handle) : fetchThreadsProfile(handle);
+                  Promise.resolve(req).then(doneOne, doneOne);
+                } catch (_) {
+                  doneOne();
+                }
               }
 
               function ensureStyles() {
@@ -2260,6 +2463,7 @@ class OmniWebViewManager(
     private val activeViews = ConcurrentHashMap<Int, OmniWebViewPlatformView>()
     private val pendingDeleteProfiles = ConcurrentHashMap.newKeySet<String>()
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var pendingPermissionCallback: ((Map<String, Boolean>) -> Unit)? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     init {
@@ -2337,6 +2541,145 @@ class OmniWebViewManager(
         return true
     }
 
+    internal fun requestRuntimePermissions(
+        permissions: Array<String>,
+        callback: (Map<String, Boolean>) -> Unit,
+    ) {
+        if (permissions.isEmpty()) {
+            callback(emptyMap())
+            return
+        }
+        val already = mutableMapOf<String, Boolean>()
+        val missing = mutableListOf<String>()
+        for (perm in permissions.distinct()) {
+            val granted = ContextCompat.checkSelfPermission(activity, perm) ==
+                PackageManager.PERMISSION_GRANTED
+            already[perm] = granted
+            if (!granted) {
+                missing.add(perm)
+            }
+        }
+        if (missing.isEmpty() || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            callback(already)
+            return
+        }
+        if (activity.isFinishing || activity.isDestroyed) {
+            callback(already)
+            return
+        }
+        pendingPermissionCallback?.invoke(emptyMap())
+        pendingPermissionCallback = { grantedMap ->
+            val merged = LinkedHashMap<String, Boolean>(already)
+            merged.putAll(grantedMap)
+            callback(merged)
+        }
+        try {
+            activity.requestPermissions(missing.toTypedArray(), PERMISSION_REQUEST_CODE)
+        } catch (_: Throwable) {
+            pendingPermissionCallback = null
+            callback(already)
+        }
+    }
+
+    fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ): Boolean {
+        if (requestCode != PERMISSION_REQUEST_CODE) return false
+        val cb = pendingPermissionCallback
+        pendingPermissionCallback = null
+        if (cb == null) return true
+        val results = LinkedHashMap<String, Boolean>()
+        for (i in permissions.indices) {
+            val granted = i < grantResults.size &&
+                grantResults[i] == PackageManager.PERMISSION_GRANTED
+            results[permissions[i]] = granted
+        }
+        cb(results)
+        return true
+    }
+
+    private fun getOrCreateSecretKey(): SecretKey? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        return try {
+            val ks = KeyStore.getInstance("AndroidKeyStore")
+            ks.load(null)
+            val existing = ks.getKey(KEYSTORE_ALIAS, null) as? SecretKey
+            if (existing != null) {
+                return existing
+            }
+            val keyGenerator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                "AndroidKeyStore",
+            )
+            val spec = KeyGenParameterSpec.Builder(
+                KEYSTORE_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .build()
+            keyGenerator.init(spec)
+            keyGenerator.generateKey()
+        } catch (e: Throwable) {
+            Log.w(TAG, "AndroidKeyStore key init failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun secureSetSecret(key: String, value: String): Boolean {
+        if (key.isBlank()) return false
+        val prefs = activity.getSharedPreferences(SECURE_PREFS_NAME, Context.MODE_PRIVATE)
+        if (value.isEmpty()) {
+            return prefs.edit().remove(key).commit()
+        }
+        val secretKey = getOrCreateSecretKey() ?: return false
+        return try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            val iv = cipher.iv
+            val cipherText = cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+            val combined = ByteArray(1 + iv.size + cipherText.size)
+            combined[0] = iv.size.toByte()
+            System.arraycopy(iv, 0, combined, 1, iv.size)
+            System.arraycopy(cipherText, 0, combined, 1 + iv.size, cipherText.size)
+            val encoded = Base64.encodeToString(combined, Base64.NO_WRAP)
+            prefs.edit().putString(key, encoded).commit()
+        } catch (e: Throwable) {
+            Log.w(TAG, "secureSetSecret failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun secureGetSecret(key: String): String? {
+        if (key.isBlank()) return null
+        val prefs = activity.getSharedPreferences(SECURE_PREFS_NAME, Context.MODE_PRIVATE)
+        val encoded = prefs.getString(key, null) ?: return null
+        val secretKey = getOrCreateSecretKey() ?: return null
+        return try {
+            val combined = Base64.decode(encoded, Base64.NO_WRAP)
+            if (combined.size < 14) return null
+            val ivLen = combined[0].toInt() and 0xFF
+            if (ivLen < 12 || ivLen > 16 || combined.size <= 1 + ivLen + 16) return null
+            val iv = combined.copyOfRange(1, 1 + ivLen)
+            val cipherText = combined.copyOfRange(1 + ivLen, combined.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, iv))
+            String(cipher.doFinal(cipherText), Charsets.UTF_8)
+        } catch (e: Throwable) {
+            Log.w(TAG, "secureGetSecret failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun secureDeleteSecret(key: String): Boolean {
+        if (key.isBlank()) return false
+        val prefs = activity.getSharedPreferences(SECURE_PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.edit().remove(key).commit()
+    }
+
     fun handleBackForFullscreen(): Boolean {
         for (view in activeViews.values) {
             if (view.exitFullscreenIfActive()) {
@@ -2350,8 +2693,16 @@ class OmniWebViewManager(
         channel.setMethodCallHandler(null)
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
+        pendingPermissionCallback?.invoke(emptyMap())
+        pendingPermissionCallback = null
         activeViews.values.toList().forEach { it.dispose() }
         activeViews.clear()
+    }
+
+    internal fun cancelPendingDeleteProfile(profileName: String) {
+        if (profileName.isNotEmpty()) {
+            pendingDeleteProfiles.remove(profileName)
+        }
     }
 
     private fun isProfileInUse(profileName: String): Boolean {
@@ -2368,7 +2719,9 @@ class OmniWebViewManager(
             return
         }
         mainHandler.post {
-            if (isProfileInUse(profileName)) return@post
+            if (isProfileInUse(profileName) || !pendingDeleteProfiles.contains(profileName)) {
+                return@post
+            }
             try {
                 val store = ProfileStore.getInstance()
                 if (store.getAllProfileNames().contains(profileName)) {
@@ -2383,30 +2736,57 @@ class OmniWebViewManager(
 
     private fun clearProfileDataInternal(profileName: String, onDone: () -> Unit) {
         val multi = isMultiProfileSupported()
+        val completed = AtomicBoolean(false)
+        fun finishOnce() {
+            if (completed.compareAndSet(false, true)) {
+                onDone()
+            }
+        }
         try {
             if (multi && profileName.isNotEmpty() && profileName != Profile.DEFAULT_PROFILE_NAME) {
                 val profile = ProfileStore.getInstance().getProfile(profileName)
                 if (profile != null) {
-                    profile.webStorage.deleteAllData()
-                    profile.cookieManager.removeAllCookies {
-                        profile.cookieManager.flush()
-                        onDone()
+                    try {
+                        profile.webStorage.deleteAllData()
+                    } catch (_: Throwable) {
                     }
-                    return
+                    profile.cookieManager.removeAllCookies {
+                        try {
+                            profile.cookieManager.flush()
+                        } catch (_: Throwable) {
+                        }
+                        finishOnce()
+                    }
+                } else {
+                    // 未作成／削除済みプロファイルに対して Default プロファイルを誤消去しない
+                    finishOnce()
                 }
+                return
             }
-            WebStorage.getInstance().deleteAllData()
+            try {
+                WebStorage.getInstance().deleteAllData()
+            } catch (_: Throwable) {
+            }
             val cm = CookieManager.getInstance()
             cm.removeAllCookies {
-                cm.flush()
-                onDone()
+                try {
+                    cm.flush()
+                } catch (_: Throwable) {
+                }
+                finishOnce()
             }
         } catch (_: Throwable) {
-            onDone()
+            finishOnce()
         }
     }
 
     private fun clearAllCookiesInternal(onDone: () -> Unit) {
+        val completed = AtomicBoolean(false)
+        fun finishOnce() {
+            if (completed.compareAndSet(false, true)) {
+                onDone()
+            }
+        }
         val cmDefault = CookieManager.getInstance()
         try {
             WebStorage.getInstance().deleteAllData()
@@ -2414,9 +2794,16 @@ class OmniWebViewManager(
         }
 
         if (!isMultiProfileSupported()) {
-            cmDefault.removeAllCookies {
-                cmDefault.flush()
-                onDone()
+            try {
+                cmDefault.removeAllCookies {
+                    try {
+                        cmDefault.flush()
+                    } catch (_: Throwable) {
+                    }
+                    finishOnce()
+                }
+            } catch (_: Throwable) {
+                finishOnce()
             }
             return
         }
@@ -2427,13 +2814,27 @@ class OmniWebViewManager(
             emptyList()
         }
 
-        val targets = profileNames.distinct().ifEmpty { listOf(Profile.DEFAULT_PROFILE_NAME) }
-        var remaining = targets.size
+        if (profileNames.isEmpty()) {
+            try {
+                cmDefault.removeAllCookies {
+                    try {
+                        cmDefault.flush()
+                    } catch (_: Throwable) {
+                    }
+                    finishOnce()
+                }
+            } catch (_: Throwable) {
+                finishOnce()
+            }
+            return
+        }
+
+        val targets = (profileNames + Profile.DEFAULT_PROFILE_NAME).distinct()
+        val remaining = AtomicInteger(targets.size)
 
         fun tick() {
-            remaining -= 1
-            if (remaining <= 0) {
-                onDone()
+            if (remaining.decrementAndGet() <= 0) {
+                finishOnce()
             }
         }
 
@@ -2441,9 +2842,23 @@ class OmniWebViewManager(
             try {
                 val profile = ProfileStore.getInstance().getProfile(name)
                 if (profile != null) {
-                    profile.webStorage.deleteAllData()
+                    try {
+                        profile.webStorage.deleteAllData()
+                    } catch (_: Throwable) {
+                    }
                     profile.cookieManager.removeAllCookies {
-                        profile.cookieManager.flush()
+                        try {
+                            profile.cookieManager.flush()
+                        } catch (_: Throwable) {
+                        }
+                        tick()
+                    }
+                } else if (name == Profile.DEFAULT_PROFILE_NAME) {
+                    cmDefault.removeAllCookies {
+                        try {
+                            cmDefault.flush()
+                        } catch (_: Throwable) {
+                        }
                         tick()
                     }
                 } else {
@@ -2486,6 +2901,19 @@ class OmniWebViewManager(
                 } else {
                     result.success(false)
                 }
+            }
+            "secureSetSecret" -> {
+                val key = call.argument<String>("key") ?: ""
+                val value = call.argument<String>("value") ?: ""
+                result.success(secureSetSecret(key, value))
+            }
+            "secureGetSecret" -> {
+                val key = call.argument<String>("key") ?: ""
+                result.success(secureGetSecret(key))
+            }
+            "secureDeleteSecret" -> {
+                val key = call.argument<String>("key") ?: ""
+                result.success(secureDeleteSecret(key))
             }
             else -> result.notImplemented()
         }
@@ -2640,12 +3068,26 @@ class OmniWebViewPlatformView(
     private val container = FrameLayout(activity)
     private lateinit var webView: OmniWebView
     val appliedProfileName: String
+    private val requestedProfileName: String
     private val initialUrl: String
     private val userAgent: String
+    private val configuredServiceId: String
+    private val customFollowHost: String?
+    private val effectiveFollowOrigins: Set<String>
 
     private var disposed = false
+    private var profileAttachFailed = false
+    private var isTabActive: Boolean = false
+    private var pendingCrashReload: Boolean = false
+    private var pendingCrashUrl: String = ""
     private var popupDialog: Dialog? = null
     private var popupWebView: OmniWebView? = null
+    private var activePopupDismiss: (() -> Unit)? = null
+    private var activePermissionDialog: AlertDialog? = null
+    private var activePermissionRequest: PermissionRequest? = null
+    private var activeGeoDialog: AlertDialog? = null
+    private var activeGeoCallback: GeolocationPermissions.Callback? = null
+    private var activeGeoOrigin: String? = null
     private var customView: View? = null
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
 
@@ -2658,20 +3100,53 @@ class OmniWebViewPlatformView(
     private var reloadObservedProgress: Boolean = false
     private var cacheBypassToken: Int = 0
     private var renderProcessCrashed: Boolean = false
+    private var mainWebViewDestroyed: Boolean = false
+    private var crashRecoveryGen: Int = 0
     private var lastCrashRecoveryAtMs: Long = 0L
+
+    private var mainAutofillToken: String = OmniWebViewManager.generateBridgeToken()
+    private var mainFollowToken: String = OmniWebViewManager.generateBridgeToken()
+    private var hasDocumentStartAutofill: Boolean = false
+    private var hasDocumentStartFollow: Boolean = false
+    private val bridgeEventTimestamps = ArrayDeque<Long>()
 
     init {
         val requestedProfile = (creationParams["profileName"] as? String)?.trim().orEmpty()
+        requestedProfileName = requestedProfile
         initialUrl = (creationParams["initialUrl"] as? String)?.trim().orEmpty()
         if (isHttpOrHttpsUrl(initialUrl)) {
             lastTargetUrl = initialUrl
         }
+        configuredServiceId = (creationParams["serviceId"] as? String)?.trim()?.lowercase().orEmpty()
+        isTabActive = creationParams["isActive"] as? Boolean ?: false
+
+        // カスタム Mastodon / Misskey インスタンスの場合は自タブの https オリジンのみ追加許可する
+        var customHost: String? = null
+        val followOrigins = LinkedHashSet<String>(OmniWebViewManager.FOLLOW_ALLOWED_ORIGINS)
+        if ((configuredServiceId == "mastodon" || configuredServiceId == "misskey") &&
+            initialUrl.isNotEmpty()
+        ) {
+            try {
+                val parsed = Uri.parse(initialUrl)
+                val host = parsed.host?.lowercase()?.trim().orEmpty()
+                if (parsed.scheme.equals("https", ignoreCase = true) && host.isNotEmpty()) {
+                    customHost = host
+                    val portSuffix = if (parsed.port != -1 && parsed.port != 443) ":${parsed.port}" else ""
+                    followOrigins.add("https://$host$portSuffix")
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        customFollowHost = customHost
+        effectiveFollowOrigins = followOrigins
+
         userAgent = (creationParams["userAgent"] as? String)?.trim().orEmpty().ifEmpty {
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
         }
 
-        val (createdWebView, resolvedProfile) = createMainWebView(requestedProfile)
+        val (createdWebView, resolvedProfile, attachFailed) = createMainWebView(requestedProfile)
         appliedProfileName = resolvedProfile
+        profileAttachFailed = attachFailed
         webView = createdWebView
         container.addView(
             webView,
@@ -2684,57 +3159,185 @@ class OmniWebViewPlatformView(
         channel.setMethodCallHandler(this)
         manager.registerView(viewId, this)
 
-        val autoLoad = creationParams["autoLoad"] as? Boolean ?: false
-        if (autoLoad && initialUrl.isNotEmpty()) {
-            loadUrlInternal(initialUrl)
+        if (profileAttachFailed) {
+            emitProfileIsolationError()
+        } else {
+            val autoLoad = creationParams["autoLoad"] as? Boolean ?: false
+            if (autoLoad && initialUrl.isNotEmpty()) {
+                loadUrlInternal(initialUrl)
+            }
         }
     }
 
-    private fun createMainWebView(requestedProfile: String): Pair<OmniWebView, String> {
+    private fun detectEffectivePlatformServiceFromHost(rawHost: String?): String? {
+        val known = OmniWebViewManager.detectPlatformServiceFromHost(rawHost)
+        if (known != null) return known
+        val h = rawHost?.trim()?.lowercase().orEmpty()
+        if (customFollowHost != null && h == customFollowHost && configuredServiceId.isNotEmpty()) {
+            return configuredServiceId
+        }
+        return null
+    }
+
+    private fun detectEffectivePlatformServiceFromHttpsUrl(rawUrl: String?): String? {
+        if (rawUrl.isNullOrBlank()) return null
+        return try {
+            val uri = Uri.parse(rawUrl.trim())
+            if (!uri.scheme.equals("https", ignoreCase = true)) return null
+            detectEffectivePlatformServiceFromHost(uri.host)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun dismissPendingPermissionDialogs() {
+        val permDlg = activePermissionDialog
+        val permReq = activePermissionRequest
+        activePermissionDialog = null
+        activePermissionRequest = null
+        if (permDlg != null) {
+            try {
+                if (permDlg.isShowing) permDlg.dismiss()
+            } catch (_: Throwable) {
+            }
+        }
+        if (permReq != null) {
+            try {
+                permReq.deny()
+            } catch (_: Throwable) {
+            }
+        }
+        val geoDlg = activeGeoDialog
+        val geoCb = activeGeoCallback
+        val geoOrigin = activeGeoOrigin
+        activeGeoDialog = null
+        activeGeoCallback = null
+        activeGeoOrigin = null
+        if (geoDlg != null) {
+            try {
+                if (geoDlg.isShowing) geoDlg.dismiss()
+            } catch (_: Throwable) {
+            }
+        }
+        if (geoCb != null && geoOrigin != null) {
+            try {
+                geoCb.invoke(geoOrigin, false, false)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun setTabActive(active: Boolean) {
+        if (disposed) return
+        isTabActive = active
+        if (!active) {
+            dismissPendingPermissionDialogs()
+            return
+        }
+        // バックグラウンド中にレンダラープロセスが終了していた場合、アクティブ復帰時に自動再構築＆再読み込みする
+        if (pendingCrashReload && !profileAttachFailed && !activity.isFinishing && !activity.isDestroyed) {
+            pendingCrashReload = false
+            val targetUrl = pendingCrashUrl.ifEmpty { resolveReloadTargetUrl(null) }
+            pendingCrashUrl = ""
+            if (renderProcessCrashed) {
+                replaceMainWebView()
+            }
+            if (!profileAttachFailed && targetUrl.isNotEmpty()) {
+                loadUrlInternal(targetUrl, bypassCache = false)
+            }
+        }
+    }
+
+    private fun emitProfileIsolationError() {
+        currentLoadHadMainFrameError = true
+        isMainFrameLoading = false
+        invokeDart(
+            "onWebResourceError",
+            mapOf(
+                "description" to "アカウント分離プロファイルの初期化に失敗したため読み込みを中止しました。アプリを再起動してください。",
+                "errorCode" to -1001,
+            ),
+        )
+    }
+
+    private fun allowBridgeEvent(): Boolean {
+        val now = System.currentTimeMillis()
+        synchronized(bridgeEventTimestamps) {
+            while (bridgeEventTimestamps.isNotEmpty() && now - bridgeEventTimestamps.first() > 1000L) {
+                bridgeEventTimestamps.removeFirst()
+            }
+            if (bridgeEventTimestamps.size >= 25) return false
+            bridgeEventTimestamps.addLast(now)
+            return true
+        }
+    }
+
+    private fun createMainWebView(requestedProfile: String): Triple<OmniWebView, String, Boolean> {
         // 1. WebView を生成（Activity コンテキストを使用）
         val target = OmniWebView(activity)
 
         // 2. 【最重要】getSettings() / loadUrl() より前に独立プロファイルを割り当てる
         var resolvedProfile = Profile.DEFAULT_PROFILE_NAME
-        if (manager.isMultiProfileSupported() &&
+        var attachFailed = false
+        val needsIsolatedProfile = manager.isMultiProfileSupported() &&
             requestedProfile.isNotEmpty() &&
             requestedProfile != Profile.DEFAULT_PROFILE_NAME
-        ) {
+        if (needsIsolatedProfile) {
+            manager.cancelPendingDeleteProfile(requestedProfile)
             try {
                 ProfileStore.getInstance().getOrCreateProfile(requestedProfile)
                 WebViewCompat.setProfile(target, requestedProfile)
                 resolvedProfile = requestedProfile
             } catch (e: Throwable) {
-                Log.w(TAG, "WebViewCompat.setProfile failed for $requestedProfile: ${e.message}")
+                // 独立プロファイル要求に失敗した場合は Default への無断フォールバックを禁止（フェイルクローズ）
+                Log.e(TAG, "WebViewCompat.setProfile failed for $requestedProfile; failing closed: ${e.message}")
+                resolvedProfile = requestedProfile
+                attachFailed = true
             }
         }
 
-        // 3. プロファイル専用の CookieManager を有効化（OAuth 用サードパーティCookie含む）
-        configureCookies(target, resolvedProfile)
+        // 3. プロファイル専用の CookieManager を有効化（分離失敗時は Default を触らない）
+        if (!attachFailed) {
+            configureCookies(target, resolvedProfile)
+        }
 
         // 4. WebSettings / Autofill ガード / フォロー計測 / Client 設定
         configureWebViewSettings(target, userAgent, supportMultipleWindows = true)
-        attachAutofillGuard(target)
-        attachFollowTracker(target)
+        mainAutofillToken = OmniWebViewManager.generateBridgeToken()
+        mainFollowToken = OmniWebViewManager.generateBridgeToken()
+        hasDocumentStartAutofill = attachAutofillGuard(target, mainAutofillToken)
+        hasDocumentStartFollow = attachFollowTracker(target, mainFollowToken)
         target.applyAutofillAllowed(false)
 
         target.webViewClient = createMainWebViewClient()
         target.webChromeClient = createMainWebChromeClient()
 
-        return Pair(target, resolvedProfile)
+        return Triple(target, resolvedProfile, attachFailed)
     }
 
     private fun replaceMainWebView() {
-        val oldView = webView
-        try {
-            container.removeView(oldView)
-        } catch (_: Throwable) {
-        }
-        mainHandler.post { safeDestroyWebView(oldView, removeJsBridge = true) }
+        crashRecoveryGen += 1
+        exitFullscreenIfActive()
+        closePopupAsync()
 
-        val (replacement, _) = createMainWebView(appliedProfileName)
+        val oldView = webView
+        val shouldDestroyOld = !mainWebViewDestroyed
+        mainWebViewDestroyed = false
+        if (shouldDestroyOld) {
+            try {
+                container.removeView(oldView)
+            } catch (_: Throwable) {
+            }
+            mainHandler.post { safeDestroyWebView(oldView, removeJsBridge = true) }
+        }
+
+        val targetProfile = requestedProfileName.ifEmpty { appliedProfileName }
+        val (replacement, _, attachFailed) = createMainWebView(targetProfile)
+        profileAttachFailed = attachFailed
         webView = replacement
         renderProcessCrashed = false
+        pendingCrashReload = false
+        pendingCrashUrl = ""
         container.addView(
             replacement,
             FrameLayout.LayoutParams(
@@ -2742,6 +3345,24 @@ class OmniWebViewPlatformView(
                 ViewGroup.LayoutParams.MATCH_PARENT,
             ),
         )
+        if (profileAttachFailed) {
+            emitProfileIsolationError()
+        }
+    }
+
+    private fun detachAndDestroyDeadMainWebView(dead: WebView) {
+        if (dead === webView) {
+            if (mainWebViewDestroyed) return
+            mainWebViewDestroyed = true
+        }
+        dismissPendingPermissionDialogs()
+        exitFullscreenIfActive()
+        closePopupAsync()
+        try {
+            container.removeView(dead)
+        } catch (_: Throwable) {
+        }
+        safeDestroyWebView(dead, removeJsBridge = true)
     }
 
     private fun configureCookies(target: WebView, profileName: String) {
@@ -2750,13 +3371,12 @@ class OmniWebViewPlatformView(
                 profileName.isNotEmpty() &&
                 profileName != Profile.DEFAULT_PROFILE_NAME
             ) {
-                ProfileStore.getInstance().getProfile(profileName)?.cookieManager
-                    ?: CookieManager.getInstance()
+                ProfileStore.getInstance().getProfile(profileName)?.cookieManager ?: return
             } else {
                 CookieManager.getInstance()
             }
         } catch (_: Throwable) {
-            CookieManager.getInstance()
+            return
         }
         try {
             cm.setAcceptCookie(true)
@@ -2775,15 +3395,18 @@ class OmniWebViewPlatformView(
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
+            allowFileAccess = false
+            allowContentAccess = false
             mediaPlaybackRequiresUserGesture = false
-            javaScriptCanOpenWindowsAutomatically = supportMultipleWindows
+            // ユーザー操作を伴わないゼロクリック window.open を禁止
+            javaScriptCanOpenWindowsAutomatically = false
             setSupportMultipleWindows(supportMultipleWindows)
             loadWithOverviewMode = true
             useWideViewPort = true
             builtInZoomControls = true
             displayZoomControls = false
             cacheMode = WebSettings.LOAD_DEFAULT
-            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             @Suppress("DEPRECATION")
             saveFormData = false
             userAgentString = ua
@@ -2837,20 +3460,23 @@ class OmniWebViewPlatformView(
 
     private fun loadUrlInternal(url: String, bypassCache: Boolean = false) {
         if (disposed) return
+        if (profileAttachFailed) {
+            emitProfileIsolationError()
+            return
+        }
         val trimmed = url.trim()
-        if (trimmed.isEmpty()) return
+        if (!isHttpOrHttpsUrl(trimmed)) return
 
         if (renderProcessCrashed) {
             replaceMainWebView()
+            if (profileAttachFailed) return
         }
 
         currentLoadHadMainFrameError = false
         lastFailedUrl = null
         awaitingReloadStart = false
         reloadSequence += 1
-        if (isHttpOrHttpsUrl(trimmed)) {
-            lastTargetUrl = trimmed
-        }
+        lastTargetUrl = trimmed
         if (bypassCache) {
             enableTemporaryCacheBypass(webView)
         } else {
@@ -2867,11 +3493,15 @@ class OmniWebViewPlatformView(
 
     private fun reloadInternal(fallbackUrl: String?) {
         if (disposed) return
+        if (profileAttachFailed) {
+            emitProfileIsolationError()
+            return
+        }
         val targetUrl = resolveReloadTargetUrl(fallbackUrl)
 
         if (renderProcessCrashed) {
             replaceMainWebView()
-            if (targetUrl.isNotEmpty()) {
+            if (!profileAttachFailed && targetUrl.isNotEmpty()) {
                 loadUrlInternal(targetUrl, bypassCache = true)
             }
             return
@@ -2939,7 +3569,7 @@ class OmniWebViewPlatformView(
 
     private fun scheduleReloadWatchdog(seq: Int, targetUrl: String) {
         mainHandler.postDelayed({
-            if (!disposed && !renderProcessCrashed && seq == reloadSequence && !reloadObservedProgress) {
+            if (!disposed && !renderProcessCrashed && !profileAttachFailed && seq == reloadSequence && !reloadObservedProgress) {
                 Log.w(TAG, "webView.reload() did not start in time; falling back to loadUrl($targetUrl)")
                 try {
                     webView.stopLoading()
@@ -2958,86 +3588,197 @@ class OmniWebViewPlatformView(
     }
 
     @SuppressLint("AddJavascriptInterface")
-    private fun attachAutofillGuard(target: OmniWebView) {
+    private fun attachAutofillGuard(target: OmniWebView, token: String): Boolean {
         try {
-            target.addJavascriptInterface(OmniAutofillBridge(target), "OmniAutofillBridge")
+            target.addJavascriptInterface(OmniAutofillBridge(target, token), "OmniAutofillBridge")
         } catch (e: Throwable) {
             Log.w(TAG, "addJavascriptInterface failed: ${e.message}")
         }
-        try {
+        return try {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                 WebViewCompat.addDocumentStartJavaScript(
                     target,
-                    OmniWebViewManager.AUTOFILL_GUARD_JS,
+                    OmniWebViewManager.buildAutofillGuardJs(token),
                     setOf("*"),
                 )
+                true
+            } else {
+                false
             }
         } catch (e: Throwable) {
             Log.w(TAG, "addDocumentStartJavaScript failed: ${e.message}")
+            false
         }
     }
 
-    private fun injectAutofillGuardFallback(target: WebView) {
+    private fun injectAutofillGuardFallback(target: WebView, token: String, skipIfDocumentStart: Boolean) {
+        if (skipIfDocumentStart) return
         try {
-            target.evaluateJavascript(OmniWebViewManager.AUTOFILL_GUARD_JS, null)
+            target.evaluateJavascript(OmniWebViewManager.buildAutofillGuardJs(token), null)
         } catch (_: Throwable) {
         }
     }
 
-    @SuppressLint("AddJavascriptInterface")
-    private fun attachFollowTracker(target: OmniWebView) {
-        try {
-            target.addJavascriptInterface(
-                OmniFollowBridge(
-                    onFollow = { source, service ->
-                        invokeDart(
-                            "onFollowDetected",
-                            mapOf("source" to source, "service" to service),
-                        )
-                    },
-                    onUnfollow = { source, service ->
-                        invokeDart(
-                            "onUnfollowDetected",
-                            mapOf("source" to source, "service" to service),
-                        )
-                    },
-                    onIdentity = { service, handle, following, followers ->
-                        val payload = mutableMapOf<String, Any>(
-                            "service" to service,
-                            "handle" to handle,
-                        )
-                        if (following >= 0) payload["following"] = following
-                        if (followers >= 0) payload["followers"] = followers
-                        invokeDart("onAccountIdentity", payload)
-                    },
-                ),
-                "OmniFollowBridge",
+    private fun dispatchVerifiedFollowEvent(
+        kind: String,
+        verifiedService: String,
+        source: String,
+        handle: String = "",
+        following: Int = -1,
+        followers: Int = -1,
+    ) {
+        if (disposed || !allowBridgeEvent()) return
+        when (kind) {
+            "follow" -> invokeDart(
+                "onFollowDetected",
+                mapOf("source" to source.ifEmpty { "auto" }, "service" to verifiedService),
             )
-        } catch (e: Throwable) {
-            Log.w(TAG, "addJavascriptInterface(OmniFollowBridge) failed: ${e.message}")
-        }
-        try {
-            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                WebViewCompat.addDocumentStartJavaScript(
-                    target,
-                    OmniWebViewManager.FOLLOW_TRACKER_JS,
-                    setOf("*"),
+            "unfollow" -> invokeDart(
+                "onUnfollowDetected",
+                mapOf("source" to source.ifEmpty { "auto" }, "service" to verifiedService),
+            )
+            "identity" -> {
+                val cleanHandle = handle.trim()
+                if (cleanHandle.isEmpty()) return
+                val payload = mutableMapOf<String, Any>(
+                    "service" to verifiedService,
+                    "handle" to cleanHandle,
                 )
-                WebViewCompat.addDocumentStartJavaScript(
-                    target,
-                    OmniWebViewManager.PROFILE_STATS_JS,
-                    setOf("*"),
-                )
+                if (following >= 0) payload["following"] = following
+                if (followers >= 0) payload["followers"] = followers
+                invokeDart("onAccountIdentity", payload)
             }
-        } catch (e: Throwable) {
-            Log.w(TAG, "addDocumentStartJavaScript(FOLLOW/PROFILE_STATS) failed: ${e.message}")
         }
     }
 
-    private fun injectFollowTrackerFallback(target: WebView) {
+    @SuppressLint("AddJavascriptInterface")
+    private fun attachFollowTracker(target: OmniWebView, token: String): Boolean {
+        var attachedListener = false
         try {
-            target.evaluateJavascript(OmniWebViewManager.FOLLOW_TRACKER_JS, null)
-            target.evaluateJavascript(OmniWebViewManager.PROFILE_STATS_JS, null)
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                WebViewCompat.addWebMessageListener(
+                    target,
+                    "OmniFollowChannel",
+                    effectiveFollowOrigins,
+                ) { view, message: WebMessageCompat, sourceOrigin, isMainFrame, _ ->
+                    if (disposed || view !== webView || !isMainFrame) return@addWebMessageListener
+                    if (!sourceOrigin.scheme.equals("https", ignoreCase = true)) return@addWebMessageListener
+                    val verifiedService = detectEffectivePlatformServiceFromHost(sourceOrigin.host)
+                        ?: return@addWebMessageListener
+                    val rawData = message.data ?: return@addWebMessageListener
+                    if (rawData.length > 4096) return@addWebMessageListener
+                    try {
+                        val obj = JSONObject(rawData)
+                        if (obj.optString("token") != token) return@addWebMessageListener
+                        when (val type = obj.optString("type")) {
+                            "follow", "unfollow" -> dispatchVerifiedFollowEvent(
+                                kind = type,
+                                verifiedService = verifiedService,
+                                source = obj.optString("source", "auto"),
+                            )
+                            "identity" -> {
+                                if (verifiedService == "instagram" ||
+                                    verifiedService == "threads" ||
+                                    verifiedService == "bluesky"
+                                ) {
+                                    dispatchVerifiedFollowEvent(
+                                        kind = "identity",
+                                        verifiedService = verifiedService,
+                                        source = "auto",
+                                        handle = obj.optString("handle", ""),
+                                        following = obj.optInt("following", -1),
+                                        followers = obj.optInt("followers", -1),
+                                    )
+                                }
+                            }
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
+                attachedListener = true
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "addWebMessageListener(OmniFollowChannel) failed: ${e.message}")
+        }
+
+        if (!attachedListener) {
+            // 古い WebView 向けフォールバック（トークン検証＋メインスレッドで実URL由来のHTTPSオリジン検証）
+            try {
+                target.addJavascriptInterface(
+                    OmniFollowBridge(
+                        expectedToken = token,
+                        onFollow = { source, _ ->
+                            mainHandler.post {
+                                if (disposed || target !== webView) return@post
+                                val svc = detectEffectivePlatformServiceFromHttpsUrl(target.url)
+                                    ?: return@post
+                                dispatchVerifiedFollowEvent("follow", svc, source)
+                            }
+                        },
+                        onUnfollow = { source, _ ->
+                            mainHandler.post {
+                                if (disposed || target !== webView) return@post
+                                val svc = detectEffectivePlatformServiceFromHttpsUrl(target.url)
+                                    ?: return@post
+                                dispatchVerifiedFollowEvent("unfollow", svc, source)
+                            }
+                        },
+                        onIdentity = { _, handle, following, followers ->
+                            mainHandler.post {
+                                if (disposed || target !== webView) return@post
+                                val svc = detectEffectivePlatformServiceFromHttpsUrl(target.url)
+                                    ?: return@post
+                                if (svc != "instagram" && svc != "threads" && svc != "bluesky") {
+                                    return@post
+                                }
+                                dispatchVerifiedFollowEvent(
+                                    kind = "identity",
+                                    verifiedService = svc,
+                                    source = "auto",
+                                    handle = handle,
+                                    following = following,
+                                    followers = followers,
+                                )
+                            }
+                        },
+                    ),
+                    "OmniFollowBridge",
+                )
+            } catch (e: Throwable) {
+                Log.w(TAG, "addJavascriptInterface(OmniFollowBridge) failed: ${e.message}")
+            }
+        }
+
+        return try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(
+                    target,
+                    OmniWebViewManager.buildFollowTrackerJs(token),
+                    effectiveFollowOrigins,
+                )
+                WebViewCompat.addDocumentStartJavaScript(
+                    target,
+                    OmniWebViewManager.buildProfileStatsJs(token),
+                    OmniWebViewManager.PROFILE_STATS_ALLOWED_ORIGINS,
+                )
+                true
+            } else {
+                false
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "addDocumentStartJavaScript(FOLLOW/PROFILE_STATS) failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun injectFollowTrackerFallback(target: WebView, url: String?) {
+        if (hasDocumentStartFollow) return
+        val svc = detectEffectivePlatformServiceFromHttpsUrl(url ?: target.url) ?: return
+        try {
+            target.evaluateJavascript(OmniWebViewManager.buildFollowTrackerJs(mainFollowToken), null)
+            if (svc == "instagram" || svc == "threads" || svc == "bluesky") {
+                target.evaluateJavascript(OmniWebViewManager.buildProfileStatsJs(mainFollowToken), null)
+            }
         } catch (_: Throwable) {
         }
     }
@@ -3069,6 +3810,12 @@ class OmniWebViewPlatformView(
                 target.removeJavascriptInterface("OmniFollowBridge")
             } catch (_: Throwable) {
             }
+            try {
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                    WebViewCompat.removeWebMessageListener(target, "OmniFollowChannel")
+                }
+            } catch (_: Throwable) {
+            }
         }
         try {
             target.destroy()
@@ -3090,6 +3837,265 @@ class OmniWebViewPlatformView(
         }
     }
 
+    private fun formatOriginLabel(rawUrl: String?): String {
+        if (rawUrl.isNullOrBlank()) return ""
+        return try {
+            val uri = Uri.parse(rawUrl.trim())
+            val scheme = uri.scheme?.lowercase().orEmpty()
+            val host = uri.host?.lowercase().orEmpty()
+            if ((scheme == "https" || scheme == "http") && host.isNotEmpty()) {
+                val port = if (uri.port != -1) ":${uri.port}" else ""
+                val prefix = if (scheme == "https") "🔒 " else "⚠ http://"
+                if (scheme == "https") "$prefix$host$port" else "$prefix$host$port"
+            } else {
+                ""
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun handleWebPermissionRequest(request: PermissionRequest?) {
+        if (request == null) return
+        mainHandler.post {
+            // 非アクティブタブ・バックグラウンド・ダイアログ多重表示時は即拒否（背景タブ偽装・スパム防止）
+            if (disposed || !isTabActive || !container.isShown ||
+                activity.isFinishing || activity.isDestroyed ||
+                activePermissionDialog != null || activeGeoDialog != null
+            ) {
+                try {
+                    request.deny()
+                } catch (_: Throwable) {
+                }
+                return@post
+            }
+            val origin = request.origin
+            val scheme = origin?.scheme?.lowercase().orEmpty()
+            val host = origin?.host?.lowercase().orEmpty()
+            if (scheme != "https" || host.isEmpty()) {
+                try {
+                    request.deny()
+                } catch (_: Throwable) {
+                }
+                return@post
+            }
+            val resources = request.resources ?: emptyArray()
+            if (resources.isEmpty()) {
+                try {
+                    request.deny()
+                } catch (_: Throwable) {
+                }
+                return@post
+            }
+            val grantableResources = ArrayList<String>()
+            val labels = ArrayList<String>()
+            val neededOsPermissions = LinkedHashSet<String>()
+            for (res in resources) {
+                when (res) {
+                    PermissionRequest.RESOURCE_VIDEO_CAPTURE -> {
+                        grantableResources.add(res)
+                        labels.add("カメラ")
+                        neededOsPermissions.add(Manifest.permission.CAMERA)
+                    }
+                    PermissionRequest.RESOURCE_AUDIO_CAPTURE -> {
+                        grantableResources.add(res)
+                        labels.add("マイク")
+                        neededOsPermissions.add(Manifest.permission.RECORD_AUDIO)
+                    }
+                    PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID -> {
+                        grantableResources.add(res)
+                        labels.add("保護されたメディア再生")
+                    }
+                    PermissionRequest.RESOURCE_MIDI_SYSEX -> {
+                        grantableResources.add(res)
+                        labels.add("MIDIデバイス")
+                    }
+                }
+            }
+            val distinctLabels = labels.distinct()
+            if (grantableResources.isEmpty() || distinctLabels.isEmpty()) {
+                try {
+                    request.deny()
+                } catch (_: Throwable) {
+                }
+                return@post
+            }
+            val handled = AtomicBoolean(false)
+            fun clearTracked() {
+                if (activePermissionRequest === request) {
+                    activePermissionRequest = null
+                    activePermissionDialog = null
+                }
+            }
+            try {
+                val dlg = AlertDialog.Builder(activity)
+                    .setTitle("権限のリクエスト")
+                    .setMessage("https://$host が以下の権限を要求しています:\n・${distinctLabels.joinToString("\n・")}\n\n許可しますか？")
+                    .setPositiveButton("許可") { _, _ ->
+                        clearTracked()
+                        if (!handled.compareAndSet(false, true)) return@setPositiveButton
+                        if (disposed || !isTabActive) {
+                            try {
+                                request.deny()
+                            } catch (_: Throwable) {
+                            }
+                            return@setPositiveButton
+                        }
+                        if (neededOsPermissions.isEmpty()) {
+                            try {
+                                request.grant(grantableResources.toTypedArray())
+                            } catch (_: Throwable) {
+                            }
+                        } else {
+                            val reqPerms = neededOsPermissions.toTypedArray()
+                            manager.requestRuntimePermissions(reqPerms) { results ->
+                                val allGranted = reqPerms.all { results[it] == true }
+                                try {
+                                    if (allGranted && !disposed && isTabActive) {
+                                        request.grant(grantableResources.toTypedArray())
+                                    } else {
+                                        request.deny()
+                                    }
+                                } catch (_: Throwable) {
+                                }
+                            }
+                        }
+                    }
+                    .setNegativeButton("拒否") { _, _ ->
+                        clearTracked()
+                        if (handled.compareAndSet(false, true)) {
+                            try {
+                                request.deny()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                    .setOnCancelListener {
+                        clearTracked()
+                        if (handled.compareAndSet(false, true)) {
+                            try {
+                                request.deny()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                    .create()
+                activePermissionRequest = request
+                activePermissionDialog = dlg
+                dlg.show()
+            } catch (_: Throwable) {
+                clearTracked()
+                if (handled.compareAndSet(false, true)) {
+                    try {
+                        request.deny()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleGeolocationPrompt(
+        origin: String?,
+        callback: GeolocationPermissions.Callback?,
+    ) {
+        if (origin == null || callback == null) return
+        mainHandler.post {
+            if (disposed || !isTabActive || !container.isShown ||
+                activity.isFinishing || activity.isDestroyed ||
+                activePermissionDialog != null || activeGeoDialog != null
+            ) {
+                try {
+                    callback.invoke(origin, false, false)
+                } catch (_: Throwable) {
+                }
+                return@post
+            }
+            val uri = try {
+                Uri.parse(origin.trim())
+            } catch (_: Throwable) {
+                null
+            }
+            val scheme = uri?.scheme?.lowercase().orEmpty()
+            val host = uri?.host?.lowercase().orEmpty()
+            if (scheme != "https" || host.isEmpty()) {
+                try {
+                    callback.invoke(origin, false, false)
+                } catch (_: Throwable) {
+                }
+                return@post
+            }
+            val handled = AtomicBoolean(false)
+            fun clearTracked() {
+                if (activeGeoCallback === callback) {
+                    activeGeoDialog = null
+                    activeGeoCallback = null
+                    activeGeoOrigin = null
+                }
+            }
+            try {
+                val dlg = AlertDialog.Builder(activity)
+                    .setTitle("位置情報のリクエスト")
+                    .setMessage("https://$host が端末の位置情報へのアクセスを要求しています。許可しますか？")
+                    .setPositiveButton("今回のみ許可") { _, _ ->
+                        clearTracked()
+                        if (!handled.compareAndSet(false, true)) return@setPositiveButton
+                        if (disposed || !isTabActive) {
+                            try {
+                                callback.invoke(origin, false, false)
+                            } catch (_: Throwable) {
+                            }
+                            return@setPositiveButton
+                        }
+                        val locPerms = arrayOf(
+                            Manifest.permission.ACCESS_FINE_LOCATION,
+                            Manifest.permission.ACCESS_COARSE_LOCATION,
+                        )
+                        manager.requestRuntimePermissions(locPerms) { results ->
+                            val locGranted =
+                                results[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                                    results[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+                            try {
+                                callback.invoke(origin, locGranted && !disposed && isTabActive, false)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                    .setNegativeButton("拒否") { _, _ ->
+                        clearTracked()
+                        if (handled.compareAndSet(false, true)) {
+                            try {
+                                callback.invoke(origin, false, false)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                    .setOnCancelListener {
+                        clearTracked()
+                        if (handled.compareAndSet(false, true)) {
+                            try {
+                                callback.invoke(origin, false, false)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                    .create()
+                activeGeoCallback = callback
+                activeGeoOrigin = origin
+                activeGeoDialog = dlg
+                dlg.show()
+            } catch (_: Throwable) {
+                clearTracked()
+                if (handled.compareAndSet(false, true)) {
+                    try {
+                        callback.invoke(origin, false, false)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+    }
+
     private fun createMainWebViewClient(): WebViewClient {
         return object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -3097,23 +4103,30 @@ class OmniWebViewPlatformView(
                 request: WebResourceRequest?,
             ): Boolean {
                 if (disposed || view == null || view !== webView) return true
-                val url = request?.url?.toString() ?: return true
-                val scheme = request.url?.scheme?.lowercase() ?: return true
+                val req = request ?: return true
+                val url = req.url?.toString() ?: return true
+                val scheme = req.url?.scheme?.lowercase() ?: return true
                 if (scheme == "http" || scheme == "https") {
                     return false
                 }
+                // サブフレームやユーザー操作なしの外部スキーム・intent リダイレクトを遮断
+                if (!req.isForMainFrame) {
+                    return true
+                }
                 if (scheme == "intent") {
-                    val fallback = extractIntentFallbackHttpUrl(url)
-                    if (fallback != null) {
-                        mainHandler.post {
-                            if (!disposed) {
-                                loadUrlInternal(fallback)
+                    if (req.hasGesture()) {
+                        val fallback = extractIntentFallbackHttpUrl(url)
+                        if (fallback != null) {
+                            mainHandler.post {
+                                if (!disposed) {
+                                    loadUrlInternal(fallback)
+                                }
                             }
                         }
                     }
                     return true
                 }
-                if (scheme == "mailto" || scheme == "tel") {
+                if ((scheme == "mailto" || scheme == "tel") && req.hasGesture()) {
                     invokeDart("onExternalScheme", mapOf("url" to url))
                 }
                 return true
@@ -3145,8 +4158,8 @@ class OmniWebViewPlatformView(
                 awaitingReloadStart = false
                 isMainFrameLoading = false
                 restoreDefaultCacheMode(view)
-                injectAutofillGuardFallback(view)
-                injectFollowTrackerFallback(view)
+                injectAutofillGuardFallback(view, mainAutofillToken, hasDocumentStartAutofill)
+                injectFollowTrackerFallback(view, url)
                 val resolvedUrl = listOf(url, view.url)
                     .firstOrNull { isHttpOrHttpsUrl(it) }
                     ?.trim()
@@ -3247,13 +4260,37 @@ class OmniWebViewPlatformView(
                 val now = System.currentTimeMillis()
                 val withinCooldown = (now - lastCrashRecoveryAtMs) < CRASH_RECOVERY_COOLDOWN_MS
                 lastCrashRecoveryAtMs = now
+                val myGen = crashRecoveryGen
+                val deadView = view
 
                 mainHandler.post {
-                    if (disposed) return@post
-                    replaceMainWebView()
-                    if (!withinCooldown && targetUrl.isNotEmpty()) {
-                        loadUrlInternal(targetUrl, bypassCache = false)
+                    // Android WebViewClient 契約に従い、true を返したクラッシュ済み WebView は
+                    // バックグラウンド・非アクティブ時であっても必ず即座にデタッチ＆破棄する
+                    if (deadView === webView) {
+                        detachAndDestroyDeadMainWebView(deadView)
                     } else {
+                        safeDestroyWebView(deadView, removeJsBridge = true)
+                    }
+                    // すでに再生成済み・破棄済み・Activity終了中の場合は二重置換しない
+                    if (disposed || !renderProcessCrashed || myGen != crashRecoveryGen ||
+                        activity.isFinishing || activity.isDestroyed
+                    ) {
+                        return@post
+                    }
+                    // 非アクティブタブまたはアプリ非表示（バックグラウンド LMK）時は一斉自動再生成を控え、
+                    // 次回タブ選択またはアプリ復帰（setTabActive(true)）時に自動再構築・再読み込みする
+                    if (!isTabActive || !container.isShown) {
+                        pendingCrashReload = true
+                        pendingCrashUrl = targetUrl
+                        if (targetUrl.isNotEmpty()) {
+                            lastFailedUrl = targetUrl
+                        }
+                        return@post
+                    }
+                    replaceMainWebView()
+                    if (!profileAttachFailed && !withinCooldown && targetUrl.isNotEmpty()) {
+                        loadUrlInternal(targetUrl, bypassCache = false)
+                    } else if (!profileAttachFailed) {
                         currentLoadHadMainFrameError = true
                         if (targetUrl.isNotEmpty()) {
                             lastFailedUrl = targetUrl
@@ -3297,11 +4334,21 @@ class OmniWebViewPlatformView(
             }
 
             override fun onPermissionRequest(request: PermissionRequest?) {
-                if (request == null) return
+                handleWebPermissionRequest(request)
+            }
+
+            override fun onPermissionRequestCanceled(request: PermissionRequest?) {
                 mainHandler.post {
-                    try {
-                        request.grant(request.resources)
-                    } catch (_: Throwable) {
+                    if (request == null || activePermissionRequest === request) {
+                        val dlg = activePermissionDialog
+                        activePermissionDialog = null
+                        activePermissionRequest = null
+                        if (dlg != null) {
+                            try {
+                                if (dlg.isShowing) dlg.dismiss()
+                            } catch (_: Throwable) {
+                            }
+                        }
                     }
                 }
             }
@@ -3310,10 +4357,21 @@ class OmniWebViewPlatformView(
                 origin: String?,
                 callback: GeolocationPermissions.Callback?,
             ) {
-                if (origin == null || callback == null) return
-                try {
-                    callback.invoke(origin, true, true)
-                } catch (_: Throwable) {
+                handleGeolocationPrompt(origin, callback)
+            }
+
+            override fun onGeolocationPermissionsHidePrompt() {
+                mainHandler.post {
+                    val dlg = activeGeoDialog
+                    activeGeoDialog = null
+                    activeGeoCallback = null
+                    activeGeoOrigin = null
+                    if (dlg != null) {
+                        try {
+                            if (dlg.isShowing) dlg.dismiss()
+                        } catch (_: Throwable) {
+                        }
+                    }
                 }
             }
 
@@ -3355,14 +4413,20 @@ class OmniWebViewPlatformView(
                 isUserGesture: Boolean,
                 resultMsg: Message?,
             ): Boolean {
-                if (disposed || activity.isFinishing || activity.isDestroyed) return false
+                if (disposed || profileAttachFailed || activity.isFinishing || activity.isDestroyed) {
+                    return false
+                }
+                // ユーザー操作なし、または非アクティブ／非表示バックグラウンドタブからのポップアップを拒否（フィッシング対策）
+                if (!isUserGesture || !isTabActive || view == null || view !== webView || !container.isShown) {
+                    return false
+                }
                 val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
 
                 return try {
                     closePopupAsync()
 
                     val child = OmniWebView(activity)
-                    // 親と同じプロファイルを即座に継承し、OAuth ログイン等のCookie分離を保つ
+                    // 親と同じプロファイルを即座に継承し、失敗時は Default に落とさず拒否（フェイルクローズ）
                     if (manager.isMultiProfileSupported() &&
                         appliedProfileName.isNotEmpty() &&
                         appliedProfileName != Profile.DEFAULT_PROFILE_NAME
@@ -3371,24 +4435,43 @@ class OmniWebViewPlatformView(
                             ProfileStore.getInstance().getOrCreateProfile(appliedProfileName)
                             WebViewCompat.setProfile(child, appliedProfileName)
                         } catch (e: Throwable) {
-                            Log.w(TAG, "Popup setProfile failed: ${e.message}")
+                            Log.e(TAG, "Popup setProfile failed for $appliedProfileName; rejecting popup: ${e.message}")
+                            safeDestroyWebView(child, removeJsBridge = false)
+                            return false
                         }
                     }
                     configureCookies(child, appliedProfileName)
                     configureWebViewSettings(child, userAgent, supportMultipleWindows = false)
+                    // ページ読み込み開始前に Autofill ガードを装着して OAuth 入力欄を正しく保護する
+                    val popupAutofillToken = OmniWebViewManager.generateBridgeToken()
+                    val popupHasDocStart = attachAutofillGuard(child, popupAutofillToken)
                     child.applyAutofillAllowed(false)
 
                     var childClosed = false
                     var dialogShown = false
-                    var autofillAttached = false
                     var localDialog: Dialog? = null
 
                     val titleView = TextView(activity).apply {
                         text = "認証ウィンドウ"
                         setTextColor(Color.WHITE)
-                        textSize = 14f
+                        textSize = 13.5f
                         maxLines = 1
-                        setPadding(24, 0, 12, 0)
+                        ellipsize = TextUtils.TruncateAt.END
+                    }
+                    // ページタイトルでは上書きできない常時表示オリジンバー（URL偽装フィッシング対策）
+                    val originView = TextView(activity).apply {
+                        text = ""
+                        setTextColor(Color.parseColor("#93C5FD"))
+                        textSize = 11.5f
+                        maxLines = 1
+                        ellipsize = TextUtils.TruncateAt.END
+                    }
+
+                    fun updateOriginHeader(url: String?) {
+                        val originLabel = formatOriginLabel(url)
+                        if (originLabel.isNotEmpty()) {
+                            originView.text = originLabel
+                        }
                     }
 
                     // 【重要】WebViewClient/WebChromeClient コールバック内で child.destroy() を
@@ -3400,26 +4483,24 @@ class OmniWebViewPlatformView(
                         localDialog = null
                         if (popupWebView === child) {
                             popupWebView = null
+                            activePopupDismiss = null
                         }
                         if (dlgToClose != null && popupDialog === dlgToClose) {
                             popupDialog = null
                         }
-                        val hadBridge = autofillAttached
                         mainHandler.post {
-                            safeDestroyPopup(child, dlgToClose, removeJsBridge = hadBridge)
+                            safeDestroyPopup(child, dlgToClose, removeJsBridge = true)
                         }
                     }
 
                     fun ensurePopupDialogShown(): Boolean {
-                        if (childClosed || disposed || activity.isFinishing || activity.isDestroyed) {
+                        if (childClosed || disposed || popupWebView !== child ||
+                            activity.isFinishing || activity.isDestroyed
+                        ) {
                             return false
                         }
                         if (dialogShown) return true
                         dialogShown = true
-                        if (!autofillAttached) {
-                            autofillAttached = true
-                            attachAutofillGuard(child)
-                        }
                         return try {
                             val dialog = Dialog(activity).apply {
                                 requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -3434,8 +4515,25 @@ class OmniWebViewPlatformView(
                                 orientation = LinearLayout.HORIZONTAL
                                 gravity = Gravity.CENTER_VERTICAL
                                 setBackgroundColor(Color.parseColor("#181C26"))
-                                setPadding(8, 12, 8, 12)
+                                setPadding(16, 10, 8, 10)
                             }
+                            val titleColumn = LinearLayout(activity).apply {
+                                orientation = LinearLayout.VERTICAL
+                            }
+                            titleColumn.addView(
+                                titleView,
+                                LinearLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                                ),
+                            )
+                            titleColumn.addView(
+                                originView,
+                                LinearLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                                ),
+                            )
                             val closeBtn = ImageButton(activity).apply {
                                 setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
                                 setBackgroundColor(Color.TRANSPARENT)
@@ -3443,7 +4541,7 @@ class OmniWebViewPlatformView(
                                 setOnClickListener { dismissThisPopupAsync() }
                             }
                             header.addView(
-                                titleView,
+                                titleColumn,
                                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
                             )
                             header.addView(
@@ -3500,17 +4598,21 @@ class OmniWebViewPlatformView(
                             popupView: WebView?,
                             request: WebResourceRequest?,
                         ): Boolean {
-                            if (childClosed || disposed) return true
-                            val url = request?.url?.toString() ?: return true
-                            val scheme = request.url?.scheme?.lowercase() ?: return true
+                            if (childClosed || disposed || popupWebView !== child) return true
+                            val req = request ?: return true
+                            val url = req.url?.toString() ?: return true
+                            val scheme = req.url?.scheme?.lowercase() ?: return true
+                            if (!req.isForMainFrame) {
+                                return scheme != "http" && scheme != "https"
+                            }
                             if (scheme != "http" && scheme != "https") {
-                                if (scheme == "intent") {
+                                if (scheme == "intent" && req.hasGesture()) {
                                     val fallback = extractIntentFallbackHttpUrl(url)
                                     if (fallback != null) {
                                         forwardToParentAndClose(fallback)
                                         return true
                                     }
-                                } else if (scheme == "mailto" || scheme == "tel") {
+                                } else if ((scheme == "mailto" || scheme == "tel") && req.hasGesture()) {
                                     invokeDart("onExternalScheme", mapOf("url" to url))
                                 }
                                 dismissThisPopupAsync()
@@ -3525,6 +4627,7 @@ class OmniWebViewPlatformView(
                                 forwardToParentAndClose(url)
                                 return true
                             }
+                            updateOriginHeader(url)
                             return false
                         }
 
@@ -3534,20 +4637,10 @@ class OmniWebViewPlatformView(
                             favicon: android.graphics.Bitmap?,
                         ) {
                             super.onPageStarted(popupView, url, favicon)
-                            if (childClosed || disposed) return
+                            if (childClosed || disposed || popupWebView !== child) return
                             child.applyAutofillAllowed(false)
                             if (!url.isNullOrEmpty() && url != "about:blank") {
                                 if (!isHttpOrHttpsUrl(url)) {
-                                    val lower = url.trim().lowercase()
-                                    if (lower.startsWith("intent://")) {
-                                        val fallback = extractIntentFallbackHttpUrl(url)
-                                        if (fallback != null) {
-                                            forwardToParentAndClose(fallback)
-                                            return
-                                        }
-                                    } else if (lower.startsWith("mailto:") || lower.startsWith("tel:")) {
-                                        invokeDart("onExternalScheme", mapOf("url" to url))
-                                    }
                                     dismissThisPopupAsync()
                                     return
                                 }
@@ -3559,19 +4652,26 @@ class OmniWebViewPlatformView(
                                     forwardToParentAndClose(url)
                                     return
                                 }
-                                titleView.text = url
+                                updateOriginHeader(url)
                             }
                         }
 
                         override fun onPageFinished(popupView: WebView?, url: String?) {
                             super.onPageFinished(popupView, url)
-                            if (childClosed || disposed) return
+                            if (childClosed || disposed || popupWebView !== child) return
                             if (popupView != null) {
-                                injectAutofillGuardFallback(popupView)
+                                injectAutofillGuardFallback(popupView, popupAutofillToken, popupHasDocStart)
+                                updateOriginHeader(url ?: popupView.url)
                                 if (!popupView.title.isNullOrEmpty()) {
                                     titleView.text = popupView.title
                                 }
                             }
+                        }
+
+                        override fun doUpdateVisitedHistory(popupView: WebView?, url: String?, isReload: Boolean) {
+                            super.doUpdateVisitedHistory(popupView, url, isReload)
+                            if (childClosed || disposed || popupWebView !== child) return
+                            updateOriginHeader(url ?: popupView?.url)
                         }
 
                         override fun onRenderProcessGone(
@@ -3586,9 +4686,51 @@ class OmniWebViewPlatformView(
 
                     child.webChromeClient = object : WebChromeClient() {
                         override fun onReceivedTitle(popupView: WebView?, title: String?) {
-                            if (childClosed || disposed) return
+                            if (childClosed || disposed || popupWebView !== child) return
                             if (!title.isNullOrEmpty()) {
                                 titleView.text = title
+                            }
+                        }
+
+                        override fun onPermissionRequest(request: PermissionRequest?) {
+                            handleWebPermissionRequest(request)
+                        }
+
+                        override fun onPermissionRequestCanceled(request: PermissionRequest?) {
+                            mainHandler.post {
+                                if (request == null || activePermissionRequest === request) {
+                                    val dlg = activePermissionDialog
+                                    activePermissionDialog = null
+                                    activePermissionRequest = null
+                                    if (dlg != null) {
+                                        try {
+                                            if (dlg.isShowing) dlg.dismiss()
+                                        } catch (_: Throwable) {
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        override fun onGeolocationPermissionsShowPrompt(
+                            origin: String?,
+                            callback: GeolocationPermissions.Callback?,
+                        ) {
+                            handleGeolocationPrompt(origin, callback)
+                        }
+
+                        override fun onGeolocationPermissionsHidePrompt() {
+                            mainHandler.post {
+                                val dlg = activeGeoDialog
+                                activeGeoDialog = null
+                                activeGeoCallback = null
+                                activeGeoOrigin = null
+                                if (dlg != null) {
+                                    try {
+                                        if (dlg.isShowing) dlg.dismiss()
+                                    } catch (_: Throwable) {
+                                    }
+                                }
                             }
                         }
 
@@ -3598,12 +4740,15 @@ class OmniWebViewPlatformView(
                     }
 
                     popupWebView = child
+                    activePopupDismiss = { dismissThisPopupAsync() }
                     if (isDialog) {
-                        ensurePopupDialogShown()
+                        if (!ensurePopupDialogShown()) {
+                            return false
+                        }
                     } else {
                         // 遷移せず不可視のまま残った about:blank ポップアップを自動回収する
                         mainHandler.postDelayed({
-                            if (!childClosed && !dialogShown) {
+                            if (!childClosed && !dialogShown && popupWebView === child) {
                                 dismissThisPopupAsync()
                             }
                         }, ORPHAN_POPUP_TIMEOUT_MS)
@@ -3636,6 +4781,11 @@ class OmniWebViewPlatformView(
     }
 
     private fun closePopupAsync() {
+        val dismissFn = activePopupDismiss
+        if (dismissFn != null) {
+            dismissFn()
+            return
+        }
         val dialog = popupDialog
         popupDialog = null
         val child = popupWebView
@@ -3648,6 +4798,7 @@ class OmniWebViewPlatformView(
     }
 
     private fun closePopupNow() {
+        activePopupDismiss = null
         val dialog = popupDialog
         popupDialog = null
         val child = popupWebView
@@ -3672,14 +4823,17 @@ class OmniWebViewPlatformView(
     override fun dispose() {
         if (disposed) return
         disposed = true
+        crashRecoveryGen += 1
         channel.setMethodCallHandler(null)
+        dismissPendingPermissionDialogs()
         exitFullscreenIfActive()
         closePopupNow()
         try {
             container.removeAllViews()
         } catch (_: Throwable) {
         }
-        if (::webView.isInitialized) {
+        if (::webView.isInitialized && !mainWebViewDestroyed) {
+            mainWebViewDestroyed = true
             safeDestroyWebView(webView, removeJsBridge = true)
         }
         manager.unregisterView(viewId, appliedProfileName)
@@ -3691,6 +4845,11 @@ class OmniWebViewPlatformView(
             return
         }
         when (call.method) {
+            "setActive" -> {
+                val active = call.argument<Boolean>("active") ?: false
+                setTabActive(active)
+                result.success(null)
+            }
             "loadUrl" -> {
                 val url = call.argument<String>("url")
                 if (!url.isNullOrEmpty()) {

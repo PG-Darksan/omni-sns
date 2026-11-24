@@ -85,6 +85,53 @@ class OmniWebViewManager {
       );
     } catch (_) {}
   }
+
+  /// Android Keystore (AES-256-GCM) に機密文字列を暗号化保存する。
+  /// ネイティブチャネル非対応環境（テスト VM 等）では `false` を返す。
+  static Future<bool> secureSetSecret(String key, String value) async {
+    try {
+      final ok = await _channel.invokeMethod<bool>(
+        'secureSetSecret',
+        <String, dynamic>{'key': key, 'value': value},
+      );
+      return ok ?? false;
+    } on MissingPluginException {
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Android Keystore (AES-256-GCM) から機密文字列を復号して読み出す。
+  /// `(supported, value)` を返す。テスト VM 等でネイティブチャネル非対応時は `(false, null)`。
+  static Future<(bool, String?)> secureGetSecret(String key) async {
+    try {
+      final val = await _channel.invokeMethod<String>(
+        'secureGetSecret',
+        <String, dynamic>{'key': key},
+      );
+      return (true, val);
+    } on MissingPluginException {
+      return (false, null);
+    } catch (_) {
+      return (false, null);
+    }
+  }
+
+  /// Android Keystore に保存した機密文字列を削除する。
+  static Future<bool> secureDeleteSecret(String key) async {
+    try {
+      final ok = await _channel.invokeMethod<bool>(
+        'secureDeleteSecret',
+        <String, dynamic>{'key': key},
+      );
+      return ok ?? false;
+    } on MissingPluginException {
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
 }
 
 /// 各アカウントタブに対応する Android ネイティブ WebView コントローラ
@@ -93,6 +140,8 @@ class OmniWebViewController {
     required this.initialUrl,
     required this.profileName,
     required this.userAgent,
+    this.serviceId = '',
+    bool initiallyActive = false,
     this.onProgress,
     this.onPageStarted,
     this.onPageFinished,
@@ -103,11 +152,13 @@ class OmniWebViewController {
     this.onFollowDetected,
     this.onUnfollowDetected,
     this.onAccountIdentity,
-  }) : _pendingUrl = initialUrl;
+  })  : _pendingUrl = initialUrl,
+        _isActive = initiallyActive;
 
   final String initialUrl;
   final String profileName;
   final String userAgent;
+  final String serviceId;
 
   final OmniWebViewProgressCallback? onProgress;
   final OmniWebViewPageStartedCallback? onPageStarted;
@@ -122,9 +173,12 @@ class OmniWebViewController {
 
   MethodChannel? _channel;
   String? _pendingUrl;
+  bool _isActive;
+  bool _pendingActiveSync = false;
   bool _disposed = false;
 
   bool get isDisposed => _disposed;
+  bool get isActive => _isActive;
 
   void attachPlatformView(int viewId) {
     if (_disposed) return;
@@ -133,11 +187,37 @@ class OmniWebViewController {
     ch.setMethodCallHandler(_handleNativeCall);
     _channel = ch;
 
+    // 作成前からアタッチまでに setActive が呼ばれた場合のみネイティブ側へ追従通知する
+    if (_pendingActiveSync) {
+      _pendingActiveSync = false;
+      setActive(_isActive, force: true);
+    }
+
     final urlToLoad = _pendingUrl;
     _pendingUrl = null;
     if (urlToLoad != null && urlToLoad.isNotEmpty) {
       loadUrl(urlToLoad);
     }
+  }
+
+  /// Flutter TLHC では非表示タブでも Android View.isShown が true のままになるため、
+  /// 現在表示中のアクティブタブかどうかを明示的にネイティブ側へ通知する。
+  Future<void> setActive(bool active, {bool force = false}) async {
+    if (_disposed) return;
+    final changed = _isActive != active;
+    _isActive = active;
+    if (!changed && !force) return;
+    final ch = _channel;
+    if (ch == null) {
+      _pendingActiveSync = true;
+      return;
+    }
+    try {
+      await ch.invokeMethod<void>(
+        'setActive',
+        <String, dynamic>{'active': active},
+      );
+    } catch (_) {}
   }
 
   Future<dynamic> _handleNativeCall(MethodCall call) async {
@@ -334,6 +414,8 @@ class OmniWebViewWidget extends StatelessWidget {
             'profileName': controller.profileName,
             'initialUrl': controller.initialUrl,
             'userAgent': controller.userAgent,
+            'serviceId': controller.serviceId,
+            'isActive': controller.isActive,
             'autoLoad': false,
           },
           creationParamsCodec: const StandardMessageCodec(),

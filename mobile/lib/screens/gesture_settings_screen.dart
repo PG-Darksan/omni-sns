@@ -44,7 +44,7 @@ class _GestureSettingsScreenState extends State<GestureSettingsScreen> {
         gestures: _settings.gestures,
       ),
     );
-    if (selected == null) return;
+    if (!mounted || selected == null) return;
 
     final nextMap = Map<String, String>.from(_settings.gestures);
     if (!_settings.allowDup && selected != 'none') {
@@ -223,7 +223,10 @@ class _GestureSettingsScreenState extends State<GestureSettingsScreen> {
                         min: 4,
                         max: 36,
                         divisions: 32,
-                        onChanged: (v) =>
+                        onChanged: (v) => setState(
+                          () => _settings = _settings.copyWith(tremor: v.round()),
+                        ),
+                        onChangeEnd: (v) =>
                             _update(_settings.copyWith(tremor: v.round())),
                       ),
                     ],
