@@ -752,6 +752,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
 
     _controllers[instance.instanceId] = controller;
+    // 新しいコントローラの WebView を必ずビルドさせるため、見た目が同じでも再ビルドする
     _updateRuntime(
       instance.instanceId,
       (cur) => cur.copyWith(
@@ -759,6 +760,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         isLoading: true,
         clearError: true,
       ),
+      forceRebuild: true,
     );
     return controller;
   }
@@ -1240,8 +1242,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _updateRuntime(
     String instanceId,
-    TabRuntimeState Function(TabRuntimeState current) updater,
-  ) {
+    TabRuntimeState Function(TabRuntimeState current) updater, {
+    bool forceRebuild = false,
+  }) {
     final current = _runtimeMap[instanceId];
     if (current == null) return;
     final next = updater(current);
@@ -1251,7 +1254,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final visible = !_isGmailOpen &&
         _settings.activeInstanceId == instanceId &&
         _activeSubTabId[instanceId] == null;
-    if (current.sameVisualState(next, includeProgress: visible)) return;
+    if (!forceRebuild && current.sameVisualState(next, includeProgress: visible)) {
+      return;
+    }
     setState(() {});
   }
 
