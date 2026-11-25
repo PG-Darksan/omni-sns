@@ -13,8 +13,9 @@ use crate::follow_sync::{
 };
 use crate::gesture::{sanitize_gesture_settings, GestureSettings};
 use crate::models::{
-    AddInstancePayload, AppConfig, AppSettings, SavedSubTab, ServiceInstance, UpdateInstancePatch,
-    UpdateSettingsPatch, WindowBounds,
+    AddInstancePayload, AppConfig, AppSettings, ArchivedInstance, SavedSubTab, ServiceInstance,
+    UpdateInstancePatch, UpdateSettingsPatch, WindowBounds, DEFAULT_VIEWPORT_BOTTOM_INSET,
+    MAX_VIEWPORT_BOTTOM_INSET,
 };
 use crate::url_utils::{
     is_valid_hex_color, make_badge_text, normalize_service_url, service_group_key,
@@ -149,6 +150,7 @@ pub fn create_default_settings() -> AppSettings {
         sidebar_width: 248,
         active_instance_id: None,
         header_collapsed: false,
+        viewport_bottom_inset: DEFAULT_VIEWPORT_BOTTOM_INSET,
         gesture: GestureSettings::default(),
         follow_sync: FollowSyncSettings {
             device_id: format!("win-{}", next_short_hex_id()),
@@ -203,6 +205,7 @@ pub fn create_default_config() -> AppConfig {
         version: CONFIG_VERSION,
         settings,
         instances,
+        archived_instances: Vec::new(),
         window_bounds: Some(WindowBounds {
             x: None,
             y: None,
@@ -216,9 +219,17 @@ pub fn create_default_config() -> AppConfig {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RawArchivedInstance {
+    instance: Option<RawInstance>,
+    archived_at: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawConfig {
     settings: Option<RawSettings>,
     instances: Option<Vec<RawInstance>>,
+    archived_instances: Option<Vec<RawArchivedInstance>>,
     window_bounds: Option<WindowBounds>,
     follow_ledger: Option<FollowSyncLedger>,
 }
@@ -231,6 +242,7 @@ struct RawSettings {
     sidebar_width: Option<u32>,
     active_instance_id: Option<String>,
     header_collapsed: Option<bool>,
+    viewport_bottom_inset: Option<u32>,
     gesture: Option<GestureSettings>,
     follow_sync: Option<FollowSyncSettings>,
 }
@@ -261,6 +273,143 @@ struct RawInstance {
     sns_followers_count: Option<u32>,
     saved_tabs: Option<Vec<SavedSubTab>>,
     saved_active_tab_index: Option<usize>,
+}
+
+fn parse_raw_instance(
+    idx: usize,
+    item: RawInstance,
+    today: &str,
+    migrated: &mut bool,
+) -> Option<ServiceInstance> {
+    let instance_id = item.instance_id?.trim().to_string();
+    let raw_url = item.url?;
+    if instance_id.is_empty() || raw_url.trim().is_empty() {
+        return None;
+    }
+    let service_id = item
+        .service_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "custom".to_string());
+    // X・および無料プランでメッセージ送信不可のサービスは旧設定からも自動除外する
+    if is_removed_service(&service_id, &instance_id) {
+        *migrated = true;
+        return None;
+    }
+    let name = item
+        .name
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "SNS".to_string());
+    let account_label = item
+        .account_label
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let color = item
+        .color
+        .filter(|c| is_valid_hex_color(c))
+        .unwrap_or_else(|| "#3B82F6".to_string());
+    let badge = item
+        .badge
+        .filter(|b| !b.trim().is_empty())
+        .unwrap_or_else(|| make_badge_text(&name))
+        .chars()
+        .take(2)
+        .collect();
+    let ua_mode = if item.ua_mode.as_deref() == Some("mobile") {
+        "mobile".to_string()
+    } else {
+        "desktop".to_string()
+    };
+    let zoom_factor = item
+        .zoom_factor
+        .filter(|z| z.is_finite())
+        .map(|z| (z * 100.0).round() / 100.0)
+        .unwrap_or(1.0)
+        .clamp(0.3, 3.0);
+
+    let mut resolved_url =
+        normalize_service_url(&raw_url).unwrap_or_else(|| "https://example.com/".to_string());
+    if service_id == "threads" {
+        if let Ok(mut parsed) = url::Url::parse(&resolved_url) {
+            if matches!(parsed.host_str(), Some("www.threads.net" | "threads.net")) {
+                if parsed.set_host(Some("www.threads.com")).is_ok() {
+                    resolved_url = parsed.to_string();
+                    *migrated = true;
+                }
+            }
+        }
+    }
+
+    let raw_follow_date = item
+        .follow_count_date
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let follow_count_today = if raw_follow_date == today {
+        item.follow_count_today.unwrap_or(0)
+    } else {
+        0
+    };
+    let unfollow_count_today = if raw_follow_date == today {
+        item.unfollow_count_today.unwrap_or(0)
+    } else {
+        0
+    };
+
+    let saved_tabs: Vec<SavedSubTab> = item
+        .saved_tabs
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| {
+            let url = normalize_service_url(&t.url)?;
+            let title = if t.title.trim().is_empty() {
+                name.clone()
+            } else {
+                t.title.trim().to_string()
+            };
+            Some(SavedSubTab { url, title })
+        })
+        .take(20)
+        .collect();
+    let (saved_tabs, saved_active_tab_index) = if saved_tabs.len() >= 2 {
+        let idx = item
+            .saved_active_tab_index
+            .unwrap_or(0)
+            .min(saved_tabs.len() - 1);
+        (saved_tabs, Some(idx))
+    } else {
+        (Vec::new(), None)
+    };
+
+    Some(ServiceInstance {
+        instance_id,
+        service_id,
+        name,
+        account_label,
+        category: item
+            .category
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "custom".to_string()),
+        url: resolved_url,
+        color,
+        badge,
+        ua_mode,
+        muted: item.muted.unwrap_or(false),
+        zoom_factor,
+        notifications_enabled: item.notifications_enabled.unwrap_or(true),
+        order: item.order.unwrap_or(idx),
+        follow_count_today,
+        follow_count_total: item.follow_count_total.unwrap_or(0),
+        unfollow_count_today,
+        unfollow_count_total: item.unfollow_count_total.unwrap_or(0),
+        follow_count_date: today.to_string(),
+        detected_handle: item
+            .detected_handle
+            .as_deref()
+            .and_then(normalize_account_handle),
+        sns_following_count: item.sns_following_count,
+        sns_followers_count: item.sns_followers_count,
+        saved_tabs,
+        saved_active_tab_index,
+    })
 }
 
 pub struct ConfigStore {
@@ -349,6 +498,9 @@ impl ConfigStore {
             if let Some(hc) = rs.header_collapsed {
                 settings.header_collapsed = hc;
             }
+            if let Some(bi) = rs.viewport_bottom_inset {
+                settings.viewport_bottom_inset = bi.clamp(0, MAX_VIEWPORT_BOTTOM_INSET);
+            }
             if let Some(g) = rs.gesture {
                 settings.gesture = sanitize_gesture_settings(g);
             }
@@ -388,35 +540,25 @@ impl ConfigStore {
         }
 
         let today = local_today_ymd();
-        let instances: Vec<ServiceInstance> = if let Some(raw_list) = raw.instances {
-            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut seen_profile_keys: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            seen_profile_keys.insert("gmail".to_string());
-            seen_profile_keys.insert("shell".to_string());
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_profile_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        seen_profile_keys.insert("gmail".to_string());
+        seen_profile_keys.insert("shell".to_string());
 
+        let instances: Vec<ServiceInstance> = if let Some(raw_list) = raw.instances {
             let mut list: Vec<ServiceInstance> = raw_list
                 .into_iter()
                 .enumerate()
                 .filter_map(|(idx, item)| {
-                    let mut instance_id = item.instance_id?.trim().to_string();
-                    let raw_url = item.url?;
-                    if instance_id.is_empty() || raw_url.trim().is_empty() {
-                        return None;
-                    }
-                    let service_id = item
-                        .service_id
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "custom".to_string());
-                    // X・および無料プランでメッセージ送信不可のサービスは旧設定からも自動除外する
-                    if is_removed_service(&service_id, &instance_id) {
-                        migrated = true;
-                        return None;
-                    }
+                    let mut inst = parse_raw_instance(idx, item, &today, &mut migrated)?;
                     // 重複IDや予約プロファイル名（gmail/shell等）によるセッション衝突を防止
-                    let mut profile_key = Self::sanitize_profile_key(&instance_id);
-                    if seen_ids.contains(&instance_id) || seen_profile_keys.contains(&profile_key) {
-                        let safe_prefix: String = service_id
+                    let mut profile_key = Self::sanitize_profile_key(&inst.instance_id);
+                    if seen_ids.contains(&inst.instance_id)
+                        || seen_profile_keys.contains(&profile_key)
+                    {
+                        let safe_prefix: String = inst
+                            .service_id
                             .chars()
                             .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
                             .collect();
@@ -428,132 +570,18 @@ impl ConfigStore {
                         loop {
                             let candidate = format!("svc-{prefix}-{}", next_short_hex_id());
                             let ckey = Self::sanitize_profile_key(&candidate);
-                            if !seen_ids.contains(&candidate) && !seen_profile_keys.contains(&ckey) {
-                                instance_id = candidate;
+                            if !seen_ids.contains(&candidate) && !seen_profile_keys.contains(&ckey)
+                            {
+                                inst.instance_id = candidate;
                                 profile_key = ckey;
                                 break;
                             }
                         }
                         migrated = true;
                     }
-                    seen_ids.insert(instance_id.clone());
+                    seen_ids.insert(inst.instance_id.clone());
                     seen_profile_keys.insert(profile_key);
-
-                    let name = item
-                        .name
-                        .filter(|n| !n.trim().is_empty())
-                        .unwrap_or_else(|| "SNS".to_string());
-                    let account_label = item
-                        .account_label
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
-                    let color = item
-                        .color
-                        .filter(|c| is_valid_hex_color(c))
-                        .unwrap_or_else(|| "#3B82F6".to_string());
-                    let badge = item
-                        .badge
-                        .filter(|b| !b.trim().is_empty())
-                        .unwrap_or_else(|| make_badge_text(&name))
-                        .chars()
-                        .take(2)
-                        .collect();
-                    let ua_mode = if item.ua_mode.as_deref() == Some("mobile") {
-                        "mobile".to_string()
-                    } else {
-                        "desktop".to_string()
-                    };
-                    let zoom_factor = item
-                        .zoom_factor
-                        .filter(|z| z.is_finite())
-                        .map(|z| (z * 100.0).round() / 100.0)
-                        .unwrap_or(1.0)
-                        .clamp(0.3, 3.0);
-
-                    let mut resolved_url = normalize_service_url(&raw_url)
-                        .unwrap_or_else(|| "https://example.com/".to_string());
-                    if service_id == "threads" {
-                        if let Ok(mut parsed) = url::Url::parse(&resolved_url) {
-                            if matches!(parsed.host_str(), Some("www.threads.net" | "threads.net")) {
-                                if parsed.set_host(Some("www.threads.com")).is_ok() {
-                                    resolved_url = parsed.to_string();
-                                    migrated = true;
-                                }
-                            }
-                        }
-                    }
-
-                    let raw_follow_date = item
-                        .follow_count_date
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_default();
-                    let follow_count_today = if raw_follow_date == today {
-                        item.follow_count_today.unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    let unfollow_count_today = if raw_follow_date == today {
-                        item.unfollow_count_today.unwrap_or(0)
-                    } else {
-                        0
-                    };
-
-                    let saved_tabs: Vec<SavedSubTab> = item
-                        .saved_tabs
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|t| {
-                            let url = normalize_service_url(&t.url)?;
-                            let title = if t.title.trim().is_empty() {
-                                name.clone()
-                            } else {
-                                t.title.trim().to_string()
-                            };
-                            Some(SavedSubTab { url, title })
-                        })
-                        .take(20)
-                        .collect();
-                    let (saved_tabs, saved_active_tab_index) = if saved_tabs.len() >= 2 {
-                        let idx = item
-                            .saved_active_tab_index
-                            .unwrap_or(0)
-                            .min(saved_tabs.len() - 1);
-                        (saved_tabs, Some(idx))
-                    } else {
-                        (Vec::new(), None)
-                    };
-
-                    Some(ServiceInstance {
-                        instance_id,
-                        service_id,
-                        name,
-                        account_label,
-                        category: item
-                            .category
-                            .filter(|c| !c.is_empty())
-                            .unwrap_or_else(|| "custom".to_string()),
-                        url: resolved_url,
-                        color,
-                        badge,
-                        ua_mode,
-                        muted: item.muted.unwrap_or(false),
-                        zoom_factor,
-                        notifications_enabled: item.notifications_enabled.unwrap_or(true),
-                        order: item.order.unwrap_or(idx),
-                        follow_count_today,
-                        follow_count_total: item.follow_count_total.unwrap_or(0),
-                        unfollow_count_today,
-                        unfollow_count_total: item.unfollow_count_total.unwrap_or(0),
-                        follow_count_date: today.clone(),
-                        detected_handle: item
-                            .detected_handle
-                            .as_deref()
-                            .and_then(normalize_account_handle),
-                        sns_following_count: item.sns_following_count,
-                        sns_followers_count: item.sns_followers_count,
-                        saved_tabs,
-                        saved_active_tab_index,
-                    })
+                    Some(inst)
                 })
                 .collect();
             list.sort_by_key(|i| i.order);
@@ -562,8 +590,37 @@ impl ConfigStore {
             }
             list
         } else {
+            for inst in &defaults.instances {
+                seen_ids.insert(inst.instance_id.clone());
+                seen_profile_keys.insert(Self::sanitize_profile_key(&inst.instance_id));
+            }
             defaults.instances
         };
+
+        let mut seen_archived = std::collections::HashSet::new();
+        let archived_instances: Vec<ArchivedInstance> = raw
+            .archived_instances
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, raw_arch)| {
+                let inst = parse_raw_instance(idx, raw_arch.instance?, &today, &mut migrated)?;
+                let profile_key = Self::sanitize_profile_key(&inst.instance_id);
+                if seen_ids.contains(&inst.instance_id)
+                    || seen_profile_keys.contains(&profile_key)
+                    || !seen_archived.insert(inst.instance_id.clone())
+                {
+                    migrated = true;
+                    return None;
+                }
+                seen_profile_keys.insert(profile_key);
+                Some(ArchivedInstance {
+                    instance: inst,
+                    archived_at: raw_arch.archived_at.unwrap_or_else(now_unix_secs),
+                })
+            })
+            .take(100)
+            .collect();
 
         let active_valid = settings
             .active_instance_id
@@ -578,6 +635,7 @@ impl ConfigStore {
             version: CONFIG_VERSION,
             settings,
             instances,
+            archived_instances,
             window_bounds: raw.window_bounds.or(defaults.window_bounds),
             follow_ledger: raw.follow_ledger.unwrap_or_default(),
         };
@@ -840,7 +898,26 @@ impl ConfigStore {
         Ok(created)
     }
 
+    fn archive_instance_inner(&mut self, instance: ServiceInstance) {
+        self.config
+            .archived_instances
+            .retain(|a| a.instance.instance_id != instance.instance_id);
+        self.config.archived_instances.insert(
+            0,
+            ArchivedInstance {
+                instance,
+                archived_at: now_unix_secs(),
+            },
+        );
+        if self.config.archived_instances.len() > 100 {
+            self.config.archived_instances.truncate(100);
+        }
+    }
+
     pub fn restore_instance(&mut self, mut instance: ServiceInstance) -> ServiceInstance {
+        self.config
+            .archived_instances
+            .retain(|a| a.instance.instance_id != instance.instance_id);
         if let Some(existing) = self
             .config
             .instances
@@ -863,32 +940,94 @@ impl ConfigStore {
         instance
     }
 
-    pub fn remove_instance(&mut self, instance_id: &str) -> bool {
-        let removed_group = self
+    pub fn restore_archived_instance(&mut self, instance_id: &str) -> Option<ServiceInstance> {
+        let pos = self
+            .config
+            .archived_instances
+            .iter()
+            .position(|a| a.instance.instance_id == instance_id)?;
+        let archived = self.config.archived_instances.remove(pos);
+        let mut instance = archived.instance;
+
+        if let Some(existing) = self
             .config
             .instances
             .iter()
-            .find(|item| item.instance_id == instance_id)
-            .map(|item| service_group_key(&item.service_id, &item.url, &item.instance_id));
-
-        let prev_len = self.config.instances.len();
-        self.config
-            .instances
-            .retain(|item| item.instance_id != instance_id);
-        if self.config.instances.len() == prev_len {
-            return false;
+            .find(|i| i.instance_id == instance.instance_id)
+            .cloned()
+        {
+            self.config.settings.active_instance_id = Some(existing.instance_id.clone());
+            self.persist();
+            return Some(existing);
         }
+
+        let group_key = service_group_key(&instance.service_id, &instance.url, &instance.instance_id);
+        let insert_pos = self
+            .config
+            .instances
+            .iter()
+            .rposition(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == group_key)
+            .map(|idx| idx + 1)
+            .unwrap_or(self.config.instances.len());
+
+        self.config.instances.insert(insert_pos, instance.clone());
+        for (idx, item) in self.config.instances.iter_mut().enumerate() {
+            item.order = idx;
+        }
+        instance.order = insert_pos;
+        self.config.settings.active_instance_id = Some(instance.instance_id.clone());
+        self.persist();
+        Some(instance)
+    }
+
+    pub fn purge_archived_instance(&mut self, instance_id: &str) -> Option<ServiceInstance> {
+        let pos = self
+            .config
+            .archived_instances
+            .iter()
+            .position(|a| a.instance.instance_id == instance_id)?;
+        let removed = self.config.archived_instances.remove(pos).instance;
+        self.persist();
+        Some(removed)
+    }
+
+    pub fn purge_all_archived_instances(&mut self) -> Vec<ServiceInstance> {
+        let removed: Vec<ServiceInstance> = self
+            .config
+            .archived_instances
+            .drain(..)
+            .map(|a| a.instance)
+            .collect();
+        if !removed.is_empty() {
+            self.persist();
+        }
+        removed
+    }
+
+    pub fn remove_instance(&mut self, instance_id: &str) -> bool {
+        let Some(pos) = self
+            .config
+            .instances
+            .iter()
+            .position(|item| item.instance_id == instance_id)
+        else {
+            return false;
+        };
+        let removed = self.config.instances.remove(pos);
+        let removed_group =
+            service_group_key(&removed.service_id, &removed.url, &removed.instance_id);
+        self.archive_instance_inner(removed);
+
         for (idx, item) in self.config.instances.iter_mut().enumerate() {
             item.order = idx;
         }
         if self.config.settings.active_instance_id.as_deref() == Some(instance_id) {
-            let same_group_fallback = removed_group.and_then(|grp| {
-                self.config
-                    .instances
-                    .iter()
-                    .find(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == grp)
-                    .map(|i| i.instance_id.clone())
-            });
+            let same_group_fallback = self
+                .config
+                .instances
+                .iter()
+                .find(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == removed_group)
+                .map(|i| i.instance_id.clone());
             self.config.settings.active_instance_id = same_group_fallback
                 .or_else(|| self.config.instances.first().map(|i| i.instance_id.clone()));
         }
@@ -902,12 +1041,22 @@ impl ConfigStore {
         }
         let id_set: std::collections::HashSet<&str> =
             instance_ids.iter().map(|s| s.as_str()).collect();
-        let prev_len = self.config.instances.len();
-        self.config
-            .instances
-            .retain(|item| !id_set.contains(item.instance_id.as_str()));
-        if self.config.instances.len() == prev_len {
+        let mut kept = Vec::with_capacity(self.config.instances.len());
+        let mut removed_list = Vec::new();
+        for item in self.config.instances.drain(..) {
+            if id_set.contains(item.instance_id.as_str()) {
+                removed_list.push(item);
+            } else {
+                kept.push(item);
+            }
+        }
+        self.config.instances = kept;
+        if removed_list.is_empty() {
             return false;
+        }
+        // 先に削除したものを先頭付近に保つため逆順にアーカイブ挿入
+        for item in removed_list.into_iter().rev() {
+            self.archive_instance_inner(item);
         }
         for (idx, item) in self.config.instances.iter_mut().enumerate() {
             item.order = idx;
@@ -1035,6 +1184,9 @@ impl ConfigStore {
         }
         if let Some(hc) = patch.header_collapsed {
             self.config.settings.header_collapsed = hc;
+        }
+        if let Some(bi) = patch.viewport_bottom_inset {
+            self.config.settings.viewport_bottom_inset = bi.clamp(0, MAX_VIEWPORT_BOTTOM_INSET);
         }
         if let Some(gesture) = patch.gesture {
             self.config.settings.gesture = sanitize_gesture_settings(gesture);
@@ -2366,6 +2518,91 @@ mod tests {
                     .starts_with("omni-sns-config.unreadable-")
             });
         assert!(has_backup);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn remove_instance_archives_login_memory_and_restores_same_profile_id() {
+        let tmp_dir = std::env::temp_dir().join(format!("omnisns-archive-test-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+
+        let mut store = ConfigStore::new(config_path.clone());
+        let added = store
+            .add_instance(AddInstancePayload {
+                service_id: "instagram".to_string(),
+                name: "Instagram".to_string(),
+                account_label: Some("サブ垢".to_string()),
+                category: "major-sns".to_string(),
+                url: "https://www.instagram.com/direct/inbox/".to_string(),
+                color: "#E1306C".to_string(),
+                badge: "IG".to_string(),
+                ua_mode: "desktop".to_string(),
+            })
+            .unwrap();
+        let saved_id = added.instance_id.clone();
+
+        // タブ削除してもログイン記憶として archived_instances に残る
+        assert!(store.remove_instance(&saved_id));
+        assert!(store.get_instance(&saved_id).is_none());
+        let cfg_after_rm = store.get_config();
+        assert_eq!(cfg_after_rm.archived_instances.len(), 1);
+        assert_eq!(cfg_after_rm.archived_instances[0].instance.instance_id, saved_id);
+        assert_eq!(
+            cfg_after_rm.archived_instances[0].instance.account_label.as_deref(),
+            Some("サブ垢")
+        );
+
+        // 再起動（再読み込み）してもログイン記憶が保持される
+        let mut reloaded = ConfigStore::new(config_path.clone());
+        assert_eq!(reloaded.get_config().archived_instances.len(), 1);
+        assert_eq!(
+            reloaded.get_config().archived_instances[0].instance.instance_id,
+            saved_id
+        );
+
+        // 復元すると同一 instance_id（＝同一プロファイル）のままアクティブ復帰しアーカイブから消える
+        let restored = reloaded.restore_archived_instance(&saved_id).unwrap();
+        assert_eq!(restored.instance_id, saved_id);
+        assert_eq!(restored.account_label.as_deref(), Some("サブ垢"));
+        assert!(reloaded.get_config().archived_instances.is_empty());
+        assert_eq!(
+            reloaded.get_settings().active_instance_id.as_deref(),
+            Some(saved_id.as_str())
+        );
+
+        // 再度削除してから完全削除（purge）できる
+        assert!(reloaded.remove_instance(&saved_id));
+        assert_eq!(reloaded.get_config().archived_instances.len(), 1);
+        assert!(reloaded.purge_archived_instance(&saved_id).is_some());
+        assert!(reloaded.get_config().archived_instances.is_empty());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn viewport_bottom_inset_defaults_clamps_and_persists() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-inset-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+
+        let mut store = ConfigStore::new(config_path.clone());
+        assert_eq!(store.get_settings().viewport_bottom_inset, DEFAULT_VIEWPORT_BOTTOM_INSET);
+
+        store.update_settings(UpdateSettingsPatch {
+            viewport_bottom_inset: Some(999),
+            ..Default::default()
+        });
+        assert_eq!(store.get_settings().viewport_bottom_inset, MAX_VIEWPORT_BOTTOM_INSET);
+
+        store.update_settings(UpdateSettingsPatch {
+            viewport_bottom_inset: Some(64),
+            ..Default::default()
+        });
+        let reloaded = ConfigStore::new(config_path);
+        assert_eq!(reloaded.get_settings().viewport_bottom_inset, 64);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

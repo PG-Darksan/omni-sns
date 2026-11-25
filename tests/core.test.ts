@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { CATEGORIES, SERVICE_CATALOG } from '../src/shared/catalog';
 import {
   buildUserAgent,
@@ -206,4 +208,111 @@ test('security validators block internal Tauri hosts, SVG/script favicons, and s
     parseSharedSyncConfig('OMNISNS_SYNC_V1:{"token":"ghp_abc123","gistId":"../other"}'),
     null
   );
+});
+
+test('Windows and Android PROFILE_STATS_JS are valid JS with universal mutual-follow, following-heavy color, and Instagram perf optimizations', () => {
+  const winSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src-tauri/src/platform_win.rs'),
+    'utf8'
+  );
+  const winMatch = /pub const PROFILE_STATS_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winMatch, 'Windows PROFILE_STATS_JS must exist');
+  const winJs = winMatch[1];
+  assert.doesNotThrow(() => new Function(winJs), 'Windows PROFILE_STATS_JS must parse cleanly');
+
+  const ktSrc = fs.readFileSync(
+    path.resolve(
+      process.cwd(),
+      'mobile/android/app/src/main/kotlin/com/pgdarksan/omni_sns_mobile/OmniWebView.kt'
+    ),
+    'utf8'
+  );
+  const partRe = /private val PROFILE_STATS_JS_PART_\d+: String = """\r?\n([\s\S]*?)\r?\n"""/g;
+  const parts: string[] = [];
+  let pm: RegExpExecArray | null;
+  while ((pm = partRe.exec(ktSrc)) !== null) {
+    assert.ok(
+      Buffer.byteLength(pm[1], 'utf8') < 60000,
+      'Each Kotlin string literal part must stay safely under JVM 65535-byte CONSTANT_Utf8 limit'
+    );
+    parts.push(pm[1]);
+  }
+  assert.ok(parts.length >= 2, 'Android PROFILE_STATS_JS should be split into safe parts');
+  const andJs = parts.join('\n');
+  assert.doesNotThrow(() => new Function(andJs), 'Android PROFILE_STATS_JS must parse cleanly');
+
+  for (const [label, js] of [
+    ['Windows', winJs],
+    ['Android', andJs]
+  ] as const) {
+    // 相互フォロー判定ピル & フォロー中＞フォロワーの色分け
+    assert.ok(js.includes('⇄ 相互'), `${label} must render mutual badge`);
+    assert.ok(js.includes('→ 片思い'), `${label} must render oneway badge`);
+    assert.ok(js.includes('← フォロワー'), `${label} must render follower badge`);
+    assert.ok(js.includes('is-following-heavy'), `${label} must highlight following > followers users`);
+    assert.ok(js.includes('data-omni-ff-heavy'), `${label} must accent following-heavy rows`);
+    // 全SNS対応プラットフォーム判定
+    for (const p of ['instagram', 'threads', 'bluesky', 'tiktok', 'mastodon', 'misskey', 'mixi2', 'pixiv', 'facebook', 'generic']) {
+      assert.ok(js.includes(`'${p}'`), `${label} must support ${p}`);
+    }
+    // Instagram パフォーマンス最適化（CDN preconnect / 並列ワーカー / 失敗ルートスキップ / show_many バッチ）
+    assert.ok(js.includes('injectInstagramPreconnects'), `${label} must inject Instagram CDN preconnects`);
+    assert.ok(js.includes('igConcurrency'), `${label} must use parallel workers on Instagram`);
+    assert.ok(js.includes('deadRouteUntil'), `${label} must skip failing Instagram routes`);
+    assert.ok(js.includes('/api/v1/friendships/show_many/'), `${label} must batch-fetch Instagram friendships`);
+    // 投稿数は取得・表示しない
+    assert.ok(!js.includes("parts.push('投稿 '"), `${label} must not display post count in inline badge`);
+  }
+});
+
+test('Windows and Android LONG_PRESS_NEW_TAB_JS and JEV_FILTER_JS parse cleanly and fit JVM string limits', () => {
+  const winSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src-tauri/src/platform_win.rs'),
+    'utf8'
+  );
+  const ktSrc = fs.readFileSync(
+    path.resolve(
+      process.cwd(),
+      'mobile/android/app/src/main/kotlin/com/pgdarksan/omni_sns_mobile/OmniWebView.kt'
+    ),
+    'utf8'
+  );
+
+  const winLpMatch = /pub const LONG_PRESS_NEW_TAB_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winLpMatch, 'Windows LONG_PRESS_NEW_TAB_JS must exist');
+  assert.doesNotThrow(() => new Function(winLpMatch[1]));
+
+  const winJevMatch = /pub const JEV_FILTER_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winJevMatch, 'Windows JEV_FILTER_JS must exist');
+  assert.doesNotThrow(() => new Function(winJevMatch[1]));
+
+  const ktLpMatch = /val LONG_PRESS_NEW_TAB_JS: String = """\r?\n([\s\S]*?)\r?\n"""/.exec(ktSrc);
+  assert.ok(ktLpMatch, 'Android LONG_PRESS_NEW_TAB_JS must exist');
+  assert.ok(Buffer.byteLength(ktLpMatch[1], 'utf8') < 60000);
+  assert.doesNotThrow(() => new Function(ktLpMatch[1]));
+
+  const jevPartRe = /private val JEV_FILTER_JS_PART_\d+: String = """\r?\n([\s\S]*?)\r?\n"""/g;
+  const jevParts: string[] = [];
+  let jm: RegExpExecArray | null;
+  while ((jm = jevPartRe.exec(ktSrc)) !== null) {
+    assert.ok(
+      Buffer.byteLength(jm[1], 'utf8') < 60000,
+      'Each Kotlin JEV_FILTER_JS part must stay under JVM 65535-byte limit'
+    );
+    jevParts.push(jm[1]);
+  }
+  assert.ok(jevParts.length >= 1, 'Android JEV_FILTER_JS parts must exist');
+  const andJevJs = jevParts.join('\n');
+  assert.doesNotThrow(() => new Function(andJevJs));
+
+  for (const [label, lp, jev] of [
+    ['Windows', winLpMatch[1], winJevMatch[1]],
+    ['Android', ktLpMatch[1], andJevJs]
+  ] as const) {
+    assert.ok(lp.includes('omnisns:open-new-tab'), `${label} long-press must support Windows bridge`);
+    assert.ok(lp.includes('onOpenNewTab'), `${label} long-press must support Android bridge`);
+    assert.ok(jev.includes('__omniJevApplyConfig'), `${label} Jev filter must expose config hook`);
+    assert.ok(jev.includes('__omniJevResolve'), `${label} Jev filter must expose batch resolver`);
+    assert.ok(jev.includes('omni-jev-active'), `${label} Jev filter must toggle CSS class`);
+  }
 });

@@ -168,16 +168,63 @@ export interface AppSettings {
   activeInstanceId: string | null;
   /** ツールバー・タブバー（ヘッダー下部）を折り畳んでいるか */
   headerCollapsed?: boolean;
+  /** PC版表示領域の下余白（px。画面下端の入力欄を上に持ち上げる） */
+  viewportBottomInset?: number;
   /** マウスジェスチャー設定 */
   gesture: GestureSettings;
   /** フォロー数クロスデバイス同期設定 */
   followSync?: FollowSyncSettings;
 }
 
+export interface ArchivedInstance {
+  /** 削除時にログイン記憶（プロファイル）を保持したまま退避されたサービスインスタンス */
+  instance: ServiceInstance;
+  /** アーカイブ日時（UNIX秒） */
+  archivedAt: number;
+}
+
+export interface JevStateSnapshot {
+  hasApiKey: boolean;
+  apiKey: string;
+  enabled: boolean;
+  isActive: boolean;
+  category: string;
+  recentCategories: string[];
+  threshold: number;
+  totalInputTokens: number;
+  totalApiCalls: number;
+  totalJudgedAccounts: number;
+  totalCostUsd: number;
+  sessionInputTokens: number;
+  sessionApiCalls: number;
+  sessionCostUsd: number;
+  cacheEntries: number;
+  checkingRequests: number;
+  lastError?: string | null;
+  liveInList: boolean;
+  liveMatched: number;
+  liveHidden: number;
+  liveAutoFetching: boolean;
+}
+
+export interface UpdateJevSettingsPatch {
+  apiKey?: string;
+  enabled?: boolean;
+  category?: string;
+  threshold?: number;
+}
+
+export interface JevTestResult {
+  ok: boolean;
+  message: string;
+}
+
 export interface AppConfig {
   version: number;
   settings: AppSettings;
   instances: ServiceInstance[];
+  /** タブ削除後もログイン記憶を残している保存済みアカウント一覧 */
+  archivedInstances?: ArchivedInstance[];
   windowBounds?: {
     x?: number;
     y?: number;

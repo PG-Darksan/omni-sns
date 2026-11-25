@@ -117,6 +117,13 @@ pub struct TabRuntimeState {
     pub cross_site_handle: Option<String>,
 }
 
+pub const DEFAULT_VIEWPORT_BOTTOM_INSET: u32 = 44;
+pub const MAX_VIEWPORT_BOTTOM_INSET: u32 = 160;
+
+fn default_viewport_bottom_inset() -> u32 {
+    DEFAULT_VIEWPORT_BOTTOM_INSET
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -126,6 +133,8 @@ pub struct AppSettings {
     pub active_instance_id: Option<String>,
     #[serde(default)]
     pub header_collapsed: bool,
+    #[serde(default = "default_viewport_bottom_inset")]
+    pub viewport_bottom_inset: u32,
     #[serde(default)]
     pub gesture: GestureSettings,
     #[serde(default)]
@@ -159,10 +168,19 @@ impl Default for WindowBounds {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ArchivedInstance {
+    pub instance: ServiceInstance,
+    pub archived_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub version: u32,
     pub settings: AppSettings,
     pub instances: Vec<ServiceInstance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_instances: Vec<ArchivedInstance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_bounds: Option<WindowBounds>,
     #[serde(default)]
@@ -206,6 +224,7 @@ pub struct UpdateSettingsPatch {
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub active_instance_id: Option<Option<String>>,
     pub header_collapsed: Option<bool>,
+    pub viewport_bottom_inset: Option<u32>,
     pub gesture: Option<GestureSettings>,
 }
 

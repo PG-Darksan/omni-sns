@@ -3,6 +3,7 @@ mod follow_sync;
 mod gesture;
 #[cfg(windows)]
 mod gesture_win;
+mod jev;
 mod models;
 #[cfg(windows)]
 mod platform_win;
@@ -19,7 +20,10 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::WebviewBuilder;
 use tauri::window::{Color, WindowBuilder};
-use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, State, Theme, WebviewUrl, WindowEvent};
+use tauri::{
+    AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize, State, Theme,
+    WebviewUrl, WindowEvent,
+};
 
 use follow_sync::{FollowSyncSettings, UpdateFollowSyncPatch};
 use gesture::GestureSettings;
@@ -204,6 +208,38 @@ async fn tab_remove_many(
 
     let guard = shared.inner.lock().unwrap();
     Ok(guard.store.get_config())
+}
+
+#[tauri::command]
+async fn archived_restore(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+) -> Result<ServiceInstance, String> {
+    ensure_shell_webview(&webview)?;
+    view_manager::restore_archived_instance(&app, &shared, &instance_id)
+}
+
+#[tauri::command]
+async fn archived_purge(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+) -> Result<bool, String> {
+    ensure_shell_webview(&webview)?;
+    view_manager::purge_archived_instance(&app, &shared, &instance_id)
+}
+
+#[tauri::command]
+async fn archived_purge_all(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+) -> Result<usize, String> {
+    ensure_shell_webview(&webview)?;
+    view_manager::purge_all_archived_instances(&app, &shared)
 }
 
 #[tauri::command]
@@ -533,6 +569,68 @@ async fn gmail_navigate(
     view_manager::navigate_gmail(&app, &shared, &url)
 }
 
+#[tauri::command]
+async fn jev_get_state(
+    webview: tauri::Webview,
+    shared: State<'_, SharedState>,
+) -> Result<jev::JevStateSnapshot, String> {
+    ensure_shell_webview(&webview)?;
+    Ok(view_manager::get_jev_snapshot(&shared))
+}
+
+#[tauri::command]
+async fn jev_update_settings(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    patch: jev::UpdateJevSettingsPatch,
+) -> Result<jev::JevStateSnapshot, String> {
+    ensure_shell_webview(&webview)?;
+    Ok(view_manager::update_jev_settings(&app, &shared, patch))
+}
+
+#[tauri::command]
+async fn jev_test_connection(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    api_key: String,
+    category: Option<String>,
+) -> Result<jev::JevTestResult, String> {
+    ensure_shell_webview(&webview)?;
+    Ok(view_manager::test_jev_connection(&app, &shared, api_key, category).await)
+}
+
+#[tauri::command]
+async fn jev_clear_cache(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+) -> Result<jev::JevStateSnapshot, String> {
+    ensure_shell_webview(&webview)?;
+    Ok(view_manager::clear_jev_cache(&app, &shared))
+}
+
+#[tauri::command]
+async fn jev_reset_usage(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+) -> Result<jev::JevStateSnapshot, String> {
+    ensure_shell_webview(&webview)?;
+    Ok(view_manager::reset_jev_usage(&app, &shared))
+}
+
+#[tauri::command]
+async fn jev_clear_error(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+) -> Result<jev::JevStateSnapshot, String> {
+    ensure_shell_webview(&webview)?;
+    Ok(view_manager::clear_jev_error(&app, &shared))
+}
+
 fn shutdown_gesture_host(shared: &SharedState) {
     #[cfg(windows)]
     {
@@ -784,9 +882,13 @@ pub fn run() {
             #[cfg(not(windows))]
             let chrome_version = "136.0.0.0".to_string();
 
+            let config_dir = config_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
             let store = ConfigStore::new(config_path);
             let initial_config = store.get_config();
-            let shared = SharedState::new(store, profiles_root.clone(), chrome_version);
+            let shared = SharedState::new(store, config_dir, profiles_root.clone(), chrome_version);
             app.manage(shared.clone());
 
             let bounds = initial_config.window_bounds.unwrap_or(WindowBounds {
@@ -822,6 +924,46 @@ pub fn run() {
             }
 
             let window = win_builder.build()?;
+
+            // 非最大化ウィンドウが画面下端（タスクバー裏など）にはみ出さないようワークエリア内へ補正する
+            if !bounds.is_maximized.unwrap_or(false) {
+                if let Some(monitor) = window
+                    .current_monitor()
+                    .ok()
+                    .flatten()
+                    .or_else(|| window.primary_monitor().ok().flatten())
+                {
+                    let work = monitor.work_area();
+                    if let (Ok(outer_pos), Ok(outer_sz), Ok(inner_sz)) = (
+                        window.outer_position(),
+                        window.outer_size(),
+                        window.inner_size(),
+                    ) {
+                        let chrome_w = outer_sz.width.saturating_sub(inner_sz.width);
+                        let chrome_h = outer_sz.height.saturating_sub(inner_sz.height);
+                        let max_inner_w = work.size.width.saturating_sub(chrome_w).max(640);
+                        let max_inner_h = work.size.height.saturating_sub(chrome_h).max(480);
+                        let clamped_w = inner_sz.width.min(max_inner_w);
+                        let clamped_h = inner_sz.height.min(max_inner_h);
+                        if clamped_w != inner_sz.width || clamped_h != inner_sz.height {
+                            let _ = window.set_size(PhysicalSize::new(clamped_w, clamped_h));
+                        }
+                        let eff_outer_w = (clamped_w + chrome_w) as i32;
+                        let eff_outer_h = (clamped_h + chrome_h) as i32;
+                        let min_x = work.position.x;
+                        let min_y = work.position.y;
+                        let max_x =
+                            (work.position.x + work.size.width as i32 - eff_outer_w).max(min_x);
+                        let max_y =
+                            (work.position.y + work.size.height as i32 - eff_outer_h).max(min_y);
+                        let clamped_x = outer_pos.x.clamp(min_x, max_x);
+                        let clamped_y = outer_pos.y.clamp(min_y, max_y);
+                        if clamped_x != outer_pos.x || clamped_y != outer_pos.y {
+                            let _ = window.set_position(PhysicalPosition::new(clamped_x, clamped_y));
+                        }
+                    }
+                }
+            }
 
             // Windows ネイティブマウスジェスチャー & 透明軌跡オーバーレイを起動
             #[cfg(windows)]
@@ -952,15 +1094,26 @@ pub fn run() {
                     false
                 });
 
+            let (shell_w, shell_h) = window
+                .inner_size()
+                .ok()
+                .map(|p| {
+                    let sf = window.scale_factor().unwrap_or(1.0);
+                    let l = p.to_logical::<f64>(sf);
+                    (l.width.max(1.0), l.height.max(1.0))
+                })
+                .unwrap_or((init_w, init_h));
+
             let _shell = window.add_child(
                 shell_builder,
                 LogicalPosition::new(0.0, 0.0),
-                LogicalSize::new(init_w, init_h),
+                LogicalSize::new(shell_w, shell_h),
             )?;
 
             if bounds.is_maximized.unwrap_or(false) {
                 let _ = window.maximize();
             }
+            view_manager::update_bounds_from_window(&app_handle, &shared);
 
             // ウィンドウイベント（リサイズ・移動・DPI変更・トレイ格納・終了）
             let app_for_win = app_handle.clone();
@@ -1099,6 +1252,9 @@ pub fn run() {
             tab_add,
             tab_remove,
             tab_remove_many,
+            archived_restore,
+            archived_purge,
+            archived_purge_all,
             tab_update,
             tab_reorder,
             tab_action,
@@ -1123,7 +1279,13 @@ pub fn run() {
             app_open_external_url,
             gmail_toggle,
             gmail_action,
-            gmail_navigate
+            gmail_navigate,
+            jev_get_state,
+            jev_update_settings,
+            jev_test_connection,
+            jev_clear_cache,
+            jev_reset_usage,
+            jev_clear_error
         ])
         .run(tauri::generate_context!())
         .expect("error while running OmniSNS");

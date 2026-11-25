@@ -3,9 +3,11 @@ import { omniApi } from './omni-api';
 import {
   AddInstancePayload,
   AppConfig,
+  ArchivedInstance,
   BrowserTabInfo,
   CatalogService,
   CategoryMeta,
+  JevStateSnapshot,
   ServiceCategory,
   ServiceInstance,
   TabRuntimeState,
@@ -42,13 +44,23 @@ interface UiState {
   closedTabsCount: number;
   gmailOpen: boolean;
   gmailRuntime: BrowserTabInfo | null;
-  selectedCatalogCategory: ServiceCategory | 'all';
+  selectedCatalogCategory: ServiceCategory | 'all' | 'archived';
   catalogSearchQuery: string;
   sidebarFilterQuery: string;
   editingMode: 'create' | 'edit' | null;
   editingInstanceId: string | null;
   editingTemplate: CatalogService | null;
+  jev: JevStateSnapshot | null;
 }
+
+const JEV_PRESET_CATEGORIES = [
+  '女の子',
+  'カフェ・グルメ',
+  'イラスト・絵師',
+  'ペット・動物',
+  'ファッション・美容',
+  '写真・カメラ'
+];
 
 const state: UiState = {
   config: null,
@@ -64,7 +76,8 @@ const state: UiState = {
   sidebarFilterQuery: '',
   editingMode: null,
   editingInstanceId: null,
-  editingTemplate: null
+  editingTemplate: null,
+  jev: null
 };
 
 let toastTimer: number | null = null;
@@ -101,6 +114,8 @@ function isAnyModalOpen(): boolean {
     !el('settings-modal').classList.contains('hidden') ||
     !el('gesture-modal').classList.contains('hidden') ||
     !el('follow-modal').classList.contains('hidden') ||
+    !el('jev-modal').classList.contains('hidden') ||
+    !el('archived-pick-modal').classList.contains('hidden') ||
     !el('confirm-modal').classList.contains('hidden')
   );
 }
@@ -293,8 +308,17 @@ function applyThemeAndLayout(): void {
   if (!state.config) return;
   const { theme, sidebarWidth } = state.config.settings;
   const headerCollapsed = Boolean(state.config.settings.headerCollapsed);
+  const bottomInset = Math.max(
+    0,
+    Math.min(160, state.config.settings.viewportBottomInset ?? 44)
+  );
   document.documentElement.setAttribute('data-theme', theme);
   document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
+  document.documentElement.style.setProperty('--viewport-bottom-inset', `${bottomInset}px`);
+
+  const bottomBar = el<HTMLElement>('viewport-bottom-bar');
+  bottomBar.classList.toggle('is-compact', bottomInset < 24);
+  el<HTMLElement>('bottom-inset-val').textContent = String(bottomInset);
 
   const mainArea = el<HTMLDivElement>('main-area');
   const active = getActiveInstance();
@@ -336,6 +360,15 @@ function renderSidebar(): void {
     totalBadge.classList.remove('hidden');
   } else {
     totalBadge.classList.add('hidden');
+  }
+
+  const archivedCount = state.config?.archivedInstances?.length ?? 0;
+  const archivedBadge = el<HTMLSpanElement>('sidebar-archived-badge');
+  if (archivedCount > 0) {
+    archivedBadge.textContent = archivedCount > 99 ? '99+' : String(archivedCount);
+    archivedBadge.classList.remove('hidden');
+  } else {
+    archivedBadge.classList.add('hidden');
   }
 
   listEl.innerHTML = '';
@@ -513,8 +546,8 @@ function renderSidebar(): void {
       e.stopPropagation();
       const msg =
         group.accounts.length >= 2
-          ? `「${group.displayName}」（全${group.accounts.length}アカウント）を一覧から削除しますか？\n※ 特定のアカウントだけ消す場合はヘッダーのアカウントタブから ✕ を押してください。`
-          : `「${group.displayName}」を一覧から削除しますか？`;
+          ? `「${group.displayName}」（全${group.accounts.length}アカウント）を一覧から削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。\n※ 特定のアカウントだけ消す場合はヘッダーのアカウントタブから ✕ を押してください。`
+          : `「${group.displayName}」を一覧から削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。`;
       const ok = await openConfirmDialog({
         title: 'サービスを削除',
         message: msg,
@@ -529,7 +562,7 @@ function renderSidebar(): void {
       } else {
         await omniApi.removeTabs(group.accounts.map((a) => a.instanceId));
       }
-      showToast(`「${group.displayName}」を削除しました`);
+      showToast(`「${group.displayName}」を削除しました（ログイン記憶は保持）`);
     });
 
     actions.appendChild(editBtn);
@@ -695,7 +728,7 @@ function renderAccountBar(): void {
         e.stopPropagation();
         const ok = await openConfirmDialog({
           title: 'アカウントを削除',
-          message: `「${group.displayName} / ${label}」を削除しますか？\n（このアカウントのログインセッションも削除されます）`,
+          message: `「${group.displayName} / ${label}」を削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。`,
           confirmLabel: '削除する',
           danger: true,
           anchorEl: delBtn,
@@ -703,7 +736,7 @@ function renderAccountBar(): void {
         });
         if (!ok) return;
         await omniApi.removeTab(inst.instanceId);
-        showToast(`「${group.displayName} / ${label}」を削除しました`);
+        showToast(`「${group.displayName} / ${label}」を削除しました（ログイン記憶は保持）`);
       });
       actions.appendChild(delBtn);
     }
@@ -713,7 +746,87 @@ function renderAccountBar(): void {
   });
 }
 
-async function addAccountForActiveService(): Promise<void> {
+let pendingNewAccountAction: (() => Promise<void>) | null = null;
+
+function formatArchivedTimestamp(unixSecs: number): string {
+  if (!unixSecs) return '';
+  const d = new Date(unixSecs * 1000);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${y}/${m}/${day} ${hh}:${mm}`;
+}
+
+function getArchivedDisplayTitle(inst: ServiceInstance): string {
+  const label = inst.accountLabel?.trim();
+  const base = label && label !== inst.name ? `${inst.name} · ${label}` : inst.name;
+  return inst.detectedHandle ? `${base} (@${inst.detectedHandle})` : base;
+}
+
+async function closeArchivedPickModal(): Promise<void> {
+  pendingNewAccountAction = null;
+  el('archived-pick-modal').classList.add('hidden');
+  await syncOverlayToMain();
+}
+
+async function openArchivedPickModal(
+  serviceName: string,
+  candidates: ArchivedInstance[],
+  onCreateNew: () => Promise<void>
+): Promise<void> {
+  pendingNewAccountAction = onCreateNew;
+  el<HTMLHeadingElement>('archived-pick-title').textContent = `「${serviceName}」にアカウントを追加`;
+  el<HTMLParagraphElement>('archived-pick-desc').textContent =
+    `「${serviceName}」の保存済みログイン記憶が ${candidates.length} 件あります。ログイン済みのまま呼び出すか、新規アカウントを作成できます。`;
+
+  const list = el<HTMLDivElement>('archived-pick-list');
+  list.innerHTML = '';
+  for (const entry of candidates) {
+    const inst = entry.instance;
+    const row = document.createElement('div');
+    row.className = 'archived-pick-row';
+
+    const info = document.createElement('div');
+    info.className = 'archived-pick-row-info';
+
+    const title = document.createElement('div');
+    title.className = 'archived-pick-row-title';
+    title.textContent = getArchivedDisplayTitle(inst);
+
+    const sub = document.createElement('div');
+    sub.className = 'archived-pick-row-sub';
+    const timeStr = formatArchivedTimestamp(entry.archivedAt);
+    sub.textContent = timeStr ? `保存: ${timeStr}` : inst.url;
+
+    info.appendChild(title);
+    info.appendChild(sub);
+
+    const restoreBtn = document.createElement('button');
+    restoreBtn.type = 'button';
+    restoreBtn.className = 'btn-primary btn-xs';
+    restoreBtn.textContent = '呼び出す';
+    restoreBtn.addEventListener('click', async () => {
+      try {
+        await omniApi.restoreArchivedTab(inst.instanceId);
+        await closeArchivedPickModal();
+        showToast(`「${getArchivedDisplayTitle(inst)}」をログイン記憶から呼び出しました`);
+      } catch (err) {
+        showToast(String(err));
+      }
+    });
+
+    row.appendChild(info);
+    row.appendChild(restoreBtn);
+    list.appendChild(row);
+  }
+
+  el('archived-pick-modal').classList.remove('hidden');
+  await syncOverlayToMain();
+}
+
+async function createNewAccountForActiveService(): Promise<void> {
   const active = getActiveInstance();
   const group = getActiveGroup();
   if (!active || !group) return;
@@ -740,6 +853,22 @@ async function addAccountForActiveService(): Promise<void> {
     uaMode: active.uaMode
   });
   showToast(`「${group.displayName} / ${nextLabel}」を追加しました（独立セッション）`);
+}
+
+async function addAccountForActiveService(): Promise<void> {
+  const active = getActiveInstance();
+  const group = getActiveGroup();
+  if (!active || !group) return;
+
+  const archivedForGroup = (state.config?.archivedInstances ?? []).filter(
+    (a) => getServiceGroupKey(a.instance) === group.key
+  );
+  if (archivedForGroup.length > 0) {
+    await openArchivedPickModal(group.displayName, archivedForGroup, createNewAccountForActiveService);
+    return;
+  }
+
+  await createNewAccountForActiveService();
 }
 
 const ICON_VOLUME_ON =
@@ -1016,10 +1145,116 @@ function renderToolbarAndViewport(): void {
   }
 }
 
+function renderArchivedLoginsPanel(): void {
+  const listEl = el<HTMLDivElement>('archived-logins-list');
+  const purgeAllBtn = el<HTMLButtonElement>('btn-purge-all-archived');
+  const allArchived = state.config?.archivedInstances ?? [];
+
+  purgeAllBtn.classList.toggle('hidden', allArchived.length === 0);
+
+  const q = state.catalogSearchQuery.trim().toLowerCase();
+  const filtered = allArchived.filter((entry) => {
+    if (!q) return true;
+    const inst = entry.instance;
+    return (
+      inst.name.toLowerCase().includes(q) ||
+      (inst.accountLabel ?? '').toLowerCase().includes(q) ||
+      (inst.detectedHandle ?? '').toLowerCase().includes(q) ||
+      inst.serviceId.toLowerCase().includes(q) ||
+      inst.url.toLowerCase().includes(q)
+    );
+  });
+
+  listEl.innerHTML = '';
+  if (filtered.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'archived-empty';
+    empty.textContent =
+      allArchived.length === 0
+        ? '保存済みのログイン記憶はまだありません。\nサイドバーやヘッダーからタブ／アカウントを削除すると、ログイン状態が自動的にここへ保存されます。'
+        : '検索条件に一致するログイン記憶が見つかりません。';
+    listEl.appendChild(empty);
+    return;
+  }
+
+  for (const entry of filtered) {
+    const inst = entry.instance;
+    const card = document.createElement('div');
+    card.className = 'archived-card';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'catalog-card-avatar';
+    avatar.style.background = inst.color;
+    avatar.textContent = inst.badge;
+
+    const meta = document.createElement('div');
+    meta.className = 'archived-card-meta';
+
+    const title = document.createElement('div');
+    title.className = 'archived-card-title';
+    title.textContent = getArchivedDisplayTitle(inst);
+    title.title = `${getArchivedDisplayTitle(inst)}\n${inst.url}`;
+
+    const sub = document.createElement('div');
+    sub.className = 'archived-card-sub';
+    const timeStr = formatArchivedTimestamp(entry.archivedAt);
+    sub.textContent = timeStr ? `保存: ${timeStr} · ${inst.url}` : inst.url;
+
+    meta.appendChild(title);
+    meta.appendChild(sub);
+
+    const actions = document.createElement('div');
+    actions.className = 'archived-card-actions';
+
+    const restoreBtn = document.createElement('button');
+    restoreBtn.type = 'button';
+    restoreBtn.className = 'btn-primary btn-xs';
+    restoreBtn.textContent = '呼び出す';
+    restoreBtn.title = 'ログイン記憶を保ったまま一覧へ復元して開く';
+    restoreBtn.addEventListener('click', async () => {
+      try {
+        await omniApi.restoreArchivedTab(inst.instanceId);
+        await closeCatalogModal();
+        showToast(`「${getArchivedDisplayTitle(inst)}」を呼び出しました`);
+      } catch (err) {
+        showToast(String(err));
+      }
+    });
+
+    const purgeBtn = document.createElement('button');
+    purgeBtn.type = 'button';
+    purgeBtn.className = 'btn-secondary btn-xs danger-text';
+    purgeBtn.textContent = '完全削除';
+    purgeBtn.title = 'このログイン記憶（Cookie・プロファイル）を完全に消去';
+    purgeBtn.addEventListener('click', async (e) => {
+      const ok = await openConfirmDialog({
+        title: 'ログイン記憶を完全削除',
+        message: `「${getArchivedDisplayTitle(inst)}」のログイン記憶（Cookie・セッション）を完全に消去しますか？\n※ この操作は取り消せません。`,
+        confirmLabel: '完全削除する',
+        danger: true,
+        anchorEl: purgeBtn,
+        anchorPoint: { x: e.clientX, y: e.clientY }
+      });
+      if (!ok) return;
+      await omniApi.purgeArchivedTab(inst.instanceId);
+      showToast(`「${getArchivedDisplayTitle(inst)}」のログイン記憶を完全削除しました`);
+    });
+
+    actions.appendChild(restoreBtn);
+    actions.appendChild(purgeBtn);
+    card.appendChild(avatar);
+    card.appendChild(meta);
+    card.appendChild(actions);
+    listEl.appendChild(card);
+  }
+}
+
 function renderCatalog(): void {
   const catTabs = el<HTMLDivElement>('catalog-categories');
   const grid = el<HTMLDivElement>('catalog-grid');
+  const archivedPanel = el<HTMLDivElement>('archived-logins-panel');
   const customForm = el<HTMLFormElement>('custom-service-form');
+  const archivedList = state.config?.archivedInstances ?? [];
 
   // Category tabs
   catTabs.innerHTML = '';
@@ -1032,6 +1267,20 @@ function renderCatalog(): void {
     renderCatalog();
   });
   catTabs.appendChild(allTab);
+
+  // 保存済みログイン記憶タブ
+  const archivedTab = document.createElement('button');
+  archivedTab.type = 'button';
+  archivedTab.className = `cat-tab archived-tab${archivedList.length > 0 ? ' has-items' : ''}${
+    state.selectedCatalogCategory === 'archived' ? ' active' : ''
+  }`;
+  archivedTab.textContent = `ログイン記憶 (${archivedList.length})`;
+  archivedTab.title = '削除したタブのログイン記憶を呼び出す・管理する';
+  archivedTab.addEventListener('click', () => {
+    state.selectedCatalogCategory = 'archived';
+    renderCatalog();
+  });
+  catTabs.appendChild(archivedTab);
 
   for (const cat of state.categories) {
     const count =
@@ -1051,13 +1300,23 @@ function renderCatalog(): void {
     catTabs.appendChild(btn);
   }
 
+  if (state.selectedCatalogCategory === 'archived') {
+    grid.classList.add('hidden');
+    customForm.classList.add('hidden');
+    archivedPanel.classList.remove('hidden');
+    renderArchivedLoginsPanel();
+    return;
+  }
+
   if (state.selectedCatalogCategory === 'custom') {
     grid.classList.add('hidden');
+    archivedPanel.classList.add('hidden');
     customForm.classList.remove('hidden');
     return;
   }
 
   grid.classList.remove('hidden');
+  archivedPanel.classList.add('hidden');
   customForm.classList.add('hidden');
 
   const q = state.catalogSearchQuery.trim().toLowerCase();
@@ -1074,10 +1333,16 @@ function renderCatalog(): void {
     );
   });
 
-  // Count how many times each service is already added
+  // Count how many times each service is already added / archived
   const addedCounts = new Map<string, number>();
   for (const inst of state.config?.instances ?? []) {
     addedCounts.set(inst.serviceId, (addedCounts.get(inst.serviceId) ?? 0) + 1);
+  }
+  const archivedByService = new Map<string, ArchivedInstance[]>();
+  for (const entry of archivedList) {
+    const arr = archivedByService.get(entry.instance.serviceId) ?? [];
+    arr.push(entry);
+    archivedByService.set(entry.instance.serviceId, arr);
   }
 
   grid.innerHTML = '';
@@ -1099,6 +1364,7 @@ function renderCatalog(): void {
 
   for (const svc of filtered) {
     const count = addedCounts.get(svc.id) ?? 0;
+    const svcArchived = archivedByService.get(svc.id) ?? [];
     const card = document.createElement('div');
     card.className = 'catalog-card';
     card.title = svc.note
@@ -1129,6 +1395,22 @@ function renderCatalog(): void {
       title.appendChild(chip);
     }
 
+    if (svcArchived.length > 0) {
+      const archChip = document.createElement('button');
+      archChip.type = 'button';
+      archChip.className = 'archived-chip';
+      archChip.textContent = svcArchived.length === 1 ? '記憶あり' : `記憶${svcArchived.length}`;
+      archChip.title = `削除済みのログイン記憶が ${svcArchived.length} 件あります（クリックで呼び出し）`;
+      archChip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        state.selectedCatalogCategory = 'archived';
+        state.catalogSearchQuery = svc.name;
+        el<HTMLInputElement>('catalog-search').value = svc.name;
+        renderCatalog();
+      });
+      title.appendChild(archChip);
+    }
+
     titleWrap.appendChild(title);
 
     const actions = document.createElement('div');
@@ -1140,25 +1422,33 @@ function renderCatalog(): void {
     addBtn.textContent = count > 0 ? '＋別垢' : '＋追加';
     addBtn.title = count > 0 ? `「${svc.name}」の別アカウントを追加して開く` : `「${svc.name}」を追加して開く`;
     addBtn.addEventListener('click', async () => {
-      const existingForSvc = (state.config?.instances ?? []).filter((i) => i.serviceId === svc.id);
-      const existingLabels = existingForSvc.map((acc, idx) =>
-        getAccountDisplayLabel(acc, idx, svc.name)
-      );
-      const nextLabel = nextDefaultAccountLabel(existingLabels);
-      if (svc.requiresCustomUrl) {
-        await openEditModalForTemplate(svc, count, nextLabel);
+      const doCreate = async () => {
+        const existingForSvc = (state.config?.instances ?? []).filter((i) => i.serviceId === svc.id);
+        const existingLabels = existingForSvc.map((acc, idx) =>
+          getAccountDisplayLabel(acc, idx, svc.name)
+        );
+        const nextLabel = nextDefaultAccountLabel(existingLabels);
+        if (svc.requiresCustomUrl) {
+          await openEditModalForTemplate(svc, count, nextLabel);
+          return;
+        }
+        await addServiceAndCloseCatalog({
+          serviceId: svc.id,
+          name: svc.name,
+          accountLabel: nextLabel,
+          category: svc.category,
+          url: svc.url,
+          color: svc.color,
+          badge: svc.badge,
+          uaMode: svc.defaultUa
+        });
+      };
+      if (svcArchived.length > 0) {
+        await closeCatalogModal();
+        await openArchivedPickModal(svc.name, svcArchived, doCreate);
         return;
       }
-      await addServiceAndCloseCatalog({
-        serviceId: svc.id,
-        name: svc.name,
-        accountLabel: nextLabel,
-        category: svc.category,
-        url: svc.url,
-        color: svc.color,
-        badge: svc.badge,
-        uaMode: svc.defaultUa
-      });
+      await doCreate();
     });
 
     const customizeBtn = document.createElement('button');
@@ -1202,7 +1492,16 @@ async function addServiceAndCloseCatalog(payload: AddInstancePayload): Promise<v
   }
 }
 
-async function openCatalogModal(): Promise<void> {
+async function openCatalogModal(
+  initialCategory?: ServiceCategory | 'all' | 'archived'
+): Promise<void> {
+  if (initialCategory) {
+    state.selectedCatalogCategory = initialCategory;
+    if (initialCategory === 'archived') {
+      state.catalogSearchQuery = '';
+      el<HTMLInputElement>('catalog-search').value = '';
+    }
+  }
   el('catalog-modal').classList.remove('hidden');
   await syncOverlayToMain();
   renderCatalog();
@@ -1288,6 +1587,9 @@ async function openSettingsModal(): Promise<void> {
   el<HTMLInputElement>('setting-minimize-tray').checked = s.minimizeToTray;
   el<HTMLInputElement>('setting-sidebar-width').value = String(s.sidebarWidth);
   el<HTMLSpanElement>('setting-sidebar-width-val').textContent = String(s.sidebarWidth);
+  const bottomInset = Math.max(0, Math.min(160, s.viewportBottomInset ?? 44));
+  el<HTMLInputElement>('setting-bottom-inset').value = String(bottomInset);
+  el<HTMLSpanElement>('setting-bottom-inset-val').textContent = String(bottomInset);
 
   el('settings-modal').classList.remove('hidden');
   await syncOverlayToMain();
@@ -1596,6 +1898,202 @@ function renderTabBar(): void {
   }
 }
 
+function formatJevUsd(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '$0';
+  if (usd < 0.0001) return `$${usd.toFixed(6)}`;
+  if (usd < 0.01) {
+    const s = usd.toFixed(5).replace(/0+$/, '');
+    return `$${s.endsWith('.') ? `${s}0` : s}`;
+  }
+  if (usd < 1) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+function formatJevJpy(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '¥0';
+  const jpy = usd * 155;
+  if (jpy < 0.01) return `約¥${jpy.toFixed(4)}`;
+  if (jpy < 1) return `約¥${jpy.toFixed(2)}`;
+  if (jpy < 100) return `約¥${jpy.toFixed(1)}`;
+  return `約¥${Math.round(jpy)}`;
+}
+
+function formatJevCostCompact(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return '$0 (¥0)';
+  return `${formatJevUsd(usd)} (${formatJevJpy(usd)})`;
+}
+
+function updateJevThresholdLabel(percent: number): void {
+  el<HTMLElement>('jev-threshold-val').textContent = String(percent);
+  el<HTMLElement>('jev-threshold-hint').textContent =
+    percent <= 48 ? '広めに表示' : percent >= 70 ? '確実な一致のみ' : '標準';
+}
+
+function renderJevCategoryChips(selected: string): void {
+  const wrap = el<HTMLDivElement>('jev-category-chips');
+  wrap.innerHTML = '';
+  const merged: string[] = [];
+  const pushUnique = (label: string) => {
+    const t = label.trim();
+    if (!t) return;
+    if (!merged.some((x) => x.toLowerCase() === t.toLowerCase())) {
+      merged.push(t);
+    }
+  };
+  for (const r of state.jev?.recentCategories ?? []) pushUnique(r);
+  for (const p of JEV_PRESET_CATEGORIES) pushUnique(p);
+
+  const selLower = selected.trim().toLowerCase();
+  for (const cat of merged.slice(0, 12)) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'jev-chip';
+    if (cat.toLowerCase() === selLower) btn.classList.add('active');
+    btn.textContent = cat;
+    btn.addEventListener('click', () => {
+      el<HTMLInputElement>('jev-category-input').value = cat;
+      renderJevCategoryChips(cat);
+    });
+    wrap.appendChild(btn);
+  }
+}
+
+function renderJevUi(): void {
+  const jev = state.jev;
+  const cat = jev?.category?.trim() || '女の子';
+  const shortCat = cat.length > 9 ? `${cat.slice(0, 8)}…` : cat;
+  const active = Boolean(jev?.isActive);
+  const busy = Boolean(jev && (jev.checkingRequests > 0 || jev.liveAutoFetching));
+  const pillText = active && jev?.liveInList
+    ? `${shortCat} ${jev.liveMatched}件${busy ? '…' : ''}`
+    : `分類: ${shortCat}`;
+
+  const pillBtn = el<HTMLButtonElement>('btn-jev-filter');
+  const collapsedBtn = el<HTMLButtonElement>('btn-collapsed-jev');
+  el<HTMLSpanElement>('jev-pill-label').textContent = pillText;
+  el<HTMLSpanElement>('collapsed-jev-label').textContent = pillText;
+  pillBtn.classList.toggle('jev-active', active);
+  collapsedBtn.classList.toggle('jev-active', active);
+
+  const toggleBtn = el<HTMLButtonElement>('btn-bottom-jev-toggle');
+  toggleBtn.textContent = active ? 'ON' : 'OFF';
+  toggleBtn.classList.toggle('active', active);
+
+  const costLabel = formatJevCostCompact(jev?.totalCostUsd ?? 0);
+  const extraStatus = jev && jev.checkingRequests > 0
+    ? '（判定中…）'
+    : jev?.liveAutoFetching
+      ? '（次ページ取得中…）'
+      : '';
+  const statusText = active && jev?.liveInList
+    ? `Jev 分類「${cat}」: 表示 ${jev.liveMatched}件 / 非表示 ${jev.liveHidden}件${extraStatus} · 費用 ${costLabel}`
+    : active
+      ? `Jev 分類「${cat}」ON（フォロー中・フォロワー一覧で自動絞り込み）· 費用 ${costLabel}`
+      : `Jev 分類フィルタ OFF（分類: ${cat}）· 費用 ${costLabel}`;
+  el<HTMLSpanElement>('bottom-jev-text').textContent = statusText;
+
+  const errEl = el<HTMLSpanElement>('bottom-jev-error');
+  const errDismissBtn = el<HTMLButtonElement>('btn-bottom-jev-error-dismiss');
+  if (jev?.lastError && jev.enabled) {
+    errEl.textContent = jev.lastError;
+    errEl.title = jev.lastError;
+    errEl.classList.remove('hidden');
+    errDismissBtn.classList.remove('hidden');
+  } else {
+    errEl.classList.add('hidden');
+    errDismissBtn.classList.add('hidden');
+  }
+
+  if (jev && !el('jev-modal').classList.contains('hidden')) {
+    el<HTMLElement>('jev-cost-total').textContent = `累計: ${formatJevCostCompact(jev.totalCostUsd)}`;
+    el<HTMLElement>('jev-cost-session').textContent = `今回の起動中: ${formatJevCostCompact(jev.sessionCostUsd)}`;
+    el<HTMLElement>('jev-cost-meta').textContent =
+      `通信 ${jev.totalApiCalls}回 · 判定 ${jev.totalJudgedAccounts}件 · 入力 ${jev.totalInputTokens.toLocaleString('ja-JP')} tok · キャッシュ ${jev.cacheEntries}件（$0.042/100万tok・出力無料）`;
+  }
+}
+
+async function openJevModal(): Promise<void> {
+  const jev = await omniApi.getJevState();
+  state.jev = jev;
+
+  const catInput = el<HTMLInputElement>('jev-category-input');
+  const keyInput = el<HTMLInputElement>('jev-api-key');
+  const enabledInput = el<HTMLInputElement>('jev-enabled');
+  const thresholdInput = el<HTMLInputElement>('jev-threshold');
+  const testResultEl = el<HTMLDivElement>('jev-test-result');
+
+  catInput.value = jev.category || '女の子';
+  keyInput.value = jev.apiKey || '';
+  keyInput.type = 'password';
+  el<HTMLButtonElement>('btn-jev-toggle-key').textContent = '表示';
+  enabledInput.checked = jev.hasApiKey ? jev.enabled : true;
+
+  const pct = Math.round(Math.min(0.85, Math.max(0.4, jev.threshold || 0.55)) * 100 / 5) * 5;
+  thresholdInput.value = String(pct);
+  updateJevThresholdLabel(pct);
+  renderJevCategoryChips(catInput.value);
+
+  testResultEl.classList.add('hidden');
+  testResultEl.classList.remove('ok', 'err');
+  testResultEl.textContent = '';
+
+  el('jev-modal').classList.remove('hidden');
+  renderJevUi();
+  await syncOverlayToMain();
+  catInput.focus();
+  catInput.select();
+}
+
+async function closeJevModal(): Promise<void> {
+  el('jev-modal').classList.add('hidden');
+  await syncOverlayToMain();
+}
+
+async function quickToggleJevFilter(): Promise<void> {
+  const jev = state.jev ?? (await omniApi.getJevState());
+  state.jev = jev;
+  if (!jev.hasApiKey) {
+    await openJevModal();
+    return;
+  }
+  const nextEnabled = !jev.enabled;
+  state.jev = await omniApi.updateJevSettings({ enabled: nextEnabled });
+  renderJevUi();
+  showToast(
+    nextEnabled
+      ? `Jev 分類フィルタ ON（「${state.jev.category}」）`
+      : 'Jev 分類フィルタ OFF'
+  );
+}
+
+async function saveJevModal(): Promise<void> {
+  const rawKey = el<HTMLInputElement>('jev-api-key').value.trim();
+  const rawCat = el<HTMLInputElement>('jev-category-input').value.trim() || '女の子';
+  const wantEnabled = el<HTMLInputElement>('jev-enabled').checked;
+  const pct = Number(el<HTMLInputElement>('jev-threshold').value) || 55;
+  state.jev = await omniApi.updateJevSettings({
+    apiKey: rawKey,
+    category: rawCat,
+    enabled: wantEnabled && rawKey.length > 0,
+    threshold: pct / 100
+  });
+  renderJevUi();
+  await closeJevModal();
+  if (state.jev.isActive) {
+    showToast(`Jev 分類「${state.jev.category}」を適用しました`);
+  } else {
+    showToast('Jev 分類フィルタ設定を保存しました');
+  }
+}
+
+async function adjustBottomInset(delta: number): Promise<void> {
+  if (!state.config) return;
+  const cur = state.config.settings.viewportBottomInset ?? 44;
+  const next = Math.max(0, Math.min(160, cur + delta));
+  if (next === cur) return;
+  await omniApi.updateSettings({ viewportBottomInset: next });
+}
+
 function renderAll(): void {
   recordLastActiveForCurrent();
   applyThemeAndLayout();
@@ -1603,6 +2101,7 @@ function renderAll(): void {
   renderAccountBar();
   renderToolbarAndViewport();
   renderTabBar();
+  renderJevUi();
   if (state.config?.settings.gesture) {
     gestureModal?.syncSettings(state.config.settings.gesture);
   }
@@ -1618,9 +2117,49 @@ function bindEvents(): void {
     renderSidebar();
   });
 
-  el<HTMLButtonElement>('btn-open-catalog').addEventListener('click', () => void openCatalogModal());
-  el<HTMLButtonElement>('btn-empty-add').addEventListener('click', () => void openCatalogModal());
+  el<HTMLButtonElement>('btn-open-catalog').addEventListener('click', () => void openCatalogModal('all'));
+  el<HTMLButtonElement>('btn-empty-add').addEventListener('click', () => void openCatalogModal('all'));
+  el<HTMLButtonElement>('btn-open-archived').addEventListener('click', () =>
+    void openCatalogModal('archived')
+  );
   el<HTMLButtonElement>('btn-open-settings').addEventListener('click', () => void openSettingsModal());
+
+  // Archived logins modals & purge-all
+  el<HTMLButtonElement>('btn-purge-all-archived').addEventListener('click', async (e) => {
+    const count = state.config?.archivedInstances?.length ?? 0;
+    if (count === 0) return;
+    const btn = e.currentTarget as HTMLElement | null;
+    const ok = await openConfirmDialog({
+      title: 'ログイン記憶をすべて完全削除',
+      message: `保存されている ${count} 件のログイン記憶（Cookie・プロファイル）をすべて完全削除しますか？\n※ この操作は取り消せません。`,
+      confirmLabel: 'すべて完全削除',
+      danger: true,
+      anchorEl: btn,
+      anchorPoint: { x: e.clientX, y: e.clientY }
+    });
+    if (!ok) return;
+    const removed = await omniApi.purgeAllArchivedTabs();
+    showToast(`ログイン記憶 ${removed} 件を完全削除しました`);
+  });
+
+  el<HTMLButtonElement>('btn-close-archived-pick').addEventListener('click', () =>
+    void closeArchivedPickModal()
+  );
+  el<HTMLButtonElement>('btn-archived-pick-cancel').addEventListener('click', () =>
+    void closeArchivedPickModal()
+  );
+  el<HTMLDivElement>('archived-pick-modal').addEventListener('click', (e) => {
+    if (e.target === el('archived-pick-modal')) {
+      void closeArchivedPickModal();
+    }
+  });
+  el<HTMLButtonElement>('btn-archived-pick-new').addEventListener('click', async () => {
+    const action = pendingNewAccountAction;
+    await closeArchivedPickModal();
+    if (action) {
+      await action();
+    }
+  });
 
   // Header account switcher add button
   el<HTMLButtonElement>('btn-add-account').addEventListener('click', () => {
@@ -2126,14 +2665,100 @@ function bindEvents(): void {
     const val = (e.target as HTMLInputElement).value;
     el<HTMLSpanElement>('setting-sidebar-width-val').textContent = val;
   });
+  el<HTMLInputElement>('setting-bottom-inset').addEventListener('input', (e) => {
+    const val = (e.target as HTMLInputElement).value;
+    el<HTMLSpanElement>('setting-bottom-inset-val').textContent = val;
+  });
   el<HTMLButtonElement>('btn-save-settings').addEventListener('click', async () => {
     await omniApi.updateSettings({
       theme: el<HTMLSelectElement>('setting-theme').value as 'dark' | 'light',
       minimizeToTray: el<HTMLInputElement>('setting-minimize-tray').checked,
-      sidebarWidth: Number(el<HTMLInputElement>('setting-sidebar-width').value)
+      sidebarWidth: Number(el<HTMLInputElement>('setting-sidebar-width').value),
+      viewportBottomInset: Number(el<HTMLInputElement>('setting-bottom-inset').value)
     });
     await closeSettingsModal();
     showToast('アプリ設定を保存しました');
+  });
+
+  // Bottom viewport margin quick adjust & Jev category filter
+  el<HTMLButtonElement>('btn-bottom-inset-dec').addEventListener('click', () =>
+    void adjustBottomInset(-12)
+  );
+  el<HTMLButtonElement>('btn-bottom-inset-inc').addEventListener('click', () =>
+    void adjustBottomInset(12)
+  );
+  el<HTMLButtonElement>('btn-jev-filter').addEventListener('click', () => void openJevModal());
+  el<HTMLButtonElement>('btn-jev-filter').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    void quickToggleJevFilter();
+  });
+  el<HTMLButtonElement>('btn-collapsed-jev').addEventListener('click', () => void openJevModal());
+  el<HTMLButtonElement>('btn-collapsed-jev').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    void quickToggleJevFilter();
+  });
+  el<HTMLButtonElement>('btn-bottom-jev-toggle').addEventListener('click', () =>
+    void quickToggleJevFilter()
+  );
+  el<HTMLButtonElement>('btn-bottom-jev-open').addEventListener('click', () => void openJevModal());
+  el<HTMLButtonElement>('btn-bottom-jev-error-dismiss').addEventListener('click', async () => {
+    state.jev = await omniApi.clearJevError();
+    renderJevUi();
+  });
+
+  el<HTMLButtonElement>('btn-close-jev').addEventListener('click', () => void closeJevModal());
+  el<HTMLButtonElement>('btn-jev-cancel').addEventListener('click', () => void closeJevModal());
+  el<HTMLDivElement>('jev-modal').addEventListener('click', (e) => {
+    if (e.target === el('jev-modal')) {
+      void closeJevModal();
+    }
+  });
+  el<HTMLInputElement>('jev-category-input').addEventListener('input', (e) => {
+    renderJevCategoryChips((e.target as HTMLInputElement).value);
+  });
+  el<HTMLInputElement>('jev-category-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void saveJevModal();
+    }
+  });
+  el<HTMLButtonElement>('btn-jev-toggle-key').addEventListener('click', () => {
+    const input = el<HTMLInputElement>('jev-api-key');
+    const showing = input.type === 'text';
+    input.type = showing ? 'password' : 'text';
+    el<HTMLButtonElement>('btn-jev-toggle-key').textContent = showing ? '表示' : '隠す';
+  });
+  el<HTMLInputElement>('jev-threshold').addEventListener('input', (e) => {
+    updateJevThresholdLabel(Number((e.target as HTMLInputElement).value) || 55);
+  });
+  el<HTMLButtonElement>('btn-jev-save').addEventListener('click', () => void saveJevModal());
+  el<HTMLButtonElement>('btn-jev-test').addEventListener('click', async () => {
+    const btn = el<HTMLButtonElement>('btn-jev-test');
+    const resultEl = el<HTMLDivElement>('jev-test-result');
+    const key = el<HTMLInputElement>('jev-api-key').value.trim();
+    const cat = el<HTMLInputElement>('jev-category-input').value.trim() || '女の子';
+    btn.disabled = true;
+    btn.textContent = 'テスト中…';
+    resultEl.classList.add('hidden');
+    try {
+      const res = await omniApi.testJevConnection(key, cat);
+      resultEl.textContent = res.message;
+      resultEl.classList.remove('hidden', 'ok', 'err');
+      resultEl.classList.add(res.ok ? 'ok' : 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '接続テスト';
+    }
+  });
+  el<HTMLButtonElement>('btn-jev-clear-cache').addEventListener('click', async () => {
+    state.jev = await omniApi.clearJevCache();
+    renderJevUi();
+    showToast('Jev 判定キャッシュを消去しました');
+  });
+  el<HTMLButtonElement>('btn-jev-reset-usage').addEventListener('click', async () => {
+    state.jev = await omniApi.resetJevUsage();
+    renderJevUi();
+    showToast('Jev 利用費用カウンタをリセットしました');
   });
 
   // Global keyboard shortcuts inside shell UI
@@ -2145,6 +2770,10 @@ function bindEvents(): void {
     if (e.key === 'Escape') {
       if (!el('confirm-modal').classList.contains('hidden')) {
         void resolveConfirmDialog(false);
+      } else if (!el('archived-pick-modal').classList.contains('hidden')) {
+        void closeArchivedPickModal();
+      } else if (!el('jev-modal').classList.contains('hidden')) {
+        void closeJevModal();
       } else if (!el('follow-modal').classList.contains('hidden')) {
         void closeFollowModal();
       } else if (!el('edit-modal').classList.contains('hidden')) {
@@ -2309,6 +2938,11 @@ async function bootstrap(): Promise<void> {
     renderTabBar();
   });
 
+  omniApi.onJevUpdated((snap) => {
+    state.jev = snap;
+    renderJevUi();
+  });
+
   omniApi.onShortcut((payload) => {
     if (payload.action === 'open-catalog') {
       void openCatalogModal();
@@ -2333,6 +2967,7 @@ async function bootstrap(): Promise<void> {
   state.gmailOpen = Boolean(data.gmailOpen);
   state.gmailRuntime = data.gmailRuntime ?? null;
   state.runtimeMap = new Map(data.runtimeStates.map((rt) => [rt.instanceId, rt]));
+  state.jev = await omniApi.getJevState().catch(() => null);
 
   el<HTMLSpanElement>('app-version').textContent = `v${data.appVersion} · Windows`;
 

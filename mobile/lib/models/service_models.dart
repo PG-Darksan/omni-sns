@@ -146,6 +146,7 @@ class ServiceInstance {
     required this.badge,
     required this.notificationsEnabled,
     required this.order,
+    this.uaMode = 'mobile',
     this.followCountToday = 0,
     this.followCountTotal = 0,
     this.unfollowCountToday = 0,
@@ -167,7 +168,10 @@ class ServiceInstance {
   final String badge;
   final bool notificationsEnabled;
   final int order;
+  final String uaMode;
   final int followCountToday;
+
+  bool get isDesktopUa => uaMode == 'desktop';
   final int followCountTotal;
   final int unfollowCountToday;
   final int unfollowCountTotal;
@@ -259,6 +263,7 @@ class ServiceInstance {
     String? badge,
     bool? notificationsEnabled,
     int? order,
+    String? uaMode,
     int? followCountToday,
     int? followCountTotal,
     int? unfollowCountToday,
@@ -283,6 +288,7 @@ class ServiceInstance {
       badge: badge ?? this.badge,
       notificationsEnabled: notificationsEnabled ?? this.notificationsEnabled,
       order: order ?? this.order,
+      uaMode: uaMode ?? this.uaMode,
       followCountToday: followCountToday ?? this.followCountToday,
       followCountTotal: followCountTotal ?? this.followCountTotal,
       unfollowCountToday: unfollowCountToday ?? this.unfollowCountToday,
@@ -312,6 +318,7 @@ class ServiceInstance {
       'badge': badge,
       'notificationsEnabled': notificationsEnabled,
       'order': order,
+      if (uaMode == 'desktop') 'uaMode': 'desktop',
       'followCountToday': followCountToday,
       'followCountTotal': followCountTotal,
       'unfollowCountToday': unfollowCountToday,
@@ -347,6 +354,7 @@ class ServiceInstance {
       badge: _asNonEmptyString(json['badge']) ?? makeBadgeText(safeName),
       notificationsEnabled: rawNotif is bool ? rawNotif : true,
       order: (json['order'] as num?)?.toInt() ?? index,
+      uaMode: json['uaMode'] == 'desktop' ? 'desktop' : 'mobile',
       followCountToday: _clampNonNegInt(json['followCountToday'], 999999) ?? 0,
       followCountTotal:
           _clampNonNegInt(json['followCountTotal'], 99999999) ?? 0,
@@ -362,6 +370,33 @@ class ServiceInstance {
       snsFollowingCount: _clampNonNegInt(json['snsFollowingCount']),
       snsFollowersCount: _clampNonNegInt(json['snsFollowersCount']),
     );
+  }
+}
+
+/// タブ削除後もログイン記憶（WebView Multi-Profile）を保持するための退避モデル
+class ArchivedInstance {
+  const ArchivedInstance({
+    required this.instance,
+    required this.archivedAt,
+  });
+
+  final ServiceInstance instance;
+  final int archivedAt;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'instance': instance.toJson(),
+      'archivedAt': archivedAt,
+    };
+  }
+
+  static ArchivedInstance? fromJson(Map<String, dynamic> json, int index) {
+    final rawInst = json['instance'];
+    if (rawInst is! Map<String, dynamic>) return null;
+    final inst = ServiceInstance.fromJson(rawInst, index);
+    final ts = (json['archivedAt'] as num?)?.toInt() ??
+        (DateTime.now().millisecondsSinceEpoch ~/ 1000);
+    return ArchivedInstance(instance: inst, archivedAt: ts);
   }
 }
 
@@ -477,6 +512,17 @@ String buildMobileUserAgent() {
   return 'Mozilla/5.0 (Linux; Android 14; Pixel 8) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
       'Chrome/136.0.0.0 Mobile Safari/537.36';
+}
+
+/// スマホ上で PC 版サイトを表示するためのデスクトップ Chrome UA を返す。
+String buildDesktopUserAgent() {
+  return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+      'AppleWebKit/537.36 (KHTML, like Gecko) '
+      'Chrome/136.0.0.0 Safari/537.36';
+}
+
+String buildUserAgentForMode(String uaMode) {
+  return uaMode == 'desktop' ? buildDesktopUserAgent() : buildMobileUserAgent();
 }
 
 /// 安全な http / https URL（ホスト名あり）かを判定する。

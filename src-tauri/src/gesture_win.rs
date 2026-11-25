@@ -1306,6 +1306,7 @@ pub fn compute_viewport_screen_rect(
     main_hwnd: isize,
     sidebar_logical_w: f64,
     header_logical_h: f64,
+    bottom_logical_h: f64,
     scale_factor: f64,
 ) -> Option<ViewportRect> {
     if main_hwnd == 0 {
@@ -1325,10 +1326,11 @@ pub fn compute_viewport_screen_rect(
     let sf = if scale_factor > 0.0 { scale_factor } else { 1.0 };
     let off_x = (sidebar_logical_w * sf).round() as i32;
     let off_y = (header_logical_h * sf).round() as i32;
+    let off_bottom = (bottom_logical_h.max(0.0) * sf).round() as i32;
     let total_w = client.right - client.left;
     let total_h = client.bottom - client.top;
     let vp_w = (total_w - off_x).max(0);
-    let vp_h = (total_h - off_y).max(0);
+    let vp_h = (total_h - off_y - off_bottom).max(0);
     Some(ViewportRect {
         left: top_left.x + off_x,
         top: top_left.y + off_y,

@@ -61,8 +61,8 @@ export const ACTION_SECTIONS: ActionSection[] = [
   {
     title: 'タブ操作',
     items: [
-      { id: 'previous-tab', label: '前のタブへ', badge: '◀', hint: 'サブタブ1枚時は前のSNSへ' },
-      { id: 'next-tab', label: '次のタブへ', badge: '▶', hint: 'サブタブ1枚時は次のSNSへ' },
+      { id: 'previous-tab', label: '前のタブへ', badge: '◀', hint: '現在のアカウント内のタブのみ切替（他SNSには移動しません）' },
+      { id: 'next-tab', label: '次のタブへ', badge: '▶', hint: '現在のアカウント内のタブのみ切替（他SNSには移動しません）' },
       { id: 'new-tab', label: '新しいタブを開く', badge: '＋' },
       {
         id: 'ctrl-click',
@@ -113,8 +113,8 @@ export const ACTION_SECTIONS: ActionSection[] = [
   {
     title: 'SNS・アカウント切替',
     items: [
-      { id: 'previous-service', label: '前のSNSサービスへ', badge: '▲' },
-      { id: 'next-service', label: '次のSNSサービスへ', badge: '▼' },
+      { id: 'previous-service', label: '上の項目へ（前のSNS）', badge: '▲', keywords: '上 項目 前 sns サービス サイドバー' },
+      { id: 'next-service', label: '下の項目へ（次のSNS）', badge: '▼', keywords: '下 項目 次 sns サービス サイドバー' },
       { id: 'previous-account', label: '前のアカウントへ（同一SNS）', badge: '◁' },
       { id: 'next-account', label: '次のアカウントへ（同一SNS）', badge: '▷' },
       { id: 'open-catalog', label: 'SNSカタログを開く', badge: '⊞' },

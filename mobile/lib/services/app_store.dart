@@ -18,6 +18,7 @@ class CatalogData {
 class AppStore {
   static const _instancesKey = 'omnisns_instances_v1';
   static const _instancesBackupKey = 'omnisns_instances_v1_corrupt_backup';
+  static const _archivedInstancesKey = 'omnisns_archived_instances_v1';
   static const _settingsKey = 'omnisns_settings_v1';
   static const _followSyncSettingsKey = 'omnisns_follow_sync_settings_v1';
   static const _followSyncLedgerKey = 'omnisns_follow_sync_ledger_v1';
@@ -226,6 +227,42 @@ class AppStore {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_instancesKey, instancesJson);
       await prefs.setString(_settingsKey, settingsJson);
+    });
+  }
+
+  Future<List<ArchivedInstance>> loadArchivedInstances(
+    List<ServiceInstance> activeInstances,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_archivedInstancesKey);
+    if (raw == null || raw.isEmpty) return [];
+    final activeIds = activeInstances.map((i) => i.instanceId).toSet();
+    final seen = <String>{};
+    final result = <ArchivedInstance>[];
+    try {
+      final list = jsonDecode(raw) as List<dynamic>;
+      for (var i = 0; i < list.length && result.length < 100; i++) {
+        final item = list[i];
+        if (item is! Map<String, dynamic>) continue;
+        final parsed = ArchivedInstance.fromJson(item, i);
+        if (parsed == null) continue;
+        if (_isRemovedService(parsed.instance)) continue;
+        if (activeIds.contains(parsed.instance.instanceId)) continue;
+        if (!seen.add(parsed.instance.instanceId)) continue;
+        result.add(parsed);
+      }
+    } catch (_) {
+      return [];
+    }
+    return result;
+  }
+
+  Future<void> saveArchivedInstances(List<ArchivedInstance> archived) {
+    final encoded = archived.take(100).map((e) => e.toJson()).toList();
+    final encodedJson = jsonEncode(encoded);
+    return _enqueueWrite(() async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_archivedInstancesKey, encodedJson);
     });
   }
 

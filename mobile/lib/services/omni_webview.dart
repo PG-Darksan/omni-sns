@@ -38,6 +38,18 @@ typedef OmniWebViewAccountIdentityCallback = void Function(
   int? following,
   int? followers,
 );
+typedef OmniWebViewOpenNewTabCallback = void Function(String url);
+typedef OmniWebViewJevGetConfigCallback = void Function();
+typedef OmniWebViewJevCheckAccountsCallback = void Function(
+  String reqId,
+  String payloadJson,
+);
+typedef OmniWebViewJevStateCallback = void Function(
+  bool active,
+  int matched,
+  int hidden,
+  bool autoFetching,
+);
 
 /// Android ネイティブ WebView マルチプロファイル管理ブリッジ
 class OmniWebViewManager {
@@ -152,6 +164,10 @@ class OmniWebViewController {
     this.onFollowDetected,
     this.onUnfollowDetected,
     this.onAccountIdentity,
+    this.onOpenNewTab,
+    this.onJevGetConfig,
+    this.onJevCheckAccounts,
+    this.onJevState,
   })  : _pendingUrl = initialUrl,
         _isActive = initiallyActive;
 
@@ -170,6 +186,10 @@ class OmniWebViewController {
   final OmniWebViewFollowDetectedCallback? onFollowDetected;
   final OmniWebViewUnfollowDetectedCallback? onUnfollowDetected;
   final OmniWebViewAccountIdentityCallback? onAccountIdentity;
+  final OmniWebViewOpenNewTabCallback? onOpenNewTab;
+  final OmniWebViewJevGetConfigCallback? onJevGetConfig;
+  final OmniWebViewJevCheckAccountsCallback? onJevCheckAccounts;
+  final OmniWebViewJevStateCallback? onJevState;
 
   MethodChannel? _channel;
   String? _pendingUrl;
@@ -272,6 +292,25 @@ class OmniWebViewController {
         if (handle.isNotEmpty) {
           onAccountIdentity?.call(service, handle, following, followers);
         }
+      case 'onOpenNewTab':
+        final url = map['url'] as String? ?? '';
+        if (url.isNotEmpty) {
+          onOpenNewTab?.call(url);
+        }
+      case 'onJevGetConfig':
+        onJevGetConfig?.call();
+      case 'onJevCheckAccounts':
+        final reqId = map['reqId'] as String? ?? '';
+        final payload = map['payload'] as String? ?? '[]';
+        if (reqId.isNotEmpty) {
+          onJevCheckAccounts?.call(reqId, payload);
+        }
+      case 'onJevState':
+        final active = map['active'] == true;
+        final matched = (map['matched'] as num?)?.toInt() ?? 0;
+        final hidden = (map['hidden'] as num?)?.toInt() ?? 0;
+        final autoFetching = map['autoFetching'] == true;
+        onJevState?.call(active, matched, hidden, autoFetching);
     }
     return null;
   }
@@ -373,6 +412,26 @@ class OmniWebViewController {
       await _channel?.invokeMethod<void>(
         'scrollToEdge',
         <String, dynamic>{'toTop': toTop},
+      );
+    } catch (_) {}
+  }
+
+  Future<void> setUserAgent(String userAgent, {bool reload = true}) async {
+    if (_disposed) return;
+    try {
+      await _channel?.invokeMethod<void>(
+        'setUserAgent',
+        <String, dynamic>{'userAgent': userAgent, 'reload': reload},
+      );
+    } catch (_) {}
+  }
+
+  Future<void> evaluateJavascript(String script) async {
+    if (_disposed) return;
+    try {
+      await _channel?.invokeMethod<void>(
+        'evaluateJavascript',
+        <String, dynamic>{'script': script},
       );
     } catch (_) {}
   }
