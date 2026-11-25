@@ -1,6 +1,6 @@
 [package]
 name = "omni-sns"
-version = "1.8.0"
+version = "1.8.1"
 description = "Windows向け 全SNS・マッチングアプリ統合メッセージングブラウザ (All-in-One SNS & Matching Desk)"
 authors = ["Darksan"]
 license = "MIT"

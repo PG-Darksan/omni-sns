@@ -4722,7 +4722,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                         Text(
-                          'Android · v1.8.0',
+                          'Android · v1.8.1',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],
