@@ -33,12 +33,16 @@ use webview2_com::{
     HistoryChangedEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler,
     SourceChangedEventHandler, WebMessageReceivedEventHandler, ZoomFactorChangedEventHandler,
 };
-use windows::Win32::Foundation::{FALSE, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{GlobalFree, LocalFree, FALSE, HANDLE, HGLOBAL, HLOCAL, HWND};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
     WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WinHttpSetOption, WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
     WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+};
+use windows::Win32::Security::Cryptography::{
+    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -53,7 +57,119 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_core::{BOOL, Interface, HSTRING, PCWSTR, PWSTR};
 
-use crate::url_utils::is_http_url;
+use crate::url_utils::{
+    canonical_external_http_url, detect_platform_service_from_url, is_safe_favicon_url,
+    is_same_site_url,
+};
+
+fn encode_hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = match bytes[i] {
+            b'0'..=b'9' => bytes[i] - b'0',
+            b'a'..=b'f' => bytes[i] - b'a' + 10,
+            b'A'..=b'F' => bytes[i] - b'A' + 10,
+            _ => return None,
+        };
+        let lo = match bytes[i + 1] {
+            b'0'..=b'9' => bytes[i + 1] - b'0',
+            b'a'..=b'f' => bytes[i + 1] - b'a' + 10,
+            b'A'..=b'F' => bytes[i + 1] - b'A' + 10,
+            _ => return None,
+        };
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// Windows DPAPI（現在ログイン中の Windows ユーザー専用鍵）で機密トークンを暗号化する。
+pub fn dpapi_protect_secret(plaintext: &str) -> Option<String> {
+    if plaintext.is_empty() {
+        return Some(String::new());
+    }
+    let mut input = plaintext.as_bytes().to_vec();
+    let in_blob = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(input.len()).ok()?,
+        pbData: input.as_mut_ptr(),
+    };
+    let mut out_blob = CRYPT_INTEGER_BLOB::default();
+    let ok = unsafe {
+        CryptProtectData(
+            &in_blob,
+            PCWSTR::null(),
+            None,
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut out_blob,
+        )
+    };
+    if ok.is_err() || out_blob.pbData.is_null() || out_blob.cbData == 0 {
+        return None;
+    }
+    let encrypted = unsafe {
+        let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
+        let hex = encode_hex_lower(slice);
+        let _ = LocalFree(Some(HLOCAL(out_blob.pbData as *mut std::ffi::c_void)));
+        hex
+    };
+    Some(format!("dpapi:v1:{encrypted}"))
+}
+
+/// Windows DPAPI で暗号化されたトークンを復号する。
+pub fn dpapi_unprotect_secret(encoded: &str) -> Option<String> {
+    let hex = encoded.trim().strip_prefix("dpapi:v1:")?;
+    let mut raw = decode_hex(hex)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let in_blob = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(raw.len()).ok()?,
+        pbData: raw.as_mut_ptr(),
+    };
+    let mut out_blob = CRYPT_INTEGER_BLOB::default();
+    let ok = unsafe {
+        CryptUnprotectData(
+            &in_blob,
+            None,
+            None,
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut out_blob,
+        )
+    };
+    if ok.is_err() || out_blob.pbData.is_null() {
+        return None;
+    }
+    let decrypted = unsafe {
+        let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
+        let s = String::from_utf8(slice.to_vec()).ok();
+        let _ = LocalFree(Some(HLOCAL(out_blob.pbData as *mut std::ffi::c_void)));
+        s
+    };
+    decrypted
+}
+
+fn has_crlf_or_nul(s: &str) -> bool {
+    s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
 
 /// WinHTTP を使って HTTPS JSON リクエスト（GET / POST / PATCH）を実行する。
 pub fn winhttp_json_request(
@@ -63,13 +179,34 @@ pub fn winhttp_json_request(
     headers: &[(&str, &str)],
     body: Option<&str>,
 ) -> Result<(u16, String), String> {
-    let ua = HSTRING::from("OmniSNS/1.5");
+    if method.is_empty()
+        || host.is_empty()
+        || path.is_empty()
+        || has_crlf_or_nul(method)
+        || has_crlf_or_nul(host)
+        || has_crlf_or_nul(path)
+        || method.bytes().any(|b| !b.is_ascii_alphabetic())
+        || host.bytes().any(|b| b.is_ascii_whitespace())
+        || path.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err("不正な HTTPS リクエストパラメータです".to_string());
+    }
+
+    let ua = HSTRING::from("OmniSNS/1.6");
     let host_h = HSTRING::from(host);
     let method_h = HSTRING::from(method);
     let path_h = HSTRING::from(path);
 
     let mut header_str = String::new();
     for (k, v) in headers {
+        if k.is_empty()
+            || has_crlf_or_nul(k)
+            || has_crlf_or_nul(v)
+            || k.bytes().any(|b| b <= 0x20 || b >= 0x7F || b == b':')
+            || v.bytes().any(|b| b < 0x20 || b == 0x7F)
+        {
+            return Err("不正な HTTP ヘッダーが含まれています".to_string());
+        }
         header_str.push_str(k);
         header_str.push_str(": ");
         header_str.push_str(v);
@@ -77,6 +214,8 @@ pub fn winhttp_json_request(
     }
     let header_wide: Vec<u16> = header_str.encode_utf16().collect();
     let body_bytes = body.map(|b| b.as_bytes()).unwrap_or(&[]);
+    let body_len = u32::try_from(body_bytes.len())
+        .map_err(|_| "送信データサイズが大きすぎます".to_string())?;
 
     unsafe {
         let session = WinHttpOpen(
@@ -112,6 +251,20 @@ pub fn winhttp_json_request(
             return Err("WinHttpOpenRequest に失敗しました".to_string());
         }
 
+        let redirect_policy: u32 = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        if WinHttpSetOption(
+            Some(req),
+            WINHTTP_OPTION_REDIRECT_POLICY,
+            Some(&redirect_policy.to_ne_bytes()),
+        )
+        .is_err()
+        {
+            let _ = WinHttpCloseHandle(req);
+            let _ = WinHttpCloseHandle(connect);
+            let _ = WinHttpCloseHandle(session);
+            return Err("WinHttpSetOption に失敗しました".to_string());
+        }
+
         let headers_opt = if header_wide.is_empty() {
             None
         } else {
@@ -122,7 +275,6 @@ pub fn winhttp_json_request(
         } else {
             Some(body_bytes.as_ptr() as *const std::ffi::c_void)
         };
-        let body_len = body_bytes.len() as u32;
 
         let send_res = WinHttpSendRequest(req, headers_opt, opt_ptr, body_len, body_len, 0);
         if send_res.is_err() {
@@ -151,10 +303,16 @@ pub fn winhttp_json_request(
             &mut header_idx,
         );
 
+        const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
         let mut response_bytes: Vec<u8> = Vec::new();
+        let mut read_err: Option<String> = None;
         loop {
             let mut avail: u32 = 0;
-            if WinHttpQueryDataAvailable(req, &mut avail).is_err() || avail == 0 {
+            if WinHttpQueryDataAvailable(req, &mut avail).is_err() {
+                read_err = Some("HTTPS 応答の読み取り中に接続が中断されました".to_string());
+                break;
+            }
+            if avail == 0 {
                 break;
             }
             let chunk_size = avail.min(65536) as usize;
@@ -167,19 +325,27 @@ pub fn winhttp_json_request(
                 &mut read,
             )
             .is_err()
-                || read == 0
             {
+                read_err = Some("HTTPS 応答の受信中にエラーが発生しました".to_string());
+                break;
+            }
+            if read == 0 {
+                break;
+            }
+            if response_bytes.len().saturating_add(read as usize) > MAX_RESPONSE_BYTES {
+                read_err = Some("HTTPS 応答サイズが上限を超えました".to_string());
                 break;
             }
             response_bytes.extend_from_slice(&buf[..read as usize]);
-            if response_bytes.len() > 2 * 1024 * 1024 {
-                break;
-            }
         }
 
         let _ = WinHttpCloseHandle(req);
         let _ = WinHttpCloseHandle(connect);
         let _ = WinHttpCloseHandle(session);
+
+        if let Some(err) = read_err {
+            return Err(err);
+        }
 
         let text = String::from_utf8_lossy(&response_bytes).to_string();
         Ok((status_code as u16, text))
@@ -218,7 +384,19 @@ pub fn winhttp_request_bytes(
     let path_h = HSTRING::from(path_and_query.as_str());
 
     let mut header_str = String::new();
+    let mut has_auth_header = false;
     for (k, v) in headers {
+        if k.is_empty()
+            || has_crlf_or_nul(k)
+            || has_crlf_or_nul(v)
+            || k.bytes().any(|b| b <= 0x20 || b >= 0x7F || b == b':')
+            || v.bytes().any(|b| b < 0x20 || b == 0x7F)
+        {
+            return Err("不正な HTTP ヘッダーが含まれています".to_string());
+        }
+        if k.eq_ignore_ascii_case("authorization") {
+            has_auth_header = true;
+        }
         header_str.push_str(k);
         header_str.push_str(": ");
         header_str.push_str(v);
@@ -265,6 +443,22 @@ pub fn winhttp_request_bytes(
             let _ = WinHttpCloseHandle(connect);
             let _ = WinHttpCloseHandle(session);
             return Err("WinHttpOpenRequest に失敗しました".to_string());
+        }
+
+        if has_auth_header {
+            let redirect_policy: u32 = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            if WinHttpSetOption(
+                Some(req),
+                WINHTTP_OPTION_REDIRECT_POLICY,
+                Some(&redirect_policy.to_ne_bytes()),
+            )
+            .is_err()
+            {
+                let _ = WinHttpCloseHandle(req);
+                let _ = WinHttpCloseHandle(connect);
+                let _ = WinHttpCloseHandle(session);
+                return Err("WinHttpSetOption に失敗しました".to_string());
+            }
         }
 
         let headers_opt = if header_wide.is_empty() {
@@ -372,9 +566,13 @@ pub fn copy_text_to_clipboard(text: &str) {
             if !ptr.is_null() {
                 copy_nonoverlapping(wide.as_ptr(), ptr as *mut u16, wide.len());
                 let _ = GlobalUnlock(hmem);
-                let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0)));
+                // SetClipboardData 成功時のみ OS が所有権を引き取る。失敗時は自分で解放する。
+                if SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))).is_err() {
+                    let _ = GlobalFree(Some(hmem));
+                }
             } else {
-                let _: HGLOBAL = hmem;
+                let h: HGLOBAL = hmem;
+                let _ = GlobalFree(Some(h));
             }
         }
 
@@ -384,11 +582,11 @@ pub fn copy_text_to_clipboard(text: &str) {
 
 /// 安全な http/https URL のみを Windows 既定ブラウザで開く。
 pub fn open_external_url(url: &str) {
-    if !is_http_url(url) {
+    let Some(canonical) = canonical_external_http_url(url) else {
         return;
-    }
+    };
     let verb = HSTRING::from("open");
-    let target = HSTRING::from(url);
+    let target = HSTRING::from(canonical);
     unsafe {
         ShellExecuteW(
             None,
@@ -688,11 +886,60 @@ pub struct TabWebviewCallbacks {
     pub on_jev_message: Arc<dyn Fn(String) + Send + Sync>,
 }
 
+/// WebView 単位で予測不能な認証トークン（128bit 相当）を生成する。
+/// 注入スクリプトのクロージャ内にのみ保持し、任意ページからの WebMessage 偽装を防ぐ。
+pub fn generate_bridge_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u64(nanos);
+    h1.write_u64(seq);
+    let a = h1.finish();
+
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(a.rotate_left(17));
+    h2.write_u64(seq ^ 0x9E37_79B9_7F4A_7C15);
+    let b = h2.finish();
+
+    format!("{a:016x}{b:016x}")
+}
+
+pub fn build_follow_tracker_js(bridge_token: &str) -> String {
+    FOLLOW_TRACKER_JS.replace("__OMNI_BRIDGE_TOKEN__", bridge_token)
+}
+
+pub fn build_profile_stats_js(bridge_token: &str) -> String {
+    PROFILE_STATS_JS.replace("__OMNI_BRIDGE_TOKEN__", bridge_token)
+}
+
+pub fn build_long_press_new_tab_js(bridge_token: &str) -> String {
+    LONG_PRESS_NEW_TAB_JS.replace("__OMNI_BRIDGE_TOKEN__", bridge_token)
+}
+
+pub fn build_jev_filter_js(bridge_token: &str) -> String {
+    JEV_FILTER_JS.replace("__OMNI_BRIDGE_TOKEN__", bridge_token)
+}
+
 /// Threads / Instagram / Bluesky / mixi2 等のフォロー・アンフォロー操作を自動検知してホストへ通知するスクリプト。
 pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
   if (window !== window.top) return;
   if (window.__omniFollowTrackerInstalled) return;
   window.__omniFollowTrackerInstalled = true;
+
+  var __OMNI_TOKEN__ = "__OMNI_BRIDGE_TOKEN__";
+  var __omniPostMessage = (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function')
+    ? window.chrome.webview.postMessage.bind(window.chrome.webview)
+    : null;
 
   var NEGATIVE_FOLLOW_RE = /(フォロー中|フォロー済|フォロー解除|フォローをやめる|フォローを外す|フォロワー|リクエスト済|リクエスト中|承認待ち|解除|following|unfollow|followers|requested|pending|remove|cancel|block|mute)/i;
   var EXACT_FOLLOW_TEXT_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォローを返す|follow|follow\s+back)$/i;
@@ -822,8 +1069,10 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       }
     } catch (_) {}
     try {
-      if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
-        window.chrome.webview.postMessage(JSON.stringify({
+      var poster = __omniPostMessage || (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function' ? window.chrome.webview.postMessage.bind(window.chrome.webview) : null);
+      if (poster) {
+        poster(JSON.stringify({
+          token: __OMNI_TOKEN__,
           type: action === 'unfollow' ? 'omnisns:unfollow' : 'omnisns:follow',
           source: source || 'auto',
           service: detectCurrentService()
@@ -1232,6 +1481,11 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   if (window.__omniProfileStatsInstalled) return;
   window.__omniProfileStatsInstalled = true;
 
+  var __OMNI_TOKEN__ = "__OMNI_BRIDGE_TOKEN__";
+  var __omniPostMessage = (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function')
+    ? window.chrome.webview.postMessage.bind(window.chrome.webview)
+    : null;
+
   var host = (window.location && window.location.hostname || '').toLowerCase();
   if (!host || host === 'localhost' || host === '127.0.0.1') return;
 
@@ -1563,8 +1817,10 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     if (key === lastPostedIdentityKey) return;
     lastPostedIdentityKey = key;
     try {
-      if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
-        window.chrome.webview.postMessage(JSON.stringify({
+      var poster = __omniPostMessage || (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function' ? window.chrome.webview.postMessage.bind(window.chrome.webview) : null);
+      if (poster) {
+        poster(JSON.stringify({
+          token: __OMNI_TOKEN__,
           type: 'omnisns:account-identity',
           service: platform,
           handle: handle,
@@ -2990,13 +3246,14 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         delete queuedSet[batch[i]];
         inFlight[batch[i]] = true;
       }
-      fetchBlueskyBatch(batch).then(function() {
+      var doneBatch = function() {
         for (var j = 0; j < batch.length; j++) delete inFlight[batch[j]];
         setTimeout(function() {
           activeWorkers = Math.max(0, activeWorkers - 1);
           processQueue();
         }, 220);
-      });
+      };
+      Promise.resolve(fetchBlueskyBatch(batch)).then(doneBatch, doneBatch);
       return;
     }
 
@@ -3017,13 +3274,14 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         else if (platform === 'tiktok') { req = fetchTikTokProfile(handle); delayMs = 680; }
         else if (platform === 'pixiv') { req = fetchPixivProfile(handle); delayMs = 320; }
         else { req = Promise.resolve(); delayMs = 300; }
-        req.then(function() {
+        var doneSingle = function() {
           delete inFlight[handle];
           setTimeout(function() {
             activeWorkers = Math.max(0, activeWorkers - 1);
             processQueue();
           }, delayMs);
-        });
+        };
+        Promise.resolve(req).then(doneSingle, doneSingle);
       })();
     }
   }
@@ -3804,6 +4062,11 @@ pub const LONG_PRESS_NEW_TAB_JS: &str = r#"(function() {
   if (window.__omniLongPressNewTabInstalled) return;
   window.__omniLongPressNewTabInstalled = true;
 
+  var __OMNI_TOKEN__ = "__OMNI_BRIDGE_TOKEN__";
+  var __omniPostMessage = (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function')
+    ? window.chrome.webview.postMessage.bind(window.chrome.webview)
+    : null;
+
   var HOLD_MS = 460;
   var MOVE_TOLERANCE_PX = 10;
   var activeTimer = null;
@@ -3931,8 +4194,9 @@ pub const LONG_PRESS_NEW_TAB_JS: &str = r#"(function() {
 
   function postOpenNewTab(url) {
     try {
-      if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
-        window.chrome.webview.postMessage(JSON.stringify({ type: 'omnisns:open-new-tab', url: url }));
+      var poster = __omniPostMessage || (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function' ? window.chrome.webview.postMessage.bind(window.chrome.webview) : null);
+      if (poster) {
+        poster(JSON.stringify({ token: __OMNI_TOKEN__, type: 'omnisns:open-new-tab', url: url }));
         return true;
       }
       if (window.OmniFollowBridge && typeof window.OmniFollowBridge.onOpenNewTab === 'function') {
@@ -4029,6 +4293,11 @@ pub const JEV_FILTER_JS: &str = r#"(function() {
   if (window.__omniJevInstalled) return;
   window.__omniJevInstalled = true;
 
+  var __OMNI_TOKEN__ = "__OMNI_BRIDGE_TOKEN__";
+  var __omniPostMessage = (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function')
+    ? window.chrome.webview.postMessage.bind(window.chrome.webview)
+    : null;
+
   var host = (location.hostname || '').toLowerCase();
   var IS_INSTAGRAM = host === 'instagram.com' || host.endsWith('.instagram.com');
   var IS_TIKTOK = host === 'tiktok.com' || host.endsWith('.tiktok.com');
@@ -4115,9 +4384,10 @@ pub const JEV_FILTER_JS: &str = r#"(function() {
 
   function sendToHost(type, payload) {
     try {
-      if (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function') {
-        var msg = Object.assign({ type: type }, payload || {});
-        window.chrome.webview.postMessage(JSON.stringify(msg));
+      var poster = __omniPostMessage || (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function' ? window.chrome.webview.postMessage.bind(window.chrome.webview) : null);
+      if (poster) {
+        var msg = Object.assign({ token: __OMNI_TOKEN__, type: type }, payload || {});
+        poster(JSON.stringify(msg));
         return true;
       }
       if (window.OmniFollowBridge) {
@@ -5371,12 +5641,30 @@ fn format_web_error_status(status: COREWEBVIEW2_WEB_ERROR_STATUS) -> &'static st
     }
 }
 
+#[derive(serde::Deserialize)]
+struct InboundWebMessage {
+    token: String,
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
+    following: Option<u64>,
+    #[serde(default)]
+    followers: Option<u64>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
 /// SNSタブ子WebView2へネイティブイベントハンドラ（ナビゲーション・ファビコン・ミュート・ショートカット等）を接続する。
 pub fn attach_tab_handlers(
     controller: &ICoreWebView2Controller,
     initial_muted: bool,
     initial_zoom: f64,
     initial_ua: &str,
+    bridge_token: String,
+    instance_home_url: String,
+    initial_navigate_url: Option<String>,
     callbacks: TabWebviewCallbacks,
 ) {
     unsafe {
@@ -5398,80 +5686,137 @@ pub fn attach_tab_handlers(
             }
         }
 
-        // WebMessage でフォロー/アンフォロー検知・ログインアカウントID＆実フォロー数・長押し新規タブ・Jev フィルタを受信する
-        // （スクリプト自体は WebviewBuilder::initialization_script でページ読み込み前に先行注入済み）
+        // WebMessage でフォロー/アンフォロー検知・ログインアカウントID＆実フォロー数・長押し新規タブ・Jev フィルタを受信する。
+        // Per-WebView 秘密トークン + args.Source()/wv.Source() 同一オリジン検証 + レート制限を強制し、
+        // 任意ページ・iframe・広告スクリプトからのメッセージ偽装や DoS を防ぐ。
         {
             let cb_follow = callbacks.on_follow_detected.clone();
             let cb_unfollow = callbacks.on_unfollow_detected.clone();
             let cb_identity = callbacks.on_account_identity.clone();
             let cb_open_new_tab = callbacks.on_open_new_tab.clone();
             let cb_jev = callbacks.on_jev_message.clone();
+            let expected_token = bridge_token;
+            let home_url_for_msg = instance_home_url;
+            let rate_state = std::sync::Mutex::new((std::time::Instant::now(), 0u32));
             let mut token = Default::default();
             let _ = wv.add_WebMessageReceived(
-                &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
-                    if let Some(args) = args {
-                        let mut raw = PWSTR::null();
-                        if args.TryGetWebMessageAsString(&mut raw).is_ok() {
-                            let msg = take_pwstr(raw);
-                            if msg.contains("\"omnisns:follow\"") {
-                                let svc = serde_json::from_str::<serde_json::Value>(&msg)
-                                    .ok()
-                                    .and_then(|v| {
-                                        v.get("service")
-                                            .and_then(|x| x.as_str())
-                                            .map(|s| s.trim().to_ascii_lowercase())
-                                            .filter(|s| !s.is_empty())
-                                    });
-                                cb_follow(svc);
-                            } else if msg.contains("\"omnisns:unfollow\"") {
-                                let svc = serde_json::from_str::<serde_json::Value>(&msg)
-                                    .ok()
-                                    .and_then(|v| {
-                                        v.get("service")
-                                            .and_then(|x| x.as_str())
-                                            .map(|s| s.trim().to_ascii_lowercase())
-                                            .filter(|s| !s.is_empty())
-                                    });
-                                cb_unfollow(svc);
-                            } else if msg.contains("\"omnisns:account-identity\"") {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
-                                    if let Some(handle) = v
-                                        .get("handle")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.trim().trim_start_matches('@').to_lowercase())
-                                        .filter(|s| !s.is_empty())
-                                    {
-                                        let svc = v
-                                            .get("service")
-                                            .and_then(|x| x.as_str())
-                                            .map(|s| s.trim().to_ascii_lowercase())
-                                            .filter(|s| !s.is_empty());
-                                        let following = v
-                                            .get("following")
-                                            .and_then(|x| x.as_u64())
-                                            .map(|n| n.min(u32::MAX as u64) as u32);
-                                        let followers = v
-                                            .get("followers")
-                                            .and_then(|x| x.as_u64())
-                                            .map(|n| n.min(u32::MAX as u64) as u32);
-                                        cb_identity(svc, handle, following, followers);
-                                    }
-                                }
-                            } else if msg.contains("\"omnisns:open-new-tab\"") {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) {
-                                    if let Some(url) = v
-                                        .get("url")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.trim())
-                                        .filter(|s| is_http_url(s))
-                                    {
-                                        cb_open_new_tab(url.to_string());
-                                    }
-                                }
-                            } else if msg.contains("\"omnisns:jev-") {
-                                cb_jev(msg);
+                &WebMessageReceivedEventHandler::create(Box::new(move |sender, args| {
+                    let (Some(wv), Some(args)) = (sender, args) else {
+                        return Ok(());
+                    };
+                    if expected_token.is_empty() {
+                        return Ok(());
+                    }
+
+                    // レート制限（1秒あたり最大25メッセージ）
+                    if let Ok(mut rl) = rate_state.lock() {
+                        if rl.0.elapsed() >= std::time::Duration::from_secs(1) {
+                            rl.0 = std::time::Instant::now();
+                            rl.1 = 1;
+                        } else {
+                            rl.1 = rl.1.saturating_add(1);
+                            if rl.1 > 25 {
+                                return Ok(());
                             }
                         }
+                    }
+
+                    // 送信元 URL とトップレベル URL の一致・http(s) スキームを検証
+                    let mut src_pw = PWSTR::null();
+                    if args.Source(&mut src_pw).is_err() {
+                        return Ok(());
+                    }
+                    let msg_source = take_pwstr(src_pw);
+                    let mut top_pw = PWSTR::null();
+                    if wv.Source(&mut top_pw).is_err() {
+                        return Ok(());
+                    }
+                    let top_source = take_pwstr(top_pw);
+
+                    let (Ok(msg_url), Ok(top_url)) =
+                        (url::Url::parse(&msg_source), url::Url::parse(&top_source))
+                    else {
+                        return Ok(());
+                    };
+                    if !matches!(msg_url.scheme(), "https" | "http")
+                        || msg_url.scheme() != top_url.scheme()
+                        || msg_url.host_str() != top_url.host_str()
+                    {
+                        return Ok(());
+                    }
+
+                    let mut raw = PWSTR::null();
+                    if args.TryGetWebMessageAsString(&mut raw).is_err() {
+                        return Ok(());
+                    }
+                    let msg = take_pwstr(raw);
+                    // Jev バッチ判定は最大 16 件のアイコン base64 を含むため最大 4MB まで許可し、通常メッセージは 8KB に制限
+                    if msg.len() > 4 * 1024 * 1024 {
+                        return Ok(());
+                    }
+                    let Ok(parsed) = serde_json::from_str::<InboundWebMessage>(&msg) else {
+                        return Ok(());
+                    };
+                    if parsed.token != expected_token {
+                        return Ok(());
+                    }
+                    if !parsed.msg_type.starts_with("omnisns:jev-") && msg.len() > 8192 {
+                        return Ok(());
+                    }
+
+                    // プラットフォーム名は JS 申告値ではなく WebView2 が検証した送信元 URL から決定する。
+                    // 既知の 16 プラットフォームに加え、Mastodon/Misskey・その他カタログ/カスタム SNS は
+                    // インスタンス設定のホーム URL と同一サイトであれば自サービスのフォロー計測を許可する。
+                    let verified_service =
+                        detect_platform_service_from_url(&msg_source).map(|s| s.to_string());
+                    let is_own_service_site = !home_url_for_msg.is_empty()
+                        && is_same_site_url(&msg_source, &home_url_for_msg);
+
+                    match parsed.msg_type.as_str() {
+                        "omnisns:follow" => {
+                            if verified_service.is_some() || is_own_service_site {
+                                cb_follow(verified_service);
+                            }
+                        }
+                        "omnisns:unfollow" => {
+                            if verified_service.is_some() || is_own_service_site {
+                                cb_unfollow(verified_service);
+                            }
+                        }
+                        "omnisns:account-identity" => {
+                            if verified_service.is_some() {
+                                if let Some(handle) = parsed
+                                    .handle
+                                    .as_deref()
+                                    .and_then(crate::follow_sync::normalize_account_handle)
+                                {
+                                    let following =
+                                        parsed.following.map(|n| n.min(u32::MAX as u64) as u32);
+                                    let followers =
+                                        parsed.followers.map(|n| n.min(u32::MAX as u64) as u32);
+                                    cb_identity(verified_service, handle, following, followers);
+                                }
+                            }
+                        }
+                        "omnisns:open-new-tab" => {
+                            if let Some(target_url) = parsed
+                                .url
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| {
+                                    crate::url_utils::is_http_url(s)
+                                        && url::Url::parse(s)
+                                            .map(|u| !crate::url_utils::is_internal_tauri_url(&u))
+                                            .unwrap_or(false)
+                                })
+                            {
+                                cb_open_new_tab(target_url.to_string());
+                            }
+                        }
+                        t if t.starts_with("omnisns:jev-") => {
+                            cb_jev(msg);
+                        }
+                        _ => {}
                     }
                     Ok(())
                 })),
@@ -5488,7 +5833,16 @@ pub fn attach_tab_handlers(
             let cb = callbacks.on_navigation_starting.clone();
             let mut token = Default::default();
             let _ = wv.add_NavigationStarting(
-                &NavigationStartingEventHandler::create(Box::new(move |_, _| {
+                &NavigationStartingEventHandler::create(Box::new(move |_, args| {
+                    if let Some(args) = args {
+                        let mut uri_pw = PWSTR::null();
+                        if args.Uri(&mut uri_pw).is_ok() {
+                            let uri = take_pwstr(uri_pw);
+                            if uri.eq_ignore_ascii_case("about:blank") {
+                                return Ok(());
+                            }
+                        }
+                    }
                     cb();
                     Ok(())
                 })),
@@ -5506,6 +5860,9 @@ pub fn attach_tab_handlers(
                         return Ok(());
                     };
                     let (url, can_back, can_fwd) = read_nav_snapshot(&wv);
+                    if url.eq_ignore_ascii_case("about:blank") {
+                        return Ok(());
+                    }
 
                     let mut is_success = BOOL(1);
                     let mut error_status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
@@ -5540,7 +5897,9 @@ pub fn attach_tab_handlers(
                 &HistoryChangedEventHandler::create(Box::new(move |sender, _| {
                     if let Some(wv) = sender {
                         let (url, can_back, can_fwd) = read_nav_snapshot(&wv);
-                        cb(url, can_back, can_fwd);
+                        if !url.eq_ignore_ascii_case("about:blank") {
+                            cb(url, can_back, can_fwd);
+                        }
                     }
                     Ok(())
                 })),
@@ -5556,7 +5915,9 @@ pub fn attach_tab_handlers(
                 &SourceChangedEventHandler::create(Box::new(move |sender, _| {
                     if let Some(wv) = sender {
                         let (url, can_back, can_fwd) = read_nav_snapshot(&wv);
-                        cb(url, can_back, can_fwd);
+                        if !url.eq_ignore_ascii_case("about:blank") {
+                            cb(url, can_back, can_fwd);
+                        }
                     }
                     Ok(())
                 })),
@@ -5575,7 +5936,7 @@ pub fn attach_tab_handlers(
                             let mut uri = PWSTR::null();
                             if wv15.FaviconUri(&mut uri).is_ok() {
                                 let favicon = take_pwstr(uri);
-                                if !favicon.is_empty() {
+                                if is_safe_favicon_url(&favicon) {
                                     cb(favicon);
                                 }
                             }
@@ -5728,6 +6089,15 @@ pub fn attach_tab_handlers(
                 })),
                 &mut token,
             );
+        }
+
+        // 全ハンドラ・ミュート・ズーム・UA 設定完了後に初期 URL へ遷移させることで
+        // 早期 NavigationCompleted / DNS エラー取りこぼしやミュート前の音声再生を防ぐ
+        if let Some(target_url) = initial_navigate_url {
+            if !target_url.is_empty() {
+                let target_h = HSTRING::from(target_url);
+                let _ = wv.Navigate(&target_h);
+            }
         }
     }
 }

@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/service_models.dart';
+import 'omni_webview.dart';
 
 class CatalogData {
   const CatalogData({
@@ -16,15 +17,30 @@ class CatalogData {
 
 class AppStore {
   static const _instancesKey = 'omnisns_instances_v1';
+  static const _instancesBackupKey = 'omnisns_instances_v1_corrupt_backup';
   static const _archivedInstancesKey = 'omnisns_archived_instances_v1';
   static const _settingsKey = 'omnisns_settings_v1';
   static const _followSyncSettingsKey = 'omnisns_follow_sync_settings_v1';
   static const _followSyncLedgerKey = 'omnisns_follow_sync_ledger_v1';
+  static const _followSyncTokenSecretKey = 'follow_sync_github_token_v1';
+
+  Future<void> _writeQueue = Future<void>.value();
+
+  Future<void> _enqueueWrite(Future<void> Function() action) {
+    final next = _writeQueue.catchError((_) {}).then((_) => action());
+    _writeQueue = next.catchError((_) {});
+    return next;
+  }
 
   static String _generateAndroidDeviceId() {
-    final r = Random();
+    Random r;
+    try {
+      r = Random.secure();
+    } catch (_) {
+      r = Random();
+    }
     final hex = List.generate(
-      8,
+      12,
       (_) => r.nextInt(16).toRadixString(16),
     ).join();
     return 'and-$hex';
@@ -104,17 +120,34 @@ class AppStore {
     var needsMigrationPersist = false;
     if (rawInstances != null && rawInstances.isNotEmpty) {
       try {
-        final list = jsonDecode(rawInstances) as List<dynamic>;
-        final parsed = List.generate(
-          list.length,
-          (idx) => ServiceInstance.fromJson(
-            list[idx] as Map<String, dynamic>,
-            idx,
-          ),
-        )
-            .where((i) => !_isRemovedService(i))
-            .toList()
-          ..sort((a, b) => a.order.compareTo(b.order));
+        final decoded = jsonDecode(rawInstances);
+        if (decoded is! List) {
+          throw const FormatException('instances JSON is not a List');
+        }
+        final parsed = <ServiceInstance>[];
+        var skippedCorrupt = false;
+        for (var idx = 0; idx < decoded.length; idx++) {
+          final item = decoded[idx];
+          if (item is! Map) {
+            skippedCorrupt = true;
+            continue;
+          }
+          try {
+            final inst = ServiceInstance.fromJson(
+              Map<String, dynamic>.from(item),
+              idx,
+            );
+            if (!_isRemovedService(inst)) {
+              parsed.add(inst);
+            }
+          } catch (_) {
+            skippedCorrupt = true;
+          }
+        }
+        if (skippedCorrupt) {
+          await prefs.setString(_instancesBackupKey, rawInstances);
+        }
+        parsed.sort((a, b) => a.order.compareTo(b.order));
 
         final migratedProfiles = assignProfilesForMigration(parsed);
         final migrated = migratedProfiles.map((inst) {
@@ -139,8 +172,10 @@ class AppStore {
         }
         instances = migrated;
       } catch (_) {
+        // 破損JSONを退避し、ユーザー操作前に _instancesKey を黙って上書きしない
+        await prefs.setString(_instancesBackupKey, rawInstances);
         instances = createDefaultInstances(catalog);
-        needsMigrationPersist = true;
+        needsMigrationPersist = false;
       }
     } else {
       instances = createDefaultInstances(catalog);
@@ -150,9 +185,10 @@ class AppStore {
     AppSettings settings;
     if (rawSettings != null && rawSettings.isNotEmpty) {
       try {
-        settings = AppSettings.fromJson(
-          jsonDecode(rawSettings) as Map<String, dynamic>,
-        );
+        final decoded = jsonDecode(rawSettings);
+        settings = decoded is Map
+            ? AppSettings.fromJson(Map<String, dynamic>.from(decoded))
+            : const AppSettings();
       } catch (_) {
         settings = const AppSettings();
       }
@@ -180,14 +216,18 @@ class AppStore {
   Future<void> saveState(
     AppSettings settings,
     List<ServiceInstance> instances,
-  ) async {
-    final prefs = await SharedPreferences.getInstance();
+  ) {
     final ordered = List.generate(
       instances.length,
       (idx) => instances[idx].copyWith(order: idx).toJson(),
     );
-    await prefs.setString(_instancesKey, jsonEncode(ordered));
-    await prefs.setString(_settingsKey, jsonEncode(settings.toJson()));
+    final instancesJson = jsonEncode(ordered);
+    final settingsJson = jsonEncode(settings.toJson());
+    return _enqueueWrite(() async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_instancesKey, instancesJson);
+      await prefs.setString(_settingsKey, settingsJson);
+    });
   }
 
   Future<List<ArchivedInstance>> loadArchivedInstances(
@@ -217,10 +257,13 @@ class AppStore {
     return result;
   }
 
-  Future<void> saveArchivedInstances(List<ArchivedInstance> archived) async {
-    final prefs = await SharedPreferences.getInstance();
+  Future<void> saveArchivedInstances(List<ArchivedInstance> archived) {
     final encoded = archived.take(100).map((e) => e.toJson()).toList();
-    await prefs.setString(_archivedInstancesKey, jsonEncode(encoded));
+    final encodedJson = jsonEncode(encoded);
+    return _enqueueWrite(() async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_archivedInstancesKey, encodedJson);
+    });
   }
 
   Future<(FollowSyncSettings, FollowSyncLedger)> loadFollowSyncState() async {
@@ -229,9 +272,12 @@ class AppStore {
     final rawSync = prefs.getString(_followSyncSettingsKey);
     if (rawSync != null && rawSync.isNotEmpty) {
       try {
-        syncSettings = FollowSyncSettings.fromJson(
-          jsonDecode(rawSync) as Map<String, dynamic>,
-        );
+        final decoded = jsonDecode(rawSync);
+        if (decoded is Map) {
+          syncSettings = FollowSyncSettings.fromJson(
+            Map<String, dynamic>.from(decoded),
+          );
+        }
       } catch (_) {}
     }
     var needsSave = false;
@@ -240,13 +286,40 @@ class AppStore {
       needsSave = true;
     }
 
+    // Android Keystore (AES-256-GCM) から PAT を復号して読み込む。
+    // 旧バージョンの平文 PAT が SharedPreferences に残っている場合は Keystore へ移行して平文を消去する。
+    final (secureSupported, secureToken) =
+        await OmniWebViewManager.secureGetSecret(_followSyncTokenSecretKey);
+    if (secureSupported) {
+      final legacyPlaintextToken = syncSettings.githubToken.trim();
+      final encryptedToken = (secureToken ?? '').trim();
+      if (encryptedToken.isNotEmpty) {
+        syncSettings = syncSettings.copyWith(githubToken: encryptedToken);
+        if (legacyPlaintextToken.isNotEmpty) {
+          // SharedPreferences 側の平文コピーを削除するため再保存
+          needsSave = true;
+        }
+      } else if (legacyPlaintextToken.isNotEmpty) {
+        final migrated = await OmniWebViewManager.secureSetSecret(
+          _followSyncTokenSecretKey,
+          legacyPlaintextToken,
+        );
+        if (migrated) {
+          needsSave = true;
+        }
+      }
+    }
+
     var ledger = FollowSyncLedger();
     final rawLedger = prefs.getString(_followSyncLedgerKey);
     if (rawLedger != null && rawLedger.isNotEmpty) {
       try {
-        ledger = FollowSyncLedger.fromJson(
-          jsonDecode(rawLedger) as Map<String, dynamic>,
-        );
+        final decoded = jsonDecode(rawLedger);
+        if (decoded is Map) {
+          ledger = FollowSyncLedger.fromJson(
+            Map<String, dynamic>.from(decoded),
+          );
+        }
       } catch (_) {}
     }
 
@@ -259,12 +332,21 @@ class AppStore {
   Future<void> saveFollowSyncState(
     FollowSyncSettings syncSettings,
     FollowSyncLedger ledger,
-  ) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      _followSyncSettingsKey,
-      jsonEncode(syncSettings.toJson()),
-    );
-    await prefs.setString(_followSyncLedgerKey, jsonEncode(ledger.toJson()));
+  ) {
+    final tokenToStore = syncSettings.githubToken.trim();
+    final ledgerJson = jsonEncode(ledger.toJson());
+    return _enqueueWrite(() async {
+      final storedSecurely = await OmniWebViewManager.secureSetSecret(
+        _followSyncTokenSecretKey,
+        tokenToStore,
+      );
+      final persistedSettings = storedSecurely
+          ? syncSettings.copyWith(githubToken: '')
+          : syncSettings;
+      final settingsJson = jsonEncode(persistedSettings.toJson());
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_followSyncSettingsKey, settingsJson);
+      await prefs.setString(_followSyncLedgerKey, ledgerJson);
+    });
   }
 }

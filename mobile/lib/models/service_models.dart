@@ -91,6 +91,48 @@ String formatLocalYmd(DateTime dt) {
   return '$y-$m-$d';
 }
 
+/// `YYYY-MM-DD` 形式の妥当なカレンダー日付かを検証する。
+bool isValidYmd(String s) {
+  if (!RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(s)) return false;
+  final y = int.tryParse(s.substring(0, 4));
+  final m = int.tryParse(s.substring(5, 7));
+  final d = int.tryParse(s.substring(8, 10));
+  if (y == null || m == null || d == null) return false;
+  if (y < 2020 || y > 2100 || m < 1 || m > 12 || d < 1) return false;
+  final dt = DateTime(y, m, d);
+  return dt.year == y && dt.month == m && dt.day == d;
+}
+
+/// 妥当な `YYYY-MM-DD` の翌日を返す（タイムゾーン差 +1日許容の上限算出用）。
+String nextYmd(String ymd) {
+  if (!isValidYmd(ymd)) return ymd;
+  final y = int.parse(ymd.substring(0, 4));
+  final m = int.parse(ymd.substring(5, 7));
+  final d = int.parse(ymd.substring(8, 10));
+  return formatLocalYmd(DateTime(y, m, d + 1));
+}
+
+String? _asNonEmptyString(dynamic v) {
+  if (v is! String) return null;
+  final t = v.trim();
+  return t.isEmpty ? null : t;
+}
+
+int? _clampNonNegInt(dynamic v, [int maxVal = 0xFFFFFFFF]) {
+  if (v is! num || !v.isFinite) return null;
+  final i = v.toInt();
+  if (i < 0) return null;
+  return i > maxVal ? maxVal : i;
+}
+
+int? _clampSignedInt(dynamic v, int minVal, int maxVal) {
+  if (v is! num || !v.isFinite) return null;
+  final i = v.toInt();
+  if (i < minVal) return minVal;
+  if (i > maxVal) return maxVal;
+  return i;
+}
+
 class ServiceInstance {
   const ServiceInstance({
     required this.instanceId,
@@ -231,6 +273,7 @@ class ServiceInstance {
     bool clearDetectedHandle = false,
     int? snsFollowingCount,
     int? snsFollowersCount,
+    bool clearSnsStats = false,
   }) {
     return ServiceInstance(
       instanceId: instanceId,
@@ -254,8 +297,10 @@ class ServiceInstance {
       detectedHandle: clearDetectedHandle
           ? null
           : (detectedHandle ?? this.detectedHandle),
-      snsFollowingCount: snsFollowingCount ?? this.snsFollowingCount,
-      snsFollowersCount: snsFollowersCount ?? this.snsFollowersCount,
+      snsFollowingCount:
+          clearSnsStats ? null : (snsFollowingCount ?? this.snsFollowingCount),
+      snsFollowersCount:
+          clearSnsStats ? null : (snsFollowersCount ?? this.snsFollowersCount),
     );
   }
 
@@ -288,40 +333,42 @@ class ServiceInstance {
   }
 
   factory ServiceInstance.fromJson(Map<String, dynamic> json, int index) {
-    final name = (json['name'] as String?)?.trim();
-    final safeName = (name == null || name.isEmpty) ? 'SNS' : name;
-    final rawLabel = (json['accountLabel'] as String?)?.trim();
-    final rawProfile = (json['profileName'] as String?)?.trim();
-    final rawFollowDate = (json['followCountDate'] as String?)?.trim();
-    final rawHandle = normalizeAccountHandle(json['detectedHandle'] as String?);
+    final safeName = _asNonEmptyString(json['name']) ?? 'SNS';
+    final rawLabel = _asNonEmptyString(json['accountLabel']);
+    final rawProfile = _asNonEmptyString(json['profileName']);
+    final rawFollowDate = _asNonEmptyString(json['followCountDate']);
+    final rawHandle = normalizeAccountHandle(
+      json['detectedHandle'] is String ? json['detectedHandle'] as String : null,
+    );
+    final rawUrl = json['url'] is String ? json['url'] as String : '';
+    final rawNotif = json['notificationsEnabled'];
     return ServiceInstance(
-      instanceId: json['instanceId'] as String? ?? 'svc-$index',
-      serviceId: json['serviceId'] as String? ?? 'custom',
+      instanceId: _asNonEmptyString(json['instanceId']) ?? 'svc-$index',
+      serviceId: _asNonEmptyString(json['serviceId']) ?? 'custom',
       name: safeName,
-      accountLabel: (rawLabel == null || rawLabel.isEmpty) ? null : rawLabel,
-      profileName:
-          (rawProfile == null || rawProfile.isEmpty) ? null : rawProfile,
-      category: json['category'] as String? ?? 'custom',
-      url: normalizeServiceUrl(json['url'] as String? ?? '') ??
-          'https://example.com/',
-      colorHex: json['colorHex'] as String? ?? '#3B82F6',
-      badge: (json['badge'] as String?) ?? makeBadgeText(safeName),
-      notificationsEnabled: json['notificationsEnabled'] as bool? ?? true,
-      order: json['order'] as int? ?? index,
-      uaMode: (json['uaMode'] as String?) == 'desktop' ? 'desktop' : 'mobile',
-      followCountToday:
-          ((json['followCountToday'] as num?)?.toInt() ?? 0).clamp(0, 999999),
-      followCountTotal: ((json['followCountTotal'] as num?)?.toInt() ?? 0)
-          .clamp(0, 99999999),
+      accountLabel: rawLabel,
+      profileName: rawProfile,
+      category: _asNonEmptyString(json['category']) ?? 'custom',
+      url: normalizeServiceUrl(rawUrl) ?? 'https://example.com/',
+      colorHex: _asNonEmptyString(json['colorHex']) ?? '#3B82F6',
+      badge: _asNonEmptyString(json['badge']) ?? makeBadgeText(safeName),
+      notificationsEnabled: rawNotif is bool ? rawNotif : true,
+      order: (json['order'] as num?)?.toInt() ?? index,
+      uaMode: json['uaMode'] == 'desktop' ? 'desktop' : 'mobile',
+      followCountToday: _clampNonNegInt(json['followCountToday'], 999999) ?? 0,
+      followCountTotal:
+          _clampNonNegInt(json['followCountTotal'], 99999999) ?? 0,
       unfollowCountToday:
-          ((json['unfollowCountToday'] as num?)?.toInt() ?? 0).clamp(0, 999999),
-      unfollowCountTotal: ((json['unfollowCountTotal'] as num?)?.toInt() ?? 0)
-          .clamp(0, 99999999),
+          _clampNonNegInt(json['unfollowCountToday'], 999999) ?? 0,
+      unfollowCountTotal:
+          _clampNonNegInt(json['unfollowCountTotal'], 99999999) ?? 0,
       followCountDate:
-          (rawFollowDate == null || rawFollowDate.isEmpty) ? null : rawFollowDate,
+          (rawFollowDate != null && isValidYmd(rawFollowDate))
+              ? rawFollowDate
+              : null,
       detectedHandle: rawHandle,
-      snsFollowingCount: (json['snsFollowingCount'] as num?)?.toInt(),
-      snsFollowersCount: (json['snsFollowersCount'] as num?)?.toInt(),
+      snsFollowingCount: _clampNonNegInt(json['snsFollowingCount']),
+      snsFollowersCount: _clampNonNegInt(json['snsFollowersCount']),
     );
   }
 }
@@ -727,15 +774,17 @@ class DeviceFollowEntry {
 
   factory DeviceFollowEntry.fromJson(Map<String, dynamic> json) {
     return DeviceFollowEntry(
-      today: (json['today'] as num?)?.toInt() ?? 0,
-      total: (json['total'] as num?)?.toInt() ?? 0,
-      todayEpoch: (json['todayEpoch'] as num?)?.toInt() ?? 0,
-      totalEpoch: (json['totalEpoch'] as num?)?.toInt() ?? 0,
-      unfollowToday: (json['unfollowToday'] as num?)?.toInt() ?? 0,
-      unfollowTotal: (json['unfollowTotal'] as num?)?.toInt() ?? 0,
-      unfollowTodayEpoch: (json['unfollowTodayEpoch'] as num?)?.toInt() ?? 0,
-      unfollowTotalEpoch: (json['unfollowTotalEpoch'] as num?)?.toInt() ?? 0,
-      updatedAt: (json['updatedAt'] as num?)?.toInt() ?? 0,
+      today: _clampSignedInt(json['today'], -999999, 999999) ?? 0,
+      total: _clampSignedInt(json['total'], -99999999, 99999999) ?? 0,
+      todayEpoch: _clampNonNegInt(json['todayEpoch']) ?? 0,
+      totalEpoch: _clampNonNegInt(json['totalEpoch']) ?? 0,
+      unfollowToday:
+          _clampSignedInt(json['unfollowToday'], -999999, 999999) ?? 0,
+      unfollowTotal:
+          _clampSignedInt(json['unfollowTotal'], -99999999, 99999999) ?? 0,
+      unfollowTodayEpoch: _clampNonNegInt(json['unfollowTodayEpoch']) ?? 0,
+      unfollowTotalEpoch: _clampNonNegInt(json['unfollowTotalEpoch']) ?? 0,
+      updatedAt: _clampNonNegInt(json['updatedAt'], 0x7FFFFFFFFFFFFFFF) ?? 0,
     );
   }
 }
@@ -777,9 +826,10 @@ class AccountFollowLedger {
       );
 
   void rollDate(String today) {
-    if (date.isEmpty) {
-      date = today;
-    } else if (date.compareTo(today) < 0) {
+    final maxAllowed = nextYmd(today);
+    if (!isValidYmd(date) ||
+        date.compareTo(today) < 0 ||
+        date.compareTo(maxAllowed) > 0) {
       date = today;
       for (final entry in devices.values) {
         entry.today = 0;
@@ -791,11 +841,15 @@ class AccountFollowLedger {
   }
 
   (int, int) effectiveCounts(String today) {
-    final sameDay = date == today;
+    // 端末間のタイムゾーン差（+1日以内）で当日分が 0 に凍結されないよう <= today+1日 を有効とする
+    final maxAllowed = nextYmd(today);
+    final activeDay = isValidYmd(date) &&
+        date.compareTo(today) >= 0 &&
+        date.compareTo(maxAllowed) <= 0;
     var sumToday = 0;
     var sumTotal = 0;
     for (final entry in devices.values) {
-      if (sameDay && entry.todayEpoch >= resetEpoch) {
+      if (activeDay && entry.todayEpoch >= resetEpoch) {
         sumToday += entry.today;
       }
       if (entry.totalEpoch >= totalResetEpoch) {
@@ -809,11 +863,14 @@ class AccountFollowLedger {
   }
 
   (int, int) effectiveUnfollowCounts(String today) {
-    final sameDay = date == today;
+    final maxAllowed = nextYmd(today);
+    final activeDay = isValidYmd(date) &&
+        date.compareTo(today) >= 0 &&
+        date.compareTo(maxAllowed) <= 0;
     var sumToday = 0;
     var sumTotal = 0;
     for (final entry in devices.values) {
-      if (sameDay && entry.unfollowTodayEpoch >= unfollowResetEpoch) {
+      if (activeDay && entry.unfollowTodayEpoch >= unfollowResetEpoch) {
         sumToday += entry.unfollowToday;
       }
       if (entry.unfollowTotalEpoch >= unfollowTotalResetEpoch) {
@@ -830,17 +887,29 @@ class AccountFollowLedger {
   bool mergeFrom(AccountFollowLedger other, String today) {
     var changed = false;
 
-    final candidates = [date, other.date, today]
-        .where((s) => s.isNotEmpty)
-        .toList()
-      ..sort();
+    // 破損日付や遠未来日付（today+1日超）によるレジャー汚染を防止
+    final maxAllowed = nextYmd(today);
+    String? sanitizeDate(String d) {
+      if (!isValidYmd(d) || d.compareTo(maxAllowed) > 0) return null;
+      return d;
+    }
+
+    final localDate = sanitizeDate(date);
+    final remoteDate = sanitizeDate(other.date);
+    final candidates = <String>[];
+    if (localDate != null) candidates.add(localDate);
+    if (remoteDate != null) candidates.add(remoteDate);
+    if (isValidYmd(today)) candidates.add(today);
+    candidates.sort();
     final targetDate = candidates.isEmpty ? today : candidates.last;
 
     if (date != targetDate) {
-      if (date.compareTo(targetDate) < 0) {
+      if (localDate == null || localDate.compareTo(targetDate) < 0) {
         for (final entry in devices.values) {
           entry.today = 0;
+          entry.todayEpoch = resetEpoch;
           entry.unfollowToday = 0;
+          entry.unfollowTodayEpoch = unfollowResetEpoch;
         }
       }
       date = targetDate;
@@ -891,7 +960,7 @@ class AccountFollowLedger {
       changed = true;
     }
 
-    final otherSameDay = other.date == targetDate;
+    final otherSameDay = remoteDate == targetDate;
     for (final item in other.devices.entries) {
       final normalized = item.value.clone();
       if (!otherSameDay || normalized.todayEpoch < resetEpoch) {
@@ -914,15 +983,46 @@ class AccountFollowLedger {
       if (local == null) {
         devices[item.key] = normalized;
         changed = true;
-      } else {
-        final remoteNewer = normalized.updatedAt > local.updatedAt ||
-            (normalized.updatedAt == local.updatedAt &&
-                (normalized.total > local.total ||
-                    normalized.today > local.today ||
-                    normalized.unfollowTotal > local.unfollowTotal ||
-                    normalized.unfollowToday > local.unfollowToday));
-        if (remoteNewer && !local.equalsValue(normalized)) {
+      } else if (normalized.updatedAt > local.updatedAt) {
+        if (!local.equalsValue(normalized)) {
           devices[item.key] = normalized;
+          changed = true;
+        }
+      } else if (normalized.updatedAt == local.updatedAt) {
+        // 同一秒衝突時はエポックとカウントを対でマージし、リセット済みカウントの復活と他フィールド後退を両方防ぐ
+        final mergedEntry = local.clone();
+        if (normalized.todayEpoch > mergedEntry.todayEpoch) {
+          mergedEntry.todayEpoch = normalized.todayEpoch;
+          mergedEntry.today = normalized.today;
+        } else if (normalized.todayEpoch == mergedEntry.todayEpoch &&
+            normalized.today > mergedEntry.today) {
+          mergedEntry.today = normalized.today;
+        }
+        if (normalized.totalEpoch > mergedEntry.totalEpoch) {
+          mergedEntry.totalEpoch = normalized.totalEpoch;
+          mergedEntry.total = normalized.total;
+        } else if (normalized.totalEpoch == mergedEntry.totalEpoch &&
+            normalized.total > mergedEntry.total) {
+          mergedEntry.total = normalized.total;
+        }
+        if (normalized.unfollowTodayEpoch > mergedEntry.unfollowTodayEpoch) {
+          mergedEntry.unfollowTodayEpoch = normalized.unfollowTodayEpoch;
+          mergedEntry.unfollowToday = normalized.unfollowToday;
+        } else if (normalized.unfollowTodayEpoch ==
+                mergedEntry.unfollowTodayEpoch &&
+            normalized.unfollowToday > mergedEntry.unfollowToday) {
+          mergedEntry.unfollowToday = normalized.unfollowToday;
+        }
+        if (normalized.unfollowTotalEpoch > mergedEntry.unfollowTotalEpoch) {
+          mergedEntry.unfollowTotalEpoch = normalized.unfollowTotalEpoch;
+          mergedEntry.unfollowTotal = normalized.unfollowTotal;
+        } else if (normalized.unfollowTotalEpoch ==
+                mergedEntry.unfollowTotalEpoch &&
+            normalized.unfollowTotal > mergedEntry.unfollowTotal) {
+          mergedEntry.unfollowTotal = normalized.unfollowTotal;
+        }
+        if (!local.equalsValue(mergedEntry)) {
+          devices[item.key] = mergedEntry;
           changed = true;
         }
       }
@@ -972,16 +1072,17 @@ class AccountFollowLedger {
       }
     }
     return AccountFollowLedger(
-      date: (json['date'] as String?) ?? '',
-      resetEpoch: (json['resetEpoch'] as num?)?.toInt() ?? 0,
-      totalResetEpoch: (json['totalResetEpoch'] as num?)?.toInt() ?? 0,
-      unfollowResetEpoch: (json['unfollowResetEpoch'] as num?)?.toInt() ?? 0,
+      date: (json['date'] is String ? json['date'] as String : ''),
+      resetEpoch: _clampNonNegInt(json['resetEpoch']) ?? 0,
+      totalResetEpoch: _clampNonNegInt(json['totalResetEpoch']) ?? 0,
+      unfollowResetEpoch: _clampNonNegInt(json['unfollowResetEpoch']) ?? 0,
       unfollowTotalResetEpoch:
-          (json['unfollowTotalResetEpoch'] as num?)?.toInt() ?? 0,
+          _clampNonNegInt(json['unfollowTotalResetEpoch']) ?? 0,
       devices: devices,
-      snsFollowing: (json['snsFollowing'] as num?)?.toInt(),
-      snsFollowers: (json['snsFollowers'] as num?)?.toInt(),
-      snsUpdatedAt: (json['snsUpdatedAt'] as num?)?.toInt() ?? 0,
+      snsFollowing: _clampNonNegInt(json['snsFollowing']),
+      snsFollowers: _clampNonNegInt(json['snsFollowers']),
+      snsUpdatedAt:
+          _clampNonNegInt(json['snsUpdatedAt'], 0x7FFFFFFFFFFFFFFF) ?? 0,
     );
   }
 }
@@ -1006,8 +1107,8 @@ class FollowSyncLedger {
     for (final entry in other.accounts.entries) {
       final local = accounts[entry.key];
       if (local == null) {
-        final cloned = entry.value.clone()..rollDate(today);
-        accounts[entry.key] = cloned;
+        final fresh = AccountFollowLedger()..mergeFrom(entry.value, today);
+        accounts[entry.key] = fresh;
         changed = true;
       } else {
         if (local.mergeFrom(entry.value, today)) {
@@ -1089,11 +1190,12 @@ class FollowSyncSettings {
 
   factory FollowSyncSettings.fromJson(Map<String, dynamic> json) {
     return FollowSyncSettings(
-      deviceId: (json['deviceId'] as String?)?.trim() ?? '',
-      githubToken: (json['githubToken'] as String?)?.trim() ?? '',
-      gistId: (json['gistId'] as String?)?.trim() ?? '',
-      lastSyncAt: (json['lastSyncAt'] as num?)?.toInt(),
-      lastSyncStatus: json['lastSyncStatus'] as String?,
+      deviceId: _asNonEmptyString(json['deviceId']) ?? '',
+      githubToken: _asNonEmptyString(json['githubToken']) ?? '',
+      gistId: _asNonEmptyString(json['gistId']) ?? '',
+      lastSyncAt: _clampNonNegInt(json['lastSyncAt'], 0x7FFFFFFFFFFFFFFF),
+      lastSyncStatus:
+          json['lastSyncStatus'] is String ? json['lastSyncStatus'] as String : null,
     );
   }
 }
@@ -1143,7 +1245,10 @@ String? detectPlatformServiceFromUrl(String? rawUrl) {
   final trimmed = rawUrl?.trim();
   if (trimmed == null || trimmed.isEmpty) return null;
   final uri = Uri.tryParse(trimmed);
-  final host = uri?.host.toLowerCase() ?? '';
+  if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+    return null;
+  }
+  final host = uri.host.toLowerCase();
   if (host.isEmpty) return null;
   bool matchesHost(String domain) => host == domain || host.endsWith('.$domain');
   if (matchesHost('instagram.com')) return 'instagram';
@@ -1169,7 +1274,7 @@ String? detectPlatformServiceFromUrl(String? rawUrl) {
 
 /// タブ内で別SNS（例: Threadsタブ内から Instagram を開いた場合）を表示している際、
 /// 表示中サービスのアカウントインスタンスへカウンター対象を切り替える。
-/// 該当サービスが一覧に未登録の場合は null を返し、元のSNSのカウントが引き継がれないようにする。
+/// 該当サービスが一覧に未登録、または別ハンドルのみの候補しかない場合は null を返し誤帰属を防ぐ。
 ServiceInstance? resolveCounterTargetInstance({
   required ServiceInstance source,
   required List<ServiceInstance> instances,
@@ -1193,25 +1298,27 @@ ServiceInstance? resolveCounterTargetInstance({
     return null;
   }
 
-  // 1. 明示または直近検出のクロスサイトハンドル一致
+  // 1. 判明しているハンドル（クロスサイト検出ハンドルを優先、無ければ元インスタンスのハンドル）
   final normHint = normalizeAccountHandle(handleHint);
-  if (normHint != null) {
+  final knownHandle = normHint ?? normalizeAccountHandle(source.detectedHandle);
+  if (knownHandle != null) {
     for (final c in candidates) {
-      if (c.detectedHandle == normHint) return c;
+      if (c.detectedHandle == knownHandle) return c;
     }
   }
 
-  // 2. 元インスタンスと同一 @handle（Threads ↔ Instagram 連携アカウント）
-  if (source.detectedHandle != null) {
-    for (final c in candidates) {
-      if (c.detectedHandle == source.detectedHandle) return c;
-    }
+  // クロスサイトでハンドルが判明している場合、別ハンドルが紐づいた候補への誤帰属・上書きを防ぐ
+  final fallbackPool = knownHandle != null
+      ? candidates.where((c) => c.detectedHandle == null).toList()
+      : candidates;
+  if (fallbackPool.isEmpty) {
+    return null;
   }
 
-  // 3. 対象サービスで直近アクティブだったアカウント
+  // 2. 対象サービスで直近アクティブだったアカウント
   final rememberedId = lastActiveByGroup[effectiveService];
   if (rememberedId != null) {
-    for (final c in candidates) {
+    for (final c in fallbackPool) {
       if (c.instanceId == rememberedId) return c;
     }
   }
@@ -1219,10 +1326,10 @@ ServiceInstance? resolveCounterTargetInstance({
   // 4. アカウントラベル一致
   final srcLabel = source.accountLabel?.trim();
   if (srcLabel != null && srcLabel.isNotEmpty) {
-    for (final c in candidates) {
+    for (final c in fallbackPool) {
       if (c.accountLabel?.trim() == srcLabel) return c;
     }
   }
 
-  return candidates.first;
+  return fallbackPool.first;
 }

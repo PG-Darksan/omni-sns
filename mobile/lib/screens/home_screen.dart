@@ -75,7 +75,7 @@ class _JevTabLiveState {
   final bool autoFetching;
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const String _gmailUrl = 'https://mail.google.com/';
   static const String _gmailProfileName = 'omnisns_gmail';
   static const int _maxExtraSubTabsPerAccount = 12;
@@ -98,6 +98,10 @@ class _HomeScreenState extends State<HomeScreen> {
   FollowSyncLedger _followLedger = FollowSyncLedger();
   Timer? _cloudSyncDebounce;
   Timer? _cloudSyncPeriodic;
+  Future<String>? _syncInFlight;
+  bool _needsResync = false;
+  int _manualSyncWaiters = 0;
+  int _followSyncConfigGen = 0;
 
   final JevService _jev = JevService();
   final Map<String, OmniWebViewController> _controllers = {};
@@ -109,11 +113,13 @@ class _HomeScreenState extends State<HomeScreen> {
   int _subTabSeq = 0;
   final Map<String, String> _lastActiveByGroup = {};
   final Map<String, ({String service, String handle})> _crossSiteIdentities = {};
+  final Map<String, List<int>> _bridgeEventTimestamps = {};
   final GlobalKey<MobileGestureOverlayState> _gestureOverlayKey = GlobalKey();
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _jev.addListener(_onJevChanged);
     unawaited(_jev.ensureLoaded());
     _bootstrap();
@@ -124,7 +130,51 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // バックグラウンド中に Android LMK で終了したアクティブタブを復帰時に自動再構築する
+      _syncActiveWebViews(forceNotifyActive: true);
+    }
+  }
+
+  void _syncActiveWebViews({bool forceNotifyActive = false}) {
+    final activeId = _isGmailOpen ? null : _settings.activeInstanceId;
+    for (final entry in _controllers.entries) {
+      final shouldBeActive =
+          entry.key == activeId && _activeSubTabId[entry.key] == null;
+      unawaited(
+        entry.value.setActive(
+          shouldBeActive,
+          force: forceNotifyActive && shouldBeActive,
+        ),
+      );
+    }
+    for (final entry in _extraTabs.entries) {
+      final activeSubId = entry.key == activeId ? _activeSubTabId[entry.key] : null;
+      for (final tab in entry.value) {
+        final shouldBeActive = activeSubId != null && tab.tabId == activeSubId;
+        unawaited(
+          tab.controller.setActive(
+            shouldBeActive,
+            force: forceNotifyActive && shouldBeActive,
+          ),
+        );
+      }
+    }
+    final gCtrl = _gmailController;
+    if (gCtrl != null && !gCtrl.isDisposed) {
+      unawaited(
+        gCtrl.setActive(
+          _isGmailOpen,
+          force: forceNotifyActive && _isGmailOpen,
+        ),
+      );
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _jev.removeListener(_onJevChanged);
     _jev.dispose();
     _cloudSyncDebounce?.cancel();
@@ -145,42 +195,50 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _bootstrap() async {
-    final catalogData = await widget.store.loadCatalog();
-    final (settings, loadedInstances) =
-        await widget.store.loadState(catalogData.services);
-    final archivedInstances =
-        await widget.store.loadArchivedInstances(loadedInstances);
-    final (followSyncSettings, followLedger) =
-        await widget.store.loadFollowSyncState();
-    final today = formatLocalYmd(DateTime.now());
-    final (instances, _) =
-        projectLedgerToInstances(loadedInstances, followLedger, today);
-    final multiProfile = await OmniWebViewManager.isMultiProfileSupported();
+    try {
+      final catalogData = await widget.store.loadCatalog();
+      final (settings, loadedInstances) =
+          await widget.store.loadState(catalogData.services);
+      final archivedInstances =
+          await widget.store.loadArchivedInstances(loadedInstances);
+      final (followSyncSettings, followLedger) =
+          await widget.store.loadFollowSyncState();
+      final today = formatLocalYmd(DateTime.now());
+      final (instances, _) =
+          projectLedgerToInstances(loadedInstances, followLedger, today);
+      final multiProfile = await OmniWebViewManager.isMultiProfileSupported();
 
-    for (final inst in instances) {
-      _runtimeMap[inst.instanceId] = TabRuntimeState(
-        currentUrl: inst.url,
-        title: inst.name,
-        isSleeping: true,
-      );
+      for (final inst in instances) {
+        _runtimeMap[inst.instanceId] = TabRuntimeState(
+          currentUrl: inst.url,
+          title: inst.name,
+          isSleeping: true,
+        );
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _categories = catalogData.categories;
+        _catalog = catalogData.services;
+        _settings = settings;
+        _instances = instances;
+        _archivedInstances = archivedInstances;
+        _followSyncSettings = followSyncSettings;
+        _followLedger = followLedger;
+        _multiProfileSupported = multiProfile;
+        _initialized = true;
+      });
+
+      widget.onThemeChanged(settings.isDarkMode);
+      _ensureSafeActiveAndLoad();
+      _startFollowSyncEngine();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _initialized = true;
+      });
+      _showSnack('初期データの読み込みに失敗しました');
     }
-
-    if (!mounted) return;
-    setState(() {
-      _categories = catalogData.categories;
-      _catalog = catalogData.services;
-      _settings = settings;
-      _instances = instances;
-      _archivedInstances = archivedInstances;
-      _followSyncSettings = followSyncSettings;
-      _followLedger = followLedger;
-      _multiProfileSupported = multiProfile;
-      _initialized = true;
-    });
-
-    widget.onThemeChanged(settings.isDarkMode);
-    _ensureSafeActiveAndLoad();
-    _startFollowSyncEngine();
   }
 
   List<ServiceInstance> get _visibleInstances => _instances;
@@ -286,11 +344,89 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastActiveByGroup[serviceGroupKey(inst)] = inst.instanceId;
       _ensureController(inst);
     }
+    _syncActiveWebViews();
     if (mounted) setState(() {});
   }
 
   Future<void> _persist() async {
     await widget.store.saveState(_settings, _instances);
+  }
+
+  bool _allowBridgeEvent(String instanceId) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final list = _bridgeEventTimestamps.putIfAbsent(instanceId, () => <int>[]);
+    list.removeWhere((t) => nowMs - t > 1000);
+    if (list.length >= 25) return false;
+    list.add(nowMs);
+    return true;
+  }
+
+  String? _verifiedBridgeService(
+    ServiceInstance src,
+    String nativeService, {
+    String? overrideUrl,
+  }) {
+    final currentUrl = overrideUrl ?? _runtimeMap[src.instanceId]?.currentUrl;
+    final fromUrl = detectPlatformServiceFromUrl(currentUrl);
+    if (fromUrl != null) return fromUrl;
+    // Mastodon / Misskey のカスタムインスタンスや初回ロード直後のイベントは、
+    // ネイティブ側で HTTPS オリジン検証済みのサービスIDとタブ設定 URL のホスト一致で検証する
+    final normNative = nativeService.trim().toLowerCase();
+    if (normNative.isEmpty) return null;
+    if (normNative == 'mastodon' || normNative == 'misskey') {
+      final curUri =
+          currentUrl != null ? Uri.tryParse(currentUrl.trim()) : null;
+      final srcUri = Uri.tryParse(src.url.trim());
+      if (curUri != null &&
+          srcUri != null &&
+          curUri.scheme == 'https' &&
+          curUri.host.isNotEmpty &&
+          curUri.host.toLowerCase() == srcUri.host.toLowerCase() &&
+          src.serviceId == normNative) {
+        return normNative;
+      }
+    }
+    const knownNativeServices = <String>{
+      'instagram',
+      'threads',
+      'bluesky',
+      'mixi2',
+      'x',
+      'tiktok',
+      'facebook',
+      'note',
+      'youtube',
+      'twitch',
+      'reddit',
+      'pinterest',
+      'linkedin',
+      'tumblr',
+      'pixiv',
+      'mastodon',
+      'misskey',
+    };
+    if (knownNativeServices.contains(normNative) &&
+        (currentUrl == null || currentUrl.trim().isEmpty)) {
+      return normNative;
+    }
+    return null;
+  }
+
+  int? _sanitizeBridgeStat(int? raw) {
+    if (raw == null || raw < 0) return null;
+    return raw > 0xFFFFFFFF ? 0xFFFFFFFF : raw;
+  }
+
+  void _clearCrossSiteHintIfReturned(String instanceId, String url) {
+    final src = _instances.cast<ServiceInstance?>().firstWhere(
+          (i) => i?.instanceId == instanceId,
+          orElse: () => null,
+        );
+    if (src == null) return;
+    final detected = detectPlatformServiceFromUrl(url);
+    if (detected == src.serviceId) {
+      _crossSiteIdentities.remove(instanceId);
+    }
   }
 
   Future<void> _persistArchived() async {
@@ -364,6 +500,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _settings = _settings.copyWith(activeInstanceId: inst.instanceId);
     });
     _ensureController(inst);
+    _syncActiveWebViews();
     await _persist();
     await _persistArchived();
     _showSnack('「${_formatArchivedDisplayTitle(inst)}」をログイン記憶から呼び出しました');
@@ -412,6 +549,9 @@ class _HomeScreenState extends State<HomeScreen> {
     final existing = _controllers[instance.instanceId];
     if (existing != null && !existing.isDisposed) return existing;
 
+    final isCurrentlyActive = !_isGmailOpen &&
+        _settings.activeInstanceId == instance.instanceId &&
+        _activeSubTabId[instance.instanceId] == null;
     late final OmniWebViewController controller;
     controller = OmniWebViewController(
       initialUrl: instance.url,
@@ -419,6 +559,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ? instance.effectiveProfileName
           : defaultWebViewProfileName,
       userAgent: buildUserAgentForMode(instance.uaMode),
+      serviceId: instance.serviceId,
+      initiallyActive: isCurrentlyActive,
       onProgress: (progress) {
         _updateRuntime(
           instance.instanceId,
@@ -430,6 +572,9 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       },
       onPageStarted: (url) {
+        if (isHttpOrHttpsUrl(url)) {
+          _clearCrossSiteHintIfReturned(instance.instanceId, url);
+        }
         _updateRuntime(
           instance.instanceId,
           (cur) => cur.copyWith(
@@ -444,6 +589,9 @@ class _HomeScreenState extends State<HomeScreen> {
         final safeTitle = title.trim().isEmpty ? instance.name : title;
         final unread = parseUnreadCountFromTitle(safeTitle);
         final validUrl = isHttpOrHttpsUrl(url);
+        if (validUrl) {
+          _clearCrossSiteHintIfReturned(instance.instanceId, url);
+        }
         _updateRuntime(
           instance.instanceId,
           (cur) => cur.copyWith(
@@ -471,6 +619,9 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       },
       onHistoryChanged: (url, canBack, canFwd) {
+        if (isHttpOrHttpsUrl(url)) {
+          _clearCrossSiteHintIfReturned(instance.instanceId, url);
+        }
         _updateRuntime(
           instance.instanceId,
           (cur) => cur.copyWith(
@@ -493,58 +644,65 @@ class _HomeScreenState extends State<HomeScreen> {
         _openExternalUrlSafely(url);
       },
       onFollowDetected: (_, service) {
+        if (!_allowBridgeEvent(instance.instanceId)) return;
         final src = _instances.cast<ServiceInstance?>().firstWhere(
               (i) => i?.instanceId == instance.instanceId,
-              orElse: () => instance,
+              orElse: () => null,
             );
         if (src == null) return;
+        final verifiedService = _verifiedBridgeService(src, service);
+        if (verifiedService == null) return;
         final resolved = _resolveCounterTarget(
           src,
-          explicitService: service,
+          explicitService: verifiedService,
         );
         if (resolved.target != null) {
           _adjustFollowCount(resolved.target!.instanceId, 1);
         }
       },
       onUnfollowDetected: (_, service) {
+        if (!_allowBridgeEvent(instance.instanceId)) return;
         final src = _instances.cast<ServiceInstance?>().firstWhere(
               (i) => i?.instanceId == instance.instanceId,
-              orElse: () => instance,
+              orElse: () => null,
             );
         if (src == null) return;
+        final verifiedService = _verifiedBridgeService(src, service);
+        if (verifiedService == null) return;
         final resolved = _resolveCounterTarget(
           src,
-          explicitService: service,
+          explicitService: verifiedService,
         );
         if (resolved.target != null) {
           _adjustUnfollowCount(resolved.target!.instanceId, 1);
         }
       },
       onAccountIdentity: (service, handle, following, followers) {
+        if (!_allowBridgeEvent(instance.instanceId)) return;
         final src = _instances.cast<ServiceInstance?>().firstWhere(
               (i) => i?.instanceId == instance.instanceId,
-              orElse: () => instance,
+              orElse: () => null,
             );
         if (src == null) return;
-        final normSvc = service.trim().toLowerCase();
+        final verifiedService = _verifiedBridgeService(src, service);
+        if (verifiedService == null) return;
         final normHandle = normalizeAccountHandle(handle);
-        if (normSvc.isNotEmpty &&
-            normSvc != src.serviceId &&
-            normHandle != null) {
+        if (normHandle == null) return;
+        if (verifiedService != src.serviceId) {
           _crossSiteIdentities[src.instanceId] =
-              (service: normSvc, handle: normHandle);
+              (service: verifiedService, handle: normHandle);
         }
         final resolved = _resolveCounterTarget(
           src,
-          explicitService: normSvc,
-          handleHint: handle,
+          explicitService: verifiedService,
+          handleHint: normHandle,
         );
         if (resolved.target != null) {
           _handleAccountIdentity(
             resolved.target!.instanceId,
-            handle,
-            following: following,
-            followers: followers,
+            normHandle,
+            following: _sanitizeBridgeStat(following),
+            followers: _sanitizeBridgeStat(followers),
           );
         }
       },
@@ -743,6 +901,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final tabId = 'sub-${++_subTabSeq}';
     final initialTitle = Uri.tryParse(targetUrl)?.host ?? instance.name;
+    final isSubInitiallyActive = activate &&
+        !_isGmailOpen &&
+        _settings.activeInstanceId == instance.instanceId;
     late final _ExtraSubTab subTab;
     late final OmniWebViewController ctrl;
     ctrl = OmniWebViewController(
@@ -751,6 +912,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ? instance.effectiveProfileName
           : defaultWebViewProfileName,
       userAgent: buildUserAgentForMode(instance.uaMode),
+      serviceId: instance.serviceId,
+      initiallyActive: isSubInitiallyActive,
       onProgress: (progress) {
         subTab.runtime = subTab.runtime.copyWith(
           progress: progress,
@@ -805,44 +968,69 @@ class _HomeScreenState extends State<HomeScreen> {
       },
       onExternalScheme: (url) => _openExternalUrlSafely(url),
       onFollowDetected: (_, service) {
+        if (!_allowBridgeEvent(instance.instanceId)) return;
         final src = _instances.cast<ServiceInstance?>().firstWhere(
               (i) => i?.instanceId == instance.instanceId,
-              orElse: () => instance,
+              orElse: () => null,
             );
         if (src == null) return;
-        final resolved = _resolveCounterTarget(src, explicitService: service);
+        final verifiedService = _verifiedBridgeService(
+          src,
+          service,
+          overrideUrl: subTab.runtime.currentUrl,
+        );
+        if (verifiedService == null) return;
+        final resolved =
+            _resolveCounterTarget(src, explicitService: verifiedService);
         if (resolved.target != null) {
           _adjustFollowCount(resolved.target!.instanceId, 1);
         }
       },
       onUnfollowDetected: (_, service) {
+        if (!_allowBridgeEvent(instance.instanceId)) return;
         final src = _instances.cast<ServiceInstance?>().firstWhere(
               (i) => i?.instanceId == instance.instanceId,
-              orElse: () => instance,
+              orElse: () => null,
             );
         if (src == null) return;
-        final resolved = _resolveCounterTarget(src, explicitService: service);
+        final verifiedService = _verifiedBridgeService(
+          src,
+          service,
+          overrideUrl: subTab.runtime.currentUrl,
+        );
+        if (verifiedService == null) return;
+        final resolved =
+            _resolveCounterTarget(src, explicitService: verifiedService);
         if (resolved.target != null) {
           _adjustUnfollowCount(resolved.target!.instanceId, 1);
         }
       },
       onAccountIdentity: (service, handle, following, followers) {
+        if (!_allowBridgeEvent(instance.instanceId)) return;
         final src = _instances.cast<ServiceInstance?>().firstWhere(
               (i) => i?.instanceId == instance.instanceId,
-              orElse: () => instance,
+              orElse: () => null,
             );
         if (src == null) return;
+        final verifiedService = _verifiedBridgeService(
+          src,
+          service,
+          overrideUrl: subTab.runtime.currentUrl,
+        );
+        if (verifiedService == null) return;
+        final normHandle = normalizeAccountHandle(handle);
+        if (normHandle == null) return;
         final resolved = _resolveCounterTarget(
           src,
-          explicitService: service.trim().toLowerCase(),
-          handleHint: handle,
+          explicitService: verifiedService,
+          handleHint: normHandle,
         );
         if (resolved.target != null) {
           _handleAccountIdentity(
             resolved.target!.instanceId,
-            handle,
-            following: following,
-            followers: followers,
+            normHandle,
+            following: _sanitizeBridgeStat(following),
+            followers: _sanitizeBridgeStat(followers),
           );
         }
       },
@@ -887,6 +1075,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final totalTabs = list.length + 1;
     if (activate) {
       _activeSubTabId[instance.instanceId] = tabId;
+      _syncActiveWebViews();
     }
     if (mounted) {
       setState(() {});
@@ -909,6 +1098,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       _isGmailOpen = false;
                       _activeSubTabId[instance.instanceId] = tabId;
                     });
+                    _syncActiveWebViews();
                   }
                 },
               ),
@@ -937,6 +1127,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (list.isEmpty) {
       _extraTabs.remove(instanceId);
     }
+    _syncActiveWebViews();
     if (mounted) setState(() {});
   }
 
@@ -978,6 +1169,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _activeSubTabId[active.instanceId] =
           nextIdx == 0 ? null : extras[nextIdx - 1].tabId;
     });
+    _syncActiveWebViews();
     _showGestureNotice('タブ ${nextIdx + 1}/$total');
     return true;
   }
@@ -1028,6 +1220,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _settings = _settings.copyWith(activeInstanceId: inst.instanceId);
     });
     _ensureController(inst);
+    _syncActiveWebViews();
     _persist();
   }
 
@@ -1041,6 +1234,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ? _gmailProfileName
           : defaultWebViewProfileName,
       userAgent: buildMobileUserAgent(),
+      serviceId: 'gmail',
+      initiallyActive: _isGmailOpen,
       onProgress: (progress) {
         if (!mounted) return;
         setState(() {
@@ -1126,12 +1321,14 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _isGmailOpen = false;
       });
+      _syncActiveWebViews();
       return;
     }
     _ensureGmailController();
     setState(() {
       _isGmailOpen = true;
     });
+    _syncActiveWebViews();
   }
 
   Future<void> _reloadGmail() async {
@@ -1199,8 +1396,24 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openExternalUrlSafely(String rawUrl) async {
-    final uri = Uri.tryParse(rawUrl.trim());
+    final trimmed = rawUrl.trim();
+    if (trimmed.isEmpty || RegExp(r'[\x00-\x1f\x7f]').hasMatch(trimmed)) {
+      return;
+    }
+    final uri = Uri.tryParse(trimmed);
     if (uri == null) return;
+    final scheme = uri.scheme.toLowerCase();
+    final allowed = switch (scheme) {
+      'https' || 'http' => uri.host.isNotEmpty && !RegExp(r'[\s"\\]').hasMatch(trimmed),
+      'mailto' => uri.path.trim().isNotEmpty,
+      'tel' => uri.path.trim().isNotEmpty &&
+          RegExp(r'^[+0-9()\-\s.]{1,32}$').hasMatch(uri.path.trim()),
+      _ => false,
+    };
+    if (!allowed) {
+      _showSnack('安全のためこのリンク形式は外部起動できません');
+      return;
+    }
     try {
       final launched = await launchUrl(
         uri,
@@ -1245,19 +1458,74 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<String> _syncFollowCloudOnce({bool silent = false}) async {
+    if (silent) {
+      final existing = _syncInFlight;
+      if (existing != null) {
+        _needsResync = true;
+        try {
+          return await existing;
+        } catch (e) {
+          return '同期エラー: ${formatSafeSyncError(e)}';
+        }
+      }
+    } else {
+      // 手動同期は進行中ジョブ（連鎖実行含む）が全て完了するまで厳密に直列待機する
+      _manualSyncWaiters += 1;
+      try {
+        while (_syncInFlight != null) {
+          try {
+            await _syncInFlight!;
+          } catch (_) {}
+          if (!mounted) return '';
+        }
+      } finally {
+        _manualSyncWaiters -= 1;
+      }
+    }
+
+    final future = _runSingleFlightCloudSync(silent: silent);
+    _syncInFlight = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_syncInFlight, future)) {
+        _syncInFlight = null;
+      }
+      // 待機中の手動同期がある場合はそちらに譲り、並列実行（重複 Gist 作成等）を防止する
+      if (_needsResync &&
+          _manualSyncWaiters == 0 &&
+          mounted &&
+          _followSyncSettings.githubToken.trim().isNotEmpty) {
+        _needsResync = false;
+        unawaited(_syncFollowCloudOnce(silent: true));
+      }
+    }
+  }
+
+  Future<String> _runSingleFlightCloudSync({required bool silent}) async {
+    final configGen = _followSyncConfigGen;
     final token = _followSyncSettings.githubToken.trim();
+    final gistId = _followSyncSettings.gistId.trim();
     if (token.isEmpty) {
-      throw Exception('GitHub Personal Access Token（gist 権限）を入力してください');
+      const msg = 'GitHub Personal Access Token（gist 権限）を入力してください';
+      if (!silent) throw const SyncUserException(msg);
+      return msg;
     }
 
     final today = formatLocalYmd(DateTime.now());
+    final snapshot = _followLedger.clone();
     try {
       final res = await FollowSyncService.syncWithGitHubGist(
         token: token,
-        gistId: _followSyncSettings.gistId,
-        localLedger: _followLedger,
+        gistId: gistId,
+        localLedger: snapshot,
         today: today,
       );
+      // 同期実行中に認証情報（Token / Gist ID）が切り替わっていた場合、
+      // 旧 Gist の結果を _followLedger へマージせず即破棄して異 Gist 間の汚染を防ぐ
+      if (_followSyncConfigGen != configGen) {
+        return '同期設定が変更されたため前回の同期結果を破棄しました';
+      }
       _followLedger.mergeFrom(res.mergedLedger, today);
       final (projected, _) =
           projectLedgerToInstances(_instances, _followLedger, today);
@@ -1274,17 +1542,17 @@ class _HomeScreenState extends State<HomeScreen> {
       await _persistAllWithFollowSync();
       return 'クラウド同期完了';
     } catch (e) {
-      final errText = e.toString().replaceFirst('Exception: ', '');
-      if (mounted) {
+      final errText = formatSafeSyncError(e);
+      if (mounted && _followSyncConfigGen == configGen) {
         setState(() {
           _followSyncSettings = _followSyncSettings.copyWith(
             lastSyncStatus: '同期エラー: $errText',
           );
         });
+        await widget.store
+            .saveFollowSyncState(_followSyncSettings, _followLedger);
       }
-      await widget.store
-          .saveFollowSyncState(_followSyncSettings, _followLedger);
-      if (!silent) rethrow;
+      if (!silent) throw SyncUserException(errText);
       return '同期エラー: $errText';
     }
   }
@@ -1346,6 +1614,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final today = formatLocalYmd(DateTime.now());
     final inst = _instances[idx];
     final prevHandle = inst.detectedHandle;
+    final switchedAccount = prevHandle != null && prevHandle != norm;
     final prevToday = inst.effectiveFollowCountToday();
     final prevTotal = inst.followCountTotal;
     final prevUfToday = inst.effectiveUnfollowCountToday();
@@ -1356,7 +1625,14 @@ class _HomeScreenState extends State<HomeScreen> {
 
     var nextInst = inst;
     if (prevHandle != norm) {
-      nextInst = nextInst.copyWith(detectedHandle: norm);
+      nextInst = nextInst.copyWith(
+        detectedHandle: norm,
+        clearSnsStats: switchedAccount,
+        followCountToday: switchedAccount ? 0 : null,
+        followCountTotal: switchedAccount ? 0 : null,
+        unfollowCountToday: switchedAccount ? 0 : null,
+        unfollowCountTotal: switchedAccount ? 0 : null,
+      );
       uiChanged = true;
     }
     if (following != null && nextInst.snsFollowingCount != following) {
@@ -1385,19 +1661,48 @@ class _HomeScreenState extends State<HomeScreen> {
               prevTotal > 0 ||
               prevUfToday > 0 ||
               prevUfTotal > 0) &&
-          devId.isNotEmpty &&
-          !acc.devices.containsKey(devId)) {
-        acc.devices[devId] = DeviceFollowEntry(
-          today: prevToday,
-          total: prevTotal,
-          todayEpoch: acc.resetEpoch,
-          totalEpoch: acc.totalResetEpoch,
-          unfollowToday: prevUfToday,
-          unfollowTotal: prevUfTotal,
-          unfollowTodayEpoch: acc.unfollowResetEpoch,
-          unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
-          updatedAt: now,
-        );
+          devId.isNotEmpty) {
+        final existingDev = acc.devices[devId];
+        if (existingDev == null) {
+          acc.devices[devId] = DeviceFollowEntry(
+            today: prevToday,
+            total: prevTotal,
+            todayEpoch: acc.resetEpoch,
+            totalEpoch: acc.totalResetEpoch,
+            unfollowToday: prevUfToday,
+            unfollowTotal: prevUfTotal,
+            unfollowTodayEpoch: acc.unfollowResetEpoch,
+            unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
+            updatedAt: now,
+          );
+        } else {
+          // 既に同一端末エントリがあってもハンドル検出前のローカル加算分を取りこぼさない
+          if (existingDev.todayEpoch < acc.resetEpoch) {
+            existingDev.today = 0;
+            existingDev.todayEpoch = acc.resetEpoch;
+          }
+          if (existingDev.totalEpoch < acc.totalResetEpoch) {
+            existingDev.total = 0;
+            existingDev.totalEpoch = acc.totalResetEpoch;
+          }
+          if (existingDev.unfollowTodayEpoch < acc.unfollowResetEpoch) {
+            existingDev.unfollowToday = 0;
+            existingDev.unfollowTodayEpoch = acc.unfollowResetEpoch;
+          }
+          if (existingDev.unfollowTotalEpoch < acc.unfollowTotalResetEpoch) {
+            existingDev.unfollowTotal = 0;
+            existingDev.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
+          }
+          existingDev.today =
+              (existingDev.today + prevToday).clamp(-999999, 999999);
+          existingDev.total =
+              (existingDev.total + prevTotal).clamp(-99999999, 99999999);
+          existingDev.unfollowToday =
+              (existingDev.unfollowToday + prevUfToday).clamp(-999999, 999999);
+          existingDev.unfollowTotal = (existingDev.unfollowTotal + prevUfTotal)
+              .clamp(-99999999, 99999999);
+          existingDev.updatedAt = max(now, existingDev.updatedAt + 1);
+        }
         ledgerChanged = true;
       }
 
@@ -1437,8 +1742,16 @@ class _HomeScreenState extends State<HomeScreen> {
     final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
     if (idx == -1) return '対象アカウントが見つかりません';
     if (trimmed.isEmpty) {
+      // 旧アカウントの投影済みカウント・SNS実数が次のアカウントに混入しないようリセット
       setState(() {
-        _instances[idx] = _instances[idx].copyWith(clearDetectedHandle: true);
+        _instances[idx] = _instances[idx].copyWith(
+          clearDetectedHandle: true,
+          clearSnsStats: true,
+          followCountToday: 0,
+          followCountTotal: 0,
+          unfollowCountToday: 0,
+          unfollowCountTotal: 0,
+        );
       });
       await _persist();
       return null;
@@ -1513,17 +1826,21 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final (projected, _) =
           projectLedgerToInstances(_instances, _followLedger, today);
-      setState(() {
-        _instances = projected;
-      });
+      if (mounted) {
+        setState(() {
+          _instances = projected;
+        });
+      }
       await _persistAllWithFollowSync();
       _notifyFollowLedgerChanged();
       return;
     }
 
-    setState(() {
-      _instances[idx] = _instances[idx].withFollowDelta(delta);
-    });
+    if (mounted) {
+      setState(() {
+        _instances[idx] = _instances[idx].withFollowDelta(delta);
+      });
+    }
     await _persist();
   }
 
@@ -1538,39 +1855,71 @@ class _HomeScreenState extends State<HomeScreen> {
     final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
 
     if (syncKey != null) {
+      final devId = _followSyncSettings.deviceId;
       final now = nowUnixSecs();
+      final prevToday = inst.effectiveFollowCountToday();
+      final prevTotal = inst.followCountTotal;
+      final prevUfToday = inst.effectiveUnfollowCountToday();
+      final prevUfTotal = inst.unfollowCountTotal;
       final acc = _followLedger.accounts.putIfAbsent(
         syncKey,
         () => AccountFollowLedger(date: today),
       );
       acc.rollDate(today);
-      acc.resetEpoch += 1;
-      for (final entry in acc.devices.values) {
-        entry.today = 0;
-        entry.todayEpoch = acc.resetEpoch;
-        entry.updatedAt = max(now, entry.updatedAt + 1);
+      // 部分リセット（今日のみリセット）で既存累計を失わないよう未シードなら先に反映
+      if (devId.isNotEmpty &&
+          acc.devices.isEmpty &&
+          (prevToday > 0 ||
+              prevTotal > 0 ||
+              prevUfToday > 0 ||
+              prevUfTotal > 0)) {
+        acc.devices[devId] = DeviceFollowEntry(
+          today: prevToday,
+          total: prevTotal,
+          todayEpoch: acc.resetEpoch,
+          totalEpoch: acc.totalResetEpoch,
+          unfollowToday: prevUfToday,
+          unfollowTotal: prevUfTotal,
+          unfollowTodayEpoch: acc.unfollowResetEpoch,
+          unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
+          updatedAt: now,
+        );
       }
+      // エポックのみ更新し、他端末エントリの updatedAt は絶対に書き換えない（並行更新の上書き防止）
+      acc.resetEpoch += 1;
       if (resetTotal) {
         acc.totalResetEpoch += 1;
-        for (final entry in acc.devices.values) {
-          entry.total = 0;
-          entry.totalEpoch = acc.totalResetEpoch;
-          entry.updatedAt = max(now, entry.updatedAt + 1);
+      }
+      if (devId.isNotEmpty) {
+        final local = acc.devices[devId];
+        if (local != null) {
+          local.today = 0;
+          local.todayEpoch = acc.resetEpoch;
+          if (resetTotal) {
+            local.total = 0;
+            local.totalEpoch = acc.totalResetEpoch;
+          }
+          local.updatedAt = max(now, local.updatedAt + 1);
         }
       }
       final (projected, _) =
           projectLedgerToInstances(_instances, _followLedger, today);
-      setState(() {
-        _instances = projected;
-      });
+      if (mounted) {
+        setState(() {
+          _instances = projected;
+        });
+      }
       await _persistAllWithFollowSync();
       _notifyFollowLedgerChanged();
       return;
     }
 
-    setState(() {
-      _instances[idx] = _instances[idx].withFollowReset(resetTotal: resetTotal);
-    });
+    if (mounted) {
+      setState(() {
+        _instances[idx] =
+            _instances[idx].withFollowReset(resetTotal: resetTotal);
+      });
+    }
     await _persist();
   }
 
@@ -1636,17 +1985,21 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final (projected, _) =
           projectLedgerToInstances(_instances, _followLedger, today);
-      setState(() {
-        _instances = projected;
-      });
+      if (mounted) {
+        setState(() {
+          _instances = projected;
+        });
+      }
       await _persistAllWithFollowSync();
       _notifyFollowLedgerChanged();
       return;
     }
 
-    setState(() {
-      _instances[idx] = _instances[idx].withUnfollowDelta(delta);
-    });
+    if (mounted) {
+      setState(() {
+        _instances[idx] = _instances[idx].withUnfollowDelta(delta);
+      });
+    }
     await _persist();
   }
 
@@ -1661,40 +2014,70 @@ class _HomeScreenState extends State<HomeScreen> {
     final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
 
     if (syncKey != null) {
+      final devId = _followSyncSettings.deviceId;
       final now = nowUnixSecs();
+      final prevToday = inst.effectiveFollowCountToday();
+      final prevTotal = inst.followCountTotal;
+      final prevUfToday = inst.effectiveUnfollowCountToday();
+      final prevUfTotal = inst.unfollowCountTotal;
       final acc = _followLedger.accounts.putIfAbsent(
         syncKey,
         () => AccountFollowLedger(date: today),
       );
       acc.rollDate(today);
-      acc.unfollowResetEpoch += 1;
-      for (final entry in acc.devices.values) {
-        entry.unfollowToday = 0;
-        entry.unfollowTodayEpoch = acc.unfollowResetEpoch;
-        entry.updatedAt = max(now, entry.updatedAt + 1);
+      if (devId.isNotEmpty &&
+          acc.devices.isEmpty &&
+          (prevToday > 0 ||
+              prevTotal > 0 ||
+              prevUfToday > 0 ||
+              prevUfTotal > 0)) {
+        acc.devices[devId] = DeviceFollowEntry(
+          today: prevToday,
+          total: prevTotal,
+          todayEpoch: acc.resetEpoch,
+          totalEpoch: acc.totalResetEpoch,
+          unfollowToday: prevUfToday,
+          unfollowTotal: prevUfTotal,
+          unfollowTodayEpoch: acc.unfollowResetEpoch,
+          unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
+          updatedAt: now,
+        );
       }
+      // エポックのみ更新し、他端末エントリの updatedAt は書き換えない
+      acc.unfollowResetEpoch += 1;
       if (resetTotal) {
         acc.unfollowTotalResetEpoch += 1;
-        for (final entry in acc.devices.values) {
-          entry.unfollowTotal = 0;
-          entry.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
-          entry.updatedAt = max(now, entry.updatedAt + 1);
+      }
+      if (devId.isNotEmpty) {
+        final local = acc.devices[devId];
+        if (local != null) {
+          local.unfollowToday = 0;
+          local.unfollowTodayEpoch = acc.unfollowResetEpoch;
+          if (resetTotal) {
+            local.unfollowTotal = 0;
+            local.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
+          }
+          local.updatedAt = max(now, local.updatedAt + 1);
         }
       }
       final (projected, _) =
           projectLedgerToInstances(_instances, _followLedger, today);
-      setState(() {
-        _instances = projected;
-      });
+      if (mounted) {
+        setState(() {
+          _instances = projected;
+        });
+      }
       await _persistAllWithFollowSync();
       _notifyFollowLedgerChanged();
       return;
     }
 
-    setState(() {
-      _instances[idx] =
-          _instances[idx].withUnfollowReset(resetTotal: resetTotal);
-    });
+    if (mounted) {
+      setState(() {
+        _instances[idx] =
+            _instances[idx].withUnfollowReset(resetTotal: resetTotal);
+      });
+    }
     await _persist();
   }
 
@@ -1706,792 +2089,76 @@ class _HomeScreenState extends State<HomeScreen> {
     return '$hh:$mm';
   }
 
+  String _generateUniqueInstanceId(String serviceId) {
+    Random r;
+    try {
+      r = Random.secure();
+    } catch (_) {
+      r = Random();
+    }
+    final safePrefix =
+        serviceId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
+    final prefix = safePrefix.isEmpty ? 'custom' : safePrefix;
+    for (var attempt = 0; attempt < 32; attempt++) {
+      final randHex =
+          r.nextInt(0xFFFFFF).toRadixString(16).padLeft(6, '0');
+      final candidate = 'svc-$prefix-$randHex';
+      if (!_instances.any((i) => i.instanceId == candidate)) {
+        return candidate;
+      }
+    }
+    return 'svc-$prefix-${DateTime.now().microsecondsSinceEpoch.toRadixString(16)}';
+  }
+
+  Future<void> _updateFollowSyncCredentials({
+    required String githubToken,
+    required String gistId,
+  }) async {
+    _followSyncConfigGen += 1;
+    if (mounted) {
+      setState(() {
+        _followSyncSettings = _followSyncSettings.copyWith(
+          githubToken: githubToken,
+          gistId: gistId,
+        );
+      });
+    } else {
+      _followSyncSettings = _followSyncSettings.copyWith(
+        githubToken: githubToken,
+        gistId: gistId,
+      );
+    }
+    await widget.store.saveFollowSyncState(_followSyncSettings, _followLedger);
+  }
+
   Future<void> _showFollowCounterSheet(
     ServiceInstance target, {
     String? crossSiteSourceName,
   }) async {
-    final handleCtrl = TextEditingController(text: target.detectedHandle ?? '');
-    final tokenCtrl =
-        TextEditingController(text: _followSyncSettings.githubToken);
-    final gistCtrl = TextEditingController(text: _followSyncSettings.gistId);
-    var isSyncing = false;
-
-    try {
-      await showModalBottomSheet<void>(
-        context: context,
-        isScrollControlled: true,
-        builder: (ctx) => StatefulBuilder(
-          builder: (ctx, setSheetState) {
-            final current = _instances.cast<ServiceInstance?>().firstWhere(
-                  (i) => i?.instanceId == target.instanceId,
-                  orElse: () => null,
-                );
-            if (current == null) return const SizedBox.shrink();
-
-            final grp = _serviceGroups.cast<_ServiceGroup?>().firstWhere(
-                  (g) => g?.key == serviceGroupKey(current),
-                  orElse: () => null,
-                );
-            final siblingIdx = grp == null
-                ? 0
-                : max(
-                    0,
-                    grp.accounts
-                        .indexWhere((a) => a.instanceId == current.instanceId),
-                  );
-            final accLabel = accountDisplayLabel(
-              current,
-              siblingIdx,
-              baseServiceName: grp?.displayName,
-            );
-            final baseTitle = _multiProfileSupported
-                ? '${grp?.displayName ?? current.name} · $accLabel'
-                : (grp?.displayName ?? current.name);
-            final withHandle = current.detectedHandle != null
-                ? '$baseTitle (@${current.detectedHandle})'
-                : baseTitle;
-            final title = crossSiteSourceName != null
-                ? '$withHandle（$crossSiteSourceNameタブ内）'
-                : withHandle;
-
-            final now = DateTime.now();
-            final todayCount = current.effectiveFollowCountToday(now);
-            final totalCount = current.followCountTotal;
-            final unfollowTodayCount = current.effectiveUnfollowCountToday(now);
-            final unfollowTotalCount = current.unfollowCountTotal;
-            var allTodaySum = 0;
-            var allUnfollowTodaySum = 0;
-            for (final inst in _instances) {
-              allTodaySum += inst.effectiveFollowCountToday(now);
-              allUnfollowTodaySum += inst.effectiveUnfollowCountToday(now);
-            }
-            final colorScheme = Theme.of(ctx).colorScheme;
-            final fs = _followSyncSettings;
-            final hasCloud = fs.githubToken.trim().isNotEmpty;
-            final syncBadge = hasCloud ? 'クラウド同期' : '未設定';
-            final syncClock = _formatSyncClock(fs.lastSyncAt);
-            final syncStatusLine = fs.lastSyncStatus != null
-                ? (syncClock.isNotEmpty
-                    ? '${fs.lastSyncStatus}（$syncClock）'
-                    : fs.lastSyncStatus!)
-                : (hasCloud
-                    ? 'GitHub 非公開 Gist で PC・スマホ間を自動同期します'
-                    : 'GitHub Token を設定すると PC・スマホ間で自動同期されます');
-
-            final snsLiveParts = <String>[];
-            if (current.snsFollowingCount != null) {
-              snsLiveParts.add('フォロー中 ${current.snsFollowingCount}人');
-            }
-            if (current.snsFollowersCount != null) {
-              snsLiveParts.add('フォロワー ${current.snsFollowersCount}人');
-            }
-
-            return SafeArea(
-              child: Padding(
-                padding: EdgeInsets.only(
-                  bottom: MediaQuery.of(ctx).viewInsets.bottom,
-                ),
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Row(
-                        children: [
-                          Icon(
-                            Icons.person_add_alt_1_rounded,
-                            color: colorScheme.primary,
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text(
-                                  'フォロー・アンフォロー カウンター',
-                                  style: TextStyle(
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                                Text(
-                                  title,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: Theme.of(ctx).textTheme.bodySmall,
-                                ),
-                              ],
-                            ),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.close),
-                            onPressed: () => Navigator.of(ctx).pop(),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Container(
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: colorScheme.primaryContainer
-                                    .withValues(alpha: 0.45),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: colorScheme.primary
-                                      .withValues(alpha: 0.4),
-                                ),
-                              ),
-                              child: Column(
-                                children: [
-                                  const Text(
-                                    '今日のフォロー数',
-                                    style: TextStyle(fontSize: 11.5),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    '$todayCount',
-                                    key: const ValueKey('follow-sheet-today'),
-                                    style: TextStyle(
-                                      fontSize: 28,
-                                      fontWeight: FontWeight.w800,
-                                      color: colorScheme.primary,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Container(
-                              padding: const EdgeInsets.all(12),
-                              decoration: BoxDecoration(
-                                color: colorScheme.surfaceContainerHighest
-                                    .withValues(alpha: 0.6),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: colorScheme.outlineVariant,
-                                ),
-                              ),
-                              child: Column(
-                                children: [
-                                  const Text(
-                                    '累計フォロー数',
-                                    style: TextStyle(fontSize: 11.5),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    '$totalCount',
-                                    key: const ValueKey('follow-sheet-total'),
-                                    style: const TextStyle(
-                                      fontSize: 28,
-                                      fontWeight: FontWeight.w800,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      if (snsLiveParts.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 7,
-                          ),
-                          decoration: BoxDecoration(
-                            color: colorScheme.primary.withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(
-                              color:
-                                  colorScheme.primary.withValues(alpha: 0.32),
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 6,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: colorScheme.primary,
-                                  borderRadius: BorderRadius.circular(999),
-                                ),
-                                child: Text(
-                                  'SNS実数',
-                                  style: TextStyle(
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w700,
-                                    color: colorScheme.onPrimary,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  snsLiveParts.join(' · '),
-                                  style: const TextStyle(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 10),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              key: const ValueKey('follow-sheet-dec'),
-                              onPressed: todayCount > 0 || totalCount > 0
-                                  ? () async {
-                                      await _adjustFollowCount(
-                                        current.instanceId,
-                                        -1,
-                                      );
-                                      setSheetState(() {});
-                                    }
-                                  : null,
-                              icon: const Icon(Icons.remove, size: 18),
-                              label: const Text('−1'),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: FilledButton.tonalIcon(
-                              key: const ValueKey('follow-sheet-inc'),
-                              onPressed: () async {
-                                await _adjustFollowCount(
-                                  current.instanceId,
-                                  1,
-                                );
-                                setSheetState(() {});
-                              },
-                              icon: const Icon(Icons.add, size: 18),
-                              label: const Text('＋1'),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextButton(
-                              onPressed: todayCount > 0
-                                  ? () async {
-                                      await _resetFollowCount(
-                                        current.instanceId,
-                                        resetTotal: false,
-                                      );
-                                      setSheetState(() {});
-                                    }
-                                  : null,
-                              child: const Text('今日をリセット'),
-                            ),
-                          ),
-                          Expanded(
-                            child: TextButton(
-                              onPressed: totalCount > 0 || todayCount > 0
-                                  ? () async {
-                                      await _resetFollowCount(
-                                        current.instanceId,
-                                        resetTotal: true,
-                                      );
-                                      setSheetState(() {});
-                                    }
-                                  : null,
-                              style: TextButton.styleFrom(
-                                foregroundColor: Colors.redAccent,
-                              ),
-                              child: const Text('累計もリセット'),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      const Text(
-                        'アンフォロー（フォロー解除）回数',
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w700,
-                          color: Colors.redAccent,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Container(
-                              padding: const EdgeInsets.all(10),
-                              decoration: BoxDecoration(
-                                color: Colors.redAccent.withValues(alpha: 0.12),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: Colors.redAccent.withValues(alpha: 0.45),
-                                ),
-                              ),
-                              child: Column(
-                                children: [
-                                  const Text(
-                                    '今日のアンフォロー数',
-                                    style: TextStyle(fontSize: 11),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    '$unfollowTodayCount',
-                                    key: const ValueKey('unfollow-sheet-today'),
-                                    style: const TextStyle(
-                                      fontSize: 24,
-                                      fontWeight: FontWeight.w800,
-                                      color: Colors.redAccent,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Container(
-                              padding: const EdgeInsets.all(10),
-                              decoration: BoxDecoration(
-                                color: colorScheme.surfaceContainerHighest
-                                    .withValues(alpha: 0.6),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(
-                                  color: colorScheme.outlineVariant,
-                                ),
-                              ),
-                              child: Column(
-                                children: [
-                                  const Text(
-                                    '累計アンフォロー数',
-                                    style: TextStyle(fontSize: 11),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    '$unfollowTotalCount',
-                                    key: const ValueKey('unfollow-sheet-total'),
-                                    style: const TextStyle(
-                                      fontSize: 24,
-                                      fontWeight: FontWeight.w800,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              key: const ValueKey('unfollow-sheet-dec'),
-                              onPressed: unfollowTodayCount > 0 ||
-                                      unfollowTotalCount > 0
-                                  ? () async {
-                                      await _adjustUnfollowCount(
-                                        current.instanceId,
-                                        -1,
-                                      );
-                                      setSheetState(() {});
-                                    }
-                                  : null,
-                              icon: const Icon(Icons.remove, size: 18),
-                              label: const Text('−1'),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              key: const ValueKey('unfollow-sheet-inc'),
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: Colors.redAccent,
-                                side: BorderSide(
-                                  color: Colors.redAccent.withValues(alpha: 0.55),
-                                ),
-                              ),
-                              onPressed: () async {
-                                await _adjustUnfollowCount(
-                                  current.instanceId,
-                                  1,
-                                );
-                                setSheetState(() {});
-                              },
-                              icon: const Icon(Icons.add, size: 18),
-                              label: const Text('＋1'),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 4),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextButton(
-                              onPressed: unfollowTodayCount > 0
-                                  ? () async {
-                                      await _resetUnfollowCount(
-                                        current.instanceId,
-                                        resetTotal: false,
-                                      );
-                                      setSheetState(() {});
-                                    }
-                                  : null,
-                              child: const Text('今日をリセット'),
-                            ),
-                          ),
-                          Expanded(
-                            child: TextButton(
-                              onPressed: unfollowTotalCount > 0 ||
-                                      unfollowTodayCount > 0
-                                  ? () async {
-                                      await _resetUnfollowCount(
-                                        current.instanceId,
-                                        resetTotal: true,
-                                      );
-                                      setSheetState(() {});
-                                    }
-                                  : null,
-                              style: TextButton.styleFrom(
-                                foregroundColor: Colors.redAccent,
-                              ),
-                              child: const Text('累計もリセット'),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: handleCtrl,
-                              decoration: const InputDecoration(
-                                isDense: true,
-                                prefixText: '@',
-                                labelText: '同期アカウントID（自動検出）',
-                                hintText: '例: darksan560',
-                                border: OutlineInputBorder(),
-                              ),
-                              style: const TextStyle(fontSize: 13),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          OutlinedButton(
-                            onPressed: () async {
-                              final err = await _setInstanceHandleManual(
-                                current.instanceId,
-                                handleCtrl.text,
-                              );
-                              if (err != null) {
-                                _showSnack(err);
-                              } else {
-                                _showSnack('同期アカウントIDを更新しました');
-                              }
-                              setSheetState(() {});
-                            },
-                            child: const Text('設定'),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Container(
-                        decoration: BoxDecoration(
-                          border: Border.all(color: colorScheme.outlineVariant),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: ExpansionTile(
-                          tilePadding:
-                              const EdgeInsets.symmetric(horizontal: 12),
-                          childrenPadding:
-                              const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                          title: Row(
-                            children: [
-                              const Expanded(
-                                child: Text(
-                                  'PC・スマホ同期設定',
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                              ),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 2,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: colorScheme.secondaryContainer,
-                                  borderRadius: BorderRadius.circular(999),
-                                ),
-                                child: Text(
-                                  syncBadge,
-                                  style: TextStyle(
-                                    fontSize: 10.5,
-                                    fontWeight: FontWeight.w700,
-                                    color: colorScheme.onSecondaryContainer,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                          children: [
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Text(
-                                  'クラウド同期 (GitHub非公開Gist)',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                                TextButton(
-                                  style: TextButton.styleFrom(
-                                    padding: EdgeInsets.zero,
-                                    minimumSize: const Size(0, 24),
-                                    tapTargetSize:
-                                        MaterialTapTargetSize.shrinkWrap,
-                                  ),
-                                  onPressed: () => _openExternalUrlSafely(
-                                    'https://github.com/settings/tokens/new?scopes=gist&description=OmniSNS%20Follow%20Sync',
-                                  ),
-                                  child: const Text(
-                                    'Token作成',
-                                    style: TextStyle(fontSize: 11),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            TextField(
-                              controller: tokenCtrl,
-                              obscureText: true,
-                              decoration: const InputDecoration(
-                                isDense: true,
-                                labelText: 'GitHub Token (gist権限)',
-                                border: OutlineInputBorder(),
-                              ),
-                              style: const TextStyle(fontSize: 12.5),
-                              onChanged: (val) {
-                                final parsed = parseSharedSyncConfig(val);
-                                if (parsed != null) {
-                                  tokenCtrl.text = parsed.token;
-                                  gistCtrl.text = parsed.gistId;
-                                  _showSnack('コピーした同期設定を自動入力しました');
-                                }
-                              },
-                            ),
-                            const SizedBox(height: 8),
-                            TextField(
-                              controller: gistCtrl,
-                              decoration: const InputDecoration(
-                                isDense: true,
-                                labelText: 'Gist ID（空欄で自動作成）',
-                                border: OutlineInputBorder(),
-                              ),
-                              style: const TextStyle(fontSize: 12.5),
-                            ),
-                            const SizedBox(height: 8),
-                            Wrap(
-                              spacing: 6,
-                              runSpacing: 6,
-                              children: [
-                                FilledButton.tonal(
-                                  onPressed: isSyncing
-                                      ? null
-                                      : () async {
-                                          setSheetState(() => isSyncing = true);
-                                          setState(() {
-                                            _followSyncSettings =
-                                                _followSyncSettings.copyWith(
-                                              githubToken:
-                                                  tokenCtrl.text.trim(),
-                                              gistId: gistCtrl.text.trim(),
-                                            );
-                                          });
-                                          await widget.store
-                                              .saveFollowSyncState(
-                                            _followSyncSettings,
-                                            _followLedger,
-                                          );
-                                          try {
-                                            final msg =
-                                                await _syncFollowCloudOnce(
-                                              silent: false,
-                                            );
-                                            gistCtrl.text =
-                                                _followSyncSettings.gistId;
-                                            _showSnack(msg);
-                                          } catch (e) {
-                                            _showSnack(
-                                              e
-                                                  .toString()
-                                                  .replaceFirst(
-                                                    'Exception: ',
-                                                    '',
-                                                  ),
-                                            );
-                                          } finally {
-                                            if (ctx.mounted) {
-                                              setSheetState(
-                                                () => isSyncing = false,
-                                              );
-                                            }
-                                          }
-                                        },
-                                  child: Text(
-                                    isSyncing ? '同期中...' : '保存して今すぐ同期',
-                                    style: const TextStyle(fontSize: 12),
-                                  ),
-                                ),
-                                OutlinedButton(
-                                  onPressed: () async {
-                                    final tk = tokenCtrl.text.trim();
-                                    if (tk.isEmpty) {
-                                      _showSnack('先にTokenを入力してください');
-                                      return;
-                                    }
-                                    await Clipboard.setData(
-                                      ClipboardData(
-                                        text: encodeSharedSyncConfig(
-                                          tk,
-                                          gistCtrl.text.trim(),
-                                        ),
-                                      ),
-                                    );
-                                    _showSnack('同期設定をコピーしました（PC側へ貼付可）');
-                                  },
-                                  child: const Text(
-                                    '設定コピー',
-                                    style: TextStyle(fontSize: 12),
-                                  ),
-                                ),
-                                OutlinedButton(
-                                  onPressed: isSyncing
-                                      ? null
-                                      : () async {
-                                          final clip = await Clipboard.getData(
-                                            Clipboard.kTextPlain,
-                                          );
-                                          final parsed = parseSharedSyncConfig(
-                                            clip?.text ?? '',
-                                          );
-                                          if (parsed == null) {
-                                            _showSnack(
-                                              'クリップボードに有効な同期設定がありません',
-                                            );
-                                            return;
-                                          }
-                                          tokenCtrl.text = parsed.token;
-                                          gistCtrl.text = parsed.gistId;
-                                          setSheetState(() => isSyncing = true);
-                                          setState(() {
-                                            _followSyncSettings =
-                                                _followSyncSettings.copyWith(
-                                              githubToken: parsed.token,
-                                              gistId: parsed.gistId,
-                                            );
-                                          });
-                                          await widget.store
-                                              .saveFollowSyncState(
-                                            _followSyncSettings,
-                                            _followLedger,
-                                          );
-                                          try {
-                                            final msg =
-                                                await _syncFollowCloudOnce(
-                                              silent: false,
-                                            );
-                                            gistCtrl.text =
-                                                _followSyncSettings.gistId;
-                                            _showSnack(msg);
-                                          } catch (e) {
-                                            _showSnack(
-                                              e
-                                                  .toString()
-                                                  .replaceFirst(
-                                                    'Exception: ',
-                                                    '',
-                                                  ),
-                                            );
-                                          } finally {
-                                            if (ctx.mounted) {
-                                              setSheetState(
-                                                () => isSyncing = false,
-                                              );
-                                            }
-                                          }
-                                        },
-                                  child: const Text(
-                                    '貼付して適用',
-                                    style: TextStyle(fontSize: 12),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            Align(
-                              alignment: Alignment.centerLeft,
-                              child: Text(
-                                syncStatusLine,
-                                style: Theme.of(ctx)
-                                    .textTheme
-                                    .bodySmall
-                                    ?.copyWith(fontSize: 11),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      if (_instances.length >= 2) ...[
-                        const Divider(height: 16),
-                        Text(
-                          allUnfollowTodaySum > 0
-                              ? '全アカウント合計（今日）: フォロー $allTodaySum回 / 解除 $allUnfollowTodaySum回'
-                              : '全アカウント合計（今日）: $allTodaySum 回',
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 6),
-                      Text(
-                        'Threads・Instagram・Bluesky 等でフォロー／フォロー解除を押すと自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。',
-                        style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
-                              fontSize: 11,
-                            ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            );
-          },
-        ),
-      );
-    } finally {
-      handleCtrl.dispose();
-      tokenCtrl.dispose();
-      gistCtrl.dispose();
-    }
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => _FollowCounterSheet(
+        targetInstanceId: target.instanceId,
+        crossSiteSourceName: crossSiteSourceName,
+        multiProfileSupported: _multiProfileSupported,
+        getInstances: () => _instances,
+        getServiceGroups: () => _serviceGroups,
+        getFollowSyncSettings: () => _followSyncSettings,
+        formatSyncClock: _formatSyncClock,
+        onAdjustFollow: _adjustFollowCount,
+        onResetFollow: (id, resetTotal) =>
+            _resetFollowCount(id, resetTotal: resetTotal),
+        onAdjustUnfollow: _adjustUnfollowCount,
+        onResetUnfollow: (id, resetTotal) =>
+            _resetUnfollowCount(id, resetTotal: resetTotal),
+        onSetHandle: _setInstanceHandleManual,
+        onSaveSyncCredentials: _updateFollowSyncCredentials,
+        onSyncNow: () => _syncFollowCloudOnce(silent: false),
+        onOpenExternalUrl: _openExternalUrlSafely,
+        onShowSnack: _showSnack,
+      ),
+    );
   }
 
   Future<void> _toggleBottomTabsCollapsed() async {
@@ -2610,14 +2277,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final nextLabel = nextDefaultAccountLabel(existingLabels);
     final catSvc = _catalogServiceFor(active.serviceId);
 
-    final randHex = Random()
-        .nextInt(0xFFFFFF)
-        .toRadixString(16)
-        .padLeft(6, '0');
-    final safePrefix =
-        active.serviceId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
-    final newInstanceId =
-        'svc-${safePrefix.isEmpty ? 'custom' : safePrefix}-$randHex';
+    final newInstanceId = _generateUniqueInstanceId(active.serviceId);
     final newInstance = ServiceInstance(
       instanceId: newInstanceId,
       serviceId: active.serviceId,
@@ -2640,6 +2300,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final insertAt =
         lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
     setState(() {
+      _isGmailOpen = false;
       _instances.insert(insertAt, newInstance);
       _runtimeMap[newInstance.instanceId] = TabRuntimeState(
         currentUrl: newInstance.url,
@@ -2649,6 +2310,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _settings = _settings.copyWith(activeInstanceId: newInstance.instanceId);
     });
     _ensureController(newInstance);
+    _syncActiveWebViews();
     await _persist();
     _showSnack('「${group.displayName} / $nextLabel」を追加しました（独立セッション）');
   }
@@ -2670,14 +2332,30 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _clearSessionForInstance(ServiceInstance inst) async {
+    final profileName = _multiProfileSupported
+        ? inst.effectiveProfileName
+        : defaultWebViewProfileName;
+    final affected = _instances
+        .where(
+          (i) =>
+              (_multiProfileSupported
+                  ? i.effectiveProfileName
+                  : defaultWebViewProfileName) ==
+              profileName,
+        )
+        .toList();
+    final affectsMultiple = affected.length > 1;
+
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('ログイン情報を消去'),
         content: Text(
-          _multiProfileSupported
-              ? 'このアカウントのCookieとログイン情報を消去してログアウトしますか？'
-              : 'Cookieとログイン情報を消去してログアウトしますか？',
+          affectsMultiple
+              ? 'このプロファイル（$profileName）を共有する全${affected.length}個のアカウントからログアウトされます。Cookieとログイン情報を消去しますか？'
+              : (_multiProfileSupported
+                  ? 'このアカウントのCookieとログイン情報を消去してログアウトしますか？'
+                  : 'Cookieとログイン情報を消去してログアウトしますか？'),
         ),
         actions: [
           TextButton(
@@ -2691,15 +2369,35 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
-    if (ok != true) return;
+    if (!mounted || ok != true) return;
 
-    final profileName = _multiProfileSupported
-        ? inst.effectiveProfileName
-        : defaultWebViewProfileName;
     await OmniWebViewManager.clearProfileData(profileName);
-    final ctrl = _controllers[inst.instanceId];
-    if (ctrl != null) {
-      await ctrl.loadUrl(inst.url);
+    if (!mounted) return;
+
+    final affectedIds = affected.map((a) => a.instanceId).toSet();
+    for (final id in affectedIds) {
+      _crossSiteIdentities.remove(id);
+    }
+    setState(() {
+      _instances = _instances.map((i) {
+        if (!affectedIds.contains(i.instanceId)) return i;
+        return i.copyWith(
+          clearDetectedHandle: true,
+          clearSnsStats: true,
+          followCountToday: 0,
+          followCountTotal: 0,
+          unfollowCountToday: 0,
+          unfollowCountTotal: 0,
+        );
+      }).toList();
+    });
+    await _persist();
+
+    for (final a in affected) {
+      final ctrl = _controllers[a.instanceId];
+      if (ctrl != null && !ctrl.isDisposed) {
+        await ctrl.loadUrl(a.url);
+      }
     }
     _showSnack('ログイン情報を消去しました');
   }
@@ -2719,7 +2417,7 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
-    if (req == null) return;
+    if (!mounted || req == null) return;
 
     if (req.restoreArchivedInstanceId != null) {
       await _restoreArchivedInstance(req.restoreArchivedInstanceId!);
@@ -2737,14 +2435,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
 
-    final randHex = Random()
-        .nextInt(0xFFFFFF)
-        .toRadixString(16)
-        .padLeft(6, '0');
-    final safePrefix =
-        req.serviceId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
-    final newInstanceId =
-        'svc-${safePrefix.isEmpty ? 'custom' : safePrefix}-$randHex';
+    final newInstanceId = _generateUniqueInstanceId(req.serviceId);
     final newInstance = ServiceInstance(
       instanceId: newInstanceId,
       serviceId: req.serviceId,
@@ -2767,6 +2458,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final insertAt =
         lastSiblingIdx >= 0 ? lastSiblingIdx + 1 : _instances.length;
     setState(() {
+      _isGmailOpen = false;
       _instances.insert(insertAt, newInstance);
       _runtimeMap[newInstance.instanceId] = TabRuntimeState(
         currentUrl: newInstance.url,
@@ -2776,6 +2468,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _settings = _settings.copyWith(activeInstanceId: newInstance.instanceId);
     });
     _ensureController(newInstance);
+    _syncActiveWebViews();
     await _persist();
     final suffix = _multiProfileSupported &&
             (newInstance.accountLabel?.isNotEmpty ?? false)
@@ -2791,6 +2484,9 @@ class _HomeScreenState extends State<HomeScreen> {
       MaterialPageRoute(
         builder: (_) => SettingsScreen(
           settings: _settings,
+          onGestureChanged: (nextGesture) {
+            _updateGestureSettings(nextGesture);
+          },
           activeServiceName:
               (!_isGmailOpen && active != null) ? (activeGroup?.displayName ?? active.name) : null,
           activeDesktopMode: (!_isGmailOpen && active != null) ? active.isDesktopUa : null,
@@ -2803,6 +2499,24 @@ class _HomeScreenState extends State<HomeScreen> {
           onOpenJevSettings: () => _showJevSettingsSheet(),
           onClearAllCookies: () async {
             await OmniWebViewManager.clearAllCookies();
+            if (!mounted) return;
+            _crossSiteIdentities.clear();
+            setState(() {
+              _instances = _instances
+                  .map(
+                    (i) => i.copyWith(
+                      clearDetectedHandle: true,
+                      clearSnsStats: true,
+                      followCountToday: 0,
+                      followCountTotal: 0,
+                      unfollowCountToday: 0,
+                      unfollowCountTotal: 0,
+                    ),
+                  )
+                  .toList();
+            });
+            await _persist();
+            if (!mounted) return;
             for (final id in _controllers.keys.toList()) {
               final inst = _instances.cast<ServiceInstance?>().firstWhere(
                     (i) => i?.instanceId == id,
@@ -2821,7 +2535,7 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
-    if (updated == null) return;
+    if (!mounted || updated == null) return;
     setState(() {
       _settings = updated;
     });
@@ -2831,6 +2545,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _updateGestureSettings(MobileGestureSettings next) async {
+    if (!mounted) return;
     setState(() {
       _settings = _settings.copyWith(gesture: next);
     });
@@ -2943,16 +2658,19 @@ class _HomeScreenState extends State<HomeScreen> {
     switch (action) {
       case 'go-back':
         if (ctrl != null && await ctrl.canGoBack()) {
+          if (!mounted) return;
           await ctrl.goBack();
           _showGestureNotice('${shapeArrows(shape)} 戻る');
-        } else if (_isGmailOpen) {
+        } else if (_isGmailOpen && mounted) {
           setState(() => _isGmailOpen = false);
+          _syncActiveWebViews();
           _showGestureNotice('${shapeArrows(shape)} Gmailを閉じました');
         } else {
           _showGestureNotice('これ以上戻れません');
         }
       case 'go-forward':
         if (ctrl != null && await ctrl.canGoForward()) {
+          if (!mounted) return;
           await ctrl.goForward();
           _showGestureNotice('${shapeArrows(shape)} 進む');
         } else {
@@ -2964,14 +2682,16 @@ class _HomeScreenState extends State<HomeScreen> {
       case 'home':
         if (_isGmailOpen) {
           final g = _ensureGmailController();
-          setState(() {
-            _gmailRuntime = _gmailRuntime.copyWith(
-              isSleeping: false,
-              isLoading: true,
-              progress: 5,
-              clearError: true,
-            );
-          });
+          if (mounted) {
+            setState(() {
+              _gmailRuntime = _gmailRuntime.copyWith(
+                isSleeping: false,
+                isLoading: true,
+                progress: 5,
+                clearError: true,
+              );
+            });
+          }
           await g.loadUrl(_gmailUrl);
           _showGestureNotice('${shapeArrows(shape)} Gmail 受信トレイ');
         } else if (active != null) {
@@ -3087,111 +2807,53 @@ class _HomeScreenState extends State<HomeScreen> {
       siblingIdx,
       baseServiceName: grp?.displayName,
     );
-    final accCtrl = TextEditingController(text: curAccLabel);
-    final nameCtrl = TextEditingController(text: inst.name);
-    final urlCtrl = TextEditingController(text: inst.url);
-    var notify = inst.notificationsEnabled;
-
     final dialogTitle = _multiProfileSupported
         ? '「${grp?.displayName ?? inst.name} · $curAccLabel」を編集'
         : '「${grp?.displayName ?? inst.name}」を編集';
 
     final updated = await showDialog<ServiceInstance>(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDialogState) => AlertDialog(
-          title: Text(dialogTitle),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (_multiProfileSupported) ...[
-                  TextField(
-                    controller: accCtrl,
-                    decoration: const InputDecoration(
-                      labelText: 'アカウント名（ヘッダー表示名）',
-                      hintText: '例: メイン / サブ / 仕事用',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                ],
-                TextField(
-                  controller: nameCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'サービス表示名',
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: urlCtrl,
-                  keyboardType: TextInputType.url,
-                  decoration: const InputDecoration(
-                    labelText: 'ホーム / DM画面 URL',
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                CheckboxListTile(
-                  value: notify,
-                  onChanged: (v) => setDialogState(() => notify = v ?? true),
-                  title: const Text('未読バッジ監視'),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('キャンセル'),
-            ),
-            FilledButton(
-              onPressed: () {
-                final normalized = normalizeServiceUrl(urlCtrl.text);
-                if (normalized == null) {
-                  ScaffoldMessenger.of(ctx).showSnackBar(
-                    const SnackBar(content: Text('有効なURLを入力してください')),
-                  );
-                  return;
-                }
-                final trimmedAcc = accCtrl.text.trim();
-                Navigator.of(ctx).pop(
-                  inst.copyWith(
-                    name: nameCtrl.text.trim().isEmpty
-                        ? inst.name
-                        : nameCtrl.text.trim(),
-                    accountLabel: _multiProfileSupported
-                        ? (trimmedAcc.isEmpty ? null : trimmedAcc)
-                        : inst.accountLabel,
-                    clearAccountLabel:
-                        _multiProfileSupported && trimmedAcc.isEmpty,
-                    url: normalized,
-                    notificationsEnabled: notify,
-                  ),
-                );
-              },
-              child: const Text('保存'),
-            ),
-          ],
-        ),
+      builder: (ctx) => _EditInstanceDialog(
+        instance: inst,
+        dialogTitle: dialogTitle,
+        initialAccountLabel: curAccLabel,
+        multiProfileSupported: _multiProfileSupported,
       ),
     );
 
-    accCtrl.dispose();
-    nameCtrl.dispose();
-    urlCtrl.dispose();
-
-    if (updated == null) return;
+    if (!mounted || updated == null) return;
     final idx =
         _instances.indexWhere((i) => i.instanceId == inst.instanceId);
     if (idx == -1) return;
 
+    final oldGroupKey = serviceGroupKey(inst);
+    final newGroupKey = serviceGroupKey(updated);
+    final urlChanged = updated.url != inst.url;
+
     setState(() {
       _instances[idx] = updated;
+      if (oldGroupKey != newGroupKey &&
+          _lastActiveByGroup[oldGroupKey] == inst.instanceId) {
+        _lastActiveByGroup.remove(oldGroupKey);
+        _lastActiveByGroup[newGroupKey] = updated.instanceId;
+      }
+      if (urlChanged) {
+        final curRt = _runtimeMap[inst.instanceId];
+        if (curRt != null) {
+          _runtimeMap[inst.instanceId] = curRt.copyWith(
+            currentUrl: updated.url,
+            clearError: true,
+          );
+        }
+      }
     });
     await _persist();
+    if (urlChanged) {
+      final ctrl = _controllers[inst.instanceId];
+      if (ctrl != null && !ctrl.isDisposed) {
+        await ctrl.loadUrl(updated.url);
+      }
+    }
     _showSnack('設定を保存しました');
   }
 
@@ -3234,13 +2896,18 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
-    if (ok != true) return;
+    if (!mounted || ok != true) return;
 
     final wasActive = _settings.activeInstanceId == inst.instanceId;
     final removedCtrl = _controllers.remove(inst.instanceId);
     removedCtrl?.dispose();
     _disposeExtraSubTabsFor(inst.instanceId);
     _runtimeMap.remove(inst.instanceId);
+    _crossSiteIdentities.remove(inst.instanceId);
+    _bridgeEventTimestamps.remove(inst.instanceId);
+    if (_lastActiveByGroup[groupKey] == inst.instanceId) {
+      _lastActiveByGroup.remove(groupKey);
+    }
     setState(() {
       _instances.removeWhere((i) => i.instanceId == inst.instanceId);
       if (wasActive) {
@@ -3284,15 +2951,18 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
-    if (ok != true) return;
+    if (!mounted || ok != true) return;
 
     final archivedBatch = List<ServiceInstance>.from(group.accounts);
     final ids = group.accounts.map((a) => a.instanceId).toSet();
+    _lastActiveByGroup.remove(group.key);
     for (final acc in group.accounts) {
       final ctrl = _controllers.remove(acc.instanceId);
       ctrl?.dispose();
       _disposeExtraSubTabsFor(acc.instanceId);
       _runtimeMap.remove(acc.instanceId);
+      _crossSiteIdentities.remove(acc.instanceId);
+      _bridgeEventTimestamps.remove(acc.instanceId);
     }
     setState(() {
       _instances.removeWhere((i) => ids.contains(i.instanceId));
@@ -3348,6 +3018,7 @@ class _HomeScreenState extends State<HomeScreen> {
           }
           if (mounted) {
             setState(() => _isGmailOpen = false);
+            _syncActiveWebViews();
           }
           return;
         }
@@ -4259,7 +3930,7 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Row(
           children: [
             Expanded(
-              child: _multiProfileSupported
+              child: (_multiProfileSupported || group.accounts.length >= 2)
                   ? ListView(
                       scrollDirection: Axis.horizontal,
                       padding: const EdgeInsets.fromLTRB(8, 5, 4, 5),
@@ -4358,38 +4029,40 @@ class _HomeScreenState extends State<HomeScreen> {
                               );
                             },
                           ),
-                        InkWell(
-                          borderRadius: BorderRadius.circular(99),
-                          onTap: _addAccountForActiveService,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(99),
-                              border: Border.all(
-                                color: colorScheme.outlineVariant,
-                              ),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.add,
-                                  size: 14,
-                                  color: colorScheme.primary,
+                        if (_multiProfileSupported)
+                          InkWell(
+                            borderRadius: BorderRadius.circular(99),
+                            onTap: _addAccountForActiveService,
+                            child: Container(
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 10),
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(99),
+                                border: Border.all(
+                                  color: colorScheme.outlineVariant,
                                 ),
-                                const SizedBox(width: 3),
-                                Text(
-                                  'アカウント追加',
-                                  style: TextStyle(
-                                    fontSize: 11.5,
-                                    fontWeight: FontWeight.w600,
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.add,
+                                    size: 14,
                                     color: colorScheme.primary,
                                   ),
-                                ),
-                              ],
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    'アカウント追加',
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: colorScheme.primary,
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
-                        ),
                       ],
                     )
                   : Padding(
@@ -4708,8 +4381,10 @@ class _HomeScreenState extends State<HomeScreen> {
                                       : _gmailUrl)
                                   : (isHttpOrHttpsUrl(activeRt?.currentUrl)
                                       ? activeRt!.currentUrl
-                                      : active!.url);
-                              _openExternalUrlSafely(url);
+                                      : active?.url);
+                              if (url != null) {
+                                _openExternalUrlSafely(url);
+                              }
                             },
                             child: const Text('外部ブラウザで開く'),
                           ),
@@ -5233,6 +4908,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     selected: activeTid == null,
                     onTap: () {
                       setState(() => _activeSubTabId.remove(active.instanceId));
+                      _syncActiveWebViews();
                     },
                   ),
                   for (final sub in extras)
@@ -5245,6 +4921,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         setState(
                           () => _activeSubTabId[active.instanceId] = sub.tabId,
                         );
+                        _syncActiveWebViews();
                       },
                       onClose: () =>
                           _closeExtraSubTab(active.instanceId, sub.tabId),
@@ -5721,5 +5398,942 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     catCtrl.dispose();
     keyCtrl.dispose();
+  }
+}
+
+class _FollowCounterSheet extends StatefulWidget {
+  const _FollowCounterSheet({
+    required this.targetInstanceId,
+    required this.crossSiteSourceName,
+    required this.multiProfileSupported,
+    required this.getInstances,
+    required this.getServiceGroups,
+    required this.getFollowSyncSettings,
+    required this.formatSyncClock,
+    required this.onAdjustFollow,
+    required this.onResetFollow,
+    required this.onAdjustUnfollow,
+    required this.onResetUnfollow,
+    required this.onSetHandle,
+    required this.onSaveSyncCredentials,
+    required this.onSyncNow,
+    required this.onOpenExternalUrl,
+    required this.onShowSnack,
+  });
+
+  final String targetInstanceId;
+  final String? crossSiteSourceName;
+  final bool multiProfileSupported;
+  final List<ServiceInstance> Function() getInstances;
+  final List<_ServiceGroup> Function() getServiceGroups;
+  final FollowSyncSettings Function() getFollowSyncSettings;
+  final String Function(int? unixSecs) formatSyncClock;
+  final Future<void> Function(String instanceId, int delta) onAdjustFollow;
+  final Future<void> Function(String instanceId, bool resetTotal) onResetFollow;
+  final Future<void> Function(String instanceId, int delta) onAdjustUnfollow;
+  final Future<void> Function(String instanceId, bool resetTotal)
+      onResetUnfollow;
+  final Future<String?> Function(String instanceId, String rawHandle)
+      onSetHandle;
+  final Future<void> Function({
+    required String githubToken,
+    required String gistId,
+  }) onSaveSyncCredentials;
+  final Future<String> Function() onSyncNow;
+  final Future<void> Function(String url) onOpenExternalUrl;
+  final void Function(String message) onShowSnack;
+
+  @override
+  State<_FollowCounterSheet> createState() => _FollowCounterSheetState();
+}
+
+class _FollowCounterSheetState extends State<_FollowCounterSheet> {
+  late final TextEditingController _handleCtrl;
+  late final TextEditingController _tokenCtrl;
+  late final TextEditingController _gistCtrl;
+  bool _isSyncing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final initial = widget.getInstances().cast<ServiceInstance?>().firstWhere(
+          (i) => i?.instanceId == widget.targetInstanceId,
+          orElse: () => null,
+        );
+    final fs = widget.getFollowSyncSettings();
+    _handleCtrl = TextEditingController(text: initial?.detectedHandle ?? '');
+    _tokenCtrl = TextEditingController(text: fs.githubToken);
+    _gistCtrl = TextEditingController(text: fs.gistId);
+  }
+
+  @override
+  void dispose() {
+    _handleCtrl.dispose();
+    _tokenCtrl.dispose();
+    _gistCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final instances = widget.getInstances();
+    final current = instances.cast<ServiceInstance?>().firstWhere(
+          (i) => i?.instanceId == widget.targetInstanceId,
+          orElse: () => null,
+        );
+    if (current == null) return const SizedBox.shrink();
+
+    final groups = widget.getServiceGroups();
+    final grp = groups.cast<_ServiceGroup?>().firstWhere(
+          (g) => g?.key == serviceGroupKey(current),
+          orElse: () => null,
+        );
+    final siblingIdx = grp == null
+        ? 0
+        : max(
+            0,
+            grp.accounts.indexWhere((a) => a.instanceId == current.instanceId),
+          );
+    final accLabel = accountDisplayLabel(
+      current,
+      siblingIdx,
+      baseServiceName: grp?.displayName,
+    );
+    final baseTitle = widget.multiProfileSupported
+        ? '${grp?.displayName ?? current.name} · $accLabel'
+        : (grp?.displayName ?? current.name);
+    final withHandle = current.detectedHandle != null
+        ? '$baseTitle (@${current.detectedHandle})'
+        : baseTitle;
+    final title = widget.crossSiteSourceName != null
+        ? '$withHandle（${widget.crossSiteSourceName}タブ内）'
+        : withHandle;
+
+    final now = DateTime.now();
+    final todayCount = current.effectiveFollowCountToday(now);
+    final totalCount = current.followCountTotal;
+    final unfollowTodayCount = current.effectiveUnfollowCountToday(now);
+    final unfollowTotalCount = current.unfollowCountTotal;
+    var allTodaySum = 0;
+    var allUnfollowTodaySum = 0;
+    for (final inst in instances) {
+      allTodaySum += inst.effectiveFollowCountToday(now);
+      allUnfollowTodaySum += inst.effectiveUnfollowCountToday(now);
+    }
+    final colorScheme = Theme.of(context).colorScheme;
+    final fs = widget.getFollowSyncSettings();
+    final hasCloud = fs.githubToken.trim().isNotEmpty;
+    final syncBadge = hasCloud ? 'クラウド同期' : '未設定';
+    final syncClock = widget.formatSyncClock(fs.lastSyncAt);
+    final syncStatusLine = fs.lastSyncStatus != null
+        ? (syncClock.isNotEmpty
+            ? '${fs.lastSyncStatus}（$syncClock）'
+            : fs.lastSyncStatus!)
+        : (hasCloud
+            ? 'GitHub 非公開 Gist で PC・スマホ間を自動同期します'
+            : 'GitHub Token を設定すると PC・スマホ間で自動同期されます');
+
+    final snsLiveParts = <String>[];
+    if (current.snsFollowingCount != null) {
+      snsLiveParts.add('フォロー中 ${current.snsFollowingCount}人');
+    }
+    if (current.snsFollowersCount != null) {
+      snsLiveParts.add('フォロワー ${current.snsFollowersCount}人');
+    }
+
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.of(context).viewInsets.bottom,
+        ),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.person_add_alt_1_rounded,
+                    color: colorScheme.primary,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'フォロー・アンフォロー カウンター',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text(
+                          title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: colorScheme.primaryContainer
+                            .withValues(alpha: 0.45),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: colorScheme.primary.withValues(alpha: 0.4),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          const Text(
+                            '今日のフォロー数',
+                            style: TextStyle(fontSize: 11.5),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '$todayCount',
+                            key: const ValueKey('follow-sheet-today'),
+                            style: TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.w800,
+                              color: colorScheme.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: colorScheme.surfaceContainerHighest
+                            .withValues(alpha: 0.6),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: colorScheme.outlineVariant,
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          const Text(
+                            '累計フォロー数',
+                            style: TextStyle(fontSize: 11.5),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '$totalCount',
+                            key: const ValueKey('follow-sheet-total'),
+                            style: const TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              if (snsLiveParts.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 7,
+                  ),
+                  decoration: BoxDecoration(
+                    color: colorScheme.primary.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: colorScheme.primary.withValues(alpha: 0.32),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: colorScheme.primary,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          'SNS実数',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                            color: colorScheme.onPrimary,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          snsLiveParts.join(' · '),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      key: const ValueKey('follow-sheet-dec'),
+                      onPressed: todayCount > 0 || totalCount > 0
+                          ? () async {
+                              await widget.onAdjustFollow(
+                                current.instanceId,
+                                -1,
+                              );
+                              if (mounted) setState(() {});
+                            }
+                          : null,
+                      icon: const Icon(Icons.remove, size: 18),
+                      label: const Text('−1'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      key: const ValueKey('follow-sheet-inc'),
+                      onPressed: () async {
+                        await widget.onAdjustFollow(current.instanceId, 1);
+                        if (mounted) setState(() {});
+                      },
+                      icon: const Icon(Icons.add, size: 18),
+                      label: const Text('＋1'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextButton(
+                      onPressed: todayCount > 0
+                          ? () async {
+                              await widget.onResetFollow(
+                                current.instanceId,
+                                false,
+                              );
+                              if (mounted) setState(() {});
+                            }
+                          : null,
+                      child: const Text('今日をリセット'),
+                    ),
+                  ),
+                  Expanded(
+                    child: TextButton(
+                      onPressed: totalCount > 0 || todayCount > 0
+                          ? () async {
+                              await widget.onResetFollow(
+                                current.instanceId,
+                                true,
+                              );
+                              if (mounted) setState(() {});
+                            }
+                          : null,
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.redAccent,
+                      ),
+                      child: const Text('累計もリセット'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'アンフォロー（フォロー解除）回数',
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.redAccent,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.redAccent.withValues(alpha: 0.12),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: Colors.redAccent.withValues(alpha: 0.45),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          const Text(
+                            '今日のアンフォロー数',
+                            style: TextStyle(fontSize: 11),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '$unfollowTodayCount',
+                            key: const ValueKey('unfollow-sheet-today'),
+                            style: const TextStyle(
+                              fontSize: 24,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.redAccent,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: colorScheme.surfaceContainerHighest
+                            .withValues(alpha: 0.6),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: colorScheme.outlineVariant,
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          const Text(
+                            '累計アンフォロー数',
+                            style: TextStyle(fontSize: 11),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '$unfollowTotalCount',
+                            key: const ValueKey('unfollow-sheet-total'),
+                            style: const TextStyle(
+                              fontSize: 24,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      key: const ValueKey('unfollow-sheet-dec'),
+                      onPressed:
+                          unfollowTodayCount > 0 || unfollowTotalCount > 0
+                              ? () async {
+                                  await widget.onAdjustUnfollow(
+                                    current.instanceId,
+                                    -1,
+                                  );
+                                  if (mounted) setState(() {});
+                                }
+                              : null,
+                      icon: const Icon(Icons.remove, size: 18),
+                      label: const Text('−1'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      key: const ValueKey('unfollow-sheet-inc'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.redAccent,
+                        side: BorderSide(
+                          color: Colors.redAccent.withValues(alpha: 0.55),
+                        ),
+                      ),
+                      onPressed: () async {
+                        await widget.onAdjustUnfollow(current.instanceId, 1);
+                        if (mounted) setState(() {});
+                      },
+                      icon: const Icon(Icons.add, size: 18),
+                      label: const Text('＋1'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextButton(
+                      onPressed: unfollowTodayCount > 0
+                          ? () async {
+                              await widget.onResetUnfollow(
+                                current.instanceId,
+                                false,
+                              );
+                              if (mounted) setState(() {});
+                            }
+                          : null,
+                      child: const Text('今日をリセット'),
+                    ),
+                  ),
+                  Expanded(
+                    child: TextButton(
+                      onPressed:
+                          unfollowTotalCount > 0 || unfollowTodayCount > 0
+                              ? () async {
+                                  await widget.onResetUnfollow(
+                                    current.instanceId,
+                                    true,
+                                  );
+                                  if (mounted) setState(() {});
+                                }
+                              : null,
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.redAccent,
+                      ),
+                      child: const Text('累計もリセット'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _handleCtrl,
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        prefixText: '@',
+                        labelText: '同期アカウントID（自動検出）',
+                        hintText: '例: darksan560',
+                        border: OutlineInputBorder(),
+                      ),
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () async {
+                      final err = await widget.onSetHandle(
+                        current.instanceId,
+                        _handleCtrl.text,
+                      );
+                      if (err != null) {
+                        widget.onShowSnack(err);
+                      } else {
+                        widget.onShowSnack('同期アカウントIDを更新しました');
+                      }
+                      if (mounted) setState(() {});
+                    },
+                    child: const Text('設定'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Container(
+                decoration: BoxDecoration(
+                  border: Border.all(color: colorScheme.outlineVariant),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: ExpansionTile(
+                  tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+                  childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                  title: Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'PC・スマホ同期設定',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: colorScheme.secondaryContainer,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          syncBadge,
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w700,
+                            color: colorScheme.onSecondaryContainer,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'クラウド同期 (GitHub非公開Gist)',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        TextButton(
+                          style: TextButton.styleFrom(
+                            padding: EdgeInsets.zero,
+                            minimumSize: const Size(0, 24),
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          ),
+                          onPressed: () => widget.onOpenExternalUrl(
+                            'https://github.com/settings/tokens/new?scopes=gist&description=OmniSNS%20Follow%20Sync',
+                          ),
+                          child: const Text(
+                            'Token作成',
+                            style: TextStyle(fontSize: 11),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: _tokenCtrl,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        labelText: 'GitHub Token (gist権限)',
+                        border: OutlineInputBorder(),
+                      ),
+                      style: const TextStyle(fontSize: 12.5),
+                      onChanged: (val) {
+                        final parsed = parseSharedSyncConfig(val);
+                        if (parsed != null) {
+                          _tokenCtrl.text = parsed.token;
+                          _gistCtrl.text = parsed.gistId;
+                          widget.onShowSnack('コピーした同期設定を自動入力しました');
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _gistCtrl,
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        labelText: 'Gist ID（空欄で自動作成）',
+                        border: OutlineInputBorder(),
+                      ),
+                      style: const TextStyle(fontSize: 12.5),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: [
+                        FilledButton.tonal(
+                          onPressed: _isSyncing
+                              ? null
+                              : () async {
+                                  final tk = _tokenCtrl.text.trim();
+                                  final gid = _gistCtrl.text.trim();
+                                  if (tk.isNotEmpty &&
+                                      !isValidGitHubToken(tk)) {
+                                    widget.onShowSnack(
+                                      'GitHub Token の形式が不正です（空白や改行を含めないでください）',
+                                    );
+                                    return;
+                                  }
+                                  if (!isValidGistId(gid)) {
+                                    widget.onShowSnack(
+                                      'Gist ID の形式が不正です（半角英数字・ハイフン・アンダースコアのみ有効）',
+                                    );
+                                    return;
+                                  }
+                                  setState(() => _isSyncing = true);
+                                  await widget.onSaveSyncCredentials(
+                                    githubToken: tk,
+                                    gistId: gid,
+                                  );
+                                  try {
+                                    final msg = await widget.onSyncNow();
+                                    if (mounted) {
+                                      _gistCtrl.text =
+                                          widget.getFollowSyncSettings().gistId;
+                                    }
+                                    widget.onShowSnack(msg);
+                                  } catch (e) {
+                                    widget.onShowSnack(formatSafeSyncError(e));
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _isSyncing = false);
+                                    }
+                                  }
+                                },
+                          child: Text(
+                            _isSyncing ? '同期中...' : '保存して今すぐ同期',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                        OutlinedButton(
+                          onPressed: () async {
+                            final tk = _tokenCtrl.text.trim();
+                            final gid = _gistCtrl.text.trim();
+                            if (tk.isEmpty) {
+                              widget.onShowSnack('先にTokenを入力してください');
+                              return;
+                            }
+                            if (!isValidGitHubToken(tk) ||
+                                !isValidGistId(gid)) {
+                              widget.onShowSnack(
+                                'GitHub Token または Gist ID の形式が不正です',
+                              );
+                              return;
+                            }
+                            await Clipboard.setData(
+                              ClipboardData(
+                                text: encodeSharedSyncConfig(tk, gid),
+                              ),
+                            );
+                            widget.onShowSnack('同期設定をコピーしました（PC側へ貼付可）');
+                          },
+                          child: const Text(
+                            '設定コピー',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                        OutlinedButton(
+                          onPressed: _isSyncing
+                              ? null
+                              : () async {
+                                  final clip = await Clipboard.getData(
+                                    Clipboard.kTextPlain,
+                                  );
+                                  if (!mounted) return;
+                                  final parsed = parseSharedSyncConfig(
+                                    clip?.text ?? '',
+                                  );
+                                  if (parsed == null) {
+                                    widget.onShowSnack(
+                                      'クリップボードに有効な同期設定がありません',
+                                    );
+                                    return;
+                                  }
+                                  _tokenCtrl.text = parsed.token;
+                                  _gistCtrl.text = parsed.gistId;
+                                  setState(() => _isSyncing = true);
+                                  await widget.onSaveSyncCredentials(
+                                    githubToken: parsed.token,
+                                    gistId: parsed.gistId,
+                                  );
+                                  try {
+                                    final msg = await widget.onSyncNow();
+                                    if (mounted) {
+                                      _gistCtrl.text =
+                                          widget.getFollowSyncSettings().gistId;
+                                    }
+                                    widget.onShowSnack(msg);
+                                  } catch (e) {
+                                    widget.onShowSnack(formatSafeSyncError(e));
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() => _isSyncing = false);
+                                    }
+                                  }
+                                },
+                          child: const Text(
+                            '貼付して適用',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        syncStatusLine,
+                        style: Theme.of(context)
+                            .textTheme
+                            .bodySmall
+                            ?.copyWith(fontSize: 11),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (instances.length >= 2) ...[
+                const Divider(height: 16),
+                Text(
+                  allUnfollowTodaySum > 0
+                      ? '全アカウント合計（今日）: フォロー $allTodaySum回 / 解除 $allUnfollowTodaySum回'
+                      : '全アカウント合計（今日）: $allTodaySum 回',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 6),
+              Text(
+                'Threads・Instagram・Bluesky 等でフォロー／フォロー解除を押すと自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      fontSize: 11,
+                    ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _EditInstanceDialog extends StatefulWidget {
+  const _EditInstanceDialog({
+    required this.instance,
+    required this.dialogTitle,
+    required this.initialAccountLabel,
+    required this.multiProfileSupported,
+  });
+
+  final ServiceInstance instance;
+  final String dialogTitle;
+  final String initialAccountLabel;
+  final bool multiProfileSupported;
+
+  @override
+  State<_EditInstanceDialog> createState() => _EditInstanceDialogState();
+}
+
+class _EditInstanceDialogState extends State<_EditInstanceDialog> {
+  late final TextEditingController _accCtrl;
+  late final TextEditingController _nameCtrl;
+  late final TextEditingController _urlCtrl;
+  late bool _notify;
+
+  @override
+  void initState() {
+    super.initState();
+    _accCtrl = TextEditingController(text: widget.initialAccountLabel);
+    _nameCtrl = TextEditingController(text: widget.instance.name);
+    _urlCtrl = TextEditingController(text: widget.instance.url);
+    _notify = widget.instance.notificationsEnabled;
+  }
+
+  @override
+  void dispose() {
+    _accCtrl.dispose();
+    _nameCtrl.dispose();
+    _urlCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final inst = widget.instance;
+    return AlertDialog(
+      title: Text(widget.dialogTitle),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (widget.multiProfileSupported) ...[
+              TextField(
+                controller: _accCtrl,
+                decoration: const InputDecoration(
+                  labelText: 'アカウント名（ヘッダー表示名）',
+                  hintText: '例: メイン / サブ / 仕事用',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+            TextField(
+              controller: _nameCtrl,
+              decoration: const InputDecoration(
+                labelText: 'サービス表示名',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _urlCtrl,
+              keyboardType: TextInputType.url,
+              decoration: const InputDecoration(
+                labelText: 'ホーム / DM画面 URL',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            CheckboxListTile(
+              value: _notify,
+              onChanged: (v) => setState(() => _notify = v ?? true),
+              title: const Text('未読バッジ監視'),
+              contentPadding: EdgeInsets.zero,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('キャンセル'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final normalized = normalizeServiceUrl(_urlCtrl.text);
+            if (normalized == null) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('有効なURLを入力してください')),
+              );
+              return;
+            }
+            final trimmedAcc = _accCtrl.text.trim();
+            Navigator.of(context).pop(
+              inst.copyWith(
+                name: _nameCtrl.text.trim().isEmpty
+                    ? inst.name
+                    : _nameCtrl.text.trim(),
+                accountLabel: widget.multiProfileSupported
+                    ? (trimmedAcc.isEmpty ? null : trimmedAcc)
+                    : inst.accountLabel,
+                clearAccountLabel:
+                    widget.multiProfileSupported && trimmedAcc.isEmpty,
+                url: normalized,
+                notificationsEnabled: _notify,
+              ),
+            );
+          },
+          child: const Text('保存'),
+        ),
+      ],
+    );
   }
 }

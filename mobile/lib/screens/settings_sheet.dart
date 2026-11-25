@@ -8,6 +8,7 @@ class SettingsScreen extends StatefulWidget {
     super.key,
     required this.settings,
     required this.onClearAllCookies,
+    this.onGestureChanged,
     this.activeServiceName,
     this.activeDesktopMode,
     this.onToggleDesktopMode,
@@ -17,6 +18,7 @@ class SettingsScreen extends StatefulWidget {
 
   final AppSettings settings;
   final Future<void> Function() onClearAllCookies;
+  final ValueChanged<MobileGestureSettings>? onGestureChanged;
   final String? activeServiceName;
   final bool? activeDesktopMode;
   final Future<void> Function(bool desktopMode)? onToggleDesktopMode;
@@ -117,7 +119,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   builder: (_) => GestureSettingsScreen(
                     initialSettings: _gesture,
                     onChanged: (next) {
-                      setState(() => _gesture = next);
+                      if (mounted) {
+                        setState(() => _gesture = next);
+                      } else {
+                        _gesture = next;
+                      }
+                      widget.onGestureChanged?.call(next);
                     },
                   ),
                 ),

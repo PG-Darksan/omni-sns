@@ -279,95 +279,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   Future<void> _openDetailedAddDialog(CatalogService svc) async {
     final suggestedLabel = _nextAccountLabelFor(svc);
-    final accountCtrl = TextEditingController(text: suggestedLabel);
-    final nameCtrl = TextEditingController(text: svc.name);
-    final urlCtrl = TextEditingController(text: svc.url);
-
     final result = await showDialog<NewInstanceRequest>(
       context: context,
-      builder: (ctx) {
-        return AlertDialog(
-          title: Text('${svc.name} を詳細追加'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (widget.multiProfileSupported) ...[
-                  TextField(
-                    controller: accountCtrl,
-                    decoration: const InputDecoration(
-                      labelText: 'アカウント名（ヘッダー表示名）',
-                      hintText: '例: メイン / サブ / 仕事用',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                ],
-                TextField(
-                  controller: nameCtrl,
-                  decoration: const InputDecoration(
-                    labelText: 'サービス表示名',
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: urlCtrl,
-                  keyboardType: TextInputType.url,
-                  decoration: const InputDecoration(
-                    labelText: '初期URL (https://...)',
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('キャンセル'),
-            ),
-            FilledButton(
-              onPressed: () {
-                final normalized = normalizeServiceUrl(urlCtrl.text);
-                if (normalized == null) {
-                  ScaffoldMessenger.of(ctx).showSnackBar(
-                    const SnackBar(
-                      content: Text('有効な http:// または https:// URL を入力してください'),
-                    ),
-                  );
-                  return;
-                }
-                final finalName = nameCtrl.text.trim().isEmpty
-                    ? svc.name
-                    : nameCtrl.text.trim();
-                final finalAcc = widget.multiProfileSupported
-                    ? (accountCtrl.text.trim().isEmpty
-                        ? suggestedLabel
-                        : accountCtrl.text.trim())
-                    : 'メイン';
-                Navigator.of(ctx).pop(
-                  NewInstanceRequest(
-                    serviceId: svc.id,
-                    name: finalName,
-                    accountLabel: finalAcc,
-                    category: svc.category,
-                    url: normalized,
-                    colorHex: svc.colorHex,
-                    badge: svc.badge,
-                  ),
-                );
-              },
-              child: const Text('追加して開く'),
-            ),
-          ],
-        );
-      },
+      builder: (ctx) => _DetailedAddServiceDialog(
+        service: svc,
+        suggestedLabel: suggestedLabel,
+        multiProfileSupported: widget.multiProfileSupported,
+      ),
     );
-
-    accountCtrl.dispose();
-    nameCtrl.dispose();
-    urlCtrl.dispose();
 
     if (result != null && mounted) {
       Navigator.of(context).pop(result);
@@ -387,12 +306,28 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
     final rawName = _customNameController.text.trim();
     final name = rawName.isEmpty ? 'カスタムSNS' : rawName;
+    final parsedHost = Uri.tryParse(normalized)?.host.toLowerCase() ?? '';
+    final targetGroupKey = parsedHost.isNotEmpty ? 'custom:$parsedHost' : '';
+    final existingSameHost = targetGroupKey.isEmpty
+        ? const <ServiceInstance>[]
+        : widget.existingInstances
+            .where((i) => serviceGroupKey(i) == targetGroupKey)
+            .toList();
+    final existingLabels = List.generate(
+      existingSameHost.length,
+      (idx) => accountDisplayLabel(
+        existingSameHost[idx],
+        idx,
+        baseServiceName: name,
+      ),
+    );
+    final nextLabel = nextDefaultAccountLabel(existingLabels);
 
     Navigator.of(context).pop(
       NewInstanceRequest(
         serviceId: 'custom',
         name: name,
-        accountLabel: 'メイン',
+        accountLabel: nextLabel,
         category: _customCategory,
         url: normalized,
         colorHex: '#3B82F6',
@@ -971,6 +906,125 @@ class _CatalogScreenState extends State<CatalogScreen> {
         FilledButton(
           onPressed: _submitCustomService,
           child: const Text('このサービスを追加して開く'),
+        ),
+      ],
+    );
+  }
+}
+
+class _DetailedAddServiceDialog extends StatefulWidget {
+  const _DetailedAddServiceDialog({
+    required this.service,
+    required this.suggestedLabel,
+    required this.multiProfileSupported,
+  });
+
+  final CatalogService service;
+  final String suggestedLabel;
+  final bool multiProfileSupported;
+
+  @override
+  State<_DetailedAddServiceDialog> createState() =>
+      _DetailedAddServiceDialogState();
+}
+
+class _DetailedAddServiceDialogState extends State<_DetailedAddServiceDialog> {
+  late final TextEditingController _accountCtrl;
+  late final TextEditingController _nameCtrl;
+  late final TextEditingController _urlCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _accountCtrl = TextEditingController(text: widget.suggestedLabel);
+    _nameCtrl = TextEditingController(text: widget.service.name);
+    _urlCtrl = TextEditingController(text: widget.service.url);
+  }
+
+  @override
+  void dispose() {
+    _accountCtrl.dispose();
+    _nameCtrl.dispose();
+    _urlCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final svc = widget.service;
+    return AlertDialog(
+      title: Text('${svc.name} を詳細追加'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (widget.multiProfileSupported) ...[
+              TextField(
+                controller: _accountCtrl,
+                decoration: const InputDecoration(
+                  labelText: 'アカウント名（ヘッダー表示名）',
+                  hintText: '例: メイン / サブ / 仕事用',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+            TextField(
+              controller: _nameCtrl,
+              decoration: const InputDecoration(
+                labelText: 'サービス表示名',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _urlCtrl,
+              keyboardType: TextInputType.url,
+              decoration: const InputDecoration(
+                labelText: '初期URL (https://...)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('キャンセル'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final normalized = normalizeServiceUrl(_urlCtrl.text);
+            if (normalized == null) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('有効な http:// または https:// URL を入力してください'),
+                ),
+              );
+              return;
+            }
+            final finalName = _nameCtrl.text.trim().isEmpty
+                ? svc.name
+                : _nameCtrl.text.trim();
+            final finalAcc = widget.multiProfileSupported
+                ? (_accountCtrl.text.trim().isEmpty
+                    ? widget.suggestedLabel
+                    : _accountCtrl.text.trim())
+                : 'メイン';
+            Navigator.of(context).pop(
+              NewInstanceRequest(
+                serviceId: svc.id,
+                name: finalName,
+                accountLabel: finalAcc,
+                category: svc.category,
+                url: normalized,
+                colorHex: svc.colorHex,
+                badge: svc.badge,
+              ),
+            );
+          },
+          child: const Text('追加して開く'),
         ),
       ],
     );

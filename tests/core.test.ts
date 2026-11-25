@@ -8,10 +8,14 @@ import {
   detectPlatformServiceFromUrl,
   getAccountDisplayLabel,
   getServiceGroupKey,
+  isSafeFaviconUrl,
   isSameSiteUrl,
+  isValidGistId,
+  isValidGitHubToken,
   makeBadgeText,
   nextDefaultAccountLabel,
   normalizeServiceUrl,
+  parseSharedSyncConfig,
   parseUnreadCountFromTitle,
   shouldOpenInAppPopup
 } from '../src/shared/url-utils';
@@ -168,6 +172,42 @@ test('detectPlatformServiceFromUrl identifies Instagram opened inside Threads ta
   assert.equal(detectPlatformServiceFromUrl('https://www.threads.net/@alice'), 'threads');
   assert.equal(detectPlatformServiceFromUrl('https://bsky.app/profile/alice.bsky.social'), 'bluesky');
   assert.equal(detectPlatformServiceFromUrl('https://example.com/other'), null);
+  assert.equal(detectPlatformServiceFromUrl('javascript://instagram.com/%0aalert(1)'), null);
+});
+
+test('security validators block internal Tauri hosts, SVG/script favicons, and sync header/path injection', () => {
+  assert.equal(normalizeServiceUrl('http://tauri.localhost/index.html'), null);
+  assert.equal(normalizeServiceUrl('https://sub.ipc.localhost/foo'), null);
+  assert.equal(normalizeServiceUrl('https://example.com/\r\nX-Inject: 1'), null);
+  assert.equal(normalizeServiceUrl('https://example.com/" --arg'), null);
+
+  assert.equal(isSafeFaviconUrl('https://www.instagram.com/favicon.ico'), true);
+  assert.equal(isSafeFaviconUrl('data:image/png;base64,iVBORw0KGgo='), true);
+  assert.equal(isSafeFaviconUrl('data:image/svg+xml,<svg onload=alert(1)>'), false);
+  assert.equal(isSafeFaviconUrl('javascript:alert(1)'), false);
+  assert.equal(isSafeFaviconUrl('file:///C:/Windows/win.ini'), false);
+  assert.equal(isSafeFaviconUrl('http://tauri.localhost/icon.png'), false);
+
+  assert.equal(isValidGitHubToken('ghp_validToken123456'), true);
+  assert.equal(isValidGitHubToken('ghp_bad\r\nX-Evil: 1'), false);
+  assert.equal(isValidGitHubToken('ghp_bad token'), false);
+  assert.equal(isValidGistId(''), true);
+  assert.equal(isValidGistId('gist_abc123-XYZ'), true);
+  assert.equal(isValidGistId('../users/me'), false);
+  assert.equal(isValidGistId('abc?x=1'), false);
+
+  assert.deepEqual(
+    parseSharedSyncConfig('OMNISNS_SYNC_V1:{"token":"ghp_abc123","gistId":"gist_01"}'),
+    { token: 'ghp_abc123', gistId: 'gist_01' }
+  );
+  assert.equal(
+    parseSharedSyncConfig('OMNISNS_SYNC_V1:{"token":"ghp_abc\\r\\nEvil: 1","gistId":"gist_01"}'),
+    null
+  );
+  assert.equal(
+    parseSharedSyncConfig('OMNISNS_SYNC_V1:{"token":"ghp_abc123","gistId":"../other"}'),
+    null
+  );
 });
 
 test('Windows and Android PROFILE_STATS_JS are valid JS with universal mutual-follow, following-heavy color, and Instagram perf optimizations', () => {

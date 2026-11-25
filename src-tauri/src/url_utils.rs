@@ -30,10 +30,30 @@ fn is_valid_version_quad(v: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Tauri 内部の特権オリジン（shell UI / IPC エンドポイント）かどうかを判定する。
+pub fn is_internal_tauri_url(parsed: &Url) -> bool {
+    if matches!(parsed.scheme(), "tauri" | "ipc" | "asset") {
+        return true;
+    }
+    if let Some(host) = parsed.host_str() {
+        let lower = host.to_ascii_lowercase();
+        if lower == "tauri.localhost"
+            || lower.ends_with(".tauri.localhost")
+            || lower == "ipc.localhost"
+            || lower.ends_with(".ipc.localhost")
+            || lower == "asset.localhost"
+            || lower.ends_with(".asset.localhost")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// ユーザー入力URLを正規化し、安全な http/https URL のみ許可する。
 pub fn normalize_service_url(raw_input: &str) -> Option<String> {
     let trimmed = raw_input.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
         return None;
     }
 
@@ -51,6 +71,9 @@ pub fn normalize_service_url(raw_input: &str) -> Option<String> {
     if parsed.host_str().map(|h| h.is_empty()).unwrap_or(true) {
         return None;
     }
+    if is_internal_tauri_url(&parsed) {
+        return None;
+    }
     Some(parsed.to_string())
 }
 
@@ -66,9 +89,63 @@ fn has_scheme_prefix(s: &str) -> bool {
     false
 }
 
+/// 外部ブラウザ起動やサブタブ遷移に安全な正規化済み http/https URL を返す。
+/// 制御文字・空白・引用符・バックスラッシュ等を含む不正な文字列を拒否し、
+/// ShellExecuteW のコマンドライン引数インジェクションを防ぐ。
+pub fn canonical_external_http_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\'))
+    {
+        return None;
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    if parsed.host_str().map(|h| h.is_empty()).unwrap_or(true) {
+        return None;
+    }
+    if is_internal_tauri_url(&parsed) {
+        return None;
+    }
+    let canonical = parsed.to_string();
+    if canonical
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\'))
+    {
+        return None;
+    }
+    Some(canonical)
+}
+
 pub fn is_http_url(url: &str) -> bool {
-    url.get(..7).map(|p| p.eq_ignore_ascii_case("http://")).unwrap_or(false)
-        || url.get(..8).map(|p| p.eq_ignore_ascii_case("https://")).unwrap_or(false)
+    canonical_external_http_url(url).is_some()
+}
+
+/// ファビコン表示用に安全な URL（http/https または raster data:image/）のみ許可する。
+pub fn is_safe_favicon_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    if canonical_external_http_url(trimmed).is_some() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const ALLOWED_DATA_PREFIXES: &[&str] = &[
+        "data:image/png;",
+        "data:image/jpeg;",
+        "data:image/jpg;",
+        "data:image/gif;",
+        "data:image/webp;",
+        "data:image/x-icon;",
+        "data:image/vnd.microsoft.icon;",
+        "data:image/bmp;",
+    ];
+    ALLOWED_DATA_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
 pub fn is_valid_hex_color(color: &str) -> bool {
@@ -211,6 +288,9 @@ pub fn is_auth_popup_url(target_url: &str) -> bool {
     let Ok(target) = Url::parse(target_url) else {
         return false;
     };
+    if is_internal_tauri_url(&target) {
+        return false;
+    }
     if target.scheme() != "https" && target.scheme() != "http" {
         return false;
     }
@@ -236,6 +316,9 @@ pub fn is_same_site_url(target_url: &str, current_service_url: &str) -> bool {
     let Ok(target) = Url::parse(target_url) else {
         return false;
     };
+    if is_internal_tauri_url(&target) {
+        return false;
+    }
     if target.scheme() != "https" && target.scheme() != "http" {
         return false;
     }
@@ -258,6 +341,9 @@ pub fn is_auth_popup_for_site(target_url: &str, current_service_url: &str) -> bo
     let Ok(target) = Url::parse(target_url) else {
         return false;
     };
+    if is_internal_tauri_url(&target) {
+        return false;
+    }
     if target.scheme() != "https" && target.scheme() != "http" {
         return false;
     }
@@ -551,5 +637,35 @@ mod tests {
             detect_platform_service_from_url("https://example.com/unknown"),
             None
         );
+    }
+
+    #[test]
+    fn external_http_and_favicon_url_security_validation() {
+        assert!(is_http_url("https://example.com/path?q=1#top"));
+        assert!(is_http_url("http://example.com/Don't"));
+        assert!(!is_http_url("https://"));
+        assert!(!is_http_url("https://example.com\" --gpu-launcher=calc"));
+        assert!(!is_http_url("https://example.com/a\r\nb"));
+        assert!(!is_http_url("https://example.com/a\0b"));
+        assert!(!is_http_url("https://example.com/a\\b"));
+        assert!(!is_http_url("javascript:alert(1)"));
+        assert!(!is_http_url("file:///C:/Windows/win.ini"));
+        assert_eq!(normalize_service_url("https://example.com/\r\nfoo"), None);
+
+        assert!(is_safe_favicon_url("https://example.com/favicon.ico"));
+        assert!(is_safe_favicon_url("data:image/png;base64,AAAA"));
+        assert!(!is_safe_favicon_url("data:image/svg+xml,<svg/>"));
+        assert!(!is_safe_favicon_url("file:///C:/secret.png"));
+        assert!(!is_safe_favicon_url("javascript:alert(1)"));
+        assert!(!is_auth_popup_url("http://tauri.localhost/oauth"));
+        assert!(!is_auth_popup_url("https://tauri.localhost/login"));
+        assert!(!is_auth_popup_for_site(
+            "http://tauri.localhost/oauth",
+            "https://www.instagram.com/"
+        ));
+        assert!(!is_same_site_url(
+            "http://tauri.localhost/",
+            "http://tauri.localhost/"
+        ));
     }
 }

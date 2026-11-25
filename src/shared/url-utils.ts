@@ -22,12 +22,22 @@ export function buildUserAgent(mode: UserAgentMode, chromeVersion = '136.0.0.0')
   );
 }
 
+const INTERNAL_TAURI_HOSTS = ['tauri.localhost', 'ipc.localhost', 'asset.localhost'];
+
+export function isInternalTauriUrl(parsed: URL): boolean {
+  if (parsed.protocol === 'tauri:' || parsed.protocol === 'ipc:' || parsed.protocol === 'asset:') {
+    return true;
+  }
+  const host = parsed.hostname.toLowerCase();
+  return INTERNAL_TAURI_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+}
+
 /**
  * ユーザー入力URLを正規化し、安全な http/https URL のみ許可する。
  */
 export function normalizeServiceUrl(rawInput: string): string | null {
   const trimmed = rawInput.trim();
-  if (!trimmed) return null;
+  if (!trimmed || /[\x00-\x1f\x7f\s"\\]/.test(trimmed)) return null;
 
   const candidate = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(trimmed)
     ? trimmed
@@ -38,10 +48,77 @@ export function normalizeServiceUrl(rawInput: string): string | null {
     if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
       return null;
     }
-    if (!parsed.hostname) {
+    if (!parsed.hostname || isInternalTauriUrl(parsed)) {
       return null;
     }
     return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+const SAFE_DATA_IMAGE_PREFIXES = [
+  'data:image/png;',
+  'data:image/jpeg;',
+  'data:image/jpg;',
+  'data:image/gif;',
+  'data:image/webp;',
+  'data:image/x-icon;',
+  'data:image/vnd.microsoft.icon;',
+  'data:image/bmp;'
+];
+
+/**
+ * ファビコンとして安全な URL（http/https または raster data:image/*）のみ許可する。
+ * data:image/svg+xml、file://、javascript:、内部 tauri.localhost 等を拒否する。
+ */
+export function isSafeFaviconUrl(rawUrl?: string | null): boolean {
+  if (!rawUrl) return false;
+  const trimmed = rawUrl.trim();
+  if (!trimmed || /[\x00-\x1f\x7f]/.test(trimmed)) return false;
+  const lower = trimmed.toLowerCase();
+  if (SAFE_DATA_IMAGE_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
+    return true;
+  }
+  if (/[\s"\\]/.test(trimmed)) return false;
+  try {
+    const parsed = new URL(trimmed);
+    return (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      Boolean(parsed.hostname) &&
+      !isInternalTauriUrl(parsed)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function isValidGitHubToken(token: string): boolean {
+  const trimmed = token.trim();
+  return /^[\x21-\x7E]{1,512}$/.test(trimmed);
+}
+
+export function isValidGistId(gistId: string): boolean {
+  const trimmed = gistId.trim();
+  return trimmed === '' || /^[A-Za-z0-9_-]{1,64}$/.test(trimmed);
+}
+
+export function parseSharedSyncConfig(raw: string): { token: string; gistId: string } | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const jsonPart = trimmed.startsWith('OMNISNS_SYNC_V1:')
+    ? trimmed.slice('OMNISNS_SYNC_V1:'.length).trim()
+    : trimmed;
+  if (!jsonPart.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(jsonPart) as { token?: unknown; gistId?: unknown };
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const token = typeof parsed.token === 'string' ? parsed.token.trim() : '';
+    const gistId = typeof parsed.gistId === 'string' ? parsed.gistId.trim() : '';
+    if (!token && !gistId) return null;
+    if (token && !isValidGitHubToken(token)) return null;
+    if (!isValidGistId(gistId)) return null;
+    return { token, gistId };
   } catch {
     return null;
   }
@@ -268,6 +345,7 @@ export function detectPlatformServiceFromUrl(rawUrl?: string | null): string | n
   if (!rawUrl || !rawUrl.trim()) return null;
   try {
     const parsed = new URL(rawUrl.trim());
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
     const host = parsed.hostname.toLowerCase();
     const matchHost = (domain: string) => host === domain || host.endsWith(`.${domain}`);
     if (matchHost('instagram.com')) return 'instagram';

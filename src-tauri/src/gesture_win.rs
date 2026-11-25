@@ -34,13 +34,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
     GetMessageW, GetSystemMetrics, IsIconic, IsWindowVisible, KillTimer, PostMessageW,
-    PostThreadMessageW, RegisterClassExW, SetTimer, SetWindowPos, SetWindowsHookExW, ShowWindow,
-    TranslateMessage, UnhookWindowsHookEx, UpdateLayeredWindow, WindowFromPoint, CS_HREDRAW,
-    CS_VREDRAW, GA_ROOT, HCURSOR, HHOOK, HICON, HWND_TOPMOST, MSG, MSLLHOOKSTRUCT, SM_SWAPBUTTON,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WH_MOUSE_LL,
-    WM_APP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    PostQuitMessage, PostThreadMessageW, RegisterClassExW, SetTimer, SetWindowPos,
+    SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, UpdateLayeredWindow,
+    WindowFromPoint, CS_HREDRAW, CS_VREDRAW, GA_ROOT, HCURSOR, HHOOK, HICON, HWND_TOPMOST, MSG,
+    MSLLHOOKSTRUCT, SM_SWAPBUTTON, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+    SW_SHOWNOACTIVATE, ULW_ALPHA, WH_MOUSE_LL, WM_APP, WM_CLOSE, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows_core::{HSTRING, PCWSTR};
 
@@ -196,7 +197,9 @@ unsafe extern "system" fn low_level_mouse_proc(
             };
 
             if msg == sec_down {
-                if st.enabled.load(Ordering::Relaxed) && !st.suspended.load(Ordering::Relaxed) {
+                let mut started = false;
+                let ov = st.overlay_hwnd.load(Ordering::Relaxed);
+                if ov != 0 && st.enabled.load(Ordering::Relaxed) && !st.suspended.load(Ordering::Relaxed) {
                     let main_raw = st.main_hwnd.load(Ordering::Relaxed);
                     if main_raw != 0 {
                         let main_hwnd = HWND(main_raw as *mut c_void);
@@ -219,21 +222,37 @@ unsafe extern "system" fn low_level_mouse_proc(
                                     if let Ok(mut q) = st.queue.lock() {
                                         q.push(HookMsg::Down(pt.x, pt.y));
                                     }
-                                    let ov = st.overlay_hwnd.load(Ordering::Relaxed);
-                                    if ov != 0 {
-                                        let _ = unsafe {
-                                            PostMessageW(
-                                                Some(HWND(ov as *mut c_void)),
-                                                WM_GESTURE_EVENT,
-                                                WPARAM(0),
-                                                LPARAM(0),
-                                            )
-                                        };
-                                    }
-                                    return LRESULT(1);
+                                    let _ = unsafe {
+                                        PostMessageW(
+                                            Some(HWND(ov as *mut c_void)),
+                                            WM_GESTURE_EVENT,
+                                            WPARAM(0),
+                                            LPARAM(0),
+                                        )
+                                    };
+                                    started = true;
                                 }
                             }
                         }
+                    }
+                }
+                if started {
+                    return LRESULT(1);
+                }
+                // 新規ジェスチャーを開始しない右押下は、前回取りこぼした tracking を確実に解除する
+                if st.tracking.swap(false, Ordering::SeqCst) {
+                    if let Ok(mut q) = st.queue.lock() {
+                        q.push(HookMsg::Abort);
+                    }
+                    if ov != 0 {
+                        let _ = unsafe {
+                            PostMessageW(
+                                Some(HWND(ov as *mut c_void)),
+                                WM_GESTURE_EVENT,
+                                WPARAM(0),
+                                LPARAM(0),
+                            )
+                        };
                     }
                 }
             } else if st.tracking.load(Ordering::Relaxed) {
@@ -550,9 +569,12 @@ impl OverlayRuntime {
         };
 
         // Esc キー / サスペンド / ウィンドウ非表示・最小化 / 30秒タイムアウトで中止
+        // (注意: WH_MOUSE_LL が WM_RBUTTONDOWN を消費しているため win32k の gafAsyncKeyState には
+        // 押下ビットが立たず、GetAsyncKeyState(VK_RBUTTON) でのポーリングは常に未押下を返してしまう)
         // (HisatorNotebook w247AbortsOnLifecycle 準拠: 焦点移動だけでは中止しない)
         let esc_down = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } < 0;
         let suspended = hook_state().suspended.load(Ordering::Relaxed);
+        let enabled = hook_state().enabled.load(Ordering::Relaxed);
         let main_raw = hook_state().main_hwnd.load(Ordering::Relaxed);
         let main_hidden = if main_raw != 0 {
             let mh = HWND(main_raw as *mut c_void);
@@ -562,7 +584,17 @@ impl OverlayRuntime {
         };
         let timed_out = stroke.started_at.elapsed() > Duration::from_secs(30);
 
-        if esc_down || suspended || main_hidden || timed_out {
+        if timed_out || suspended || !enabled || main_hidden {
+            hook_state().tracking.store(false, Ordering::SeqCst);
+            self.stroke = None;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_GESTURE_TICK);
+            }
+            self.hide_overlay();
+            return;
+        }
+
+        if esc_down {
             stroke.canceled = true;
             self.hide_overlay();
             return;
@@ -682,6 +714,14 @@ impl OverlayRuntime {
 
         let w = vp.width;
         let h = vp.height;
+        if w <= 0 || h <= 0 || w > 16384 || h > 16384 {
+            self.hide_overlay();
+            return;
+        }
+        let Some(buf_bytes) = (w as usize).checked_mul(h as usize).and_then(|px| px.checked_mul(4)) else {
+            self.hide_overlay();
+            return;
+        };
         let sf = (if vp.scale_factor > 0.0 {
             vp.scale_factor
         } else {
@@ -710,10 +750,16 @@ impl OverlayRuntime {
                 ReleaseDC(None, screen_dc);
                 return;
             };
+            if bits.is_null() {
+                let _ = DeleteObject(HGDIOBJ(hbmp.0));
+                let _ = DeleteDC(mem_dc);
+                ReleaseDC(None, screen_dc);
+                return;
+            }
             let old_obj: HGDIOBJ = SelectObject(mem_dc, HGDIOBJ(hbmp.0));
 
             // ゼロ初期化（完全透明）
-            std::ptr::write_bytes(bits as *mut u8, 0, (w as usize) * (h as usize) * 4);
+            std::ptr::write_bytes(bits as *mut u8, 0, buf_bytes);
 
             let mut gp_bmp: *mut GpBitmap = std::ptr::null_mut();
             let mut gfx: *mut GpGraphics = std::ptr::null_mut();
@@ -1030,6 +1076,12 @@ unsafe extern "system" fn overlay_wnd_proc(
             });
             LRESULT(0)
         }
+        WM_CLOSE => {
+            unsafe {
+                PostQuitMessage(0);
+            }
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
@@ -1037,6 +1089,8 @@ unsafe extern "system" fn overlay_wnd_proc(
 #[derive(Clone)]
 pub struct GestureWinHost {
     thread_id: Arc<AtomicIsize>,
+    shutdown_requested: Arc<AtomicBool>,
+    join_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl GestureWinHost {
@@ -1048,20 +1102,20 @@ impl GestureWinHost {
         let st = hook_state();
         st.main_hwnd.store(main_hwnd, Ordering::SeqCst);
         st.enabled.store(initial_settings.enabled, Ordering::SeqCst);
+        st.tracking.store(false, Ordering::SeqCst);
         if let Ok(mut s) = st.settings.lock() {
             *s = initial_settings;
         }
 
         let thread_id = Arc::new(AtomicIsize::new(0));
         let thread_id_bg = thread_id.clone();
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_bg = shutdown_requested.clone();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("omnisns-gesture".to_string())
             .spawn(move || {
                 unsafe {
-                    let tid = windows::Win32::System::Threading::GetCurrentThreadId();
-                    thread_id_bg.store(tid as isize, Ordering::SeqCst);
-
                     // GDI+ 初期化
                     let mut gdip_token: usize = 0;
                     let gdip_input = GdiplusStartupInput {
@@ -1071,6 +1125,9 @@ impl GestureWinHost {
                     let _ = GdiplusStartup(&mut gdip_token, &gdip_input, std::ptr::null_mut());
 
                     // 透明レイヤードオーバーレイウィンドウ作成
+                    // 注意: 別スレッドの main_hwnd を owner にすると Win32 が入力キューを暗黙結合
+                    // (AttachThreadInput) し、WH_MOUSE_LL スレッドと UI スレッド間でデッドロック・
+                    // OS 全体のマウスフリーズを引き起こすため、必ず owner = None + WS_EX_TOPMOST とする。
                     let hmod = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
                     let hinst = HINSTANCE(hmod.0);
                     let class_name = HSTRING::from("OmniSNSGestureOverlay");
@@ -1086,14 +1143,12 @@ impl GestureWinHost {
                     };
                     let _ = RegisterClassExW(&wc);
 
-                    let owner = if main_hwnd != 0 {
-                        Some(HWND(main_hwnd as *mut c_void))
-                    } else {
-                        None
-                    };
-
                     let overlay_hwnd = CreateWindowExW(
-                        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                        WS_EX_LAYERED
+                            | WS_EX_TRANSPARENT
+                            | WS_EX_NOACTIVATE
+                            | WS_EX_TOOLWINDOW
+                            | WS_EX_TOPMOST,
                         &class_name,
                         PCWSTR::null(),
                         WS_POPUP,
@@ -1101,55 +1156,72 @@ impl GestureWinHost {
                         0,
                         1,
                         1,
-                        owner,
+                        None,
                         None,
                         Some(hinst),
                         None,
                     )
                     .unwrap_or_default();
 
-                    if !overlay_hwnd.0.is_null() {
-                        hook_state()
-                            .overlay_hwnd
-                            .store(overlay_hwnd.0 as isize, Ordering::SeqCst);
-                        OVERLAY_RT.with(|cell| {
-                            *cell.borrow_mut() = Some(OverlayRuntime {
-                                hwnd: overlay_hwnd,
-                                callbacks,
-                                stroke: None,
-                                notice: None,
-                                dirty: false,
-                                visible: false,
-                            });
+                    if overlay_hwnd.0.is_null() {
+                        if gdip_token != 0 {
+                            GdiplusShutdown(gdip_token);
+                        }
+                        return;
+                    }
+
+                    // メッセージキュー確立後にのみスレッド ID と HWND を公開する
+                    let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+                    hook_state()
+                        .overlay_hwnd
+                        .store(overlay_hwnd.0 as isize, Ordering::SeqCst);
+                    thread_id_bg.store(tid as isize, Ordering::SeqCst);
+
+                    OVERLAY_RT.with(|cell| {
+                        *cell.borrow_mut() = Some(OverlayRuntime {
+                            hwnd: overlay_hwnd,
+                            callbacks,
+                            stroke: None,
+                            notice: None,
+                            dirty: false,
+                            visible: false,
                         });
+                    });
+
+                    // 起動直後にすでに shutdown() が呼ばれていた場合はフック登録せず即時終了
+                    if !shutdown_bg.load(Ordering::SeqCst) {
+                        // 低レベルマウスフック登録（このスレッドのメッセージループで高速処理）
+                        let hook: Option<HHOOK> = SetWindowsHookExW(
+                            WH_MOUSE_LL,
+                            Some(low_level_mouse_proc),
+                            Some(hinst),
+                            0,
+                        )
+                        .ok();
+
+                        let mut msg = MSG::default();
+                        // GetMessageW はエラー時に -1 を返すため、.0 > 0 で判定して無限ループを防ぐ
+                        while !shutdown_bg.load(Ordering::SeqCst) {
+                            let res = GetMessageW(&mut msg, None, 0, 0);
+                            if res.0 <= 0 {
+                                break;
+                            }
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+
+                        if let Some(h) = hook {
+                            let _ = UnhookWindowsHookEx(h);
+                        }
                     }
 
-                    // 低レベルマウスフック登録（このスレッドのメッセージループで高速処理）
-                    let hook: Option<HHOOK> = SetWindowsHookExW(
-                        WH_MOUSE_LL,
-                        Some(low_level_mouse_proc),
-                        Some(hinst),
-                        0,
-                    )
-                    .ok();
-
-                    let mut msg = MSG::default();
-                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-
-                    if let Some(h) = hook {
-                        let _ = UnhookWindowsHookEx(h);
-                    }
                     hook_state().overlay_hwnd.store(0, Ordering::SeqCst);
                     hook_state().tracking.store(false, Ordering::SeqCst);
+                    thread_id_bg.store(0, Ordering::SeqCst);
                     OVERLAY_RT.with(|cell| {
                         *cell.borrow_mut() = None;
                     });
-                    if !overlay_hwnd.0.is_null() {
-                        let _ = DestroyWindow(overlay_hwnd);
-                    }
+                    let _ = DestroyWindow(overlay_hwnd);
                     if gdip_token != 0 {
                         GdiplusShutdown(gdip_token);
                     }
@@ -1157,7 +1229,11 @@ impl GestureWinHost {
             })
             .ok();
 
-        Self { thread_id }
+        Self {
+            thread_id,
+            shutdown_requested,
+            join_handle: Arc::new(Mutex::new(handle)),
+        }
     }
 
     pub fn update_viewport(&self, vp: ViewportRect) {
@@ -1197,10 +1273,29 @@ impl GestureWinHost {
     }
 
     pub fn shutdown(&self) {
-        let tid = self.thread_id.load(Ordering::Relaxed) as u32;
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        let ov = hook_state().overlay_hwnd.load(Ordering::SeqCst);
+        if ov != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(ov as *mut c_void)),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+        let tid = self.thread_id.load(Ordering::SeqCst) as u32;
         if tid != 0 {
             unsafe {
                 let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
+        if let Ok(mut slot) = self.join_handle.lock() {
+            if let Some(handle) = slot.take() {
+                if handle.thread().id() != std::thread::current().id() {
+                    let _ = handle.join();
+                }
             }
         }
     }

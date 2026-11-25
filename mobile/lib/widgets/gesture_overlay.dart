@@ -177,11 +177,37 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     });
   }
 
+  void _resetActiveGesture() {
+    _longPressTimer?.cancel();
+    _longPressTimer = null;
+    _stopLiveScroll();
+    _activePointer = null;
+    _downLocal = null;
+    _currentLocal = null;
+    _isDraggingGesture = false;
+    _isMovingHandle = false;
+    _previewXFrac = null;
+    _previewYFrac = null;
+  }
+
+  @override
+  void didUpdateWidget(covariant MobileGestureOverlay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!widget.settings.enabled ||
+        oldWidget.settings.triggerSide != widget.settings.triggerSide) {
+      _resetActiveGesture();
+    }
+  }
+
+  @override
+  void deactivate() {
+    _resetActiveGesture();
+    super.deactivate();
+  }
+
   @override
   void dispose() {
-    _longPressTimer?.cancel();
-    _liveScrollArmTimer?.cancel();
-    _liveScrollTickTimer?.cancel();
+    _resetActiveGesture();
     _noticeTimer?.cancel();
     super.dispose();
   }
@@ -223,23 +249,21 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     if (_liveScrollArmTimer != null) return;
     _liveScrollArmTimer = Timer(const Duration(milliseconds: 190), () {
       _liveScrollArmTimer = null;
-      if (!_isDraggingGesture || _path.invalidated) return;
+      if (!mounted || !_isDraggingGesture || _path.invalidated) return;
       final curShape = _path.shape;
       if (curShape.length != 1) return;
       final curAct = widget.settings.actionFor(curShape);
       if (!isLiveScrollAction(curAct)) return;
       HapticFeedback.selectionClick();
-      if (mounted) {
-        setState(() {
-          _isLiveScrolling = true;
-          _liveScrollAction = curAct;
-        });
-      }
+      setState(() {
+        _isLiveScrolling = true;
+        _liveScrollAction = curAct;
+      });
       _liveScrollTickTimer?.cancel();
       _liveScrollTickTimer = Timer.periodic(
         const Duration(milliseconds: 24),
         (_) {
-          if (!_isLiveScrolling || _currentLocal == null) {
+          if (!mounted || !_isLiveScrolling || _currentLocal == null) {
             _stopLiveScroll();
             return;
           }
@@ -403,21 +427,36 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
       builder: (context, constraints) {
         final w = constraints.maxWidth;
         final h = constraints.maxHeight;
-        if (w <= 0 || h <= 0) return const SizedBox.shrink();
+        if (w < 48.0 || h < 56.0) {
+          // 画面分割や横向きキーボード展開で描画領域が極端に狭くなった場合は
+          // clamp() の ArgumentError を防ぎつつ進行中のジェスチャー／タイマーを安全に停止
+          if (_activePointer != null ||
+              _isDraggingGesture ||
+              _isMovingHandle ||
+              _isLiveScrolling) {
+            _resetActiveGesture();
+          }
+          return const SizedBox.shrink();
+        }
 
         final orbSize = 42.0;
         final yFrac = _previewYFrac ?? settings.handleYFraction;
         final xFrac = _previewXFrac ?? settings.handleXFraction;
+        final minY = min(28.0, h / 2);
+        final maxY = max(h - 28.0, minY);
+        final minX = min(24.0, w / 2);
+        final maxX = max(w - 24.0, minX);
+        final clampedY = (yFrac * h).clamp(minY, maxY).toDouble();
         final orbCenters = <Offset>[];
 
         if (settings.triggerSide == 'both') {
-          orbCenters.add(Offset(26.0, (yFrac * h).clamp(28.0, h - 28.0)));
-          orbCenters.add(Offset(w - 26.0, (yFrac * h).clamp(28.0, h - 28.0)));
+          orbCenters.add(Offset(min(26.0, w / 2), clampedY));
+          orbCenters.add(Offset(max(w - 26.0, w / 2), clampedY));
         } else {
           orbCenters.add(
             Offset(
-              (xFrac * w).clamp(24.0, w - 24.0),
-              (yFrac * h).clamp(28.0, h - 28.0),
+              (xFrac * w).clamp(minX, maxX).toDouble(),
+              clampedY,
             ),
           );
         }
