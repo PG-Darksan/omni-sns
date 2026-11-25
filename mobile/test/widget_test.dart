@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -132,6 +133,123 @@ void main() {
     );
 
     ctrl.dispose();
+  });
+
+  test('OmniWebViewController auto-loads at creation, restores last URL on re-creation, and parses open-new-tab activate', () async {
+    final calls = <MethodCall>[];
+    const channel = MethodChannel('com.pgdarksan.omnisns/webview_98');
+    const channel2 = MethodChannel('com.pgdarksan.omnisns/webview_97');
+    for (final ch in [channel, channel2]) {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(ch, (call) async {
+        calls.add(call);
+        return null;
+      });
+    }
+    addTearDown(() {
+      for (final ch in [channel, channel2]) {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(ch, null);
+      }
+    });
+
+    final opened = <(String, bool)>[];
+    final ctrl = OmniWebViewController(
+      initialUrl: 'https://www.instagram.com/',
+      profileName: 'omnisns_instagram',
+      userAgent: buildMobileUserAgent(),
+      onOpenNewTab: (url, activate) => opened.add((url, activate)),
+    );
+
+    // 初回生成時は初期 URL をネイティブ生成パラメータで読み込み、アタッチ後に重複 loadUrl しない
+    expect(ctrl.takeCreationLoadUrl(), 'https://www.instagram.com/');
+    ctrl.attachPlatformView(98);
+    await Future<void>.delayed(Duration.zero);
+    expect(calls.where((c) => c.method == 'loadUrl'), isEmpty);
+
+    // 閲覧中の URL を記憶し、PlatformView が再生成された場合はその URL で自動復元する
+    final codec = const StandardMethodCodec();
+    Future<void> sendNative(String ch, String method, Map<String, dynamic> args) async {
+      final completer = Completer<void>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.handlePlatformMessage(
+        ch,
+        codec.encodeMethodCall(MethodCall(method, args)),
+        (_) => completer.complete(),
+      );
+      await completer.future;
+    }
+
+    await sendNative(channel.name, 'onPageFinished', {
+      'url': 'https://www.instagram.com/someone/',
+      'title': 'someone',
+      'canGoBack': true,
+      'canGoForward': false,
+      'hadError': false,
+    });
+    expect(ctrl.takeCreationLoadUrl(), 'https://www.instagram.com/someone/');
+
+    // F/FW バッジのタップは activate=true、長押しは activate=false（未指定）として渡される
+    await sendNative(channel.name, 'onOpenNewTab', {
+      'url': 'https://www.instagram.com/foo/',
+      'activate': true,
+    });
+    await sendNative(channel.name, 'onOpenNewTab', {'url': 'https://www.instagram.com/bar/'});
+    expect(opened, [
+      ('https://www.instagram.com/foo/', true),
+      ('https://www.instagram.com/bar/', false),
+    ]);
+
+    ctrl.attachPlatformView(97);
+    ctrl.dispose();
+    expect(ctrl.takeCreationLoadUrl(), isNull);
+  });
+
+  testWidgets('OmniWebViewController reloads an active tab only when the native view never starts loading', (tester) async {
+    final calls = <MethodCall>[];
+    const channel = MethodChannel('com.pgdarksan.omnisns/webview_96');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      calls.add(call);
+      return null;
+    });
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+
+    final ctrl = OmniWebViewController(
+      initialUrl: 'https://bsky.app/',
+      profileName: 'omnisns_bluesky',
+      userAgent: buildMobileUserAgent(),
+      initiallyActive: true,
+    );
+    ctrl.takeCreationLoadUrl();
+    ctrl.attachPlatformView(96);
+    await tester.pump(const Duration(milliseconds: 2600));
+    expect(calls.where((c) => c.method == 'reload').length, 1);
+
+    // 読み込みイベントを受信済みなら、再度アクティブ化しても余計な再読み込みはしない
+    await tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+      channel.name,
+      const StandardMethodCodec().encodeMethodCall(
+        const MethodCall('onProgress', {'progress': 30}),
+      ),
+      (_) {},
+    );
+    await ctrl.setActive(false);
+    await ctrl.setActive(true);
+    await tester.pump(const Duration(milliseconds: 2600));
+    expect(calls.where((c) => c.method == 'reload').length, 1);
+    ctrl.dispose();
+  });
+
+  test('TabRuntimeState.sameVisualState ignores progress-only changes for hidden tabs', () {
+    const base = TabRuntimeState(currentUrl: 'https://x.com/', title: 'X', progress: 10, isLoading: true);
+    final progressed = base.copyWith(progress: 60);
+    expect(base.sameVisualState(progressed), isFalse);
+    expect(base.sameVisualState(progressed, includeProgress: false), isTrue);
+    expect(base.sameVisualState(base.copyWith(isLoading: false), includeProgress: false), isFalse);
+    expect(base.sameVisualState(base.copyWith(title: 'Y'), includeProgress: false), isFalse);
   });
 
   testWidgets('HomeScreen header reload, collapse toggle, and follow counter work cleanly', (tester) async {

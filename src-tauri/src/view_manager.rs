@@ -2912,20 +2912,22 @@ fn attach_windows_handlers(
                     );
                 }
             }),
-        on_open_new_tab: Arc::new(move |target_url| {
+        on_open_new_tab: Arc::new(move |target_url, activate| {
             let app_bg = app_lp.clone();
             let shared_bg = shared_lp.clone();
             let inst_bg = id_lp.clone();
             let after_tid = tid_lp.clone();
             tauri::async_runtime::spawn(async move {
+                // activate=true（F/FW バッジのクリック）は新規タブを開いてそのまま切り替える
                 match create_subtab_with_options(
                     &app_bg,
                     &shared_bg,
                     &inst_bg,
                     Some(target_url),
                     Some(&after_tid),
-                    false,
+                    activate,
                 ) {
+                    Ok(_) if activate => {}
                     Ok(_) => {
                         let total = {
                             let guard = shared_bg.inner.lock().unwrap();
@@ -3580,7 +3582,7 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
             on_follow_detected: Arc::new(move |_| {}),
             on_unfollow_detected: Arc::new(move |_| {}),
             on_account_identity: Arc::new(move |_s, _h, _flwng, _flwrs| {}),
-            on_open_new_tab: Arc::new(move |url| {
+            on_open_new_tab: Arc::new(move |url, _activate| {
                 if is_http_url(&url) {
                     #[cfg(windows)]
                     crate::platform_win::open_external_url(&url);
