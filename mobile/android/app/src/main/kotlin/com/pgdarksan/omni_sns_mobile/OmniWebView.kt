@@ -183,7 +183,7 @@ private class OmniFollowBridge(
     private val onFollow: (String, String) -> Unit,
     private val onUnfollow: (String, String) -> Unit,
     private val onIdentity: (String, String, Int, Int) -> Unit,
-    private val onOpenNewTabCb: (String) -> Unit,
+    private val onOpenNewTabCb: (String, Boolean) -> Unit,
     private val onJevGetConfigCb: () -> Unit,
     private val onJevCheckAccountsCb: (String, String) -> Unit,
     private val onJevStateCb: (Boolean, Int, Int, Boolean) -> Unit,
@@ -214,7 +214,17 @@ private class OmniFollowBridge(
         if (token != expectedToken) return
         val clean = url?.trim().orEmpty()
         if (clean.startsWith("http://", ignoreCase = true) || clean.startsWith("https://", ignoreCase = true)) {
-            onOpenNewTabCb(clean)
+            onOpenNewTabCb(clean, false)
+        }
+    }
+
+    /** F/FW バッジのタップ用: 新規タブを作成してそのタブへ即座に切り替える。 */
+    @JavascriptInterface
+    fun onOpenNewTabActivate(token: String?, url: String?) {
+        if (token != expectedToken) return
+        val clean = url?.trim().orEmpty()
+        if (clean.startsWith("http://", ignoreCase = true) || clean.startsWith("https://", ignoreCase = true)) {
+            onOpenNewTabCb(clean, true)
         }
     }
 
@@ -3165,6 +3175,21 @@ class OmniWebViewManager(
       'color:inherit;white-space:nowrap;opacity:0.95;pointer-events:none;' +
       '}' +
       '.omni-ff-wrap.is-row .omni-ff-badge{pointer-events:auto;cursor:pointer;}' +
+      '.omni-ff-badge.is-link{' +
+      'pointer-events:auto;cursor:pointer;position:relative;' +
+      '-webkit-tap-highlight-color:transparent;touch-action:manipulation;' +
+      'transition:transform 90ms ease-out,filter 90ms ease-out;' +
+      '}' +
+      '.omni-ff-badge.is-link::after{' +
+      'content:"";position:absolute;left:-3px;right:-3px;top:-6px;bottom:-6px;' +
+      '}' +
+      '.omni-ff-badge.is-link:active{transform:scale(0.93);filter:brightness(1.25);}' +
+      '@keyframes omni-ff-open-pop{' +
+      '0%{transform:scale(0.9);box-shadow:0 0 0 0 rgba(56,189,248,0.75);}' +
+      '100%{transform:scale(1);box-shadow:0 0 0 7px rgba(56,189,248,0);}' +
+      '}' +
+      '.omni-ff-badge.is-opening{animation:omni-ff-open-pop 360ms ease-out;}' +
+      '.omni-ff-badge.is-heavy-icon{padding:1px 6px;font-size:11px;line-height:1.2;}' +
       '.omni-ff-badge.is-pending{' +
       'background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.32);opacity:0.72;' +
       '}' +
@@ -3288,6 +3313,106 @@ class OmniWebViewManager(
     return null;
   }
 
+  function toBadgeHttpUrl(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    var trimmed = raw.trim();
+    if (!trimmed || trimmed === '#' || /^(?:javascript|mailto|tel|data|blob):/i.test(trimmed)) return null;
+    try {
+      var parsed = new URL(trimmed, location.href);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+      return parsed.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function buildProfileUrlForHandle(handle) {
+    if (!handle || !isValidHandle(handle)) return null;
+    var path = '';
+    if (platform === 'instagram') path = '/' + handle + '/';
+    else if (platform === 'threads' || platform === 'tiktok' || platform === 'mixi2' ||
+             platform === 'mastodon' || platform === 'misskey') path = '/@' + handle;
+    else if (platform === 'bluesky') path = '/profile/' + handle;
+    else if (platform === 'pixiv') path = /^\d+$/.test(handle) ? '/users/' + handle : '';
+    else if (platform === 'reddit') path = '/user/' + handle + '/';
+    else if (platform === 'linkedin') path = '/in/' + handle + '/';
+    else if (platform === 'facebook') path = /^\d+$/.test(handle) ? '/profile.php?id=' + handle : '/' + handle;
+    else if (platform === 'x') path = '/' + handle;
+    if (!path) return null;
+    return toBadgeHttpUrl(path);
+  }
+
+  // バッジ近傍のリンクから対象ユーザーのプロフィール URL を解決する（見つからない場合はプラットフォーム規則で組み立て）
+  function resolveBadgeProfileUrl(wrap, handle) {
+    try {
+      var prev = wrap.previousElementSibling;
+      if (prev && prev.tagName === 'A' && extractHandleFromLink(prev) === handle) {
+        var pu = toBadgeHttpUrl(prev.getAttribute('href'));
+        if (pu) return pu;
+      }
+      var scope = wrap.closest('[data-omni-ff-row]') || wrap.parentElement;
+      for (var hop = 0; scope && hop < 3; hop++) {
+        var links = scope.querySelectorAll('a[href]');
+        for (var i = 0; i < links.length && i < 40; i++) {
+          if (extractHandleFromLink(links[i]) !== handle) continue;
+          var u = toBadgeHttpUrl(links[i].getAttribute('href'));
+          if (u) return u;
+        }
+        scope = scope.parentElement;
+      }
+    } catch (_) {}
+    return buildProfileUrlForHandle(handle);
+  }
+
+  function postOpenNewTabActivate(url) {
+    try {
+      var ch = __omniFollowChannel || window.OmniFollowChannel;
+      if (ch && typeof ch.postMessage === 'function') {
+        ch.postMessage(JSON.stringify({ token: __omniFollowToken, type: 'open-new-tab', url: url, activate: true }));
+        return true;
+      }
+      var br = __omniFollowBridge || window.OmniFollowBridge;
+      if (br && typeof br.onOpenNewTabActivate === 'function') {
+        br.onOpenNewTabActivate(__omniFollowToken, url);
+        return true;
+      }
+      if (br && typeof br.onOpenNewTab === 'function') {
+        br.onOpenNewTab(__omniFollowToken, url);
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  var lastBadgeOpenAt = 0;
+
+  // 人数ピルのタップ: 人数表示中は新規タブで開いて即切り替え、取得中/再取得表示中は優先再取得
+  function bindStatBadgeClick(statEl, wrap, handle) {
+    statEl.addEventListener('click', function(ev) {
+      var state = statEl.getAttribute('data-omni-ff-state') || '';
+      if (state === 'banner') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+      if (ev.isTrusted === false) return;
+      if (state === 'stats') {
+        var now = Date.now();
+        if (now - lastBadgeOpenAt < 700) return;
+        var url = resolveBadgeProfileUrl(wrap, handle);
+        if (url && postOpenNewTabActivate(url)) {
+          lastBadgeOpenAt = now;
+          statEl.classList.remove('is-opening');
+          void statEl.offsetWidth;
+          statEl.classList.add('is-opening');
+          setTimeout(function() { statEl.classList.remove('is-opening'); }, 420);
+          return;
+        }
+      }
+      enqueueFetch(handle, true, true);
+      scheduleRenderBadges();
+    });
+  }
+
   function renderWrapContents(wrap, display, handle, isRow) {
     // 関係ピル更新
     var relEl = wrap.querySelector('.omni-ff-rel');
@@ -3306,35 +3431,32 @@ class OmniWebViewManager(
 
     // 人数ピル更新
     var statEl = wrap.querySelector('.omni-ff-badge');
+    var isBanner = wrap.classList.contains('is-profile-banner');
     if (display && display.statsText) {
       if (!statEl) {
         statEl = document.createElement('span');
-        if (isRow) {
-          statEl.addEventListener('click', function(ev) {
-            ev.preventDefault();
-            ev.stopPropagation();
-            enqueueFetch(handle, true, true);
-            scheduleRenderBadges();
-          });
-        }
+        bindStatBadgeClick(statEl, wrap, handle);
         wrap.appendChild(statEl);
       }
-      var statCls = 'omni-ff-badge' + (display.isFollowingHeavy ? ' is-following-heavy' : '');
-      if (statEl.className !== statCls) statEl.className = statCls;
+      var statCls = 'omni-ff-badge' + (display.isFollowingHeavy ? ' is-following-heavy' : '') +
+        (isBanner ? ' is-heavy-icon' : ' is-link');
+      if (statEl.className !== statCls && statEl.className !== statCls + ' is-opening') statEl.className = statCls;
+      var nextState = isBanner ? 'banner' : 'stats';
+      if (statEl.getAttribute('data-omni-ff-state') !== nextState) statEl.setAttribute('data-omni-ff-state', nextState);
       if (statEl.textContent !== display.statsText) statEl.textContent = display.statsText;
-      var tip = isRow ? display.statsTitle + '（クリックで再取得）' : display.statsTitle;
+      var tip = isBanner ? display.statsTitle : display.statsTitle + '（タップで新規タブに開く）';
       if (statEl.title !== tip) statEl.title = tip;
+      var aria = isBanner && display.isFollowingHeavy ? 'フォロー多め' : tip;
+      if (statEl.getAttribute('aria-label') !== aria) statEl.setAttribute('aria-label', aria);
+      if (!isBanner && statEl.getAttribute('role') !== 'link') statEl.setAttribute('role', 'link');
     } else if (isRow && canActiveFetchPlatform()) {
       if (!statEl) {
         statEl = document.createElement('span');
-        statEl.addEventListener('click', function(ev) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          enqueueFetch(handle, true, true);
-          scheduleRenderBadges();
-        });
+        bindStatBadgeClick(statEl, wrap, handle);
         wrap.appendChild(statEl);
       }
+      if (statEl.getAttribute('data-omni-ff-state') !== 'pending') statEl.setAttribute('data-omni-ff-state', 'pending');
+      if (statEl.hasAttribute('role')) statEl.removeAttribute('role');
       if (inFlight[handle] || queuedSet[handle]) {
         statEl.className = 'omni-ff-badge is-pending';
         if (statEl.textContent !== '取得中…') statEl.textContent = '取得中…';
@@ -3662,12 +3784,12 @@ class OmniWebViewManager(
           return;
         }
       }
-      // プロフィール画面では相互ピルとフォロー多め強調のみ簡潔に表示（元の人数表示と重複しすぎないよう）
+      // プロフィール画面では相互ピルとフォロー多め強調（文字なしの ▲ アイコンのみ）を簡潔に表示（元の人数表示と重複しすぎないよう）
       var bannerDisplay = {
         relKind: display.relKind,
         relText: display.relText,
         relTitle: display.relTitle,
-        statsText: display.isFollowingHeavy ? '▲ フォロー多め' : '',
+        statsText: display.isFollowingHeavy ? '▲' : '',
         statsTitle: display.statsTitle,
         isFollowingHeavy: display.isFollowingHeavy
       };
@@ -3791,8 +3913,15 @@ class OmniWebViewManager(
     scheduleRelBatch();
   }
 
+  var deferredWhileHidden = false;
+
   function scheduleRenderBadges(delayMs) {
     if (!pageBooted) return;
+    // 非表示（バックグラウンドタブ）中は DOM 全走査を行わず、表示復帰時に 1 回だけまとめて走査する
+    if (document.visibilityState === 'hidden') {
+      deferredWhileHidden = true;
+      return;
+    }
     if (renderTimer) return;
     var wait = typeof delayMs === 'number' ? delayMs : (platform === 'instagram' ? 300 : 200);
     renderTimer = setTimeout(function() {
@@ -3847,8 +3976,20 @@ class OmniWebViewManager(
       }, { capture: true, passive: true });
     } catch (_) {}
     try {
+      document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState === 'visible' && deferredWhileHidden) {
+          deferredWhileHidden = false;
+          scheduleRenderBadges(60);
+        }
+      });
+    } catch (_) {}
+    try {
       if (typeof MutationObserver === 'function' && document.body) {
         var mo = new MutationObserver(function(mutations) {
+          if (document.visibilityState === 'hidden') {
+            deferredWhileHidden = true;
+            return;
+          }
           for (var i = 0; i < mutations.length; i++) {
             var added = mutations[i].addedNodes;
             if (added && added.length > 0) {
@@ -5980,6 +6121,8 @@ class OmniWebViewPlatformView(
         private const val CACHE_BYPASS_RESET_MS = 10_000L
         private const val CRASH_RECOVERY_COOLDOWN_MS = 5000L
         private const val ORPHAN_POPUP_TIMEOUT_MS = 15_000L
+        private const val ACTIVATION_REDRAW_KICK_MS = 120L
+        private const val ACTIVATION_REDRAW_KICK_LATE_MS = 420L
 
         private val LINK_SHIM_HOSTS = setOf(
             "l.threads.net",
@@ -6137,6 +6280,8 @@ class OmniWebViewPlatformView(
     private var mainWebViewDestroyed: Boolean = false
     private var crashRecoveryGen: Int = 0
     private var lastCrashRecoveryAtMs: Long = 0L
+    private var webViewPaused: Boolean = false
+    private var activationKickGen: Int = 0
 
     private var mainAutofillToken: String = OmniWebViewManager.generateBridgeToken()
     private var mainFollowToken: String = OmniWebViewManager.generateBridgeToken()
@@ -6196,9 +6341,14 @@ class OmniWebViewPlatformView(
         if (profileAttachFailed) {
             emitProfileIsolationError()
         } else {
+            // Dart 側の attach → loadUrl の往復を待たず、生成直後に読み込みを開始して初回表示を高速化する
             val autoLoad = creationParams["autoLoad"] as? Boolean ?: false
-            if (autoLoad && initialUrl.isNotEmpty()) {
-                loadUrlInternal(initialUrl)
+            val autoLoadUrl = (creationParams["autoLoadUrl"] as? String)?.trim().orEmpty()
+            if (autoLoad) {
+                val target = if (isHttpOrHttpsUrl(autoLoadUrl)) autoLoadUrl else initialUrl
+                if (target.isNotEmpty()) {
+                    loadUrlInternal(target)
+                }
             }
         }
     }
@@ -6266,6 +6416,8 @@ class OmniWebViewPlatformView(
         isTabActive = active
         if (!active) {
             dismissPendingPermissionDialogs()
+            activationKickGen += 1
+            applyBackgroundThrottle()
             return
         }
         // バックグラウンド中にレンダラープロセスが終了していた場合、アクティブ復帰時に自動再構築＆再読み込みする
@@ -6280,6 +6432,63 @@ class OmniWebViewPlatformView(
                 loadUrlInternal(targetUrl, bypassCache = false)
             }
         }
+        applyBackgroundThrottle()
+        ensureLoadedOnActivation()
+        scheduleActivationRedrawKicks()
+    }
+
+    /**
+     * 非アクティブタブは初回読み込み完了後に WebView.onPause() でページを hidden 扱いにし、
+     * rAF・動画再生・タイマー頻度を抑えてアクティブタブの描画/操作を軽くする。
+     * 読み込み中のタブは一時停止せず裏で読み込みを完了させ、切替時に即表示できるようにする。
+     */
+    private fun applyBackgroundThrottle() {
+        if (disposed || mainWebViewDestroyed || renderProcessCrashed) return
+        val shouldPause = !isTabActive && !isMainFrameLoading && customView == null
+        if (shouldPause == webViewPaused) return
+        webViewPaused = shouldPause
+        try {
+            if (shouldPause) webView.onPause() else webView.onResume()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * タブ切替時、まだ一度もページがコミットされていない（読み込み未開始・取りこぼし）場合は自動で読み込む。
+     * これにより新規タブへ切り替えた際に手動で再読み込みボタンを押す必要がなくなる。
+     */
+    private fun ensureLoadedOnActivation() {
+        if (disposed || profileAttachFailed || renderProcessCrashed || mainWebViewDestroyed) return
+        if (isMainFrameLoading || currentLoadHadMainFrameError) return
+        val current = try {
+            webView.url?.trim().orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+        if (isHttpOrHttpsUrl(current)) return
+        val target = resolveReloadTargetUrl(null)
+        if (target.isNotEmpty()) {
+            loadUrlInternal(target)
+        }
+    }
+
+    /**
+     * Flutter TLHC では非表示中に描画されたタブのテクスチャが切替直後に更新されず白紙のままになることがあるため、
+     * 切替直後〜合成完了後にかけて数回再描画を要求する。
+     */
+    private fun scheduleActivationRedrawKicks() {
+        val gen = ++activationKickGen
+        val kick = Runnable {
+            if (disposed || !isTabActive || gen != activationKickGen || mainWebViewDestroyed) return@Runnable
+            try {
+                webView.invalidate()
+                container.invalidate()
+            } catch (_: Throwable) {
+            }
+        }
+        mainHandler.post(kick)
+        mainHandler.postDelayed(kick, ACTIVATION_REDRAW_KICK_MS)
+        mainHandler.postDelayed(kick, ACTIVATION_REDRAW_KICK_LATE_MS)
     }
 
     private fun emitProfileIsolationError() {
@@ -6369,6 +6578,7 @@ class OmniWebViewPlatformView(
         val (replacement, _, attachFailed) = createMainWebView(targetProfile)
         profileAttachFailed = attachFailed
         webView = replacement
+        webViewPaused = false
         renderProcessCrashed = false
         pendingCrashReload = false
         pendingCrashUrl = ""
@@ -6760,7 +6970,13 @@ class OmniWebViewPlatformView(
                                 if (cleanUrl.startsWith("http://", ignoreCase = true) ||
                                     cleanUrl.startsWith("https://", ignoreCase = true)
                                 ) {
-                                    invokeDart("onOpenNewTab", mapOf("url" to cleanUrl))
+                                    invokeDart(
+                                        "onOpenNewTab",
+                                        mapOf(
+                                            "url" to cleanUrl,
+                                            "activate" to obj.optBoolean("activate", false),
+                                        ),
+                                    )
                                 }
                             }
                             "jev-get-config" -> {
@@ -6840,10 +7056,10 @@ class OmniWebViewPlatformView(
                                 )
                             }
                         },
-                        onOpenNewTabCb = { url ->
+                        onOpenNewTabCb = { url, activate ->
                             mainHandler.post {
                                 if (disposed || target !== webView || !allowBridgeEvent()) return@post
-                                invokeDart("onOpenNewTab", mapOf("url" to url))
+                                invokeDart("onOpenNewTab", mapOf("url" to url, "activate" to activate))
                             }
                         },
                         onJevGetConfigCb = {
@@ -7323,6 +7539,8 @@ class OmniWebViewPlatformView(
                         "hadError" to currentLoadHadMainFrameError,
                     ),
                 )
+                // 裏で読み込み完了した非アクティブタブはここで一時停止して前面タブの負荷を下げる
+                applyBackgroundThrottle()
             }
 
             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
@@ -7386,6 +7604,7 @@ class OmniWebViewPlatformView(
                     "onWebResourceError",
                     mapOf("description" to desc, "errorCode" to code),
                 )
+                applyBackgroundThrottle()
             }
 
             override fun onRenderProcessGone(

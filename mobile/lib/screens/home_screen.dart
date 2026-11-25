@@ -724,13 +724,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           );
         }
       },
-      onOpenNewTab: (url) {
+      onOpenNewTab: (url, activate) {
         final src = _instances.cast<ServiceInstance?>().firstWhere(
               (i) => i?.instanceId == instance.instanceId,
               orElse: () => instance,
             );
         if (src != null) {
-          _openUrlInNewSubTab(src, url, activate: false);
+          // F/FW バッジのタップ（activate=true）は新規タブを開いてそのまま切り替える
+          _openUrlInNewSubTab(src, url, activate: activate);
         }
       },
       onJevGetConfig: () {
@@ -751,6 +752,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
 
     _controllers[instance.instanceId] = controller;
+    // 新しいコントローラの WebView を必ずビルドさせるため、見た目が同じでも再ビルドする
     _updateRuntime(
       instance.instanceId,
       (cur) => cur.copyWith(
@@ -758,6 +760,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         isLoading: true,
         clearError: true,
       ),
+      forceRebuild: true,
     );
     return controller;
   }
@@ -933,56 +936,68 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       serviceId: instance.serviceId,
       initiallyActive: isSubInitiallyActive,
       onProgress: (progress) {
-        subTab.runtime = subTab.runtime.copyWith(
-          progress: progress,
-          isLoading: progress < 100,
-          isSleeping: false,
+        _updateSubTabRuntime(
+          subTab,
+          (cur) => cur.copyWith(
+            progress: progress,
+            isLoading: progress < 100,
+            isSleeping: false,
+          ),
         );
-        if (mounted) setState(() {});
       },
       onPageStarted: (url) {
-        subTab.runtime = subTab.runtime.copyWith(
-          currentUrl: isHttpOrHttpsUrl(url) ? url : subTab.runtime.currentUrl,
-          isLoading: true,
-          isSleeping: false,
-          clearError: true,
+        _updateSubTabRuntime(
+          subTab,
+          (cur) => cur.copyWith(
+            currentUrl: isHttpOrHttpsUrl(url) ? url : cur.currentUrl,
+            isLoading: true,
+            isSleeping: false,
+            clearError: true,
+          ),
         );
-        if (mounted) setState(() {});
       },
       onPageFinished: (url, title, canBack, canFwd, hadError) {
         final safeTitle = title.trim().isEmpty ? initialTitle : title;
         final validUrl = isHttpOrHttpsUrl(url);
-        subTab.runtime = subTab.runtime.copyWith(
-          currentUrl: validUrl ? url : subTab.runtime.currentUrl,
-          title: safeTitle,
-          progress: 100,
-          isLoading: false,
-          isSleeping: false,
-          canGoBack: canBack,
-          canGoForward: canFwd,
-          clearError: !hadError && validUrl,
+        _updateSubTabRuntime(
+          subTab,
+          (cur) => cur.copyWith(
+            currentUrl: validUrl ? url : cur.currentUrl,
+            title: safeTitle,
+            progress: 100,
+            isLoading: false,
+            isSleeping: false,
+            canGoBack: canBack,
+            canGoForward: canFwd,
+            clearError: !hadError && validUrl,
+          ),
         );
-        if (mounted) setState(() {});
       },
       onTitleChanged: (title) {
         final safeTitle = title.trim().isEmpty ? initialTitle : title;
-        subTab.runtime = subTab.runtime.copyWith(title: safeTitle);
-        if (mounted) setState(() {});
+        _updateSubTabRuntime(
+          subTab,
+          (cur) => cur.copyWith(title: safeTitle),
+        );
       },
       onHistoryChanged: (url, canBack, canFwd) {
-        subTab.runtime = subTab.runtime.copyWith(
-          currentUrl: isHttpOrHttpsUrl(url) ? url : subTab.runtime.currentUrl,
-          canGoBack: canBack,
-          canGoForward: canFwd,
+        _updateSubTabRuntime(
+          subTab,
+          (cur) => cur.copyWith(
+            currentUrl: isHttpOrHttpsUrl(url) ? url : cur.currentUrl,
+            canGoBack: canBack,
+            canGoForward: canFwd,
+          ),
         );
-        if (mounted) setState(() {});
       },
       onWebResourceError: (description, errorCode) {
-        subTab.runtime = subTab.runtime.copyWith(
-          isLoading: false,
-          loadError: '$description ($errorCode)',
+        _updateSubTabRuntime(
+          subTab,
+          (cur) => cur.copyWith(
+            isLoading: false,
+            loadError: '$description ($errorCode)',
+          ),
         );
-        if (mounted) setState(() {});
       },
       onExternalScheme: (url) => _openExternalUrlSafely(url),
       onFollowDetected: (_, service) {
@@ -1052,13 +1067,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           );
         }
       },
-      onOpenNewTab: (url) {
+      onOpenNewTab: (url, activate) {
         final src = _instances.cast<ServiceInstance?>().firstWhere(
               (i) => i?.instanceId == instance.instanceId,
               orElse: () => instance,
             );
         if (src != null) {
-          _openUrlInNewSubTab(src, url, activate: false);
+          // F/FW バッジのタップ（activate=true）は新規タブを開いてそのまま切り替える
+          _openUrlInNewSubTab(src, url, activate: activate);
         }
       },
       onJevGetConfig: () => _pushJevConfigToController(ctrl),
@@ -1226,12 +1242,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   void _updateRuntime(
     String instanceId,
-    TabRuntimeState Function(TabRuntimeState current) updater,
-  ) {
+    TabRuntimeState Function(TabRuntimeState current) updater, {
+    bool forceRebuild = false,
+  }) {
     final current = _runtimeMap[instanceId];
     if (current == null) return;
-    _runtimeMap[instanceId] = updater(current);
-    if (mounted) setState(() {});
+    final next = updater(current);
+    _runtimeMap[instanceId] = next;
+    if (!mounted) return;
+    // 非表示タブの進捗だけの変化や、見た目が変わらない更新では再ビルドしない
+    final visible = !_isGmailOpen &&
+        _settings.activeInstanceId == instanceId &&
+        _activeSubTabId[instanceId] == null;
+    if (!forceRebuild && current.sameVisualState(next, includeProgress: visible)) {
+      return;
+    }
+    setState(() {});
+  }
+
+  /// 追加サブタブの runtime を更新し、必要な場合のみ再ビルドする
+  void _updateSubTabRuntime(
+    _ExtraSubTab subTab,
+    TabRuntimeState Function(TabRuntimeState current) updater,
+  ) {
+    final current = subTab.runtime;
+    final next = updater(current);
+    subTab.runtime = next;
+    if (!mounted) return;
+    final visible = !_isGmailOpen &&
+        _settings.activeInstanceId == subTab.instanceId &&
+        _activeSubTabId[subTab.instanceId] == subTab.tabId;
+    if (current.sameVisualState(next, includeProgress: visible)) return;
+    setState(() {});
   }
 
   void _activateInstance(ServiceInstance inst) {

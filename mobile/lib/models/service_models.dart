@@ -505,6 +505,22 @@ class TabRuntimeState {
       loadError: clearError ? null : (loadError ?? this.loadError),
     );
   }
+
+  /// UI 上の見た目が同一かどうか（同一なら setState を省略して再ビルドを減らす）。
+  ///
+  /// 進捗バーはアクティブタブにしか表示されないため、非表示タブでは
+  /// [includeProgress] を false にして progress だけの変化を無視できる。
+  bool sameVisualState(TabRuntimeState other, {bool includeProgress = true}) {
+    return currentUrl == other.currentUrl &&
+        title == other.title &&
+        (!includeProgress || progress == other.progress) &&
+        unreadCount == other.unreadCount &&
+        isLoading == other.isLoading &&
+        isSleeping == other.isSleeping &&
+        canGoBack == other.canGoBack &&
+        canGoForward == other.canGoForward &&
+        loadError == other.loadError;
+  }
 }
 
 /// WebViewの `; wv)` トークンを除いたクリーンなスマホ版 Android Chrome UA を返す。

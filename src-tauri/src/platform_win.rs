@@ -882,7 +882,8 @@ pub struct TabWebviewCallbacks {
     pub on_follow_detected: Arc<dyn Fn(Option<String>) + Send + Sync>,
     pub on_unfollow_detected: Arc<dyn Fn(Option<String>) + Send + Sync>,
     pub on_account_identity: Arc<dyn Fn(Option<String>, String, Option<u32>, Option<u32>) + Send + Sync>,
-    pub on_open_new_tab: Arc<dyn Fn(String) + Send + Sync>,
+    /// 新規タブ要求（第2引数 true の場合は開いた直後にそのタブへ切り替える）
+    pub on_open_new_tab: Arc<dyn Fn(String, bool) + Send + Sync>,
     pub on_jev_message: Arc<dyn Fn(String) + Send + Sync>,
 }
 
@@ -3482,6 +3483,21 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       'color:inherit;white-space:nowrap;opacity:0.95;pointer-events:none;' +
       '}' +
       '.omni-ff-wrap.is-row .omni-ff-badge{pointer-events:auto;cursor:pointer;}' +
+      '.omni-ff-badge.is-link{' +
+      'pointer-events:auto;cursor:pointer;position:relative;' +
+      'transition:transform 90ms ease-out,filter 90ms ease-out;' +
+      '}' +
+      '.omni-ff-badge.is-link::after{' +
+      'content:\"\";position:absolute;left:-3px;right:-3px;top:-4px;bottom:-4px;' +
+      '}' +
+      '.omni-ff-badge.is-link:hover{filter:brightness(1.18);text-decoration:underline;}' +
+      '.omni-ff-badge.is-link:active{transform:scale(0.94);filter:brightness(1.25);}' +
+      '@keyframes omni-ff-open-pop{' +
+      '0%{transform:scale(0.9);box-shadow:0 0 0 0 rgba(56,189,248,0.75);}' +
+      '100%{transform:scale(1);box-shadow:0 0 0 7px rgba(56,189,248,0);}' +
+      '}' +
+      '.omni-ff-badge.is-opening{animation:omni-ff-open-pop 360ms ease-out;}' +
+      '.omni-ff-badge.is-heavy-icon{padding:1px 6px;font-size:12px;line-height:1.2;}' +
       '.omni-ff-badge.is-pending{' +
       'background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.32);opacity:0.72;' +
       '}' +
@@ -3602,6 +3618,97 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     return null;
   }
 
+  function toBadgeHttpUrl(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    var trimmed = raw.trim();
+    if (!trimmed || trimmed === '#' || /^(?:javascript|mailto|tel|data|blob):/i.test(trimmed)) return null;
+    try {
+      var parsed = new URL(trimmed, location.href);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+      return parsed.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function buildProfileUrlForHandle(handle) {
+    if (!handle || !isValidHandle(handle)) return null;
+    var path = '';
+    if (platform === 'instagram') path = '/' + handle + '/';
+    else if (platform === 'threads' || platform === 'tiktok' || platform === 'mixi2' ||
+             platform === 'mastodon' || platform === 'misskey') path = '/@' + handle;
+    else if (platform === 'bluesky') path = '/profile/' + handle;
+    else if (platform === 'pixiv') path = /^\d+$/.test(handle) ? '/users/' + handle : '';
+    else if (platform === 'reddit') path = '/user/' + handle + '/';
+    else if (platform === 'linkedin') path = '/in/' + handle + '/';
+    else if (platform === 'facebook') path = /^\d+$/.test(handle) ? '/profile.php?id=' + handle : '/' + handle;
+    else if (platform === 'x') path = '/' + handle;
+    if (!path) return null;
+    return toBadgeHttpUrl(path);
+  }
+
+  // バッジ近傍のリンクから対象ユーザーのプロフィール URL を解決する（見つからない場合はプラットフォーム規則で組み立て）
+  function resolveBadgeProfileUrl(wrap, handle) {
+    try {
+      var prev = wrap.previousElementSibling;
+      if (prev && prev.tagName === 'A' && extractHandleFromLink(prev) === handle) {
+        var pu = toBadgeHttpUrl(prev.getAttribute('href'));
+        if (pu) return pu;
+      }
+      var scope = wrap.closest('[data-omni-ff-row]') || wrap.parentElement;
+      for (var hop = 0; scope && hop < 3; hop++) {
+        var links = scope.querySelectorAll('a[href]');
+        for (var i = 0; i < links.length && i < 40; i++) {
+          if (extractHandleFromLink(links[i]) !== handle) continue;
+          var u = toBadgeHttpUrl(links[i].getAttribute('href'));
+          if (u) return u;
+        }
+        scope = scope.parentElement;
+      }
+    } catch (_) {}
+    return buildProfileUrlForHandle(handle);
+  }
+
+  function postOpenNewTabActivate(url) {
+    try {
+      var poster = __omniPostMessage || (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function' ? window.chrome.webview.postMessage.bind(window.chrome.webview) : null);
+      if (poster) {
+        poster(JSON.stringify({ token: __OMNI_TOKEN__, type: 'omnisns:open-new-tab', url: url, activate: true }));
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  var lastBadgeOpenAt = 0;
+
+  // 人数ピルのクリック: 人数表示中は新規タブで開いて即切り替え、取得中/再取得表示中は優先再取得
+  function bindStatBadgeClick(statEl, wrap, handle) {
+    statEl.addEventListener('click', function(ev) {
+      var state = statEl.getAttribute('data-omni-ff-state') || '';
+      if (state === 'banner') return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+      if (ev.isTrusted === false) return;
+      if (state === 'stats') {
+        var now = Date.now();
+        if (now - lastBadgeOpenAt < 700) return;
+        var url = resolveBadgeProfileUrl(wrap, handle);
+        if (url && postOpenNewTabActivate(url)) {
+          lastBadgeOpenAt = now;
+          statEl.classList.remove('is-opening');
+          void statEl.offsetWidth;
+          statEl.classList.add('is-opening');
+          setTimeout(function() { statEl.classList.remove('is-opening'); }, 420);
+          return;
+        }
+      }
+      enqueueFetch(handle, true, true);
+      scheduleRenderBadges();
+    });
+  }
+
   function renderWrapContents(wrap, display, handle, isRow) {
     // 関係ピル更新
     var relEl = wrap.querySelector('.omni-ff-rel');
@@ -3620,35 +3727,32 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
     // 人数ピル更新
     var statEl = wrap.querySelector('.omni-ff-badge');
+    var isBanner = wrap.classList.contains('is-profile-banner');
     if (display && display.statsText) {
       if (!statEl) {
         statEl = document.createElement('span');
-        if (isRow) {
-          statEl.addEventListener('click', function(ev) {
-            ev.preventDefault();
-            ev.stopPropagation();
-            enqueueFetch(handle, true, true);
-            scheduleRenderBadges();
-          });
-        }
+        bindStatBadgeClick(statEl, wrap, handle);
         wrap.appendChild(statEl);
       }
-      var statCls = 'omni-ff-badge' + (display.isFollowingHeavy ? ' is-following-heavy' : '');
-      if (statEl.className !== statCls) statEl.className = statCls;
+      var statCls = 'omni-ff-badge' + (display.isFollowingHeavy ? ' is-following-heavy' : '') +
+        (isBanner ? ' is-heavy-icon' : ' is-link');
+      if (statEl.className !== statCls && statEl.className !== statCls + ' is-opening') statEl.className = statCls;
+      var nextState = isBanner ? 'banner' : 'stats';
+      if (statEl.getAttribute('data-omni-ff-state') !== nextState) statEl.setAttribute('data-omni-ff-state', nextState);
       if (statEl.textContent !== display.statsText) statEl.textContent = display.statsText;
-      var tip = isRow ? display.statsTitle + '（クリックで再取得）' : display.statsTitle;
+      var tip = isBanner ? display.statsTitle : display.statsTitle + '（クリックで新規タブに開く）';
       if (statEl.title !== tip) statEl.title = tip;
+      var aria = isBanner && display.isFollowingHeavy ? 'フォロー多め' : tip;
+      if (statEl.getAttribute('aria-label') !== aria) statEl.setAttribute('aria-label', aria);
+      if (!isBanner && statEl.getAttribute('role') !== 'link') statEl.setAttribute('role', 'link');
     } else if (isRow && canActiveFetchPlatform()) {
       if (!statEl) {
         statEl = document.createElement('span');
-        statEl.addEventListener('click', function(ev) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          enqueueFetch(handle, true, true);
-          scheduleRenderBadges();
-        });
+        bindStatBadgeClick(statEl, wrap, handle);
         wrap.appendChild(statEl);
       }
+      if (statEl.getAttribute('data-omni-ff-state') !== 'pending') statEl.setAttribute('data-omni-ff-state', 'pending');
+      if (statEl.hasAttribute('role')) statEl.removeAttribute('role');
       if (inFlight[handle] || queuedSet[handle]) {
         statEl.className = 'omni-ff-badge is-pending';
         if (statEl.textContent !== '取得中…') statEl.textContent = '取得中…';
@@ -3976,12 +4080,12 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           return;
         }
       }
-      // プロフィール画面では相互ピルとフォロー多め強調のみ簡潔に表示（元の人数表示と重複しすぎないよう）
+      // プロフィール画面では相互ピルとフォロー多め強調（文字なしの ▲ アイコンのみ）を簡潔に表示（元の人数表示と重複しすぎないよう）
       var bannerDisplay = {
         relKind: display.relKind,
         relText: display.relText,
         relTitle: display.relTitle,
-        statsText: display.isFollowingHeavy ? '▲ フォロー多め' : '',
+        statsText: display.isFollowingHeavy ? '▲' : '',
         statsTitle: display.statsTitle,
         isFollowingHeavy: display.isFollowingHeavy
       };
@@ -4105,8 +4209,15 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     scheduleRelBatch();
   }
 
+  var deferredWhileHidden = false;
+
   function scheduleRenderBadges(delayMs) {
     if (!pageBooted) return;
+    // 非表示（バックグラウンドタブ）中は DOM 全走査を行わず、表示復帰時に 1 回だけまとめて走査する
+    if (document.visibilityState === 'hidden') {
+      deferredWhileHidden = true;
+      return;
+    }
     if (renderTimer) return;
     var wait = typeof delayMs === 'number' ? delayMs : (platform === 'instagram' ? 300 : 200);
     renderTimer = setTimeout(function() {
@@ -4161,8 +4272,20 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       }, { capture: true, passive: true });
     } catch (_) {}
     try {
+      document.addEventListener('visibilitychange', function() {
+        if (document.visibilityState === 'visible' && deferredWhileHidden) {
+          deferredWhileHidden = false;
+          scheduleRenderBadges(60);
+        }
+      });
+    } catch (_) {}
+    try {
       if (typeof MutationObserver === 'function' && document.body) {
         var mo = new MutationObserver(function(mutations) {
+          if (document.visibilityState === 'hidden') {
+            deferredWhileHidden = true;
+            return;
+          }
           for (var i = 0; i < mutations.length; i++) {
             var added = mutations[i].addedNodes;
             if (added && added.length > 0) {
@@ -5820,6 +5943,8 @@ struct InboundWebMessage {
     followers: Option<u64>,
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    activate: Option<bool>,
 }
 
 /// SNSタブ子WebView2へネイティブイベントハンドラ（ナビゲーション・ファビコン・ミュート・ショートカット等）を接続する。
@@ -5976,7 +6101,10 @@ pub fn attach_tab_handlers(
                                             .unwrap_or(false)
                                 })
                             {
-                                cb_open_new_tab(target_url.to_string());
+                                cb_open_new_tab(
+                                    target_url.to_string(),
+                                    parsed.activate.unwrap_or(false),
+                                );
                             }
                         }
                         t if t.starts_with("omnisns:jev-") => {
