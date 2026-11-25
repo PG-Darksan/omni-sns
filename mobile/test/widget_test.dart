@@ -194,11 +194,17 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('header-collapse-button')));
     await tester.pump();
     expect(find.byKey(const ValueKey('collapsed-header-bar')), findsOneWidget);
+    expect(find.byKey(const ValueKey('collapsed-jev-filter-chip')), findsOneWidget);
     expect(find.byKey(const ValueKey('header-gmail-button')), findsOneWidget);
     expect(find.byKey(const ValueKey('header-reload-button')), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey('header-expand-button')));
     await tester.pump();
     expect(find.byKey(const ValueKey('collapsed-header-bar')), findsNothing);
+
+    // ヘッダーに「分類:女の子」のような長いラベルや URL が貼り付いていないこと
+    expect(find.textContaining('分類:'), findsNothing);
+    expect(find.textContaining('https://'), findsNothing);
+    expect(find.byKey(const ValueKey('jev-filter-chip')), findsOneWidget);
   });
 
   test('Follow count daily rollover, delta, reset, and headerCollapsed roundtrip work cleanly', () {
@@ -1205,5 +1211,57 @@ void main() {
     expect(ids.contains('next-tab'), isTrue);
     expect(ids.contains('previous-service'), isTrue);
     expect(ids.contains('next-service'), isTrue);
+  });
+
+  test('Closing a subtab selects the right neighbor, or remaining tab when only 2 tabs exist', () {
+    // 2タブ状態 [Main, t1] で t1 (idx=0) を閉じると残り（Main = null）へ移動
+    expect(pickNextActiveSubTabAfterClose(const [], 0), isNull);
+
+    // 3タブ状態 [Main, t1, t2] で t1 (idx=0) を閉じると右隣 t2 へ移動
+    expect(pickNextActiveSubTabAfterClose(const ['t2'], 0), 't2');
+
+    // 4タブ状態 [Main, t1, t2, t3] で t2 (idx=1) を閉じると右隣 t3 へ移動
+    expect(pickNextActiveSubTabAfterClose(const ['t1', 't3'], 1), 't3');
+
+    // 右端 t3 (idx=2) を閉じた場合は右隣がないため残りの末尾 t2 へ移動
+    expect(pickNextActiveSubTabAfterClose(const ['t1', 't2'], 2), 't2');
+  });
+
+  test('Mobile GesturePath enforces straight-line segments only and rejects squiggly/diagonal strokes', () {
+    // 水平・垂直の直線セグメントのみを頂点として出力（ブレを直線にスナップ）
+    final straight = GesturePath(tremorPx: 10);
+    straight.reset(const Offset(100, 100));
+    straight.push(const Offset(140, 104));
+    straight.push(const Offset(180, 97));
+    expect(straight.shape, 'R');
+    expect(straight.vertices, const [Offset(100, 100), Offset(180, 100)]);
+
+    // 斜め・曲線（ちょろちょろ線）の開始は即無効化
+    final diag = GesturePath(tremorPx: 10);
+    diag.reset(const Offset(100, 100));
+    diag.push(const Offset(130, 130));
+    expect(diag.invalidated, isTrue);
+    expect(diag.release(), '');
+
+    // ジグザグ・3方向目の曲がりは無効化
+    final zigzag = GesturePath(tremorPx: 10);
+    zigzag.reset(const Offset(100, 100));
+    zigzag.push(const Offset(160, 100));
+    zigzag.push(const Offset(160, 160));
+    expect(zigzag.shape, 'RD');
+    expect(
+      zigzag.vertices,
+      const [Offset(100, 100), Offset(160, 100), Offset(160, 160)],
+    );
+    zigzag.push(const Offset(220, 160));
+    expect(zigzag.invalidated, isTrue);
+    expect(zigzag.release(), '');
+
+    // 連続スクロール時も純粋な垂直直線に固定
+    final scroll = GesturePath(tremorPx: 10);
+    scroll.reset(const Offset(100, 100));
+    scroll.push(const Offset(100, 150));
+    scroll.advanceLiveScroll(const Offset(135, 220));
+    expect(scroll.vertices, const [Offset(100, 100), Offset(100, 220)]);
   });
 }

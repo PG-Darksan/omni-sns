@@ -344,6 +344,12 @@ impl GesturePath {
         }
 
         let Some(dir) = classify_dir(dx, dy, AXIS_RATIO) else {
+            // 開始直後から斜め・曲線（ちょろちょろ線）に大きく逸れた場合は即キャンセル
+            if self.dirs.is_empty() && dx.abs() > tol * 2.2 && dy.abs() > tol * 2.2 {
+                self.invalid = true;
+                self.pending = false;
+                return;
+            }
             self.pending = true;
             return;
         };
@@ -605,6 +611,12 @@ mod tests {
         three.add(Point::new(160.0, 220.0));
         assert!(three.invalid());
         assert_eq!(three.release(), None);
+
+        // 開始直後から斜め・曲線（ちょろちょろ線）へ逸れたら即無効化
+        let mut diag = GesturePath::new(Point::new(100.0, 100.0), 4);
+        diag.add(Point::new(125.0, 125.0));
+        assert!(diag.invalid());
+        assert_eq!(diag.release(), None);
     }
 
     #[test]

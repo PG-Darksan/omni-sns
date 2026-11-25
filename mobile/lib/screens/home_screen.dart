@@ -15,6 +15,22 @@ import 'catalog_sheet.dart';
 import 'gesture_settings_screen.dart';
 import 'settings_sheet.dart';
 
+/// サブタブを閉じた後に選択すべき次のアクティブタブID（null = メインタブ）を返す。
+/// - 右側にタブがある場合は右隣のタブへ移動する
+/// - 残りタブがメインタブのみ（2タブ状態で閉じた場合）や右端を閉じた場合は残りの隣接タブへ移動する
+String? pickNextActiveSubTabAfterClose(
+  List<String> remainingExtraTabIds,
+  int closedIdx,
+) {
+  if (remainingExtraTabIds.isEmpty) {
+    return null;
+  }
+  if (closedIdx >= 0 && closedIdx < remainingExtraTabIds.length) {
+    return remainingExtraTabIds[closedIdx];
+  }
+  return remainingExtraTabIds.last;
+}
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
@@ -98,6 +114,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   FollowSyncLedger _followLedger = FollowSyncLedger();
   Timer? _cloudSyncDebounce;
   Timer? _cloudSyncPeriodic;
+  Timer? _snackDismissTimer;
   Future<String>? _syncInFlight;
   bool _needsResync = false;
   int _manualSyncWaiters = 0;
@@ -179,6 +196,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _jev.dispose();
     _cloudSyncDebounce?.cancel();
     _cloudSyncPeriodic?.cancel();
+    _snackDismissTimer?.cancel();
     _gmailController?.dispose();
     _gmailController = null;
     for (final ctrl in _controllers.values) {
@@ -1081,29 +1099,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() {});
       HapticFeedback.mediumImpact();
       if (!activate) {
-        ScaffoldMessenger.of(context)
-          ..hideCurrentSnackBar()
-          ..showSnackBar(
-            SnackBar(
-              content: Text('新規タブで開きました（全$totalTabsタブ）'),
-              duration: const Duration(seconds: 3),
-              action: SnackBarAction(
-                label: '開く',
-                onPressed: () {
-                  if (!mounted) return;
-                  final stillExists = (_extraTabs[instance.instanceId] ?? [])
-                      .any((t) => t.tabId == tabId);
-                  if (stillExists) {
-                    setState(() {
-                      _isGmailOpen = false;
-                      _activeSubTabId[instance.instanceId] = tabId;
-                    });
-                    _syncActiveWebViews();
-                  }
-                },
-              ),
+        _showTimedSnackBar(
+          SnackBar(
+            content: Text('新規タブで開きました（全$totalTabsタブ）'),
+            duration: const Duration(milliseconds: 2500),
+            action: SnackBarAction(
+              label: '開く',
+              onPressed: () {
+                _snackDismissTimer?.cancel();
+                if (!mounted) return;
+                final stillExists = (_extraTabs[instance.instanceId] ?? [])
+                    .any((t) => t.tabId == tabId);
+                if (stillExists) {
+                  setState(() {
+                    _isGmailOpen = false;
+                    _activeSubTabId[instance.instanceId] = tabId;
+                  });
+                  _syncActiveWebViews();
+                }
+              },
             ),
-          );
+          ),
+          duration: const Duration(milliseconds: 2500),
+        );
       }
     }
   }
@@ -1117,11 +1135,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     removed.controller.dispose();
     _jevLiveByKey.remove('sub:$tabId');
     if (_activeSubTabId[instanceId] == tabId) {
-      if (list.isEmpty) {
+      final nextId = pickNextActiveSubTabAfterClose(
+        list.map((t) => t.tabId).toList(),
+        idx,
+      );
+      if (nextId == null) {
         _activeSubTabId.remove(instanceId);
       } else {
-        final nextIdx = (idx - 1).clamp(0, list.length - 1);
-        _activeSubTabId[instanceId] = idx == 0 ? null : list[nextIdx].tabId;
+        _activeSubTabId[instanceId] = nextId;
       }
     }
     if (list.isEmpty) {
@@ -2973,16 +2994,35 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _showSnack('「${group.displayName}」を削除しました（ログイン記憶は保持）');
   }
 
-  void _showSnack(String message) {
+  void _showTimedSnackBar(
+    SnackBar snackBar, {
+    Duration duration = const Duration(milliseconds: 2200),
+  }) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: Text(message),
-          duration: const Duration(seconds: 2),
-        ),
-      );
+    _snackDismissTimer?.cancel();
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.clearSnackBars();
+    final controller = messenger.showSnackBar(snackBar);
+    // Android でユーザー補助サービス（アクセシビリティ機能）が有効だと
+    // SnackBarAction 付きの SnackBar が自動で閉じない Flutter の仕様を回避し、
+    // 常に指定秒数で確実に閉じるように明示タイマーを併用する。
+    _snackDismissTimer = Timer(duration, () {
+      _snackDismissTimer = null;
+      if (!mounted) return;
+      try {
+        controller.close();
+      } catch (_) {}
+    });
+  }
+
+  void _showSnack(String message) {
+    _showTimedSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+      ),
+      duration: const Duration(seconds: 2),
+    );
   }
 
   @override
@@ -3040,155 +3080,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         appBar: headerCollapsed
             ? null
             : AppBar(
-                toolbarHeight: 50,
+                toolbarHeight: 44,
                 titleSpacing: 4,
                 title: _isGmailOpen
-                    ? InkWell(
-                        borderRadius: BorderRadius.circular(8),
-                        onTap: () async {
-                          await Clipboard.setData(
-                            ClipboardData(text: _gmailRuntime.currentUrl),
-                          );
-                          _showSnack('Gmail のURLをコピーしました');
-                        },
-                        child: Row(
-                          children: [
-                            Container(
-                              width: 26,
-                              height: 26,
-                              decoration: BoxDecoration(
-                                color: const Color(0xFFEA4335),
-                                borderRadius: BorderRadius.circular(7),
-                              ),
-                              alignment: Alignment.center,
-                              child: const Text(
-                                'GM',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  const Text(
-                                    'Gmail（アプリ内）',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                  Text(
-                                    _gmailRuntime.currentUrl,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .labelSmall
-                                        ?.copyWith(fontSize: 10.5),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
+                    ? const Text(
+                        'Gmail',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.bold,
                         ),
                       )
                     : active == null
                     ? const Text('OmniSNS')
-                    : InkWell(
-                        borderRadius: BorderRadius.circular(8),
-                        onTap: () async {
-                          final url = activeRt?.currentUrl ?? active.url;
-                          await Clipboard.setData(ClipboardData(text: url));
-                          _showSnack('現在のURLをコピーしました');
-                        },
-                        child: Row(
-                          children: [
-                            Container(
-                              width: 26,
-                              height: 26,
-                              decoration: BoxDecoration(
-                                color: parseHexColor(active.colorHex),
-                                borderRadius: BorderRadius.circular(7),
-                              ),
-                              alignment: Alignment.center,
-                              child: Text(
-                                active.badge,
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Row(
-                                    children: [
-                                      Flexible(
-                                        child: Text(
-                                          activeGroup?.displayName ?? active.name,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(
-                                            fontSize: 14,
-                                            fontWeight: FontWeight.bold,
-                                          ),
-                                        ),
-                                      ),
-                                      if (active.isDesktopUa) ...[
-                                        const SizedBox(width: 5),
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 5,
-                                            vertical: 1,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: Theme.of(context)
-                                                .colorScheme
-                                                .primaryContainer,
-                                            borderRadius: BorderRadius.circular(4),
-                                          ),
-                                          child: Text(
-                                            'PC',
-                                            style: TextStyle(
-                                              fontSize: 9.5,
-                                              fontWeight: FontWeight.w700,
-                                              color: Theme.of(context)
-                                                  .colorScheme
-                                                  .onPrimaryContainer,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ],
-                                  ),
-                                  Text(
-                                    activeRt?.currentUrl ?? active.url,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .labelSmall
-                                        ?.copyWith(fontSize: 10.5),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
+                    : active.isDesktopUa
+                    ? Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
                         ),
-                      ),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.primaryContainer,
+                          borderRadius: BorderRadius.circular(5),
+                        ),
+                        child: Text(
+                          'PC',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onPrimaryContainer,
+                          ),
+                        ),
+                      )
+                    : const SizedBox.shrink(),
                 actions: [
                   if (tabsCollapsed)
                     Padding(
@@ -3344,6 +3271,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           }
                         case 'sleep':
                           if (active != null) _sleepInstance(active.instanceId);
+                        case 'copy-url':
+                          final copyUrl = _isGmailOpen
+                              ? _gmailRuntime.currentUrl
+                              : (activeRt?.currentUrl ?? active?.url ?? '');
+                          if (copyUrl.isNotEmpty) {
+                            await Clipboard.setData(ClipboardData(text: copyUrl));
+                            _showSnack('現在のURLをコピーしました');
+                          }
                         case 'external':
                           if (_isGmailOpen) {
                             final url = isHttpOrHttpsUrl(_gmailRuntime.currentUrl)
@@ -3436,6 +3371,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             child: Text('タブ休止（メモリ解放）'),
                           ),
                         ],
+                        const PopupMenuItem(
+                          value: 'copy-url',
+                          child: Text('現在のURLをコピー'),
+                        ),
                         const PopupMenuItem(
                           value: 'external',
                           child: Text('外部ブラウザで開く'),
@@ -3572,27 +3511,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                   ),
                   if (_isGmailOpen) ...[
-                    Container(
-                      width: 20,
-                      height: 20,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFEA4335),
-                        borderRadius: BorderRadius.circular(5),
-                      ),
-                      alignment: Alignment.center,
-                      child: const Text(
-                        'GM',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 8.5,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
                     const Expanded(
                       child: Text(
-                        'Gmail（アプリ内）',
+                        'Gmail',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
@@ -3628,93 +3549,120 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
                     ),
                   ] else if (active != null) ...[
-                    Container(
-                      width: 20,
-                      height: 20,
-                      decoration: BoxDecoration(
-                        color: parseHexColor(active.colorHex),
-                        borderRadius: BorderRadius.circular(5),
-                      ),
-                      alignment: Alignment.center,
-                      child: Text(
-                        active.badge,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 8.5,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        activeGroup?.displayName ?? active.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                    InkWell(
-                      key: const ValueKey('follow-counter-chip'),
-                      borderRadius: BorderRadius.circular(99),
-                      onTap: () {
-                        if (counterTarget != null) {
-                          _showFollowCounterSheet(
-                            counterTarget,
-                            crossSiteSourceName:
-                                resolvedCounter?.isCrossSite == true
-                                    ? (activeGroup?.displayName ?? active.name)
-                                    : null,
-                          );
-                        } else if (resolvedCounter?.effectiveService != null) {
-                          _showSnack(
-                            '${_serviceDisplayName(resolvedCounter!.effectiveService!)} を追加するとカウントできます',
-                          );
-                        }
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 7,
-                          vertical: 3,
-                        ),
-                        decoration: BoxDecoration(
-                          color: hasAnyToday
-                              ? colorScheme.tertiaryContainer
-                              : colorScheme.surface,
-                          borderRadius: BorderRadius.circular(99),
-                          border: Border.all(
-                            color: hasAnyToday
-                                ? colorScheme.tertiary
-                                : colorScheme.outlineVariant,
+                    const Spacer(),
+                    Tooltip(
+                      message: _jev.isActive
+                          ? '分類フィルタ ON（${_jev.category}）· 長押しで設定'
+                          : '分類フィルタ OFF（${_jev.category}）· 長押しで設定',
+                      child: InkWell(
+                        key: const ValueKey('collapsed-jev-filter-chip'),
+                        borderRadius: BorderRadius.circular(99),
+                        onTap: () async {
+                          if (!_jev.hasApiKey) {
+                            await _showJevSettingsSheet();
+                          } else {
+                            final next = !_jev.enabled;
+                            final reset = await _jev.updateSettings(enabled: next);
+                            _syncJevConfigToAllControllers(resetJudged: reset);
+                            _showSnack(
+                              next
+                                  ? 'Jev 分類フィルタ ON（「${_jev.category}」）'
+                                  : 'Jev 分類フィルタ OFF',
+                            );
+                          }
+                        },
+                        onLongPress: _showJevSettingsSheet,
+                        child: Container(
+                          width: 28,
+                          height: 24,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: _jev.isActive
+                                ? colorScheme.primaryContainer
+                                : colorScheme.surface,
+                            borderRadius: BorderRadius.circular(99),
+                            border: Border.all(
+                              color: _jev.isActive
+                                  ? colorScheme.primary
+                                  : colorScheme.outlineVariant,
+                            ),
+                          ),
+                          child: Icon(
+                            _jev.isActive
+                                ? Icons.filter_alt_rounded
+                                : Icons.filter_alt_outlined,
+                            size: 15,
+                            color: _jev.isActive
+                                ? colorScheme.onPrimaryContainer
+                                : colorScheme.onSurfaceVariant,
                           ),
                         ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              Icons.person_add_alt_1_rounded,
-                              size: 12,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Tooltip(
+                      message: todayUnfollows > 0
+                          ? 'フォロー $todayFollows / 解除 $todayUnfollows'
+                          : 'フォロー $todayFollows',
+                      child: InkWell(
+                        key: const ValueKey('follow-counter-chip'),
+                        borderRadius: BorderRadius.circular(99),
+                        onTap: () {
+                          if (counterTarget != null) {
+                            _showFollowCounterSheet(
+                              counterTarget,
+                              crossSiteSourceName:
+                                  resolvedCounter?.isCrossSite == true
+                                      ? (activeGroup?.displayName ?? active.name)
+                                      : null,
+                            );
+                          } else if (resolvedCounter?.effectiveService != null) {
+                            _showSnack(
+                              '${_serviceDisplayName(resolvedCounter!.effectiveService!)} を追加するとカウントできます',
+                            );
+                          }
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: hasAnyToday
+                                ? colorScheme.tertiaryContainer
+                                : colorScheme.surface,
+                            borderRadius: BorderRadius.circular(99),
+                            border: Border.all(
                               color: hasAnyToday
-                                  ? colorScheme.onTertiaryContainer
-                                  : colorScheme.onSurfaceVariant,
+                                  ? colorScheme.tertiary
+                                  : colorScheme.outlineVariant,
                             ),
-                            const SizedBox(width: 3),
-                            Text(
-                              todayUnfollows > 0
-                                  ? '$crossSiteBadge$todayFollows/-$todayUnfollows'
-                                  : '$crossSiteBadge$todayFollows',
-                              style: TextStyle(
-                                fontSize: 10.5,
-                                fontWeight: FontWeight.w700,
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.person_add_alt_1_rounded,
+                                size: 12,
                                 color: hasAnyToday
                                     ? colorScheme.onTertiaryContainer
                                     : colorScheme.onSurfaceVariant,
                               ),
-                            ),
-                          ],
+                              const SizedBox(width: 2.5),
+                              Text(
+                                todayUnfollows > 0
+                                    ? '$crossSiteBadge$todayFollows/-$todayUnfollows'
+                                    : '$crossSiteBadge$todayFollows',
+                                style: TextStyle(
+                                  fontSize: 10.5,
+                                  fontWeight: FontWeight.w700,
+                                  color: hasAnyToday
+                                      ? colorScheme.onTertiaryContainer
+                                      : colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -4065,136 +4013,121 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                       ],
                     )
-                  : Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: Text(
-                          group.displayName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                    ),
+                  : const SizedBox.shrink(),
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(4, 5, 2, 5),
-              child: InkWell(
-                key: const ValueKey('jev-filter-chip'),
-                borderRadius: BorderRadius.circular(99),
-                onTap: () async {
-                  if (!_jev.hasApiKey) {
-                    await _showJevSettingsSheet();
-                  } else {
-                    final next = !_jev.enabled;
-                    final reset = await _jev.updateSettings(enabled: next);
-                    _syncJevConfigToAllControllers(resetJudged: reset);
-                    _showSnack(
-                      next
-                          ? 'Jev 分類フィルタ ON（「${_jev.category}」）'
-                          : 'Jev 分類フィルタ OFF',
-                    );
-                  }
-                },
-                onLongPress: _showJevSettingsSheet,
-                child: () {
-                  final live = _currentJevLiveState(active);
-                  final cat = _jev.category;
-                  final shortCat =
-                      cat.length > 6 ? '${cat.substring(0, 5)}…' : cat;
-                  final activeOn = _jev.isActive;
-                  final label = activeOn && live.active
-                      ? '$shortCat ${live.matched}件'
-                      : '分類:$shortCat';
-                  return Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Tooltip(
+                message: _jev.isActive
+                    ? '分類フィルタ ON（${_jev.category}）· 長押しで設定'
+                    : '分類フィルタ OFF（${_jev.category}）· 長押しで設定',
+                child: InkWell(
+                  key: const ValueKey('jev-filter-chip'),
+                  borderRadius: BorderRadius.circular(99),
+                  onTap: () async {
+                    if (!_jev.hasApiKey) {
+                      await _showJevSettingsSheet();
+                    } else {
+                      final next = !_jev.enabled;
+                      final reset = await _jev.updateSettings(enabled: next);
+                      _syncJevConfigToAllControllers(resetJudged: reset);
+                      _showSnack(
+                        next
+                            ? 'Jev 分類フィルタ ON（「${_jev.category}」）'
+                            : 'Jev 分類フィルタ OFF',
+                      );
+                    }
+                  },
+                  onLongPress: _showJevSettingsSheet,
+                  child: Container(
+                    width: 30,
+                    height: 28,
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: activeOn
+                      color: _jev.isActive
                           ? colorScheme.primaryContainer
                           : colorScheme.surface,
                       borderRadius: BorderRadius.circular(99),
                       border: Border.all(
-                        color: activeOn
+                        color: _jev.isActive
                             ? colorScheme.primary
                             : colorScheme.outlineVariant,
                       ),
                     ),
-                    child: Text(
-                      label,
-                      style: TextStyle(
-                        fontSize: 10.5,
-                        fontWeight:
-                            activeOn ? FontWeight.w700 : FontWeight.w600,
-                        color: activeOn
-                            ? colorScheme.onPrimaryContainer
-                            : colorScheme.onSurfaceVariant,
-                      ),
+                    child: Icon(
+                      _jev.isActive
+                          ? Icons.filter_alt_rounded
+                          : Icons.filter_alt_outlined,
+                      size: 16,
+                      color: _jev.isActive
+                          ? colorScheme.onPrimaryContainer
+                          : colorScheme.onSurfaceVariant,
                     ),
-                  );
-                }(),
+                  ),
+                ),
               ),
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(2, 5, 8, 5),
-              child: InkWell(
-                key: const ValueKey('follow-counter-chip'),
-                borderRadius: BorderRadius.circular(99),
-                onTap: () {
-                  if (counterTarget != null) {
-                    _showFollowCounterSheet(
-                      counterTarget,
-                      crossSiteSourceName:
-                          resolvedCounter.isCrossSite ? group.displayName : null,
-                    );
-                  } else if (resolvedCounter.effectiveService != null) {
-                    _showSnack(
-                      '${_serviceDisplayName(resolvedCounter.effectiveService!)} を追加するとカウントできます',
-                    );
-                  }
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 9),
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: hasAnyToday
-                        ? colorScheme.tertiaryContainer
-                        : colorScheme.surface,
-                    borderRadius: BorderRadius.circular(99),
-                    border: Border.all(
+              child: Tooltip(
+                message: todayUnfollows > 0
+                    ? '$crossSitePrefixフォロー $todayFollows / 解除 $todayUnfollows'
+                    : '$crossSitePrefixフォロー $todayFollows',
+                child: InkWell(
+                  key: const ValueKey('follow-counter-chip'),
+                  borderRadius: BorderRadius.circular(99),
+                  onTap: () {
+                    if (counterTarget != null) {
+                      _showFollowCounterSheet(
+                        counterTarget,
+                        crossSiteSourceName:
+                            resolvedCounter.isCrossSite ? group.displayName : null,
+                      );
+                    } else if (resolvedCounter.effectiveService != null) {
+                      _showSnack(
+                        '${_serviceDisplayName(resolvedCounter.effectiveService!)} を追加するとカウントできます',
+                      );
+                    }
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
                       color: hasAnyToday
-                          ? colorScheme.tertiary
-                          : colorScheme.outlineVariant,
-                    ),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.person_add_alt_1_rounded,
-                        size: 13.5,
+                          ? colorScheme.tertiaryContainer
+                          : colorScheme.surface,
+                      borderRadius: BorderRadius.circular(99),
+                      border: Border.all(
                         color: hasAnyToday
-                            ? colorScheme.onTertiaryContainer
-                            : colorScheme.onSurfaceVariant,
+                            ? colorScheme.tertiary
+                            : colorScheme.outlineVariant,
                       ),
-                      const SizedBox(width: 4),
-                      Text(
-                        todayUnfollows > 0
-                            ? '$crossSitePrefixフォロー $todayFollows / 解除 $todayUnfollows'
-                            : '$crossSitePrefixフォロー $todayFollows',
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.person_add_alt_1_rounded,
+                          size: 13,
                           color: hasAnyToday
                               ? colorScheme.onTertiaryContainer
                               : colorScheme.onSurfaceVariant,
                         ),
-                      ),
-                    ],
+                        const SizedBox(width: 3),
+                        Text(
+                          todayUnfollows > 0
+                              ? '$crossSitePrefix$todayFollows/-$todayUnfollows'
+                              : '$crossSitePrefix$todayFollows',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w700,
+                            color: hasAnyToday
+                                ? colorScheme.onTertiaryContainer
+                                : colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -4722,7 +4655,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                         Text(
-                          'Android · v1.8.1',
+                          'Android · v1.8.2',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],

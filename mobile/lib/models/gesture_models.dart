@@ -392,130 +392,223 @@ class MobileGestureSettings {
   }
 }
 
-/// HisatorNotebook / PC版 OmniSNS 準拠の12方向ジェスチャー幾何認識エンジン。
+/// HisatorNotebook / PC版 OmniSNS (`W246GesturePath`) 準拠の直線専用12方向ジェスチャー幾何認識エンジン。
+/// 自由曲線の軌跡は描画せず、厳密な水平・垂直の直線セグメント（始点 → 角 → 終点）のみを認識・描画する。
 class GesturePath {
   GesturePath({
-    this.firstStepPx = 22.0,
-    this.cornerStepPx = 26.0,
-    this.axisRatio = 1.65,
-    this.minTurnSpanPx = 30.0,
+    this.tremorPx = 10.0,
+    this.axisRatio = 1.8,
+    this.releaseAxisRatio = 1.3,
+    this.releaseMinLen = 16.0,
+    this.releaseTailRatio = 0.25,
+    this.releaseTailMin = 20.0,
+    this.releaseTailMax = 40.0,
   });
 
-  final double firstStepPx;
-  final double cornerStepPx;
+  double tremorPx;
   final double axisRatio;
-  final double minTurnSpanPx;
+  final double releaseAxisRatio;
+  final double releaseMinLen;
+  final double releaseTailRatio;
+  final double releaseTailMin;
+  final double releaseTailMax;
 
-  final List<Offset> _points = <Offset>[];
   Offset _origin = Offset.zero;
   Offset _pivot = Offset.zero;
-  Offset _extreme = Offset.zero;
+  Offset _last = Offset.zero;
+  Offset _end = Offset.zero;
+  Offset? _corner;
   final List<GestureDirection> _dirs = <GestureDirection>[];
+  double _maxLen = 0.0;
+  int _count = 0;
   bool _invalidated = false;
+  bool _pending = false;
+  bool _everRecognized = false;
 
-  List<Offset> get points => List<Offset>.unmodifiable(_points);
+  double get tolerance =>
+      max(tremorPx, min(_maxLen * 0.15, max(6.0, tremorPx * 1.1)));
+
   bool get invalidated => _invalidated;
+  bool get pending => _pending;
+  bool get everRecognized => _everRecognized;
   Offset get origin => _origin;
 
+  /// 直線セグメントの頂点列（始点 → [直角コーナー] → 終点）。自由曲線（ちょろちょろ線）は生成しない。
+  List<Offset> get vertices {
+    final pts = <Offset>[_origin];
+    if (_corner != null) {
+      pts.add(_corner!);
+    }
+    if (_dirs.isNotEmpty) {
+      pts.add(_end);
+    }
+    return pts;
+  }
+
+  /// 後方互換ゲッター（常に直線頂点列を返す）。
+  List<Offset> get points => vertices;
+
   String get shape {
-    if (_invalidated || _dirs.isEmpty) return '';
+    if (_invalidated || _pending || _dirs.isEmpty) return '';
     return _dirs.map((d) => d.code).join();
   }
 
-  void reset(Offset start) {
-    _points
-      ..clear()
-      ..add(start);
+  void reset(Offset start, {double? tremor}) {
+    if (tremor != null) {
+      tremorPx = tremor.clamp(4.0, 36.0);
+    }
     _origin = start;
     _pivot = start;
-    _extreme = start;
+    _last = start;
+    _end = start;
+    _corner = null;
     _dirs.clear();
+    _maxLen = 0.0;
+    _count = 1;
     _invalidated = false;
+    _pending = false;
+    _everRecognized = false;
   }
 
   void push(Offset pt) {
-    if (_points.isEmpty) {
+    if (_count == 0) {
       reset(pt);
       return;
     }
-    final last = _points.last;
-    if ((pt - last).distance >= 2.0) {
-      _points.add(pt);
-      if (_points.length > 240) {
-        _points.removeAt(1);
-      }
-    }
     if (_invalidated) return;
-
-    if (_dirs.isEmpty) {
-      final dx = pt.dx - _origin.dx;
-      final dy = pt.dy - _origin.dy;
-      final dist = sqrt(dx * dx + dy * dy);
-      if (dist < firstStepPx) return;
-      final dir = _pickCardinal(dx, dy);
-      if (dir == null) return;
-      _dirs.add(dir);
-      _pivot = _origin;
-      _extreme = pt;
+    if (!pt.dx.isFinite || !pt.dy.isFinite) {
+      _invalidated = true;
       return;
     }
-
-    final curDir = _dirs.last;
-    // 現在方向への最大到達点（折り返し基準）を更新
-    if (_progressAlong(pt, _extreme, curDir) > 0) {
-      _extreme = pt;
+    if ((pt.dx - _last.dx).abs() < 1e-6 && (pt.dy - _last.dy).abs() < 1e-6) {
+      return;
     }
-
-    final dx = pt.dx - _extreme.dx;
-    final dy = pt.dy - _extreme.dy;
-    final distFromExtreme = sqrt(dx * dx + dy * dy);
-    if (distFromExtreme < cornerStepPx) return;
-
-    final nextDir = _pickCardinal(dx, dy);
-    if (nextDir == null || nextDir == curDir) return;
-
-    // 180度逆戻りはキャンセル扱い
-    if (nextDir == curDir.opposite) {
+    _last = pt;
+    _count++;
+    if (_count > 200000) {
       _invalidated = true;
       return;
     }
 
-    // 2方向まで（3方向目へ曲がったら無効化）
-    if (_dirs.length >= 2) {
-      _invalidated = true;
-      return;
-    }
-
-    // 1本目のストロークが短すぎるままのブレは無視
-    final firstSpan = _progressAlong(_extreme, _pivot, curDir);
-    if (firstSpan < minTurnSpanPx * 0.65) {
-      return;
-    }
-
-    _dirs.add(nextDir);
-    _pivot = _extreme;
-    _extreme = pt;
-  }
-
-  GestureDirection? _pickCardinal(double dx, double dy) {
+    final tol = tolerance;
+    final dx = pt.dx - _pivot.dx;
+    final dy = pt.dy - _pivot.dy;
     final ax = dx.abs();
     final ay = dy.abs();
-    if (ax >= ay * axisRatio) {
+    if (max(ax, ay) <= tol) {
+      _pending = false;
+      return;
+    }
+
+    final dir = _classifyDir(dx, dy, axisRatio);
+    if (dir == null) {
+      // 開始直後から斜め・曲線（ちょろちょろ線）に大きく逸れた場合は即キャンセル
+      if (_dirs.isEmpty && ax > tol * 2.2 && ay > tol * 2.2) {
+        _invalidated = true;
+        _pending = false;
+        return;
+      }
+      _pending = true;
+      return;
+    }
+    _pending = false;
+    _step(pt, dir, tol);
+  }
+
+  /// 連続スクロール中は軌跡終点を始点と同一軸上の純粋な直線に固定して更新する。
+  void advanceLiveScroll(Offset pt) {
+    if (_invalidated || _dirs.isEmpty) return;
+    final dir = _dirs.last;
+    final start = _corner ?? _origin;
+    if (dir == GestureDirection.l || dir == GestureDirection.r) {
+      _end = Offset(pt.dx, start.dy);
+    } else {
+      _end = Offset(start.dx, pt.dy);
+    }
+  }
+
+  /// 指を離した時点の保留状態を解決し、確定した直線ジェスチャー形状を返す。
+  String release() {
+    if (_pending && !_invalidated) {
+      _resolvePendingAtRelease();
+    }
+    return shape;
+  }
+
+  void _step(Offset pt, GestureDirection dir, double tol) {
+    if (_dirs.isEmpty) {
+      _dirs.add(dir);
+      _advance(pt, dir, tol);
+    } else if (_dirs.last == dir) {
+      _advance(pt, dir, tol);
+    } else if (_dirs.last == dir.opposite || _dirs.length >= 2) {
+      // 180度逆戻り・ジグザグ・3方向目への曲がりは無効化
+      _invalidated = true;
+      return;
+    } else {
+      _corner = _end;
+      _dirs.add(dir);
+      _advance(pt, dir, tol);
+    }
+    if (shape.isNotEmpty) {
+      _everRecognized = true;
+    }
+  }
+
+  void _resolvePendingAtRelease() {
+    final dx = _last.dx - _pivot.dx;
+    final dy = _last.dy - _pivot.dy;
+    final ax = dx.abs();
+    final ay = dy.abs();
+    final len = max(ax, ay);
+    final dir = _classifyDir(dx, dy, releaseAxisRatio);
+
+    final tol = tolerance;
+    if (_dirs.isNotEmpty) {
+      final tail =
+          (_maxLen * releaseTailRatio).clamp(releaseTailMin, releaseTailMax);
+      if (len <= tail) {
+        _pending = false;
+        if (dir != null && dir == _dirs.last) {
+          _advance(_last, dir, tol);
+        }
+        return;
+      }
+    }
+
+    if (dir == null || len < releaseMinLen) {
+      return;
+    }
+    _pending = false;
+    _step(_last, dir, tol);
+  }
+
+  void _advance(Offset pt, GestureDirection dir, double tol) {
+    final horizontal = dir == GestureDirection.l || dir == GestureDirection.r;
+    final start = _corner ?? _origin;
+    if (horizontal) {
+      final y = pt.dy - (pt.dy - _pivot.dy).clamp(-tol, tol);
+      _pivot = Offset(pt.dx, y);
+      _end = Offset(pt.dx, start.dy);
+      _maxLen = max(_maxLen, (pt.dx - start.dx).abs());
+    } else {
+      final x = pt.dx - (pt.dx - _pivot.dx).clamp(-tol, tol);
+      _pivot = Offset(x, pt.dy);
+      _end = Offset(start.dx, pt.dy);
+      _maxLen = max(_maxLen, (pt.dy - start.dy).abs());
+    }
+  }
+
+  GestureDirection? _classifyDir(double dx, double dy, double ratio) {
+    final ax = dx.abs();
+    final ay = dy.abs();
+    if (ax > ay * ratio) {
       return dx < 0 ? GestureDirection.l : GestureDirection.r;
     }
-    if (ay >= ax * axisRatio) {
+    if (ay > ax * ratio) {
       return dy < 0 ? GestureDirection.u : GestureDirection.d;
     }
     return null;
-  }
-
-  double _progressAlong(Offset pt, Offset ref, GestureDirection dir) {
-    return switch (dir) {
-      GestureDirection.l => ref.dx - pt.dx,
-      GestureDirection.r => pt.dx - ref.dx,
-      GestureDirection.u => ref.dy - pt.dy,
-      GestureDirection.d => pt.dy - ref.dy,
-    };
   }
 }
 

@@ -262,6 +262,12 @@ test('Windows and Android PROFILE_STATS_JS are valid JS with universal mutual-fo
     assert.ok(js.includes('/api/v1/friendships/show_many/'), `${label} must batch-fetch Instagram friendships`);
     // 投稿数は取得・表示しない
     assert.ok(!js.includes("parts.push('投稿 '"), `${label} must not display post count in inline badge`);
+    // コンパクトなフォロー・フォロワー表記（F/FW）と片思い経過時間メモリ
+    assert.ok(js.includes("'/FW'"), `${label} must use compact F/FW inline stats format`);
+    assert.ok(!js.includes("parts.push('フォロー '"), `${label} must not use verbose フォロー label in badge`);
+    assert.ok(js.includes('FOLLOWED_AT_KEY'), `${label} must persist followed user timestamps`);
+    assert.ok(js.includes('formatOnewayElapsedCompact'), `${label} must format oneway elapsed hours`);
+    assert.ok(js.includes("totalHours + '時間'"), `${label} must display elapsed hours for oneway follows`);
   }
 });
 

@@ -289,7 +289,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     _isDraggingGesture = false;
     _isMovingHandle = false;
     _stopLiveScroll();
-    _path.reset(local);
+    _path.reset(local, tremor: widget.settings.tremor.toDouble());
 
     _longPressTimer?.cancel();
     _longPressTimer = Timer(const Duration(milliseconds: 460), () {
@@ -327,14 +327,15 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
         _longPressTimer?.cancel();
         _longPressTimer = null;
         _isDraggingGesture = true;
-        _path.reset(_downLocal!);
+        _path.reset(_downLocal!, tremor: widget.settings.tremor.toDouble());
       } else {
         return;
       }
     }
 
     if (_isLiveScrolling) {
-      // ライブスクロール中は縦方向の距離変化だけで速度更新（軌跡再描画のみ）
+      // ライブスクロール中は縦方向の直線長さと速度のみ更新（自由曲線は描かない）
+      _path.advanceLiveScroll(local);
       if (mounted) setState(() {});
       return;
     }
@@ -352,7 +353,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     final wasMoving = _isMovingHandle;
     final wasDragging = _isDraggingGesture;
     final wasLiveScroll = _isLiveScrolling;
-    final finalShape = _path.shape;
+    final finalShape = cancelled ? '' : _path.release();
     final wasInvalid = _path.invalidated;
 
     _stopLiveScroll();
@@ -474,15 +475,15 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
                 child: IgnorePointer(
                   child: Stack(
                     children: [
-                      if (settings.showTrail)
+                      if (settings.showTrail &&
+                          _path.everRecognized &&
+                          !_path.invalidated &&
+                          _path.vertices.length >= 2)
                         CustomPaint(
                           size: Size(w, h),
                           painter: _GestureTrailPainter(
-                            points: _path.points,
-                            invalidated: _path.invalidated,
+                            vertices: _path.vertices,
                             isLiveScroll: _isLiveScrolling,
-                            liveOrigin: _path.origin,
-                            liveCurrent: _currentLocal,
                           ),
                         ),
                       if (settings.showFeedback)
@@ -720,65 +721,54 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
 
 class _GestureTrailPainter extends CustomPainter {
   _GestureTrailPainter({
-    required this.points,
-    required this.invalidated,
+    required this.vertices,
     required this.isLiveScroll,
-    required this.liveOrigin,
-    required this.liveCurrent,
   });
 
-  final List<Offset> points;
-  final bool invalidated;
+  /// 直線セグメントの頂点列のみ（始点 → [直角コーナー] → 終点）。自由曲線は描画しない。
+  final List<Offset> vertices;
   final bool isLiveScroll;
-  final Offset liveOrigin;
-  final Offset? liveCurrent;
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (points.length < 2) return;
+    if (vertices.length < 2) return;
 
-    final baseColor = invalidated
-        ? const Color(0xFF94A3B8)
-        : (isLiveScroll ? kGestureTealBright : kGestureTeal);
-
-    final path = Path()..moveTo(points.first.dx, points.first.dy);
-    if (isLiveScroll && liveCurrent != null) {
-      path.lineTo(liveCurrent!.dx, liveCurrent!.dy);
-    } else {
-      for (var i = 1; i < points.length; i++) {
-        path.lineTo(points[i].dx, points[i].dy);
-      }
+    final baseColor = isLiveScroll ? kGestureTealBright : kGestureTeal;
+    final path = Path()..moveTo(vertices.first.dx, vertices.first.dy);
+    for (var i = 1; i < vertices.length; i++) {
+      path.lineTo(vertices[i].dx, vertices[i].dy);
     }
 
-    // グロー外枠
-    final glow = Paint()
-      ..color = baseColor.withValues(alpha: 0.28)
-      ..strokeWidth = 10.0
+    // 白縁取り（HisatorNotebook / Windows版 _W246TrailPainter 準拠の直線ライン）
+    final halo = Paint()
+      ..color = const Color(0xF0FFFFFF)
+      ..strokeWidth = 7.0
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
-    canvas.drawPath(path, glow);
+    canvas.drawPath(path, halo);
 
-    // 本体ライン
+    // 本体直線ライン
     final line = Paint()
       ..color = baseColor
-      ..strokeWidth = 4.2
+      ..strokeWidth = 4.0
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
     canvas.drawPath(path, line);
 
     // 始点マーカー
+    final origin = vertices.first;
     canvas.drawCircle(
-      liveOrigin,
-      5.5,
+      origin,
+      6.0,
       Paint()
         ..color = Colors.white
         ..style = PaintingStyle.fill,
     );
     canvas.drawCircle(
-      liveOrigin,
-      3.5,
+      origin,
+      4.0,
       Paint()
         ..color = baseColor
         ..style = PaintingStyle.fill,

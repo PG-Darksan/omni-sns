@@ -577,8 +577,6 @@ function renderSidebar(): void {
 }
 
 function renderAccountBar(): void {
-  const avatarEl = el<HTMLSpanElement>('accountbar-avatar');
-  const serviceNameEl = el<HTMLSpanElement>('accountbar-service-name');
   const stripEl = el<HTMLDivElement>('account-strip');
   const addBtn = el<HTMLButtonElement>('btn-add-account');
 
@@ -587,31 +585,12 @@ function renderAccountBar(): void {
 
   stripEl.innerHTML = '';
   if (!active || !group) {
-    avatarEl.style.background = 'var(--accent)';
-    avatarEl.textContent = 'O';
-    serviceNameEl.textContent = 'サービス未選択';
     addBtn.disabled = true;
     return;
   }
 
   addBtn.disabled = false;
   addBtn.title = `「${group.displayName}」に独立セッションの別アカウントを追加`;
-
-  const activeRt = state.runtimeMap.get(active.instanceId);
-  avatarEl.innerHTML = '';
-  avatarEl.style.background = active.color;
-  if (activeRt?.faviconUrl && isSafeFaviconUrl(activeRt.faviconUrl)) {
-    const img = document.createElement('img');
-    img.src = activeRt.faviconUrl;
-    img.alt = '';
-    img.onerror = () => {
-      avatarEl.textContent = active.badge;
-    };
-    avatarEl.appendChild(img);
-  } else {
-    avatarEl.textContent = active.badge;
-  }
-  serviceNameEl.textContent = group.displayName;
 
   group.accounts.forEach((inst, idx) => {
     const rt = state.runtimeMap.get(inst.instanceId);
@@ -963,9 +942,6 @@ function renderToolbarAndViewport(): void {
 
   const backBtn = el<HTMLButtonElement>('btn-back');
   const fwdBtn = el<HTMLButtonElement>('btn-forward');
-  const dotEl = el<HTMLSpanElement>('active-service-dot');
-  const nameEl = el<HTMLSpanElement>('active-service-name');
-  const urlInput = el<HTMLInputElement>('active-url-input');
   const copyUrlBtn = el<HTMLButtonElement>('btn-copy-url');
   const uaBtn = el<HTMLButtonElement>('btn-toggle-ua');
   const muteBtn = el<HTMLButtonElement>('btn-toggle-mute');
@@ -975,7 +951,6 @@ function renderToolbarAndViewport(): void {
   const followLabelEl = el<HTMLElement>('follow-pill-label');
   const followTodayEl = el<HTMLElement>('follow-today-count');
   const unfollowSepEl = el<HTMLElement>('unfollow-pill-sep');
-  const unfollowLabelEl = el<HTMLElement>('unfollow-pill-label');
   const unfollowTodayEl = el<HTMLElement>('unfollow-today-count');
   const collapsedNewTabBtn = el<HTMLButtonElement>('btn-collapsed-new-subtab');
   const collapsedFollowBtn = el<HTMLButtonElement>('btn-collapsed-follow');
@@ -1010,13 +985,6 @@ function renderToolbarAndViewport(): void {
     fwdBtn.disabled = !grt?.canGoForward;
     collapsedReloadBtn.disabled = false;
     copyUrlBtn.disabled = false;
-    urlInput.disabled = false;
-    dotEl.className = `status-dot ${grt?.isLoading ? 'loading' : 'ready'}`;
-    nameEl.textContent = 'Gmail（アプリ内）';
-    const gmailUrl = grt?.currentUrl || 'https://mail.google.com/';
-    if (document.activeElement !== urlInput) {
-      urlInput.value = gmailUrl;
-    }
     if (grt?.loadError) {
       el<HTMLParagraphElement>('error-detail').textContent = grt.loadError;
       errorEl.classList.remove('hidden');
@@ -1025,10 +993,11 @@ function renderToolbarAndViewport(): void {
       followBtn.disabled = true;
       collapsedNewTabBtn.disabled = true;
       collapsedFollowBtn.disabled = true;
+      followLabelEl.textContent = '';
+      followLabelEl.classList.add('hidden');
       followTodayEl.textContent = '0';
-      unfollowTodayEl.textContent = '0';
+      unfollowTodayEl.textContent = '-0';
       unfollowSepEl.classList.add('hidden');
-      unfollowLabelEl.classList.add('hidden');
       unfollowTodayEl.classList.add('hidden');
       collapsedFollowEl.textContent = '0';
       followBtn.classList.remove('has-count');
@@ -1049,18 +1018,15 @@ function renderToolbarAndViewport(): void {
     collapsedFollowBtn.disabled = true;
     collapsedReloadBtn.disabled = true;
     copyUrlBtn.disabled = true;
-    urlInput.disabled = true;
-    urlInput.value = '';
+    followLabelEl.textContent = '';
+    followLabelEl.classList.add('hidden');
     followTodayEl.textContent = '0';
-    unfollowTodayEl.textContent = '0';
+    unfollowTodayEl.textContent = '-0';
     unfollowSepEl.classList.add('hidden');
-    unfollowLabelEl.classList.add('hidden');
     unfollowTodayEl.classList.add('hidden');
     collapsedFollowEl.textContent = '0';
     followBtn.classList.remove('has-count');
     collapsedFollowBtn.classList.remove('has-count');
-    dotEl.className = 'status-dot';
-    nameEl.textContent = 'サービス未選択';
     uaBtn.textContent = 'PC版';
     uaBtn.classList.remove('mobile-mode');
     muteBtn.innerHTML = ICON_VOLUME_ON;
@@ -1079,16 +1045,15 @@ function renderToolbarAndViewport(): void {
   collapsedFollowBtn.disabled = !counterInst;
   collapsedReloadBtn.disabled = false;
   copyUrlBtn.disabled = false;
-  urlInput.disabled = false;
-  followLabelEl.textContent =
-    counterInfo.isCrossSite && counterInst ? `${counterInst.badge} フォロー` : 'フォロー';
+  const crossBadge = counterInfo.isCrossSite && counterInst ? counterInst.badge : '';
+  followLabelEl.textContent = crossBadge;
+  followLabelEl.classList.toggle('hidden', !crossBadge);
   followTodayEl.textContent = String(todayFollow);
-  unfollowTodayEl.textContent = String(todayUnfollow);
+  unfollowTodayEl.textContent = `-${todayUnfollow}`;
   const showUnfollowPill = todayUnfollow > 0;
   unfollowSepEl.classList.toggle('hidden', !showUnfollowPill);
-  unfollowLabelEl.classList.toggle('hidden', !showUnfollowPill);
   unfollowTodayEl.classList.toggle('hidden', !showUnfollowPill);
-  const crossPrefix = counterInfo.isCrossSite && counterInst ? `${counterInst.badge} ` : '';
+  const crossPrefix = crossBadge ? `${crossBadge} ` : '';
   collapsedFollowEl.textContent = showUnfollowPill
     ? `${crossPrefix}${todayFollow}/-${todayUnfollow}`
     : `${crossPrefix}${todayFollow}`;
@@ -1122,12 +1087,6 @@ function renderToolbarAndViewport(): void {
   }
   backBtn.disabled = !rt?.canGoBack;
   fwdBtn.disabled = !rt?.canGoForward;
-  dotEl.className = `status-dot ${rt?.isLoading ? 'loading' : rt?.isSleeping ? '' : 'ready'}`;
-  nameEl.textContent = displayTitle;
-  const resolvedUrl = rt?.currentUrl || active.url;
-  if (document.activeElement !== urlInput) {
-    urlInput.value = resolvedUrl;
-  }
 
   const isMobile = active.uaMode === 'mobile';
   uaBtn.textContent = isMobile ? 'スマホ版' : 'PC版';
@@ -1783,13 +1742,16 @@ async function toggleHeaderCollapsed(): Promise<void> {
 }
 
 async function focusAddressBar(): Promise<void> {
-  if (!state.config || !getActiveInstance()) return;
-  if (state.config.settings.headerCollapsed) {
-    await omniApi.updateSettings({ headerCollapsed: false });
-  }
-  const urlInput = el<HTMLInputElement>('active-url-input');
-  urlInput.focus();
-  urlInput.select();
+  const urlText = state.gmailOpen
+    ? state.gmailRuntime?.currentUrl || 'https://mail.google.com/'
+    : (() => {
+        const active = getActiveInstance();
+        const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
+        return rt?.currentUrl || active?.url || '';
+      })();
+  if (!urlText) return;
+  await omniApi.copyText(urlText);
+  showToast('URLをクリップボードにコピーしました');
 }
 
 async function closeSettingsModal(): Promise<void> {
@@ -1961,17 +1923,20 @@ function renderJevCategoryChips(selected: string): void {
 function renderJevUi(): void {
   const jev = state.jev;
   const cat = jev?.category?.trim() || '女の子';
-  const shortCat = cat.length > 9 ? `${cat.slice(0, 8)}…` : cat;
   const active = Boolean(jev?.isActive);
   const busy = Boolean(jev && (jev.checkingRequests > 0 || jev.liveAutoFetching));
-  const pillText = active && jev?.liveInList
-    ? `${shortCat} ${jev.liveMatched}件${busy ? '…' : ''}`
-    : `分類: ${shortCat}`;
+  const pillTip = active && jev?.liveInList
+    ? `Jev 分類「${cat}」ON（表示 ${jev.liveMatched}件${busy ? '…' : ''} · クリックで設定 / 右クリックでOFF）`
+    : active
+      ? `Jev 分類「${cat}」ON（クリックで設定 / 右クリックでOFF）`
+      : `Jev 分類「${cat}」OFF（クリックで設定 / 右クリックでON）`;
 
   const pillBtn = el<HTMLButtonElement>('btn-jev-filter');
   const collapsedBtn = el<HTMLButtonElement>('btn-collapsed-jev');
-  el<HTMLSpanElement>('jev-pill-label').textContent = pillText;
-  el<HTMLSpanElement>('collapsed-jev-label').textContent = pillText;
+  pillBtn.title = pillTip;
+  collapsedBtn.title = pillTip;
+  pillBtn.setAttribute('aria-label', pillTip);
+  collapsedBtn.setAttribute('aria-label', pillTip);
   pillBtn.classList.toggle('jev-active', active);
   collapsedBtn.classList.toggle('jev-active', active);
 
@@ -2284,68 +2249,15 @@ function bindEvents(): void {
 
   el<HTMLButtonElement>('btn-copy-url').addEventListener('click', async () => {
     const urlText = state.gmailOpen
-      ? state.gmailRuntime?.currentUrl ||
-        el<HTMLInputElement>('active-url-input').value.trim() ||
-        'https://mail.google.com/'
+      ? state.gmailRuntime?.currentUrl || 'https://mail.google.com/'
       : (() => {
           const active = getActiveInstance();
           const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
-          return rt?.currentUrl || active?.url || el<HTMLInputElement>('active-url-input').value.trim();
+          return rt?.currentUrl || active?.url || '';
         })();
     if (!urlText) return;
     await omniApi.copyText(urlText);
     showToast('URLをクリップボードにコピーしました');
-  });
-
-  const urlInput = el<HTMLInputElement>('active-url-input');
-  urlInput.addEventListener('focus', () => {
-    urlInput.select();
-  });
-  urlInput.addEventListener('keydown', async (e) => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopPropagation();
-      if (state.gmailOpen) {
-        urlInput.value = state.gmailRuntime?.currentUrl || 'https://mail.google.com/';
-      } else {
-        const active = getActiveInstance();
-        const rt = active ? state.runtimeMap.get(active.instanceId) : undefined;
-        urlInput.value = rt?.currentUrl || active?.url || '';
-      }
-      urlInput.blur();
-      return;
-    }
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      const normalized = normalizeServiceUrl(urlInput.value);
-      if (!normalized) {
-        showToast('有効な http:// または https:// URL を入力してください');
-        return;
-      }
-      if (state.gmailOpen) {
-        try {
-          await omniApi.navigateGmail(normalized);
-          urlInput.blur();
-        } catch (err) {
-          showToast(String(err));
-        }
-        return;
-      }
-      const active = getActiveInstance();
-      if (!active) return;
-      const openInNewTab = e.altKey || e.ctrlKey || e.metaKey;
-      try {
-        if (openInNewTab) {
-          await omniApi.createSubTab(active.instanceId, normalized);
-          showToast('同じアカウントの新しいタブで開きました');
-        } else {
-          await omniApi.navigateSubTab(active.instanceId, normalized);
-        }
-        urlInput.blur();
-      } catch (err) {
-        showToast(String(err));
-      }
-    }
   });
 
   // Placeholder buttons

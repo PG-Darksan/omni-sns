@@ -695,7 +695,7 @@ impl OverlayRuntime {
 
         let draw_stroke = self.stroke.as_ref().filter(|s| !s.canceled);
         let has_trail = draw_stroke
-            .map(|s| s.settings.show_trail && s.path.ever_recognized())
+            .map(|s| s.settings.show_trail && s.path.ever_recognized() && !s.path.invalid())
             .unwrap_or(false);
         let has_guide = draw_stroke
             .map(|s| s.settings.show_feedback && s.path.shape().is_some())

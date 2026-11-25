@@ -67,11 +67,6 @@
     <div id="main-area" class="main-area">
       <!-- 同一SNS アカウント即時切替ヘッダー (高さ40px固定) -->
       <div id="accountbar" class="accountbar" role="tablist" aria-label="同一SNSのアカウント切替">
-        <div id="accountbar-service" class="accountbar-service">
-          <span id="accountbar-avatar" class="accountbar-avatar">O</span>
-          <span id="accountbar-service-name" class="accountbar-service-name">サービス未選択</span>
-        </div>
-        <div class="accountbar-divider" aria-hidden="true"></div>
         <div id="account-strip" class="account-strip"></div>
         <div class="accountbar-right">
           <button
@@ -101,10 +96,11 @@
           <button
             id="btn-collapsed-jev"
             type="button"
-            class="tool-pill jev-pill accountbar-collapsed-only"
+            class="tool-btn jev-pill jev-icon-btn accountbar-collapsed-only"
             title="Jev 分類フィルタ（クリックで設定・分類変更 / 右クリックでON・OFF切替）"
+            aria-label="Jev 分類フィルタ"
           >
-            <span id="collapsed-jev-label">分類: 女の子</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
           </button>
           <button
             id="btn-collapsed-follow"
@@ -141,26 +137,13 @@
           <button id="btn-forward" class="tool-btn" title="進む" disabled>→</button>
           <button id="btn-reload" class="tool-btn" title="再読み込み (Shift+クリックでスーパーリロード)">↻</button>
           <button id="btn-home" class="tool-btn" title="このアカウントのDM/ホーム画面へ戻る">⌂</button>
-        </div>
-
-        <div class="toolbar-address">
-          <span id="active-service-dot" class="status-dot"></span>
-          <span id="active-service-name" class="active-name">サービス未選択</span>
-          <input
-            id="active-url-input"
-            type="text"
-            class="url-input"
-            value=""
-            placeholder="URLを入力して Enter で移動（Alt+Enter で別タブ）"
-            spellcheck="false"
-            autocomplete="off"
-            aria-label="現在のURL（入力してEnterで移動、Alt+Enterで新しいタブで開く）"
-          />
           <button id="btn-copy-url" class="tool-btn" title="現在のURLをコピー" aria-label="現在のURLをコピー">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           </button>
           <button id="btn-open-external" class="tool-btn" title="既定のブラウザで開く">↗</button>
         </div>
+
+        <div class="toolbar-spacer" aria-hidden="true"></div>
 
         <div class="toolbar-controls">
           <button
@@ -176,10 +159,11 @@
           <button
             id="btn-jev-filter"
             type="button"
-            class="tool-pill jev-pill"
+            class="tool-btn jev-pill jev-icon-btn"
             title="Jev 分類フィルタ（クリックで分類入力・設定 / 右クリックでON・OFF切替）"
+            aria-label="Jev 分類フィルタ"
           >
-            <span id="jev-pill-label">分類: 女の子</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
           </button>
           <button
             id="btn-follow-counter"
@@ -188,11 +172,10 @@
             title="フォロー・アンフォロー回数カウンター（自動カウント / クリックで調整・リセット）"
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
-            <span id="follow-pill-label">フォロー</span>
+            <span id="follow-pill-label" class="hidden"></span>
             <strong id="follow-today-count">0</strong>
             <span id="unfollow-pill-sep" class="unfollow-pill-part hidden">/</span>
-            <span id="unfollow-pill-label" class="unfollow-pill-part hidden">解除</span>
-            <strong id="unfollow-today-count" class="unfollow-pill-part hidden">0</strong>
+            <strong id="unfollow-today-count" class="unfollow-pill-part hidden">-0</strong>
           </button>
           <button id="btn-toggle-ua" class="tool-pill" title="PC版 / モバイル版 User-Agent を切り替え">PC版</button>
           <button id="btn-toggle-mute" class="tool-btn" title="ミュート切替" aria-label="ミュート切替">
@@ -448,7 +431,7 @@
             <li><kbd>リンク長押し</kbd> : 遷移先を同一アカウントの新しいタブで開く</li>
             <li><kbd>右ドラッグ</kbd> : マウスジェスチャー（タブ切替・Ctrl+クリック・アカウント切替・連続スクロール等）</li>
             <li><kbd>Ctrl</kbd> + <kbd>クリック</kbd> / <kbd>中クリック</kbd> : 同一アカウントのログイン状態を保ったままリンクを別タブで開く</li>
-            <li><kbd>Ctrl</kbd> + <kbd>L</kbd> : アドレスバーにフォーカス（<kbd>Enter</kbd> で移動 / <kbd>Alt</kbd>+<kbd>Enter</kbd> で別タブで開く）</li>
+            <li><kbd>Ctrl</kbd> + <kbd>L</kbd> : 現在のURLをクリップボードにコピー</li>
             <li><kbd>Ctrl</kbd> + <kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> : 表示倍率の拡大 / 縮小 / 100%リセット</li>
             <li><kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> / <kbd>←</kbd> <kbd>→</kbd> : 同一SNS内のアカウントを瞬時に切り替え</li>
             <li><kbd>Ctrl</kbd> + <kbd>T</kbd> / <kbd>W</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> : 新しいタブ / タブを閉じる / 閉じたタブを復元</li>

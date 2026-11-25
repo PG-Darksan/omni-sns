@@ -970,6 +970,8 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
   var userInteractionSeq = 0;
   var lastUserInteractionAt = 0;
   var lastPointerDownAt = 0;
+  var lastClickedTargetHandle = '';
+  var lastClickedTargetAt = 0;
 
   function bumpUserInteraction(fromPointerDown) {
     var now = Date.now();
@@ -1065,7 +1067,10 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     }
     try {
       if (typeof window.__omniOnFollowAction === 'function') {
-        window.__omniOnFollowAction(action, targetKey || '');
+        var fallbackHandle = (lastClickedTargetHandle && now - lastClickedTargetAt <= 5000)
+          ? lastClickedTargetHandle
+          : '';
+        window.__omniOnFollowAction(action, targetKey || '', fallbackHandle);
       }
     } catch (_) {}
     try {
@@ -1375,6 +1380,40 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     }
   }
 
+  function extractHandleNearButton(btn) {
+    try {
+      if (!btn) return '';
+      var row = btn.closest ? btn.closest('[data-omni-ff-row]') : null;
+      if (row) {
+        var rh = (row.getAttribute('data-omni-ff-row') || '').trim().toLowerCase();
+        if (rh) return rh;
+      }
+      var labels = readElementLabels(btn);
+      var aria = labels.aria || '';
+      var am = /^@?([a-z0-9._-]{1,40})\s*(?:をフォロー|のフォロー)/i.exec(aria) ||
+               /^(?:follow|unfollow)\s+@?([a-z0-9._-]{1,40})/i.exec(aria);
+      if (am && am[1]) return am[1].toLowerCase();
+      var cur = btn.parentElement;
+      for (var d = 0; d < 6 && cur && cur !== document.body; d++) {
+        if (typeof window.__omniExtractHandleFromRow === 'function') {
+          var eh = window.__omniExtractHandleFromRow(cur);
+          if (eh) return eh;
+        }
+        var imgs = cur.querySelectorAll ? cur.querySelectorAll('img[alt]') : [];
+        for (var j = 0; j < imgs.length && j < 4; j++) {
+          var alt = (imgs[j].getAttribute('alt') || '').trim();
+          var im = /^@?([a-z0-9._-]{1,40})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
+          if (im && im[1]) return im[1].toLowerCase();
+        }
+        cur = cur.parentElement;
+      }
+      if (typeof window.__omniResolveProfileHandle === 'function') {
+        return window.__omniResolveProfileHandle() || '';
+      }
+    } catch (_) {}
+    return '';
+  }
+
   document.addEventListener('click', function(e) {
     try {
       if (e && (e.isTrusted === false || e.button !== 0 || e.ctrlKey || e.metaKey)) return;
@@ -1392,6 +1431,11 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       if (!isFollowBtn && !isUnfollowBtn) return;
 
       var clickedAt = Date.now();
+      var clickedHandle = extractHandleNearButton(btn);
+      if (clickedHandle) {
+        lastClickedTargetHandle = clickedHandle;
+        lastClickedTargetAt = clickedAt;
+      }
       var hadDialog = !!document.querySelector('[role="dialog"]');
       var inDialog = !!btn.closest('[role="dialog"]');
       var initialLabels = readElementLabels(btn);
@@ -1418,22 +1462,22 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
               }
             }
             if (isElementHidden(btn)) {
-              emitRelation('follow', 'dom', '', clickInteractionId);
+              emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
               return;
             }
             if (btn.getAttribute('aria-pressed') === 'true') {
-              emitRelation('follow', 'dom', '', clickInteractionId);
+              emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
               return;
             }
             var after = readElementLabels(btn);
             if ((after.text && POST_FOLLOW_STATE_RE.test(after.text)) ||
                 (after.aria && POST_FOLLOW_STATE_RE.test(after.aria))) {
-              emitRelation('follow', 'dom', '', clickInteractionId);
+              emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
               return;
             }
             if ((after.text !== initialLabels.text || after.aria !== initialLabels.aria) &&
                 !isFollowButtonElement(btn)) {
-              emitRelation('follow', 'dom', '', clickInteractionId);
+              emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
             }
           } catch (_) {}
         }, 1000);
@@ -1455,13 +1499,13 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
               }
             }
             if (isConfirmBtn && isElementHidden(btn)) {
-              emitRelation('unfollow', 'dom', '', clickInteractionId);
+              emitRelation('unfollow', 'dom', clickedHandle, clickInteractionId);
               return;
             }
             var afterU = readElementLabels(btn);
             if ((afterU.text && EXACT_FOLLOW_TEXT_RE.test(afterU.text)) ||
                 (!afterU.text && afterU.aria && ARIA_FOLLOW_RE.test(afterU.aria))) {
-              emitRelation('unfollow', 'dom', '', clickInteractionId);
+              emitRelation('unfollow', 'dom', clickedHandle, clickInteractionId);
             }
           } catch (_) {}
         }, 1000);
@@ -1543,9 +1587,13 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   var CACHE_KEY = 'omnisns_ff_cache_v3_' + platform + '_' + host.replace(/[^a-z0-9.-]/g, '');
   var REL_SET_KEY = 'omnisns_rel_sets_v1_' + platform + '_' + host.replace(/[^a-z0-9.-]/g, '');
+  var FOLLOWED_AT_KEY = 'omnisns_followed_at_v1_' + platform + '_' + host.replace(/[^a-z0-9.-]/g, '');
   var CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+  var FOLLOWED_AT_TTL_MS = 180 * 24 * 60 * 60 * 1000;
   var MAX_CACHE_ENTRIES = 800;
+  var MAX_FOLLOWED_AT_ENTRIES = 3000;
   var statsMap = Object.create(null);
+  var followedAtMap = Object.create(null);
   var userIdMap = Object.create(null);
   var idToHandleMap = Object.create(null);
   var privateMap = Object.create(null);
@@ -1669,7 +1717,82 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           }
         }
       }
+      loadFollowedAtFromStorage(st);
     } catch (_) {}
+  }
+
+  function loadFollowedAtFromStorage(st) {
+    try {
+      var store = st || getStorage();
+      if (!store) return;
+      var raw = store.getItem(FOLLOWED_AT_KEY);
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return;
+      var now = Date.now();
+      var nextMap = Object.create(null);
+      for (var k in parsed) {
+        var ts = parsed[k];
+        if (typeof ts === 'number' && isFinite(ts) && ts > 0 && now - ts < FOLLOWED_AT_TTL_MS) {
+          nextMap[k] = ts;
+        }
+      }
+      followedAtMap = nextMap;
+    } catch (_) {}
+  }
+
+  function persistFollowedAtNow() {
+    try {
+      var st = getStorage();
+      if (!st) return;
+      var keys = Object.keys(followedAtMap);
+      if (keys.length > MAX_FOLLOWED_AT_ENTRIES) {
+        keys.sort(function(a, b) { return (followedAtMap[b] || 0) - (followedAtMap[a] || 0); });
+        var trimmed = Object.create(null);
+        for (var i = 0; i < MAX_FOLLOWED_AT_ENTRIES; i++) trimmed[keys[i]] = followedAtMap[keys[i]];
+        followedAtMap = trimmed;
+      }
+      st.setItem(FOLLOWED_AT_KEY, JSON.stringify(followedAtMap));
+    } catch (_) {}
+  }
+
+  function rememberFollowedAt(handle, ts) {
+    if (!handle || handle === selfHandle) return;
+    var stamp = typeof ts === 'number' && isFinite(ts) && ts > 0 ? Math.floor(ts) : Date.now();
+    followedAtMap[handle] = stamp;
+    persistFollowedAtNow();
+  }
+
+  function forgetFollowedAt(handle) {
+    if (!handle || !followedAtMap[handle]) return;
+    delete followedAtMap[handle];
+    persistFollowedAtNow();
+  }
+
+  function formatOnewayElapsedCompact(followedTs) {
+    if (typeof followedTs !== 'number' || !isFinite(followedTs) || followedTs <= 0) return '';
+    var diffMs = Date.now() - followedTs;
+    if (diffMs < 0) diffMs = 0;
+    var totalMins = Math.floor(diffMs / 60000);
+    if (totalMins < 60) return totalMins + '分';
+    var totalHours = Math.floor(totalMins / 60);
+    return totalHours + '時間';
+  }
+
+  function formatOnewayElapsedDetail(followedTs) {
+    try {
+      var d = new Date(followedTs);
+      var pad2 = function(n) { return n < 10 ? '0' + n : String(n); };
+      var dateStr = (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+      var diffMs = Math.max(0, Date.now() - followedTs);
+      var totalMins = Math.floor(diffMs / 60000);
+      var hrs = Math.floor(totalMins / 60);
+      var mins = totalMins % 60;
+      var dur = hrs > 0 ? (hrs + '時間' + mins + '分') : (mins + '分');
+      return 'フォロー日時: ' + dateStr + '（経過 ' + dur + '）';
+    } catch (_) {
+      return '';
+    }
   }
 
   function schedulePersistCache() {
@@ -1915,6 +2038,11 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     var nextPriv = priv !== null ? priv : (prev ? prev.isPrivate : null);
     var nextIFollow = relOut !== null ? relOut : (prev ? prev.iFollow : null);
     var nextFollowsMe = relIn !== null ? relIn : (prev ? prev.followsMe : null);
+    if (prev && prev.iFollow === false && nextIFollow === true && !followedAtMap[h]) {
+      rememberFollowedAt(h, Date.now());
+    } else if (nextIFollow === false && followedAtMap[h]) {
+      forgetFollowedAt(h);
+    }
     var changed = !prev ||
       prev.followers !== nextFollowers ||
       prev.following !== nextFollowing ||
@@ -1945,19 +2073,39 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     return recordStats(rawHandle, null, null, null, null, iFollow, followsMe);
   }
 
-  // フォロー／アンフォロー操作を即座にバッジへ反映するフック
-  window.__omniOnFollowAction = function(action, targetKey) {
+  // フォロー／アンフォロー操作を即座に記憶・バッジへ反映するフック
+  window.__omniOnFollowAction = function(action, targetKey, fallbackHandle) {
     try {
       var isFollow = action === 'follow';
       var key = String(targetKey || '').trim().toLowerCase();
       var h = '';
       if (key) {
         if (idToHandleMap[key]) h = idToHandleMap[key];
-        else h = normalizeHandle(key);
+        else if (!/^\d+$/.test(key)) h = normalizeHandle(key);
+      }
+      if (!h && fallbackHandle) {
+        h = normalizeHandle(fallbackHandle);
+        if (h && key && /^\d+$/.test(key)) {
+          idToHandleMap[key] = h;
+          userIdMap[h] = key;
+        }
       }
       if (!h) h = getCurrentProfileHandleFromUrl();
       if (h && h !== selfHandle) {
+        if (isFollow) {
+          var prevTs = followedAtMap[h];
+          if (!prevTs || Date.now() - prevTs > 5000) {
+            rememberFollowedAt(h, Date.now());
+          }
+        } else {
+          forgetFollowedAt(h);
+        }
         recordRelation(h, isFollow, null);
+        if (isFollow) {
+          enqueueFetch(h, true, false);
+          scheduleRelBatch(120);
+        }
+        scheduleRenderBadges(60);
       }
     } catch (_) {}
   };
@@ -3318,18 +3466,18 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     style.id = 'omni-ff-style';
     style.textContent =
       '.omni-ff-wrap{' +
-      'display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px;margin-left:5px;' +
-      'vertical-align:middle;line-height:1.3;user-select:none;letter-spacing:0;' +
+      'display:inline-flex;align-items:center;flex-wrap:wrap;gap:3px;margin-left:4px;' +
+      'vertical-align:middle;line-height:1.25;user-select:none;letter-spacing:0;' +
       '}' +
       '.omni-ff-wrap.is-row{' +
-      'display:flex;margin:3px 0 0 0;max-width:100%;width:fit-content;' +
+      'display:flex;margin:2px 0 0 0;max-width:100%;width:fit-content;' +
       '}' +
       '.omni-ff-wrap.is-profile-banner{' +
       'display:inline-flex;margin:4px 0 4px 8px;' +
       '}' +
       '.omni-ff-badge{' +
-      'display:inline-flex;align-items:center;gap:3px;padding:1.5px 7px;' +
-      'border-radius:999px;font-size:10.5px;font-weight:600;line-height:1.35;' +
+      'display:inline-flex;align-items:center;gap:2px;padding:1px 5px;' +
+      'border-radius:999px;font-size:10px;font-weight:600;line-height:1.3;' +
       'background:rgba(21,156,171,0.16);border:1px solid rgba(21,156,171,0.46);' +
       'color:inherit;white-space:nowrap;opacity:0.95;pointer-events:none;' +
       '}' +
@@ -3348,8 +3496,8 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       'background:rgba(245,158,11,0.20);border-color:#d97706;color:#92400e;' +
       '}' +
       '.omni-ff-rel{' +
-      'display:inline-flex;align-items:center;gap:2px;padding:1.5px 7px;' +
-      'border-radius:999px;font-size:10.5px;font-weight:700;line-height:1.35;' +
+      'display:inline-flex;align-items:center;gap:2px;padding:1px 5px;' +
+      'border-radius:999px;font-size:10px;font-weight:700;line-height:1.3;' +
       'white-space:nowrap;pointer-events:none;' +
       '}' +
       '.omni-ff-rel.is-mutual{' +
@@ -3385,8 +3533,13 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       relText = '⇄ 相互';
       relTitle = '相互フォロー中（お互いにフォローしています）';
     } else if (relKind === 'oneway') {
-      relText = '→ 片思い';
-      relTitle = '片思い中（相手からフォローバックされていません）';
+      var fTs = followedAtMap[handle];
+      var elapsed = fTs ? formatOnewayElapsedCompact(fTs) : '';
+      relText = elapsed ? ('→ 片思い ' + elapsed) : '→ 片思い';
+      var detail = fTs ? formatOnewayElapsedDetail(fTs) : '';
+      relTitle = detail
+        ? ('片思い中（相手からフォローバックされていません）\n' + detail)
+        : '片思い中（相手からフォローバックされていません）';
     } else if (relKind === 'follower') {
       relText = '← フォロワー';
       relTitle = '相手があなたをフォローしています（未フォローバック）';
@@ -3401,28 +3554,31 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var hasFollowers = typeof entry.followers === 'number';
       isFollowingHeavy = hasFollowing && hasFollowers && entry.following > entry.followers;
 
-      var parts = [];
       var titleParts = [];
       if (entry.isPrivate === true) {
-        parts.push('🔒');
         titleParts.push('非公開アカウント');
       }
       if (hasFollowing) {
-        parts.push('フォロー ' + formatCompactCount(entry.following));
         titleParts.push('フォロー中: ' + entry.following.toLocaleString('ja-JP') + '人');
       }
       if (hasFollowers) {
-        parts.push('フォロワー ' + formatCompactCount(entry.followers));
         titleParts.push('フォロワー: ' + entry.followers.toLocaleString('ja-JP') + '人');
       }
       if (isFollowingHeavy) {
         titleParts.push('★ フォロー中の方がフォロワーより多いユーザー');
       }
-      if (parts.length > 0) {
-        var lockPrefix = parts[0] === '🔒' ? '🔒 ' : '';
-        var heavyPrefix = isFollowingHeavy ? '▲ ' : '';
-        var body = (lockPrefix ? parts.slice(1) : parts).join(' · ');
-        statsText = heavyPrefix + lockPrefix + body;
+      var compactBody = '';
+      if (hasFollowing && hasFollowers) {
+        compactBody = 'F' + formatCompactCount(entry.following) + '/FW' + formatCompactCount(entry.followers);
+      } else if (hasFollowing) {
+        compactBody = 'F' + formatCompactCount(entry.following);
+      } else if (hasFollowers) {
+        compactBody = 'FW' + formatCompactCount(entry.followers);
+      }
+      if (compactBody) {
+        var lockPrefix = entry.isPrivate === true ? '🔒' : '';
+        var heavyPrefix = isFollowingHeavy ? '▲' : '';
+        statsText = heavyPrefix + lockPrefix + compactBody;
         statsTitle = titleParts.join(' / ');
       }
     }
@@ -3495,15 +3651,15 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       }
       if (inFlight[handle] || queuedSet[handle]) {
         statEl.className = 'omni-ff-badge is-pending';
-        if (statEl.textContent !== '人数を取得中…') statEl.textContent = '人数を取得中…';
+        if (statEl.textContent !== '取得中…') statEl.textContent = '取得中…';
         statEl.title = 'フォロー数・フォロワー数を取得中';
       } else if (failedMap[handle] || Date.now() < backoffUntil) {
         statEl.className = 'omni-ff-badge is-retry';
-        if (statEl.textContent !== '人数を取得 ↻') statEl.textContent = '人数を取得 ↻';
+        if (statEl.textContent !== '再取得↻') statEl.textContent = '再取得↻';
         statEl.title = 'クリックしてフォロー数・フォロワー数を取得';
       } else {
         statEl.className = 'omni-ff-badge is-pending';
-        if (statEl.textContent !== '人数を取得中…') statEl.textContent = '人数を取得中…';
+        if (statEl.textContent !== '取得中…') statEl.textContent = '取得中…';
         statEl.title = 'クリックして優先取得';
       }
     } else if (statEl) {
@@ -4035,6 +4191,16 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   }
 
   function boot() {
+    window.__omniResolveProfileHandle = getCurrentProfileHandleFromUrl;
+    window.__omniExtractHandleFromRow = extractHandleFromRow;
+    try {
+      window.addEventListener('storage', function(ev) {
+        if (ev && ev.key === FOLLOWED_AT_KEY) {
+          loadFollowedAtFromStorage();
+          scheduleRenderBadges(80);
+        }
+      });
+    } catch (_) {}
     injectInstagramPreconnects();
     detectDynamicPlatformFromDom();
     hookHistory();
@@ -4344,7 +4510,7 @@ pub const JEV_FILTER_JS: &str = r#"(function() {
         : /(getFollowers|getFollows|followers|following)/i);
   var FOLLOW_GRAPH_KEY_RE = /^(edge_followed_by|edge_follow|xdt_api__v1__friendships|mutual_followers|userList|followers|follows)/i;
   var IGNORE_TEXT = /^(フォロー|フォロー中|フォローバック|フォローする|友達|削除|メッセージ|リクエスト済み|ブロック|制限する|親しい友達|共通|認証済み|新しいフォロワー|すべて見る|おすすめ|購読|相互|片思い|フォロワー|Follow|Following|Follow Back|Friends|Remove|Message|Requested|Verified|New|See All|Suggested|Subscriptions|•|・|\s*)$/i;
-  var IGNORE_SUB = /(がフォロー中|Followed by|フォロワー\s*[\d,.万億kKmM]+|フォロー中\s*[\d,.万億kKmM]+|件の投稿|Followers\s*[\d,.kKmM]+|⇄\s*相互|→\s*片思い|←\s*フォロワー)/i;
+  var IGNORE_SUB = /(がフォロー中|Followed by|フォロワー\s*[\d,.万億kKmM]+|フォロー中\s*[\d,.万億kKmM]+|F[\d,.万億kKmM]+\/FW[\d,.万億kKmM]+|件の投稿|Followers\s*[\d,.kKmM]+|⇄\s*相互|→\s*片思い(?:\s*\d+(?:分|時間))?|←\s*フォロワー)/i;
   var FOLLOW_HEADER = /^(?:[\d,.万億kKmM]+\s*(?:人|人の)?\s*)?(フォロワー|フォロー中|共通のフォロワー|友達|Followers|Following|Follows|Mutual|Mutual followers|Friends|アカウント|ユーザー|People|Accounts)(?:\s*[\d,.万億kKmM人件]+)?$/i;
   var NON_FOLLOW_TAB = /^(おすすめ|Suggested|投稿|Posts|メディア|Media|いいね|Likes)$/i;
   var AVATAR_SIZE = 320;

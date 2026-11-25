@@ -849,8 +849,8 @@ html[data-theme='light'] .gmail-pill.active {
 .follow-pill {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 0 9px;
+  gap: 3px;
+  padding: 0 7px;
 }
 
 .follow-pill.has-count {
@@ -1038,6 +1038,11 @@ html[data-theme='light'] .unfollow-pill-part {
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+.toolbar-spacer {
+  flex: 1;
+  min-width: 8px;
 }
 
 .toolbar-address {
@@ -2718,6 +2723,13 @@ html[data-theme='light'] .bottom-jev-error {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.jev-icon-btn {
+  width: 28px;
+  min-width: 28px;
+  padding: 0;
+  justify-content: center;
 }
 
 .jev-pill.jev-active {
