@@ -3165,6 +3165,21 @@ class OmniWebViewManager(
       '.omni-ff-wrap.is-row{' +
       'display:flex;margin:2px 0 0 0;max-width:100%;width:fit-content;' +
       '}' +
+      '.omni-ff-wrap.is-row.is-below{' +
+      'width:auto;max-width:100%;box-sizing:border-box;margin:3px 0 2px 0;' +
+      'align-self:stretch;justify-self:stretch;grid-column:1/-1;order:9999;' +
+      '}' +
+      '.omni-ff-wrap.is-row.is-overlay{' +
+      'position:absolute;left:0;right:0;bottom:2px;margin:0;width:auto;max-width:none;' +
+      'box-sizing:border-box;z-index:2;' +
+      '}' +
+      '[data-omni-ff-padrow="1"]{padding-bottom:var(--omni-ff-pad,20px) !important;}' +
+      '[data-omni-ff-posrel="1"]{position:relative !important;}' +
+      '.omni-ff-wrap.is-row.is-push{max-width:none;}' +
+      '.omni-ff-wrap.is-row.is-raised{' +
+      'position:relative;z-index:5;padding:1px;border-radius:9px;background:rgba(15,23,42,0.88);' +
+      '}' +
+      'html[data-omni-ff-theme="light"] .omni-ff-wrap.is-row.is-raised{background:rgba(255,255,255,0.92);}' +
       '.omni-ff-wrap.is-profile-banner{' +
       'display:inline-flex;margin:4px 0 4px 8px;' +
       '}' +
@@ -3627,7 +3642,24 @@ class OmniWebViewManager(
     }
   }
 
-  function upsertRowBadge(row, container, handle) {
+  // 行要素ごとのテキスト列・バッジのキャッシュ（毎スキャンの祖先 getBoundingClientRect 走査と重複バッジ生成を防ぐ）
+  var rowColCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  var rowWrapCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+  function getRowTextColumn(row, btn, handle) {
+    var cached = rowColCache ? rowColCache.get(row) : null;
+    if (cached && cached.h === handle && cached.col.isConnected && row.contains(cached.col)) return cached.col;
+    var col = findRowTextColumn(row, btn, handle);
+    if (col && rowColCache) {
+      try {
+        var rr = row.getBoundingClientRect();
+        if (rr.width >= 1 && rr.height >= 1) rowColCache.set(row, { h: handle, col: col });
+      } catch (_) {}
+    }
+    return col;
+  }
+
+  function upsertRowBadge(row, container, handle, btn, placements) {
     ensureStyles();
     var entry = statsMap[handle];
     var display = formatBadgeDisplay(entry, handle, true);
@@ -3640,7 +3672,11 @@ class OmniWebViewManager(
 
     if (!display && !canActiveFetchPlatform()) return;
 
-    var wrap = findChildWrapByUser(container, handle);
+    // 下段へ退避済みのバッジも見つけられるよう、テキスト列ではなく行全体から探す
+    var wrap = rowWrapCache ? rowWrapCache.get(row) : null;
+    if (!wrap || !wrap.isConnected || wrap.getAttribute('data-omni-ff-user') !== handle || !row.contains(wrap)) {
+      wrap = findChildWrapByUser(row, handle);
+    }
     if (!wrap) {
       wrap = document.createElement('div');
       wrap.className = 'omni-ff-wrap is-row';
@@ -3651,12 +3687,346 @@ class OmniWebViewManager(
         return;
       }
     }
+    if (rowWrapCache) rowWrapCache.set(row, wrap);
     renderWrapContents(wrap, display, handle, true);
+    if (placements && btn) {
+      var de = document.documentElement;
+      var fitKey = (wrap.textContent || '') + '|' + ((de && de.clientWidth) || window.innerWidth || 0);
+      if (wrap.getAttribute('data-omni-ff-fit') !== fitKey) {
+        placements.push({ row: row, col: container, btn: btn, wrap: wrap, key: fitKey });
+      }
+    }
+  }
+
+  function ffRectsOverlap(a, b) {
+    return a.right > b.left + 1 && a.left < b.right - 1 && a.bottom > b.top + 1 && a.top < b.bottom - 1;
+  }
+
+  // バッジ（各ピル）がフォローボタンに重なる / テキスト列・行からはみ出しているか
+  function ffPillsClash(wrap, colRect, btnRect, rowRect) {
+    var kids = wrap.children;
+    for (var k = 0; k < kids.length; k++) {
+      var kr = kids[k].getBoundingClientRect();
+      if (kr.width < 1 || kr.height < 1) continue;
+      if (btnRect && ffRectsOverlap(kr, btnRect)) return true;
+      if (colRect && kr.right > colRect.right + 2) return true;
+      if (rowRect && (kr.right > rowRect.right + 1 || kr.left < rowRect.left - 1)) return true;
+    }
+    return false;
+  }
+
+  // 子要素を末尾に追加した時に新しい行（下段）になる親要素か
+  function ffLineBreakMode(el) {
+    try {
+      var cs = window.getComputedStyle(el);
+      var d = cs.display || '';
+      if (d.indexOf('grid') >= 0) return 'grid';
+      if (d.indexOf('flex') >= 0) return (cs.flexDirection || 'row') === 'column' ? 'column' : '';
+      if (d === 'block' || d === 'flow-root' || d === 'list-item' || d === 'inline-block' || d === 'table-cell') return 'block';
+    } catch (_) {}
+    return '';
+  }
+
+  function ffClearRowPad(row) {
+    if (row.hasAttribute('data-omni-ff-padrow')) row.removeAttribute('data-omni-ff-padrow');
+    if (row.hasAttribute('data-omni-ff-padbase')) row.removeAttribute('data-omni-ff-padbase');
+    if (row.hasAttribute('data-omni-ff-posrel')) row.removeAttribute('data-omni-ff-posrel');
+    if (row.style && row.style.getPropertyValue('--omni-ff-pad')) row.style.removeProperty('--omni-ff-pad');
+  }
+
+  function ffSetWrapPlace(it, pl) {
+    var w = it.wrap;
+    var row = it.row;
+    var mode = pl.mode;
+    var below = mode === 'below' || mode === 'overlay';
+    var host = mode === 'below' ? pl.target : (mode === 'overlay' ? row : (mode === 'push' ? pl.host : it.col));
+    if (host && w.parentElement !== host) host.appendChild(w);
+    w.classList.toggle('is-below', below);
+    w.classList.toggle('is-overlay', mode === 'overlay');
+    w.classList.toggle('is-raised', mode === 'raised');
+    w.classList.toggle('is-push', mode === 'push');
+    var padL = below && pl.indent > 0 ? pl.indent + 'px' : '';
+    if (w.style.paddingLeft !== padL) w.style.paddingLeft = padL;
+    var mt = mode === 'push' ? Math.round(pl.push) + 'px' : '';
+    if (w.style.marginTop !== mt) w.style.marginTop = mt;
+    var wd = mode === 'push' ? Math.round(pl.width) + 'px' : '';
+    if (w.style.width !== wd) w.style.width = wd;
+    if (mode === 'push') {
+      if (w.getAttribute('data-omni-ff-push') !== String(Math.round(pl.push))) w.setAttribute('data-omni-ff-push', String(Math.round(pl.push)));
+    } else if (w.hasAttribute('data-omni-ff-push')) {
+      w.removeAttribute('data-omni-ff-push');
+    }
+    if (mode === 'overlay') {
+      var base = String(pl.basePad);
+      if (row.getAttribute('data-omni-ff-padbase') !== base) row.setAttribute('data-omni-ff-padbase', base);
+      // 元の下余白はバッジの下に残し、バッジ分の高さだけ余白を足す
+      var bottomPx = Math.max(2, pl.basePad) + 'px';
+      if (w.style.bottom !== bottomPx) w.style.bottom = bottomPx;
+      if (!row.style.getPropertyValue('--omni-ff-pad')) row.style.setProperty('--omni-ff-pad', (Math.max(2, pl.basePad) + 20) + 'px');
+      if (row.getAttribute('data-omni-ff-padrow') !== '1') row.setAttribute('data-omni-ff-padrow', '1');
+      if (pl.posRel && row.getAttribute('data-omni-ff-posrel') !== '1') row.setAttribute('data-omni-ff-posrel', '1');
+    } else {
+      if (w.style.bottom) w.style.bottom = '';
+      ffClearRowPad(row);
+    }
+    if (w.getAttribute('data-omni-ff-place') !== mode) w.setAttribute('data-omni-ff-place', mode);
+  }
+
+  function ffPillMetrics(wrap) {
+    var m = { total: 0, maxW: 0, maxH: 0, top: Infinity };
+    var kids = wrap.children;
+    for (var k = 0; k < kids.length; k++) {
+      var kr = kids[k].getBoundingClientRect();
+      if (kr.width < 1 || kr.height < 1) continue;
+      m.total += kr.width + 3;
+      if (kr.width > m.maxW) m.maxW = kr.width;
+      if (kr.height > m.maxH) m.maxH = kr.height;
+      if (kr.top < m.top) m.top = kr.top;
+    }
+    return m;
+  }
+
+  // テキスト列が細くボタンと重なる行（PC版レイアウトを狭い画面で表示した時など）:
+  // バッジをテキストブロックの末尾に置いて行の右端まで横幅を広げ、ボタンの下端より下へずらす。
+  // 縦中央揃えのボタンは列が伸びた分だけ下がるため、ユーザー名 → ボタン → バッジ の順に重ならず並ぶ。
+  // ずらし量は書き込み後の実測で決める（applyRowBadgePlacements の検証段階）。
+  function ffPushHost(it) {
+    var best = it.col;
+    var el = it.col.parentElement;
+    for (var d = 0; el && el !== it.row && d < 6 && !el.contains(it.btn); d++) {
+      var lm = ffLineBreakMode(el);
+      if (lm === 'block' || lm === 'column') best = el;
+      el = el.parentElement;
+    }
+    return best;
+  }
+
+  function ffPushPlan(it, cr, br, rr, curPush) {
+    if (!br || br.left <= cr.left + 1) return null;
+    var host = ffPushHost(it);
+    var hr = host === it.col ? cr : host.getBoundingClientRect();
+    var width = Math.floor(rr.right - hr.left - 2);
+    var pm = ffPillMetrics(it.wrap);
+    if (!pm.maxW || pm.maxW + 2 > width) return null;
+    // テキストブロック〜行の間に、はみ出したバッジを切り取る要素があれば使えない
+    var el = host;
+    for (var d = 0; el && el !== it.row && d < 8; d++) {
+      var cs = window.getComputedStyle(el);
+      if (cs.overflowX !== 'visible' || cs.overflowY !== 'visible') return null;
+      el = el.parentElement;
+    }
+    return { it: it, mode: 'push', host: host, push: Math.max(0, curPush), width: width };
+  }
+
+  // 行全体が横並びの場合: 行の下側に余白を確保してそこへバッジを表示する（サイト側要素の配置は変えない）
+  function ffOverlayPlan(it, cr, rr) {
+    var rcs = window.getComputedStyle(it.row);
+    var bl = parseFloat(rcs.borderLeftWidth) || 0;
+    var indent = Math.round(cr.left - (rr.left + bl));
+    if (indent < 0 || indent > rr.width * 0.5) indent = 0;
+    var padAttr = it.row.getAttribute('data-omni-ff-padbase');
+    var basePad = padAttr !== null ? (parseFloat(padAttr) || 0) : (parseFloat(rcs.paddingBottom) || 0);
+    return {
+      it: it,
+      mode: 'overlay',
+      indent: indent,
+      basePad: Math.max(0, Math.round(basePad)),
+      posRel: it.row.getAttribute('data-omni-ff-posrel') === '1' || rcs.position === 'static'
+    };
+  }
+
+  // 下段に新しい行を作れる要素（ブロック / 縦並び flex / grid）をテキスト列とボタンの共通祖先から行要素まで探す
+  function ffBelowOrOverlayPlan(it, cr, rr) {
+    var target = null;
+    var anc = it.col.parentElement;
+    while (anc && anc !== it.row && !anc.contains(it.btn)) anc = anc.parentElement;
+    for (var depth = 0; anc && depth < 6; depth++) {
+      if (ffLineBreakMode(anc)) { target = anc; break; }
+      if (anc === it.row) break;
+      anc = anc.parentElement;
+    }
+    if (!target) return ffOverlayPlan(it, cr, rr);
+    var tr = target.getBoundingClientRect();
+    var tcs = window.getComputedStyle(target);
+    var innerLeft = tr.left + (parseFloat(tcs.borderLeftWidth) || 0) + (parseFloat(tcs.paddingLeft) || 0);
+    var indent = Math.round(cr.left - innerLeft);
+    if (indent < 0 || indent > tr.width * 0.5) indent = 0;
+    return { it: it, mode: 'below', target: target, indent: indent };
+  }
+
+  // 行バッジがフォローボタンに隠れないよう配置を決める。
+  // 優先順: そのまま → ボタンの下へずらす → 行内の下段 → 行下の余白 → ボタンより前面（最終手段）
+  // 読み取り → 書き込み → 検証 の順にまとめて処理し、強制レイアウトを最小限にする。
+  function applyRowBadgePlacements(items) {
+    if (!items || !items.length) return;
+    var vh = window.innerHeight || 900;
+    var plans = [];
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      try {
+        if (!it.wrap.isConnected || !it.col.isConnected || !it.row.contains(it.wrap)) continue;
+        var rr = it.row.getBoundingClientRect();
+        // 画面外の行は表示されてから判定する（判定済みキーを付けずに次回スキャンへ回す）
+        if (rr.width < 1 || rr.height < 1 || rr.bottom < -180 || rr.top > vh + 260) continue;
+        var place = it.wrap.getAttribute('data-omni-ff-place') || 'inline';
+        var cr = it.col.getBoundingClientRect();
+        var br = it.btn.isConnected ? it.btn.getBoundingClientRect() : null;
+        if (br && (br.width < 1 || br.height < 1)) br = null;
+        var fits;
+        if (place === 'inline') {
+          fits = !ffPillsClash(it.wrap, cr, br, rr);
+        } else {
+          // 退避中: テキスト列にボタンと重ならず収まる幅が戻った時だけ通常表示へ戻す（ちらつき防止の余白付き）
+          var maxPill = ffPillMetrics(it.wrap).maxW;
+          var avail = cr.width;
+          if (br && br.left > cr.left && br.top < cr.bottom && br.bottom > cr.top) avail = Math.min(avail, br.left - cr.left);
+          fits = maxPill > 0 && maxPill + 12 <= avail;
+        }
+        var plan = null;
+        if (fits) {
+          plan = { it: it, mode: place === 'inline' ? 'keep' : 'inline' };
+        } else {
+          var inCol = place === 'inline' || place === 'push' || place === 'raised';
+          if (inCol && it.row.getAttribute('data-omni-ff-nopush') !== '1') {
+            plan = ffPushPlan(it, cr, br, rr, place === 'push' ? (parseFloat(it.wrap.getAttribute('data-omni-ff-push')) || 0) : 0);
+          }
+          if (!plan) {
+            if (it.row.getAttribute('data-omni-ff-nooverlay') === '1') plan = { it: it, mode: 'raised' };
+            else if (it.row.getAttribute('data-omni-ff-nobelow') === '1') plan = ffOverlayPlan(it, cr, rr);
+            else plan = ffBelowOrOverlayPlan(it, cr, rr);
+          }
+        }
+        plan.colLeft = cr.left;
+        plan.btnLeft = br ? br.left : null;
+        plans.push(plan);
+      } catch (_) {}
+    }
+
+    var verify = [];
+    var done = [];
+    for (var p = 0; p < plans.length; p++) {
+      var pl = plans[p];
+      try {
+        if (pl.mode !== 'keep') ffSetWrapPlace(pl.it, pl);
+        if (pl.mode === 'below' || pl.mode === 'overlay' || pl.mode === 'push') verify.push(pl);
+        else done.push(pl.it);
+      } catch (_) {}
+    }
+    if (!verify.length && !done.length) return;
+
+    // 検証: 配置後もボタンと重なる / 既存要素が横にずれた場合は次の手段へ
+    var failedPush = [];
+    var failedBelow = [];
+    var failedOverlay = [];
+    var padFix = [];
+    var pushPending = [];
+    for (var v = 0; v < verify.length; v++) {
+      var vp = verify[v];
+      try {
+        var rr2 = vp.it.row.getBoundingClientRect();
+        var br2 = vp.it.btn.isConnected ? vp.it.btn.getBoundingClientRect() : null;
+        if (br2 && (br2.width < 1 || br2.height < 1)) br2 = null;
+        if (vp.mode === 'push') {
+          pushPending.push(vp);
+          continue;
+        }
+        var cr2 = vp.it.col.getBoundingClientRect();
+        var shifted = Math.abs(cr2.left - vp.colLeft) > 3 ||
+          (!!br2 && vp.btnLeft !== null && Math.abs(br2.left - vp.btnLeft) > 3);
+        if (vp.mode === 'below') {
+          if (shifted || ffPillsClash(vp.it.wrap, null, br2, rr2)) failedBelow.push(vp.it);
+          else done.push(vp.it);
+        } else if (shifted) {
+          failedOverlay.push(vp.it);
+        } else {
+          // 余白の高さをバッジの実際の高さ（折り返し含む）に合わせる
+          var wh = vp.it.wrap.getBoundingClientRect().height;
+          padFix.push({ row: vp.it.row, pad: Math.max(2, vp.basePad) + Math.ceil(wh) + 3 });
+          done.push(vp.it);
+        }
+      } catch (_) {}
+    }
+    for (var q = 0; q < padFix.length; q++) {
+      try {
+        var padVal = padFix[q].pad + 'px';
+        if (padFix[q].row.style.getPropertyValue('--omni-ff-pad') !== padVal) padFix[q].row.style.setProperty('--omni-ff-pad', padVal);
+      } catch (_) {}
+    }
+    // ボタン下へのずらし量: 1 回目は重なり量を実測して決め（縦中央揃えなら 2 倍ずらす必要がある）、2 回目で確認する。
+    // ずらし過ぎ（ボタンが縦中央揃えでない場合など）は余白を詰める。
+    for (var round = 0; round < 2 && pushPending.length; round++) {
+      var nextPending = [];
+      var pushWrites = [];
+      for (var x = 0; x < pushPending.length; x++) {
+        var pp = pushPending[x];
+        try {
+          var brP = pp.it.btn.isConnected ? pp.it.btn.getBoundingClientRect() : null;
+          if (brP && (brP.width < 1 || brP.height < 1)) brP = null;
+          if (ffPillsClash(pp.it.wrap, null, null, pp.it.row.getBoundingClientRect())) {
+            failedPush.push(pp.it);
+            continue;
+          }
+          var pmP = ffPillMetrics(pp.it.wrap);
+          if (brP && ffPillsClash(pp.it.wrap, null, brP, null)) {
+            var nextPush = pp.push + 2 * Math.ceil(brP.bottom - pmP.top + 4);
+            if (round > 0 || nextPush > 160) {
+              failedPush.push(pp.it);
+            } else {
+              pp.push = nextPush;
+              pushWrites.push(pp);
+              nextPending.push(pp);
+            }
+            continue;
+          }
+          var gapP = brP ? pmP.top - brP.bottom : 0;
+          if (brP && gapP > 12 && pp.push > 0) {
+            pp.push = Math.max(0, Math.round(pp.push - (gapP - 6)));
+            pushWrites.push(pp);
+          }
+          done.push(pp.it);
+        } catch (_) {}
+      }
+      for (var y = 0; y < pushWrites.length; y++) {
+        try {
+          var pw = pushWrites[y].it.wrap;
+          var pv = Math.round(pushWrites[y].push);
+          pw.style.marginTop = pv + 'px';
+          pw.setAttribute('data-omni-ff-push', String(pv));
+        } catch (_) {}
+      }
+      pushPending = nextPending;
+    }
+    // 置けなかった行は前面表示で暫定表示し、次回スキャンで次の手段を試す（判定済みキーは付けない）
+    for (var a = 0; a < failedPush.length; a++) {
+      try {
+        failedPush[a].row.setAttribute('data-omni-ff-nopush', '1');
+        ffSetWrapPlace(failedPush[a], { mode: 'raised' });
+      } catch (_) {}
+    }
+    for (var b = 0; b < failedBelow.length; b++) {
+      try {
+        failedBelow[b].row.setAttribute('data-omni-ff-nobelow', '1');
+        ffSetWrapPlace(failedBelow[b], { mode: 'raised' });
+      } catch (_) {}
+    }
+    for (var f = 0; f < failedOverlay.length; f++) {
+      try {
+        failedOverlay[f].row.setAttribute('data-omni-ff-nooverlay', '1');
+        ffSetWrapPlace(failedOverlay[f], { mode: 'raised' });
+        done.push(failedOverlay[f]);
+      } catch (_) {}
+    }
+    for (var s = 0; s < done.length; s++) {
+      try {
+        if (done[s].wrap.getAttribute('data-omni-ff-fit') !== done[s].key) done[s].wrap.setAttribute('data-omni-ff-fit', done[s].key);
+      } catch (_) {}
+    }
   }
 
   function scanFollowListRows(rootScope) {
     var listContext = detectSelfListPageContext();
     var scope = rootScope || document;
+    var placements = [];
     try {
       var btns = scope.querySelectorAll('button, [role="button"]');
       var maxBtns = rootScope ? 320 : 280;
@@ -3696,7 +4066,7 @@ class OmniWebViewManager(
           row.setAttribute('data-omni-ff-row', handle);
         }
 
-        var col = findRowTextColumn(row, btn, handle);
+        var col = getRowTextColumn(row, btn, handle);
         if (!col) continue;
 
         inferRelationFromRowDom(row, bTxt, handle, listContext);
@@ -3711,8 +4081,11 @@ class OmniWebViewManager(
             scheduleRelBatch(160);
           }
         }
-        upsertRowBadge(row, col, handle);
+        upsertRowBadge(row, col, handle, btn, placements);
       }
+    } catch (_) {}
+    try {
+      applyRowBadgePlacements(placements);
     } catch (_) {}
   }
 
@@ -6739,6 +7112,8 @@ class OmniWebViewPlatformView(
             restoreDefaultCacheMode(webView)
         }
         isMainFrameLoading = true
+        // 一時停止中の裏タブでも読み込みは表示状態で進め、切替時に即表示できるようにする
+        applyBackgroundThrottle()
         try {
             webView.loadUrl(trimmed)
         } catch (e: Throwable) {
@@ -6802,6 +7177,7 @@ class OmniWebViewPlatformView(
         reloadObservedProgress = false
         awaitingReloadStart = true
         isMainFrameLoading = true
+        applyBackgroundThrottle()
 
         if (shouldForceLoadUrl && targetUrl.isNotEmpty()) {
             if (hasValidCurrentUrl && targetUrl.contains('#') && targetUrl == rawUrl) {
@@ -7504,6 +7880,8 @@ class OmniWebViewPlatformView(
                 awaitingReloadStart = false
                 reloadObservedProgress = true
                 isMainFrameLoading = true
+                // ページ側リダイレクト等で始まった読み込みも、一時停止中の裏タブなら再開して読み込ませる
+                applyBackgroundThrottle()
                 val cleanUrl = if (isHttpOrHttpsUrl(url)) url!!.trim() else ""
                 if (cleanUrl.isNotEmpty()) {
                     currentLoadHadMainFrameError = false
@@ -8142,6 +8520,8 @@ class OmniWebViewPlatformView(
         } catch (_: Throwable) {
         }
         customViewCallback = null
+        // 全画面動画を閉じた非アクティブタブは再び一時停止対象にする
+        applyBackgroundThrottle()
         return true
     }
 
