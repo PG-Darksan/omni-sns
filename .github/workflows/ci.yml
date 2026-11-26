@@ -50,7 +50,8 @@ jobs:
 
       - name: Analyze Flutter code
         working-directory: mobile
-        run: flutter analyze
+        # 新しい Flutter stable の非推奨通知（info）では失敗させない。warning / error は従来どおり失敗扱い
+        run: flutter analyze --no-fatal-infos
 
       - name: Run Flutter tests
         working-directory: mobile

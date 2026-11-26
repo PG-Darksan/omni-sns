@@ -268,6 +268,13 @@ test('Windows and Android PROFILE_STATS_JS are valid JS with universal mutual-fo
     assert.ok(js.includes('FOLLOWED_AT_KEY'), `${label} must persist followed user timestamps`);
     assert.ok(js.includes('formatOnewayElapsedCompact'), `${label} must format oneway elapsed hours`);
     assert.ok(js.includes("totalHours + '時間'"), `${label} must display elapsed hours for oneway follows`);
+    // フォロー一覧の行バッジがフォローボタンに隠れないよう配置を調整（PC版レイアウトを狭い画面で表示した時など）
+    assert.ok(js.includes('function applyRowBadgePlacements'), `${label} must relocate row badges overlapped by the follow button`);
+    assert.ok(js.includes('applyRowBadgePlacements(placements)'), `${label} must apply row badge placements after each list scan`);
+    for (const mode of ['is-push', 'is-below', 'is-overlay', 'is-raised']) {
+      assert.ok(js.includes(mode), `${label} must style ${mode} row badge placement`);
+    }
+    assert.ok(js.includes('rowColCache'), `${label} must cache the row text column between scans`);
   }
 });
 
