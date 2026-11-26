@@ -48,6 +48,7 @@ export interface OmniApi {
   removeTab: (instanceId: string) => Promise<AppConfig>;
   removeTabs: (instanceIds: string[]) => Promise<AppConfig>;
   restoreArchivedTab: (instanceId: string) => Promise<ServiceInstance>;
+  renameArchivedTab: (instanceId: string, accountLabel: string) => Promise<ServiceInstance>;
   purgeArchivedTab: (instanceId: string) => Promise<boolean>;
   purgeAllArchivedTabs: () => Promise<number>;
   updateTab: (
@@ -70,6 +71,7 @@ export interface OmniApi {
   resetFollowCount: (instanceId: string, resetTotal: boolean) => Promise<ServiceInstance | null>;
   adjustUnfollowCount: (instanceId: string, delta: number) => Promise<ServiceInstance | null>;
   resetUnfollowCount: (instanceId: string, resetTotal: boolean) => Promise<ServiceInstance | null>;
+  refreshFollowCounts: () => Promise<AppConfig>;
   setFollowHandle: (instanceId: string, handle: string) => Promise<ServiceInstance>;
   updateFollowSyncSettings: (patch: UpdateFollowSyncPatch) => Promise<FollowSyncSettings>;
   syncFollowNow: () => Promise<FollowSyncSettings>;
@@ -122,6 +124,8 @@ export const omniApi: OmniApi = {
   removeTab: (instanceId) => invoke<AppConfig>('tab_remove', { instanceId }),
   removeTabs: (instanceIds) => invoke<AppConfig>('tab_remove_many', { instanceIds }),
   restoreArchivedTab: (instanceId) => invoke<ServiceInstance>('archived_restore', { instanceId }),
+  renameArchivedTab: (instanceId, accountLabel) =>
+    invoke<ServiceInstance>('archived_rename', { instanceId, accountLabel }),
   purgeArchivedTab: (instanceId) => invoke<boolean>('archived_purge', { instanceId }),
   purgeAllArchivedTabs: () => invoke<number>('archived_purge_all'),
   updateTab: (instanceId, patch) =>
@@ -151,6 +155,7 @@ export const omniApi: OmniApi = {
     invoke<ServiceInstance | null>('unfollow_adjust', { instanceId, delta }),
   resetUnfollowCount: (instanceId, resetTotal) =>
     invoke<ServiceInstance | null>('unfollow_reset', { instanceId, resetTotal }),
+  refreshFollowCounts: () => invoke<AppConfig>('follow_refresh'),
   setFollowHandle: (instanceId, handle) =>
     invoke<ServiceInstance>('follow_set_handle', { instanceId, handle }),
   updateFollowSyncSettings: (patch) =>

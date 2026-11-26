@@ -65,6 +65,10 @@ pub struct ServiceInstance {
     pub unfollow_count_total: u32,
     #[serde(default)]
     pub follow_count_date: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub follow_events: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfollow_events: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,9 +123,16 @@ pub struct TabRuntimeState {
 
 pub const DEFAULT_VIEWPORT_BOTTOM_INSET: u32 = 44;
 pub const MAX_VIEWPORT_BOTTOM_INSET: u32 = 160;
+pub const DEFAULT_FOLLOW_WINDOW_HOURS: u32 = 24;
+pub const MIN_FOLLOW_WINDOW_HOURS: u32 = 1;
+pub const MAX_FOLLOW_WINDOW_HOURS: u32 = 168;
 
 fn default_viewport_bottom_inset() -> u32 {
     DEFAULT_VIEWPORT_BOTTOM_INSET
+}
+
+fn default_follow_window_hours() -> u32 {
+    DEFAULT_FOLLOW_WINDOW_HOURS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +146,10 @@ pub struct AppSettings {
     pub header_collapsed: bool,
     #[serde(default = "default_viewport_bottom_inset")]
     pub viewport_bottom_inset: u32,
+    #[serde(default = "default_follow_window_hours")]
+    pub follow_window_hours: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catalog_order: Vec<String>,
     #[serde(default)]
     pub gesture: GestureSettings,
     #[serde(default)]
@@ -225,6 +240,8 @@ pub struct UpdateSettingsPatch {
     pub active_instance_id: Option<Option<String>>,
     pub header_collapsed: Option<bool>,
     pub viewport_bottom_inset: Option<u32>,
+    pub follow_window_hours: Option<u32>,
+    pub catalog_order: Option<Vec<String>>,
     pub gesture: Option<GestureSettings>,
 }
 

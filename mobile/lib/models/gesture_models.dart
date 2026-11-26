@@ -1,12 +1,16 @@
 import 'dart:math';
 import 'dart:ui';
 
-/// 12方向ジェスチャーの形状キー（1方向4種 + 直角に1回曲げる2方向8種）
+/// 16方向ジェスチャーの形状キー（1方向4種 + 斜め4種 + 直角に1回曲げる2方向8種）
 const List<String> kGestureShapes = <String>[
   'L',
   'R',
   'U',
   'D',
+  'NW',
+  'NE',
+  'SW',
+  'SE',
   'LU',
   'LD',
   'RU',
@@ -18,6 +22,7 @@ const List<String> kGestureShapes = <String>[
 ];
 
 const List<String> kSingleGestureShapes = <String>['L', 'R', 'U', 'D'];
+const List<String> kDiagonalGestureShapes = <String>['NW', 'NE', 'SW', 'SE'];
 const List<String> kDoubleGestureShapes = <String>[
   'LU',
   'LD',
@@ -29,14 +34,28 @@ const List<String> kDoubleGestureShapes = <String>[
   'DR',
 ];
 
-enum GestureDirection { l, r, u, d }
+bool isSingleStrokeShape(String shape) =>
+    kSingleGestureShapes.contains(shape) ||
+    kDiagonalGestureShapes.contains(shape);
+
+enum GestureDirection { l, r, u, d, nw, ne, sw, se }
 
 extension GestureDirectionExt on GestureDirection {
+  bool get isDiagonal =>
+      this == GestureDirection.nw ||
+      this == GestureDirection.ne ||
+      this == GestureDirection.sw ||
+      this == GestureDirection.se;
+
   String get code => switch (this) {
         GestureDirection.l => 'L',
         GestureDirection.r => 'R',
         GestureDirection.u => 'U',
         GestureDirection.d => 'D',
+        GestureDirection.nw => 'NW',
+        GestureDirection.ne => 'NE',
+        GestureDirection.sw => 'SW',
+        GestureDirection.se => 'SE',
       };
 
   GestureDirection get opposite => switch (this) {
@@ -44,7 +63,22 @@ extension GestureDirectionExt on GestureDirection {
         GestureDirection.r => GestureDirection.l,
         GestureDirection.u => GestureDirection.d,
         GestureDirection.d => GestureDirection.u,
+        GestureDirection.nw => GestureDirection.se,
+        GestureDirection.se => GestureDirection.nw,
+        GestureDirection.ne => GestureDirection.sw,
+        GestureDirection.sw => GestureDirection.ne,
       };
+
+  (double, double) get diagUnit {
+    const s = 0.7071067811865475; // 1 / sqrt(2)
+    return switch (this) {
+      GestureDirection.nw => (-s, -s),
+      GestureDirection.ne => (s, -s),
+      GestureDirection.sw => (-s, s),
+      GestureDirection.se => (s, s),
+      _ => (0.0, 0.0),
+    };
+  }
 }
 
 class GestureActionDef {
@@ -194,6 +228,10 @@ Map<String, String> defaultMobileGestures() {
     'R': 'go-forward',
     'U': 'scroll:up',
     'D': 'scroll:down',
+    'NW': 'none',
+    'NE': 'none',
+    'SW': 'none',
+    'SE': 'none',
     'LU': 'previous-service',
     'RU': 'next-service',
     'LD': 'previous-account',
@@ -206,6 +244,16 @@ Map<String, String> defaultMobileGestures() {
 }
 
 String shapeArrows(String shape) {
+  switch (shape) {
+    case 'NW':
+      return '↖';
+    case 'NE':
+      return '↗';
+    case 'SW':
+      return '↙';
+    case 'SE':
+      return '↘';
+  }
   final buf = StringBuffer();
   for (final ch in shape.split('')) {
     switch (ch) {
@@ -228,6 +276,10 @@ String shapeNameJa(String shape) {
     'R' => '右',
     'U' => '上',
     'D' => '下',
+    'NW' => '左上',
+    'NE' => '右上',
+    'SW' => '左下',
+    'SE' => '右下',
     'LU' => '左→上',
     'LD' => '左→下',
     'RU' => '右→上',
@@ -493,6 +545,28 @@ class GesturePath {
     final tol = tolerance;
     final dx = pt.dx - _pivot.dx;
     final dy = pt.dy - _pivot.dy;
+
+    if (_dirs.isNotEmpty && _dirs.first.isDiagonal) {
+      final firstDir = _dirs.first;
+      final (ux, uy) = firstDir.diagUnit;
+      final along = dx * ux + dy * uy;
+      final perp = (dx * (-uy) + dy * ux).abs();
+      if (max(along.abs(), perp) <= tol) {
+        _pending = false;
+        return;
+      }
+      if (along > tol && along > perp * axisRatio) {
+        _pending = false;
+        _advanceDiagonal(pt, firstDir, tol);
+      } else if (along < -tol || perp > tol * 2.4) {
+        _invalidated = true;
+        _pending = false;
+      } else {
+        _pending = true;
+      }
+      return;
+    }
+
     final ax = dx.abs();
     final ay = dy.abs();
     if (max(ax, ay) <= tol) {
@@ -500,14 +574,19 @@ class GesturePath {
       return;
     }
 
-    final dir = _classifyDir(dx, dy, axisRatio);
-    if (dir == null) {
-      // 開始直後から斜め・曲線（ちょろちょろ線）に大きく逸れた場合は即キャンセル
-      if (_dirs.isEmpty && ax > tol * 2.2 && ay > tol * 2.2) {
-        _invalidated = true;
-        _pending = false;
+    if (_dirs.isEmpty) {
+      final dir = _classifyFirstDir(dx, dy, tol);
+      if (dir == null) {
+        _pending = true;
         return;
       }
+      _pending = false;
+      _step(pt, dir, tol);
+      return;
+    }
+
+    final dir = _classifyDir(dx, dy, axisRatio);
+    if (dir == null) {
       _pending = true;
       return;
     }
@@ -520,7 +599,11 @@ class GesturePath {
     if (_invalidated || _dirs.isEmpty) return;
     final dir = _dirs.last;
     final start = _corner ?? _origin;
-    if (dir == GestureDirection.l || dir == GestureDirection.r) {
+    if (dir.isDiagonal) {
+      final (ux, uy) = dir.diagUnit;
+      final proj = max(0.0, (pt.dx - start.dx) * ux + (pt.dy - start.dy) * uy);
+      _end = Offset(start.dx + proj * ux, start.dy + proj * uy);
+    } else if (dir == GestureDirection.l || dir == GestureDirection.r) {
       _end = Offset(pt.dx, start.dy);
     } else {
       _end = Offset(start.dx, pt.dy);
@@ -538,11 +621,22 @@ class GesturePath {
   void _step(Offset pt, GestureDirection dir, double tol) {
     if (_dirs.isEmpty) {
       _dirs.add(dir);
-      _advance(pt, dir, tol);
+      if (dir.isDiagonal) {
+        _advanceDiagonal(pt, dir, tol);
+      } else {
+        _advance(pt, dir, tol);
+      }
     } else if (_dirs.last == dir) {
-      _advance(pt, dir, tol);
-    } else if (_dirs.last == dir.opposite || _dirs.length >= 2) {
-      // 180度逆戻り・ジグザグ・3方向目への曲がりは無効化
+      if (dir.isDiagonal) {
+        _advanceDiagonal(pt, dir, tol);
+      } else {
+        _advance(pt, dir, tol);
+      }
+    } else if (dir.isDiagonal ||
+        _dirs.first.isDiagonal ||
+        _dirs.last == dir.opposite ||
+        _dirs.length >= 2) {
+      // 180度逆戻り・斜め後の曲げ・3方向目への曲がりは無効化
       _invalidated = true;
       return;
     } else {
@@ -561,19 +655,39 @@ class GesturePath {
     final ax = dx.abs();
     final ay = dy.abs();
     final len = max(ax, ay);
-    final dir = _classifyDir(dx, dy, releaseAxisRatio);
-
+    final dist = sqrt(dx * dx + dy * dy);
     final tol = tolerance;
-    if (_dirs.isNotEmpty) {
+
+    if (_dirs.isEmpty) {
+      if (dist < releaseMinLen) return;
+      final dir = _classifyOctantDir(dx, dy);
+      _pending = false;
+      _step(_last, dir, tol);
+      return;
+    }
+
+    if (_dirs.first.isDiagonal) {
       final tail =
           (_maxLen * releaseTailRatio).clamp(releaseTailMin, releaseTailMax);
-      if (len <= tail) {
+      if (dist <= tail) {
         _pending = false;
-        if (dir != null && dir == _dirs.last) {
-          _advance(_last, dir, tol);
+        final (ux, uy) = _dirs.first.diagUnit;
+        if (dx * ux + dy * uy > 0) {
+          _advanceDiagonal(_last, _dirs.first, tol);
         }
-        return;
       }
+      return;
+    }
+
+    final dir = _classifyDir(dx, dy, releaseAxisRatio);
+    final tail =
+        (_maxLen * releaseTailRatio).clamp(releaseTailMin, releaseTailMax);
+    if (len <= tail) {
+      _pending = false;
+      if (dir != null && dir == _dirs.last) {
+        _advance(_last, dir, tol);
+      }
+      return;
     }
 
     if (dir == null || len < releaseMinLen) {
@@ -599,6 +713,25 @@ class GesturePath {
     }
   }
 
+  void _advanceDiagonal(Offset pt, GestureDirection dir, double tol) {
+    final (ux, uy) = dir.diagUnit;
+    final px = -uy;
+    final py = ux;
+    final dpx = pt.dx - _pivot.dx;
+    final dpy = pt.dy - _pivot.dy;
+    final along = dpx * ux + dpy * uy;
+    final perp = dpx * px + dpy * py;
+    final clampedPerp = perp - perp.clamp(-tol, tol);
+    _pivot = Offset(
+      _pivot.dx + along * ux + clampedPerp * px,
+      _pivot.dy + along * uy + clampedPerp * py,
+    );
+    final proj =
+        max(0.0, (pt.dx - _origin.dx) * ux + (pt.dy - _origin.dy) * uy);
+    _end = Offset(_origin.dx + proj * ux, _origin.dy + proj * uy);
+    _maxLen = max(_maxLen, proj);
+  }
+
   GestureDirection? _classifyDir(double dx, double dy, double ratio) {
     final ax = dx.abs();
     final ay = dy.abs();
@@ -609,6 +742,42 @@ class GesturePath {
       return dy < 0 ? GestureDirection.u : GestureDirection.d;
     }
     return null;
+  }
+
+  GestureDirection _classifyDiagQuadrant(double dx, double dy) {
+    if (dx < 0 && dy < 0) return GestureDirection.nw;
+    if (dx >= 0 && dy < 0) return GestureDirection.ne;
+    if (dx < 0 && dy >= 0) return GestureDirection.sw;
+    return GestureDirection.se;
+  }
+
+  GestureDirection? _classifyFirstDir(double dx, double dy, double tol) {
+    final ax = dx.abs();
+    final ay = dy.abs();
+    if (ax > ay * 2.4) {
+      return dx < 0 ? GestureDirection.l : GestureDirection.r;
+    }
+    if (ay > ax * 2.4) {
+      return dy < 0 ? GestureDirection.u : GestureDirection.d;
+    }
+    final dist = sqrt(dx * dx + dy * dy);
+    if (ax >= ay * 0.52 && ay >= ax * 0.52 && dist > tol * 1.4) {
+      return _classifyDiagQuadrant(dx, dy);
+    }
+    return null;
+  }
+
+  GestureDirection _classifyOctantDir(double dx, double dy) {
+    const octantRatio = 2.414213562373095;
+    final ax = dx.abs();
+    final ay = dy.abs();
+    if (ax >= ay * octantRatio) {
+      return dx < 0 ? GestureDirection.l : GestureDirection.r;
+    }
+    if (ay >= ax * octantRatio) {
+      return dy < 0 ? GestureDirection.u : GestureDirection.d;
+    }
+    return _classifyDiagQuadrant(dx, dy);
   }
 }
 

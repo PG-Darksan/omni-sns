@@ -222,6 +222,37 @@ async fn archived_restore(
 }
 
 #[tauri::command]
+async fn archived_rename(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+    instance_id: String,
+    account_label: String,
+) -> Result<ServiceInstance, String> {
+    ensure_shell_webview(&webview)?;
+    view_manager::rename_archived_instance(&app, &shared, &instance_id, &account_label)
+}
+
+#[tauri::command]
+async fn follow_refresh(
+    webview: tauri::Webview,
+    app: AppHandle,
+    shared: State<'_, SharedState>,
+) -> Result<AppConfig, String> {
+    ensure_shell_webview(&webview)?;
+    let (changed, cfg) = {
+        let mut guard = shared.inner.lock().unwrap();
+        let changed = guard.store.refresh_follow_window_counts();
+        let cfg = guard.store.get_config();
+        (changed, cfg)
+    };
+    if changed {
+        view_manager::emit_state_updated(&app, &shared);
+    }
+    Ok(cfg)
+}
+
+#[tauri::command]
 async fn archived_purge(
     webview: tauri::Webview,
     app: AppHandle,
@@ -1194,6 +1225,14 @@ pub fn run() {
                                     &app_cloud,
                                     &shared_cloud,
                                 );
+                            } else {
+                                let changed = {
+                                    let mut g = shared_cloud.inner.lock().unwrap();
+                                    g.store.refresh_follow_window_counts()
+                                };
+                                if changed {
+                                    view_manager::emit_state_updated(&app_cloud, &shared_cloud);
+                                }
                             }
                             for _ in 0..60 {
                                 std::thread::sleep(Duration::from_secs(1));
@@ -1253,8 +1292,10 @@ pub fn run() {
             tab_remove,
             tab_remove_many,
             archived_restore,
+            archived_rename,
             archived_purge,
             archived_purge_all,
+            follow_refresh,
             tab_update,
             tab_reorder,
             tab_action,

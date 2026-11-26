@@ -293,15 +293,33 @@ export function getServiceGroupKey(inst: {
 }
 
 /**
+ * 「メイン」「アカウント 3」等の自動付与ラベル（未命名状態）かを判定する。
+ */
+export function isGenericAccountLabel(label?: string | null): boolean {
+  const trimmed = label?.trim() ?? '';
+  if (!trimmed) return true;
+  return trimmed === 'メイン' || /^アカウント\s*\d+$/.test(trimmed);
+}
+
+/**
  * 同一SNS内でのアカウント表示名（ヘッダー切替ピル用）を決定する。
  */
 export function getAccountDisplayLabel(
-  inst: { name: string; accountLabel?: string },
+  inst: { name: string; accountLabel?: string; detectedHandle?: string },
   siblingIndex: number,
   baseServiceName?: string
 ): string {
   const explicit = inst.accountLabel?.trim();
-  if (explicit) return explicit;
+  const handle = inst.detectedHandle?.trim().replace(/^@+/, '');
+  if (explicit) {
+    if (handle && isGenericAccountLabel(explicit)) {
+      return `@${handle}`;
+    }
+    return explicit;
+  }
+  if (handle) {
+    return `@${handle}`;
+  }
 
   const rawName = inst.name.trim();
   const base = baseServiceName?.trim();
@@ -322,6 +340,55 @@ export function getAccountDisplayLabel(
   }
 
   return siblingIndex === 0 ? 'メイン' : `アカウント ${siblingIndex + 1}`;
+}
+
+/**
+ * ログイン記憶（アーカイブ済みアカウント）の分かりやすい表示タイトルを生成する。
+ * 検出済み @handle がある場合は「アカウント 3」より @handle を優先表示する。
+ */
+export function formatArchivedAccountTitle(inst: {
+  name: string;
+  accountLabel?: string;
+  detectedHandle?: string;
+}): string {
+  const label = inst.accountLabel?.trim() ?? '';
+  const handle = inst.detectedHandle?.trim().replace(/^@+/, '') ?? '';
+  if (handle) {
+    if (
+      !label ||
+      label === inst.name ||
+      isGenericAccountLabel(label) ||
+      label.replace(/^@+/, '').toLowerCase() === handle.toLowerCase()
+    ) {
+      return `${inst.name} · @${handle}`;
+    }
+    return `${inst.name} · ${label} (@${handle})`;
+  }
+  return label && label !== inst.name ? `${inst.name} · ${label}` : inst.name;
+}
+
+/**
+ * サービスカタログをユーザー指定の並び順でソートして返す。
+ */
+export function sortCatalogServices<T extends { id: string }>(
+  catalog: readonly T[],
+  catalogOrder?: readonly string[] | null
+): T[] {
+  if (!catalogOrder || catalogOrder.length === 0) {
+    return [...catalog];
+  }
+  const rank = new Map<string, number>();
+  catalogOrder.forEach((id, idx) => {
+    if (!rank.has(id)) rank.set(id, idx);
+  });
+  return [...catalog].sort((a, b) => {
+    const ra = rank.get(a.id);
+    const rb = rank.get(b.id);
+    if (ra !== undefined && rb !== undefined) return ra - rb;
+    if (ra !== undefined) return -1;
+    if (rb !== undefined) return 1;
+    return 0;
+  });
 }
 
 /**

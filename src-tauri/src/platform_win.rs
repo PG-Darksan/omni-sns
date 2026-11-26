@@ -951,6 +951,9 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
   var CONFIRM_UNFOLLOW_TEXT_RE = /^(?:フォロー解除|フォローを解除|フォローをやめる|フォローを外す|unfollow)$/i;
   var ARIA_UNFOLLOW_RE = /^(?:(?:フォロー中|フォロー解除|フォローをやめる|following|unfollow)|.+?(?:のフォローを解除|のフォローをやめる|をアンフォロー)|unfollow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
   var NON_UNFOLLOW_RE = /(フォロワー|followers|ブロック|block|ミュート|mute|報告|report|削除|remove\s+follower)/i;
+  var FOLLOWING_STATE_BTN_RE = /^(?:フォロー中|フォロー済|フォロー済み|相互フォロー|友達|リクエスト済|リクエスト済み|リクエスト中|承認待ち|following|friends|mutual|requested)$/i;
+  var EXACT_BLOCK_CONFIRM_RE = /^(?:ブロック|ブロックする|ブロックを実行|block|block\s+user|block\s+account)$/i;
+  var NON_BLOCK_RE = /(ブロック解除|ブロックを解除|ブロックリスト|ブロック中|unblock|blocked\s+accounts|blocked\s+users)/i;
 
   function makeChannelState() {
     return {
@@ -965,7 +968,8 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
   }
   var states = {
     follow: makeChannelState(),
-    unfollow: makeChannelState()
+    unfollow: makeChannelState(),
+    block: makeChannelState()
   };
 
   var userInteractionSeq = 0;
@@ -973,6 +977,7 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
   var lastPointerDownAt = 0;
   var lastClickedTargetHandle = '';
   var lastClickedTargetAt = 0;
+  var lastBlockFollowContext = { handle: '', isFollowing: null, ts: 0 };
 
   function bumpUserInteraction(fromPointerDown) {
     var now = Date.now();
@@ -1107,13 +1112,13 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
 
   function extractTargetKey(url, decodedBody) {
     try {
-      var m = /\/friendships\/(?:create|destroy)\/([^\/?#]+)/i.exec(url) ||
-              /\/web\/friendships\/([^\/?#]+)\/(?:follow|unfollow)/i.exec(url) ||
-              /\/api\/v1\/accounts\/([^\/?#]+)\/(?:follow|unfollow)/i.exec(url);
+      var m = /\/friendships\/(?:create|destroy|block)\/([^\/?#]+)/i.exec(url) ||
+              /\/web\/friendships\/([^\/?#]+)\/(?:follow|unfollow|block)/i.exec(url) ||
+              /\/api\/v1\/accounts\/([^\/?#]+)\/(?:follow|unfollow|block)/i.exec(url);
       if (m && m[1]) return String(m[1]).trim().toLowerCase();
 
-      m = /"(?:target_user_id|targetUserId|to_user_id|subscribee_id|subject|rkey)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
-          /(?:^|&)(?:target_user_id|to_user_id)=([a-z0-9._-]+)/i.exec(decodedBody);
+      m = /"(?:target_user_id|targetUserId|blocked_user_id|blockedUserId|to_user_id|toUserId|target_id|subscribee_id|subject|rkey)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
+          /(?:^|&)(?:target_user_id|blocked_user_id|to_user_id|target_id)=([a-z0-9._-]+)/i.exec(decodedBody);
       if (m && m[1]) return String(m[1]).trim().toLowerCase();
 
       m = /"(?:user_id|profile_id|userId)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
@@ -1122,6 +1127,90 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       if (m && m[1]) return String(m[1]).trim().toLowerCase();
     } catch (_) {}
     return '';
+  }
+
+  function detectDomFollowingInScope(scope, excludeDialog) {
+    try {
+      if (!scope || !scope.querySelectorAll) return null;
+      var btns = scope.querySelectorAll('button, [role="button"]');
+      var sawUnfollowed = false;
+      for (var i = 0; i < btns.length && i < 60; i++) {
+        var b = btns[i];
+        if (b.closest && b.closest('nav, [role="navigation"]')) continue;
+        if (excludeDialog && b.closest && b.closest('[role="dialog"], [role="alertdialog"]')) continue;
+        if (isElementHidden(b)) continue;
+        var lbl = readElementLabels(b);
+        var txt = lbl.text || '';
+        if (txt && txt.length <= 24) {
+          if (FOLLOWING_STATE_BTN_RE.test(txt)) return true;
+          if (EXACT_FOLLOW_TEXT_RE.test(txt)) sawUnfollowed = true;
+        }
+      }
+      if (sawUnfollowed) return false;
+    } catch (_) {}
+    return null;
+  }
+
+  function detectProfileDomFollowingState() {
+    try {
+      var header = document.querySelector('main header, [role="main"] header, header');
+      var res = header ? detectDomFollowingInScope(header, true) : null;
+      if (res !== null) return res;
+      var main = document.querySelector('main, [role="main"]');
+      if (main) return detectDomFollowingInScope(main, true);
+    } catch (_) {}
+    return null;
+  }
+
+  function isTargetFollowedForBlock(targetKey, fallbackHandle) {
+    try {
+      var now = Date.now();
+      var fb = fallbackHandle || ((lastClickedTargetHandle && now - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '');
+      var curProfile = (typeof window.__omniResolveProfileHandle === 'function')
+        ? String(window.__omniResolveProfileHandle() || '').trim().toLowerCase()
+        : '';
+      var key = String(targetKey || '').trim().toLowerCase();
+      var targetH = fb ? String(fb).trim().toLowerCase() : (!/^\d+$/.test(key) ? key : '');
+
+      if (curProfile && (!targetH || targetH === curProfile)) {
+        var liveDom = detectProfileDomFollowingState();
+        if (liveDom !== null) return liveDom;
+      }
+      if (typeof window.__omniIsFollowingUser === 'function') {
+        var cached = window.__omniIsFollowingUser(key, fb);
+        if (typeof cached === 'boolean') return cached;
+      }
+      if (lastBlockFollowContext.isFollowing !== null &&
+          now - lastBlockFollowContext.ts <= 30000 &&
+          (!targetH || !lastBlockFollowContext.handle || lastBlockFollowContext.handle === targetH)) {
+        return lastBlockFollowContext.isFollowing;
+      }
+      if (!curProfile) {
+        var fallbackDom = detectProfileDomFollowingState();
+        if (fallbackDom === true) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function handleBlockCompleted(source, targetKey, interactionId, wasFollowing, fallbackHandle) {
+    var bst = states.block;
+    var now = Date.now();
+    if (source === 'network') {
+      bst.lastNetworkAt = now;
+    } else {
+      bst.lastDomEmitAt = now;
+    }
+    bst.lastAnyEmitAt = now;
+    if (wasFollowing) {
+      emitRelation('unfollow', source, targetKey, interactionId);
+    } else {
+      try {
+        if (typeof window.__omniOnFollowAction === 'function') {
+          window.__omniOnFollowAction('unfollow', targetKey || '', fallbackHandle || '');
+        }
+      } catch (_) {}
+    }
   }
 
   function detectRelationApiRequest(rawUrl, method, rawBody) {
@@ -1136,6 +1225,12 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
         if (body.indexOf('%') >= 0) decodedBody = decodeURIComponent(body.replace(/\+/g, ' '));
       } catch (_) {}
       var lowerBody = decodedBody.toLowerCase();
+
+      if ((/\/friendships\/block(?:\/|\?|$)/i.test(lowerUrl) ||
+           /\/web\/friendships\/[^\/?#]+\/block(?:\/|\?|$)/i.test(lowerUrl)) &&
+          !/unblock/i.test(lowerUrl)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
 
       if (/\/friendships\/destroy(?:\/|\?|$)/i.test(lowerUrl) ||
           /\/web\/friendships\/[^\/?#]+\/unfollow(?:\/|\?|$)/i.test(lowerUrl)) {
@@ -1154,6 +1249,11 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
         var fnameMatch = /(?:fb_api_req_friendly_name|friendlyname)["'=\s:]+([a-z0-9_]+)/i.exec(decodedBody);
         var fname = fnameMatch ? fnameMatch[1] : '';
         if (fname) {
+          if (/block/i.test(fname) &&
+              !/unblock|remove.?block|delete.?block|destroy|list|count|query|fetch|load|get|status|info|show|check|modal|dialog|sheet|suggest|setting|privacy|history|blocked.?account|blocked.?user|blocked.?list/i.test(fname) &&
+              /(?:mutation|create|add|blockuser|blockaccount|userblock|block_user|block_account)/i.test(fname)) {
+            return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+          }
           if (/remove.?follower|block|mute|restrict|suggestion|recommend|list|count|query|fetch|load|get|status|info|chaining|similar|show|check|batch|many|bulk|sync|refresh|feed|timeline|modal|dialog|sheet/i.test(fname)) {
             return null;
           }
@@ -1166,6 +1266,10 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
             return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
           }
           return null;
+        }
+        if (/usebarcelonablockmutation|barcelonablockmutation|polarisblockusermutation|usepolarisblockmutation|polarisblockmutation|textpostappblockmutation|igwebprofileblockmutation|cometblockusermutation|usecometblockmutation|friendingcometblockmutation|polarisfriendshipsblock/i.test(lowerBody) &&
+            !/unblock/i.test(lowerBody)) {
+          return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
         }
         if (/usebarcelonaunfollowmutation|barcelonaunfollowmutation|polarisfriendshipsunfollow|polarisunfollowmutation|usepolarisunfollowmutation|polarisuserunfollowmutation|igwebprofileunfollowmutation|textpostappunfollowmutation|friendingcometunfollowmutation|polarisfriendshipsdestroy/i.test(lowerBody)) {
           return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
@@ -1185,18 +1289,36 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
           lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
         return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
       }
+      if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
+          lowerBody.indexOf('app.bsky.graph.block') >= 0) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
 
+      if (/\/api\/v1\/accounts\/[^\/?#]+\/block(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
       if (/\/api\/v1\/accounts\/[^\/?#]+\/unfollow(?:\?|$)/i.test(lowerUrl)) {
         return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
       }
       if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) {
         return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
       }
+      if (/\/api\/blocking\/create(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
       if (/\/api\/following\/delete(?:\?|$)/i.test(lowerUrl)) {
         return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
       }
       if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) {
         return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/(?:api|aweme\/v\d+)\/commit\/block/i.test(lowerUrl) &&
+          !/unblock|block_type=0/i.test(lowerUrl) &&
+          !/"block_type"\s*:\s*0/i.test(lowerBody)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/blocks\/create\.json(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
       }
       if (/\/api\/commit\/follow\/user/i.test(lowerUrl)) {
         if (/[?&]type=1(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=1(?:&|$)|"type"\s*:\s*1/i.test(lowerBody)) {
@@ -1234,17 +1356,29 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
         var relReq = detectRelationApiRequest(reqUrl, reqMethod, reqBody);
         var reqInteractionId = 0;
         var st = relReq ? states[relReq.action] : null;
+        var blockWasFollowing = false;
+        var blockFbHandle = '';
         if (relReq && st) {
           st.lastNetworkStartAt = Date.now();
           st.inFlight++;
           reqInteractionId = currentInteractionId();
+          if (relReq.action === 'block') {
+            blockFbHandle = (lastClickedTargetHandle && Date.now() - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '';
+            blockWasFollowing = isTargetFollowedForBlock(relReq.targetKey, blockFbHandle);
+          }
         }
         var promise = origFetch.apply(this, arguments);
         if (relReq && st && promise && typeof promise.then === 'function') {
           promise.then(function(res) {
             st.inFlight = Math.max(0, st.inFlight - 1);
             try {
-              if (res && res.ok) emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
+              if (res && res.ok) {
+                if (relReq.action === 'block') {
+                  handleBlockCompleted('network', relReq.targetKey, reqInteractionId, blockWasFollowing, blockFbHandle);
+                } else {
+                  emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
+                }
+              }
             } catch (_) {}
           }, function() {
             st.inFlight = Math.max(0, st.inFlight - 1);
@@ -1276,6 +1410,12 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
             st.lastNetworkStartAt = Date.now();
             st.inFlight++;
             var reqInteractionId = currentInteractionId();
+            var blockWasFollowing = false;
+            var blockFbHandle = '';
+            if (relReq.action === 'block') {
+              blockFbHandle = (lastClickedTargetHandle && Date.now() - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '';
+              blockWasFollowing = isTargetFollowedForBlock(relReq.targetKey, blockFbHandle);
+            }
             var done = false;
             var finish = function() {
               if (!done) {
@@ -1287,7 +1427,11 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
               finish();
               try {
                 if (this.status >= 200 && this.status < 300) {
-                  emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
+                  if (relReq.action === 'block') {
+                    handleBlockCompleted('network', relReq.targetKey, reqInteractionId, blockWasFollowing, blockFbHandle);
+                  } else {
+                    emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
+                  }
                 }
               } catch (_) {}
             }, { once: true });
@@ -1415,6 +1559,49 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     return '';
   }
 
+  function isBlockButtonElement(el) {
+    if (!el || el.disabled) return false;
+    try {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      if (el.closest('nav')) return false;
+      var labels = readElementLabels(el);
+      if (labels.text && NON_BLOCK_RE.test(labels.text)) return false;
+      if (labels.aria && NON_BLOCK_RE.test(labels.aria)) return false;
+      if (labels.text && labels.text.length <= 24 && EXACT_BLOCK_CONFIRM_RE.test(labels.text)) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function captureBlockFollowContext(btn, clickedHandle) {
+    try {
+      var now = Date.now();
+      var h = clickedHandle || '';
+      var state = null;
+      var row = btn && btn.closest ? btn.closest('[data-omni-ff-row]') : null;
+      if (row) {
+        state = detectDomFollowingInScope(row, false);
+      }
+      if (state === null) {
+        var curProfile = (typeof window.__omniResolveProfileHandle === 'function')
+          ? String(window.__omniResolveProfileHandle() || '').trim().toLowerCase()
+          : '';
+        if (curProfile && (!h || h === curProfile)) {
+          state = detectProfileDomFollowingState();
+          if (!h) h = curProfile;
+        }
+      }
+      if (state === null && h && typeof window.__omniIsFollowingUser === 'function') {
+        var cached = window.__omniIsFollowingUser(h, h);
+        if (typeof cached === 'boolean') state = cached;
+      }
+      if (state !== null) {
+        lastBlockFollowContext = { handle: h, isFollowing: state, ts: now };
+      }
+    } catch (_) {}
+  }
+
   document.addEventListener('click', function(e) {
     try {
       if (e && (e.isTrusted === false || e.button !== 0 || e.ctrlKey || e.metaKey)) return;
@@ -1424,22 +1611,57 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       if (!target) return;
       if (target.nodeType !== 1) target = target.parentElement;
       if (!target || typeof target.closest !== 'function') return;
-      var btn = target.closest('button, [role="button"], a');
+      var btn = target.closest('button, [role="button"], [role="menuitem"], a');
       if (!btn) return;
-
-      var isFollowBtn = isFollowButtonElement(btn);
-      var isUnfollowBtn = !isFollowBtn && isUnfollowButtonElement(btn);
-      if (!isFollowBtn && !isUnfollowBtn) return;
 
       var clickedAt = Date.now();
       var clickedHandle = extractHandleNearButton(btn);
+      var inDialog = !!btn.closest('[role="dialog"], [role="alertdialog"]');
+      var isFollowBtn = isFollowButtonElement(btn);
+      var isUnfollowBtn = !isFollowBtn && isUnfollowButtonElement(btn);
+      var isBlockBtn = !isFollowBtn && !isUnfollowBtn && isBlockButtonElement(btn);
+
+      if (!inDialog || !isBlockBtn) {
+        captureBlockFollowContext(btn, clickedHandle);
+      }
+      if (!isFollowBtn && !isUnfollowBtn && !isBlockBtn) {
+        if (clickedHandle) {
+          lastClickedTargetHandle = clickedHandle;
+          lastClickedTargetAt = clickedAt;
+        }
+        return;
+      }
+
       if (clickedHandle) {
         lastClickedTargetHandle = clickedHandle;
         lastClickedTargetAt = clickedAt;
       }
-      var hadDialog = !!document.querySelector('[role="dialog"]');
-      var inDialog = !!btn.closest('[role="dialog"]');
+      var hadDialog = !!document.querySelector('[role="dialog"], [role="alertdialog"]');
       var initialLabels = readElementLabels(btn);
+
+      if (isBlockBtn) {
+        var wasFollowingAtClick = isTargetFollowedForBlock(clickedHandle, clickedHandle);
+        if (inDialog && wasFollowingAtClick) {
+          var bst = states.block;
+          var ustB = states.unfollow;
+          setTimeout(function() {
+            try {
+              if (bst.inFlight > 0 || ustB.inFlight > 0 ||
+                  bst.lastNetworkStartAt >= clickedAt - 300 ||
+                  bst.lastNetworkAt >= clickedAt - 300 ||
+                  ustB.lastNetworkStartAt >= clickedAt - 300 ||
+                  ustB.lastNetworkAt >= clickedAt - 300 ||
+                  ustB.lastAnyEmitAt >= clickedAt - 300) {
+                return;
+              }
+              if (isElementHidden(btn)) {
+                handleBlockCompleted('dom', clickedHandle, clickInteractionId, true, clickedHandle);
+              }
+            } catch (_) {}
+          }, 1000);
+        }
+        return;
+      }
 
       if (isFollowBtn) {
         var fst = states.follow;
@@ -1617,7 +1839,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   var deadRouteUntil = Object.create(null);
   var selfHandle = '';
   var selfDid = '';
-  var selfIdFetchStarted = false;
+  var selfIdFetchLastAt = 0;
   var selfDidFetchStarted = false;
   var lastPostedIdentityKey = '';
   var persistTimer = null;
@@ -2111,6 +2333,32 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     } catch (_) {}
   };
 
+  // ブロック時に「現在フォロー中のユーザーか」を判定するフック（フォロー中のみ解除カウントに含める）
+  window.__omniIsFollowingUser = function(targetKey, fallbackHandle) {
+    try {
+      var key = String(targetKey || '').trim().toLowerCase();
+      var h = '';
+      if (key) {
+        if (idToHandleMap[key]) h = idToHandleMap[key];
+        else if (!/^\d+$/.test(key)) h = normalizeHandle(key);
+      }
+      if (!h && fallbackHandle) {
+        h = normalizeHandle(fallbackHandle);
+        if (h && key && /^\d+$/.test(key)) {
+          idToHandleMap[key] = h;
+          userIdMap[h] = key;
+        }
+      }
+      if (!h) h = getCurrentProfileHandleFromUrl();
+      if (!h || h === selfHandle) return null;
+      var ent = statsMap[h];
+      if (ent && typeof ent.iFollow === 'boolean') return ent.iFollow;
+      if (selfFollowingSet[h]) return true;
+      if (followedAtMap[h]) return true;
+    } catch (_) {}
+    return null;
+  };
+
   function extractRelationFromObject(obj) {
     var iFollow = null;
     var followsMe = null;
@@ -2314,6 +2562,10 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         setSelfHandle(obj.viewer_username);
       } else if (obj.viewer && typeof obj.viewer === 'object' && typeof obj.viewer.username === 'string') {
         setSelfHandle(obj.viewer.username);
+      } else if (obj.logged_in_user && typeof obj.logged_in_user === 'object' && typeof obj.logged_in_user.username === 'string') {
+        setSelfHandle(obj.logged_in_user.username);
+      } else if (obj.PolarisViewer && typeof obj.PolarisViewer === 'object' && obj.PolarisViewer.data && typeof obj.PolarisViewer.data.username === 'string') {
+        setSelfHandle(obj.PolarisViewer.data.username);
       }
 
       var keys = Object.keys(obj);
@@ -2625,23 +2877,41 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   }
 
   function tryFetchSelfByCookie() {
-    if (platform !== 'instagram' || selfHandle || selfIdFetchStarted) return;
+    if (platform !== 'instagram' || selfHandle) return;
+    var now = Date.now();
+    if (now - selfIdFetchLastAt < 25000) return;
     var dsUserId = getCookieValue('ds_user_id');
     if (!dsUserId || !/^\d{5,24}$/.test(dsUserId)) return;
-    selfIdFetchStarted = true;
+    selfIdFetchLastAt = now;
+    var headers = buildIgHeaders();
     internalFetch('/api/v1/users/' + encodeURIComponent(dsUserId) + '/info/', {
       method: 'GET',
       credentials: 'include',
-      headers: buildIgHeaders()
+      headers: headers
     }).then(function(res) {
-      if (!res || !res.ok) return;
-      return res.json().then(function(data) {
-        var u = data && data.user;
-        if (u && typeof u.username === 'string') {
-          setSelfHandle(u.username);
-          extractFromJsonObject(data);
+      if (!res || !res.ok) return null;
+      return res.json().catch(function() { return null; });
+    }).then(function(data) {
+      var u = data && data.user;
+      if (u && typeof u.username === 'string' && u.username) {
+        setSelfHandle(u.username);
+        extractFromJsonObject(data);
+        return;
+      }
+      if (selfHandle) return;
+      return internalFetch('/api/v1/accounts/current_user/?edit=true', {
+        method: 'GET',
+        credentials: 'include',
+        headers: headers
+      }).then(function(r2) {
+        if (!r2 || !r2.ok) return null;
+        return r2.json().catch(function() { return null; });
+      }).then(function(d2) {
+        var u2 = d2 && d2.user;
+        if (u2 && typeof u2.username === 'string' && u2.username) {
+          setSelfHandle(u2.username);
         }
-      }).catch(function() {});
+      });
     }).catch(function() {});
   }
 
@@ -2675,8 +2945,8 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     try {
       if (platform === 'instagram') {
         tryFetchSelfByCookie();
-        var navLinks = document.querySelectorAll('nav a[href], [role="navigation"] a[href]');
-        for (var i = 0; i < navLinks.length && i < 80; i++) {
+        var navLinks = document.querySelectorAll('nav a[href], [role="navigation"] a[href], a[href]');
+        for (var i = 0; i < navLinks.length && i < 160; i++) {
           var a = navLinks[i];
           var href = a.getAttribute('href') || '';
           var m = /^\/([a-z0-9._]{1,35})\/?(?:\?.*)?$/i.exec(href);
@@ -2687,31 +2957,52 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           var aria = (a.getAttribute('aria-label') || '').trim();
           var img = a.querySelector('img[alt]');
           var alt = img ? (img.getAttribute('alt') || '') : '';
+          var inNav = !!a.closest('nav, [role="navigation"]');
+          var outsideContent = !a.closest('main, article, [role="main"], [role="dialog"], [role="grid"]');
+          var altLower = alt.toLowerCase();
+          var isOwnPicAlt = /(プロフィール写真|profile picture)/i.test(alt) &&
+            (inNav || (outsideContent && altLower.indexOf(h) >= 0));
           if (/^(プロフィール|profile)$/i.test(label) ||
               /^(プロフィール|profile)$/i.test(aria) ||
-              (/(プロフィール写真|profile picture)/i.test(alt) && a.closest('nav, [role="navigation"]'))) {
+              isOwnPicAlt) {
             setSelfHandle(h);
             return;
           }
         }
-        tryFetchSelfByCookie();
       } else if (platform === 'threads') {
         var tLinks = document.querySelectorAll('nav a[href^="/@"], [role="navigation"] a[href^="/@"], a[href^="/@"]');
-        for (var j = 0; j < tLinks.length && j < 120; j++) {
+        for (var j = 0; j < tLinks.length && j < 140; j++) {
           var ta = tLinks[j];
           var thref = ta.getAttribute('href') || '';
           var tm = /^\/@([a-z0-9._]{1,35})\/?(?:\?.*)?$/i.exec(thref);
           if (!tm) continue;
-          var svg = ta.querySelector('svg[aria-label]');
+          var svg = ta.querySelector('svg[aria-label], [aria-label]');
           var sAria = svg ? (svg.getAttribute('aria-label') || '') : '';
           var tAria = ta.getAttribute('aria-label') || '';
           var tTxt = (ta.innerText || ta.textContent || '').trim();
-          if (/^(プロフィール|profile)$/i.test(sAria) || /^(プロフィール|profile)$/i.test(tAria) || /^(プロフィール|profile)$/i.test(tTxt)) {
+          var tImg = ta.querySelector('img[alt]');
+          var tAlt = tImg ? (tImg.getAttribute('alt') || '') : '';
+          var tOutside = !ta.closest('main, article, [role="main"], [role="dialog"]');
+          if (/^(プロフィール|profile)$/i.test(sAria) ||
+              /^(プロフィール|profile)$/i.test(tAria) ||
+              /^(プロフィール|profile)$/i.test(tTxt) ||
+              (tOutside && /(プロフィール写真|profile picture)/i.test(tAlt))) {
             setSelfHandle(tm[1]);
             return;
           }
         }
       } else if (platform === 'bluesky') {
+        try {
+          var rawBsky = window.localStorage && window.localStorage.getItem('BSKY_STORAGE');
+          if (rawBsky) {
+            var parsedBsky = JSON.parse(rawBsky);
+            var bHandle = parsedBsky && parsedBsky.session && parsedBsky.session.currentAccount && parsedBsky.session.currentAccount.handle;
+            if (typeof bHandle === 'string' && bHandle) {
+              setSelfHandle(bHandle);
+              return;
+            }
+          }
+        } catch (_) {}
         var bLinks = document.querySelectorAll('a[data-testid="profileBtn"][href^="/profile/"], nav a[href^="/profile/"]');
         for (var k = 0; k < bLinks.length && k < 60; k++) {
           var ba = bLinks[k];
@@ -3684,11 +3975,11 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     return buildProfileUrlForHandle(handle);
   }
 
-  function postOpenNewTabActivate(url) {
+  function postOpenNewTabBackground(url) {
     try {
       var poster = __omniPostMessage || (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function' ? window.chrome.webview.postMessage.bind(window.chrome.webview) : null);
       if (poster) {
-        poster(JSON.stringify({ token: __OMNI_TOKEN__, type: 'omnisns:open-new-tab', url: url, activate: true }));
+        poster(JSON.stringify({ token: __OMNI_TOKEN__, type: 'omnisns:open-new-tab', url: url, activate: false }));
         return true;
       }
     } catch (_) {}
@@ -3697,7 +3988,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   var lastBadgeOpenAt = 0;
 
-  // 人数ピルのクリック: 人数表示中は新規タブで開いて即切り替え、取得中/再取得表示中は優先再取得
+  // 人数ピルのクリック: 人数表示中はバックグラウンドの新規タブで開く、取得中/再取得表示中は優先再取得
   function bindStatBadgeClick(statEl, wrap, handle) {
     statEl.addEventListener('click', function(ev) {
       var state = statEl.getAttribute('data-omni-ff-state') || '';
@@ -3710,7 +4001,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         var now = Date.now();
         if (now - lastBadgeOpenAt < 700) return;
         var url = resolveBadgeProfileUrl(wrap, handle);
-        if (url && postOpenNewTabActivate(url)) {
+        if (url && postOpenNewTabBackground(url)) {
           lastBadgeOpenAt = now;
           statEl.classList.remove('is-opening');
           void statEl.offsetWidth;
@@ -3755,7 +4046,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var nextState = isBanner ? 'banner' : 'stats';
       if (statEl.getAttribute('data-omni-ff-state') !== nextState) statEl.setAttribute('data-omni-ff-state', nextState);
       if (statEl.textContent !== display.statsText) statEl.textContent = display.statsText;
-      var tip = isBanner ? display.statsTitle : display.statsTitle + '（クリックで新規タブに開く）';
+      var tip = isBanner ? display.statsTitle : display.statsTitle + '（クリックで裏タブに開く）';
       if (statEl.title !== tip) statEl.title = tip;
       var aria = isBanner && display.isFollowingHeavy ? 'フォロー多め' : tip;
       if (statEl.getAttribute('aria-label') !== aria) statEl.setAttribute('aria-label', aria);

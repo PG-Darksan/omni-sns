@@ -106,7 +106,7 @@ class _GestureSettingsScreenState extends State<GestureSettingsScreen> {
                 style: TextStyle(fontWeight: FontWeight.bold),
               ),
               subtitle: const Text(
-                '画面端のジェスチャーボタンから上下左右にドラッグして操作。ボタン長押しで好きな位置へ移動できます。',
+                '画面端のジェスチャーボタンから上下左右・斜めにドラッグして操作。ボタン長押しで好きな位置へ移動できます。',
                 style: TextStyle(fontSize: 12),
               ),
               value: _settings.enabled,
@@ -147,6 +147,15 @@ class _GestureSettingsScreenState extends State<GestureSettingsScreen> {
           ),
           const SizedBox(height: 8),
           _buildShapeGrid(kSingleGestureShapes, gestures, colorScheme),
+          const SizedBox(height: 18),
+          Text(
+            '斜め（↖ ↗ ↙ ↘）',
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.bold,
+                ),
+          ),
+          const SizedBox(height: 8),
+          _buildShapeGrid(kDiagonalGestureShapes, gestures, colorScheme),
           const SizedBox(height: 18),
           Text(
             '2方向（直角に1回曲げる 8通り）',

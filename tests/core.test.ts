@@ -6,8 +6,10 @@ import { CATEGORIES, SERVICE_CATALOG } from '../src/shared/catalog';
 import {
   buildUserAgent,
   detectPlatformServiceFromUrl,
+  formatArchivedAccountTitle,
   getAccountDisplayLabel,
   getServiceGroupKey,
+  isGenericAccountLabel,
   isSafeFaviconUrl,
   isSameSiteUrl,
   isValidGistId,
@@ -17,7 +19,8 @@ import {
   normalizeServiceUrl,
   parseSharedSyncConfig,
   parseUnreadCountFromTitle,
-  shouldOpenInAppPopup
+  shouldOpenInAppPopup,
+  sortCatalogServices
 } from '../src/shared/url-utils';
 
 test('SERVICE_CATALOG has unique IDs, valid HTTPS URLs, valid categories, and excludes paid-messaging SNS', () => {
@@ -275,6 +278,8 @@ test('Windows and Android PROFILE_STATS_JS are valid JS with universal mutual-fo
       assert.ok(js.includes(mode), `${label} must style ${mode} row badge placement`);
     }
     assert.ok(js.includes('rowColCache'), `${label} must cache the row text column between scans`);
+    assert.ok(js.includes('__omniIsFollowingUser'), `${label} must expose follow-state cache for block-as-unfollow`);
+    assert.ok(js.includes('/api/v1/accounts/current_user/'), `${label} must support cookie-based Instagram self-handle fallback`);
   }
 });
 
@@ -328,4 +333,95 @@ test('Windows and Android LONG_PRESS_NEW_TAB_JS and JEV_FILTER_JS parse cleanly 
     assert.ok(jev.includes('__omniJevResolve'), `${label} Jev filter must expose batch resolver`);
     assert.ok(jev.includes('omni-jev-active'), `${label} Jev filter must toggle CSS class`);
   }
+});
+
+test('Windows and Android FOLLOW_TRACKER_JS parse cleanly, count followed-user blocks as unfollow, and fit JVM string limits', () => {
+  const winSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src-tauri/src/platform_win.rs'),
+    'utf8'
+  );
+  const ktSrc = fs.readFileSync(
+    path.resolve(
+      process.cwd(),
+      'mobile/android/app/src/main/kotlin/com/pgdarksan/omni_sns_mobile/OmniWebView.kt'
+    ),
+    'utf8'
+  );
+
+  const winFtMatch = /pub const FOLLOW_TRACKER_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winFtMatch, 'Windows FOLLOW_TRACKER_JS must exist');
+  assert.doesNotThrow(() => new Function(winFtMatch[1]), 'Windows FOLLOW_TRACKER_JS must parse cleanly');
+
+  const ktFtMatch = /val FOLLOW_TRACKER_JS: String = """\r?\n([\s\S]*?)\r?\n[ \t]*"""/.exec(ktSrc);
+  assert.ok(ktFtMatch, 'Android FOLLOW_TRACKER_JS must exist');
+  assert.ok(
+    Buffer.byteLength(ktFtMatch[1], 'utf8') < 60000,
+    `Android FOLLOW_TRACKER_JS (${Buffer.byteLength(ktFtMatch[1], 'utf8')} bytes) must stay safely under JVM 65535-byte CONSTANT_Utf8 limit`
+  );
+  assert.doesNotThrow(() => new Function(ktFtMatch[1]), 'Android FOLLOW_TRACKER_JS must parse cleanly');
+
+  for (const [label, js] of [
+    ['Windows', winFtMatch[1]],
+    ['Android', ktFtMatch[1]]
+  ] as const) {
+    assert.ok(js.includes('handleBlockCompleted'), `${label} must handle followed-user block as unfollow`);
+    assert.ok(js.includes('__omniIsFollowingUser'), `${label} must inspect followed-user cache before counting block`);
+    assert.ok(js.includes('friendships\\/(?:create|destroy|block)'), `${label} must detect Instagram/Threads block endpoints`);
+    assert.ok(js.includes('app.bsky.graph.block'), `${label} must detect Bluesky block endpoints`);
+  }
+});
+
+test('catalog reordering and archived account title helpers work cleanly', () => {
+  const ordered = sortCatalogServices(
+    [
+      { id: 'instagram' },
+      { id: 'threads' },
+      { id: 'bluesky' },
+      { id: 'discord' }
+    ],
+    ['discord', 'bluesky', 'unknown-id', 'bluesky']
+  );
+  assert.deepEqual(
+    ordered.map((s) => s.id),
+    ['discord', 'bluesky', 'instagram', 'threads']
+  );
+
+  assert.equal(isGenericAccountLabel(''), true);
+  assert.equal(isGenericAccountLabel('メイン'), true);
+  assert.equal(isGenericAccountLabel('アカウント 3'), true);
+  assert.equal(isGenericAccountLabel('仕事用'), false);
+  assert.equal(isGenericAccountLabel('@hanako'), false);
+
+  assert.equal(
+    formatArchivedAccountTitle({
+      name: 'Instagram',
+      accountLabel: 'アカウント 3',
+      detectedHandle: 'hanako'
+    }),
+    'Instagram · @hanako'
+  );
+  assert.equal(
+    formatArchivedAccountTitle({
+      name: 'Instagram',
+      accountLabel: '@hanako',
+      detectedHandle: 'hanako'
+    }),
+    'Instagram · @hanako'
+  );
+  assert.equal(
+    formatArchivedAccountTitle({
+      name: 'Instagram',
+      accountLabel: 'サブ垢',
+      detectedHandle: 'sub_user'
+    }),
+    'Instagram · サブ垢 (@sub_user)'
+  );
+  assert.equal(
+    getAccountDisplayLabel(
+      { name: 'Instagram', accountLabel: 'アカウント 3', detectedHandle: 'hanako' },
+      2,
+      'Instagram'
+    ),
+    '@hanako'
+  );
 });

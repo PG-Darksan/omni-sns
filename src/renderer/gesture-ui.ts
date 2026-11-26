@@ -2,14 +2,23 @@ import { GestureSettings, GestureShape } from '../shared/types';
 import { omniApi } from './omni-api';
 
 export const SINGLE_SHAPES: GestureShape[] = ['L', 'R', 'U', 'D'];
+export const DIAGONAL_SHAPES: GestureShape[] = ['NW', 'NE', 'SW', 'SE'];
 export const DOUBLE_SHAPES: GestureShape[] = ['LU', 'LD', 'RU', 'RD', 'UL', 'UR', 'DL', 'DR'];
-export const ALL_SHAPES: GestureShape[] = [...SINGLE_SHAPES, ...DOUBLE_SHAPES];
+export const ALL_SHAPES: GestureShape[] = [
+  ...SINGLE_SHAPES,
+  ...DIAGONAL_SHAPES,
+  ...DOUBLE_SHAPES
+];
 
 export const DEFAULT_GESTURES: Record<GestureShape, string> = {
   L: 'previous-tab',
   R: 'next-tab',
   U: 'scroll:up',
   D: 'scroll:down',
+  NW: 'none',
+  NE: 'none',
+  SW: 'none',
+  SE: 'none',
   LU: 'previous-service',
   LD: 'go-forward',
   RU: 'next-service',
@@ -135,6 +144,10 @@ export function actionLabel(actionId: string): string {
 }
 
 export function shapeArrows(shape: string): string {
+  if (shape === 'NW') return '↖';
+  if (shape === 'NE') return '↗';
+  if (shape === 'SW') return '↙';
+  if (shape === 'SE') return '↘';
   return shape
     .split('')
     .map((c) => (c === 'L' ? '←' : c === 'R' ? '→' : c === 'U' ? '↑' : c === 'D' ? '↓' : ''))
@@ -142,22 +155,41 @@ export function shapeArrows(shape: string): string {
 }
 
 export function shapeNameJa(shape: string): string {
+  if (shape === 'NW') return '左上';
+  if (shape === 'NE') return '右上';
+  if (shape === 'SW') return '左下';
+  if (shape === 'SE') return '右下';
   return shape
     .split('')
     .map((c) => (c === 'L' ? '左' : c === 'R' ? '右' : c === 'U' ? '上' : c === 'D' ? '下' : ''))
     .join('→');
 }
 
-/** HisatorNotebook _W246ShapeIconPainter 準拠の SVG アイコン（始点丸 + 直線 + 終点矢印） */
+/** HisatorNotebook _W246ShapeIconPainter 準拠の SVG アイコン（始点丸 + 直線/斜線 + 終点矢印） */
 export function buildShapeSvg(shape: string, size = 28): string {
   const unit = (d: string): [number, number] =>
     d === 'L' ? [-1, 0] : d === 'R' ? [1, 0] : d === 'U' ? [0, -1] : [0, 1];
+  const diagVec: Record<string, [number, number]> = {
+    NW: [-1, -1],
+    NE: [1, -1],
+    SW: [-1, 1],
+    SE: [1, 1]
+  };
 
   const raw: [number, number][] = [[0, 0]];
-  for (const d of shape) {
-    const last = raw[raw.length - 1];
-    const u = unit(d);
-    raw.push([last[0] + u[0], last[1] + u[1]]);
+  let endDir: [number, number];
+  if (diagVec[shape]) {
+    const [vx, vy] = diagVec[shape];
+    raw.push([vx, vy]);
+    const inv = Math.SQRT1_2;
+    endDir = [vx * inv, vy * inv];
+  } else {
+    for (const d of shape) {
+      const last = raw[raw.length - 1];
+      const u = unit(d);
+      raw.push([last[0] + u[0], last[1] + u[1]]);
+    }
+    endDir = unit(shape[shape.length - 1]);
   }
 
   let minX = 0;
@@ -185,7 +217,7 @@ export function buildShapeSvg(shape: string, size = 28): string {
     .join(' ');
 
   const end = pts[pts.length - 1];
-  const [dx, dy] = unit(shape[shape.length - 1]);
+  const [dx, dy] = endDir;
   const head = 4.5;
   const bx = end[0] - dx * head;
   const by = end[1] - dy * head;
@@ -493,6 +525,7 @@ export class GestureBoardModal {
   private renderBoard(): void {
     if (!this.settings) return;
     this.renderShapeGrid('gesture-grid-single', SINGLE_SHAPES);
+    this.renderShapeGrid('gesture-grid-diagonal', DIAGONAL_SHAPES);
     this.renderShapeGrid('gesture-grid-double', DOUBLE_SHAPES);
   }
 

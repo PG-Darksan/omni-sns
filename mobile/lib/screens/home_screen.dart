@@ -114,6 +114,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   FollowSyncLedger _followLedger = FollowSyncLedger();
   Timer? _cloudSyncDebounce;
   Timer? _cloudSyncPeriodic;
+  Timer? _followWindowRefreshTimer;
   Timer? _snackDismissTimer;
   Future<String>? _syncInFlight;
   bool _needsResync = false;
@@ -196,6 +197,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _jev.dispose();
     _cloudSyncDebounce?.cancel();
     _cloudSyncPeriodic?.cancel();
+    _followWindowRefreshTimer?.cancel();
     _snackDismissTimer?.cancel();
     _gmailController?.dispose();
     _gmailController = null;
@@ -222,8 +224,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final (followSyncSettings, followLedger) =
           await widget.store.loadFollowSyncState();
       final today = formatLocalYmd(DateTime.now());
-      final (instances, _) =
-          projectLedgerToInstances(loadedInstances, followLedger, today);
+      final (instances, _) = projectLedgerToInstances(
+        loadedInstances,
+        followLedger,
+        today,
+        windowHours: settings.followWindowHours,
+      );
       final multiProfile = await OmniWebViewManager.isMultiProfileSupported();
 
       for (final inst in instances) {
@@ -250,6 +256,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       widget.onThemeChanged(settings.isDarkMode);
       _ensureSafeActiveAndLoad();
       _startFollowSyncEngine();
+      _followWindowRefreshTimer?.cancel();
+      _followWindowRefreshTimer = Timer.periodic(
+        const Duration(seconds: 30),
+        (_) => _refreshFollowWindowCounts(),
+      );
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -452,12 +463,80 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   String _formatArchivedDisplayTitle(ServiceInstance inst) {
-    final label = inst.accountLabel?.trim();
-    final base = (label != null && label.isNotEmpty && label != inst.name)
-        ? '${inst.name} · $label'
-        : inst.name;
-    final h = inst.detectedHandle?.trim();
-    return (h != null && h.isNotEmpty) ? '$base (@$h)' : base;
+    return formatArchivedAccountTitle(inst);
+  }
+
+  Future<ServiceInstance?> _renameArchivedInstance(
+    String instanceId,
+    String newLabel,
+  ) async {
+    final idx = _archivedInstances
+        .indexWhere((a) => a.instance.instanceId == instanceId);
+    if (idx == -1) return null;
+    final entry = _archivedInstances[idx];
+    final trimmed = newLabel.trim();
+    final updatedInst = entry.instance.copyWith(
+      accountLabel: trimmed.isEmpty ? null : trimmed,
+      clearAccountLabel: trimmed.isEmpty,
+    );
+    setState(() {
+      _archivedInstances[idx] = ArchivedInstance(
+        instance: updatedInst,
+        archivedAt: entry.archivedAt,
+      );
+    });
+    await _persistArchived();
+    return updatedInst;
+  }
+
+  Future<void> _updateCatalogOrder(List<String> newOrder) async {
+    final sanitized = sanitizeCatalogOrder(newOrder);
+    if (mounted) {
+      setState(() {
+        _settings = _settings.copyWith(catalogOrder: sanitized);
+      });
+    } else {
+      _settings = _settings.copyWith(catalogOrder: sanitized);
+    }
+    await _persist();
+  }
+
+  void _refreshFollowWindowCounts() {
+    if (!mounted || !_initialized) return;
+    final today = formatLocalYmd(DateTime.now());
+    final (projected, changed) = projectLedgerToInstances(
+      _instances,
+      _followLedger,
+      today,
+      windowHours: _settings.followWindowHours,
+    );
+    if (changed && mounted) {
+      setState(() {
+        _instances = projected;
+      });
+      unawaited(_persist());
+    }
+  }
+
+  Future<void> _updateFollowWindowHours(int hours) async {
+    final clamped = hours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final today = formatLocalYmd(DateTime.now());
+    final (projected, _) = projectLedgerToInstances(
+      _instances,
+      _followLedger,
+      today,
+      windowHours: clamped,
+    );
+    if (mounted) {
+      setState(() {
+        _settings = _settings.copyWith(followWindowHours: clamped);
+        _instances = projected;
+      });
+    } else {
+      _settings = _settings.copyWith(followWindowHours: clamped);
+      _instances = projected;
+    }
+    await _persist();
   }
 
   Future<void> _archiveInstances(List<ServiceInstance> removed) async {
@@ -1117,7 +1196,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!activate) {
         _showTimedSnackBar(
           SnackBar(
-            content: Text('新規タブで開きました（全$totalTabsタブ）'),
+            content: Text('裏タブで開きました（全$totalTabsタブ）'),
             duration: const Duration(milliseconds: 2500),
             action: SnackBarAction(
               label: '開く',
@@ -1590,8 +1669,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return '同期設定が変更されたため前回の同期結果を破棄しました';
       }
       _followLedger.mergeFrom(res.mergedLedger, today);
-      final (projected, _) =
-          projectLedgerToInstances(_instances, _followLedger, today);
+      final (projected, _) = projectLedgerToInstances(
+        _instances,
+        _followLedger,
+        today,
+        windowHours: _settings.followWindowHours,
+      );
       if (mounted) {
         setState(() {
           _instances = projected;
@@ -1675,13 +1758,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (idx == -1) return;
 
     final today = formatLocalYmd(DateTime.now());
+    final now = nowUnixSecs();
+    final winH = _settings.followWindowHours;
+    final cutoff = now > winH * 3600 ? now - winH * 3600 : 0;
+    final retentionCutoff =
+        now > maxEventRetentionSecs ? now - maxEventRetentionSecs : 0;
     final inst = _instances[idx];
     final prevHandle = inst.detectedHandle;
     final switchedAccount = prevHandle != null && prevHandle != norm;
-    final prevToday = inst.effectiveFollowCountToday();
-    final prevTotal = inst.followCountTotal;
-    final prevUfToday = inst.effectiveUnfollowCountToday();
-    final prevUfTotal = inst.unfollowCountTotal;
+    final prevFollowEvents = List<int>.from(inst.followEvents);
+    final prevUnfollowEvents = List<int>.from(inst.unfollowEvents);
 
     var uiChanged = false;
     var ledgerChanged = false;
@@ -1695,8 +1781,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         followCountTotal: switchedAccount ? 0 : null,
         unfollowCountToday: switchedAccount ? 0 : null,
         unfollowCountTotal: switchedAccount ? 0 : null,
+        followEvents: switchedAccount ? const [] : null,
+        unfollowEvents: switchedAccount ? const [] : null,
       );
       uiChanged = true;
+    }
+    if (isGenericAccountLabel(nextInst.accountLabel, prevHandle: prevHandle)) {
+      final autoLabel = '@$norm';
+      if (nextInst.accountLabel != autoLabel) {
+        nextInst = nextInst.copyWith(accountLabel: autoLabel);
+        uiChanged = true;
+      }
     }
     if (following != null && nextInst.snsFollowingCount != following) {
       nextInst = nextInst.copyWith(snsFollowingCount: following);
@@ -1709,7 +1804,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final key = makeAccountSyncKey(inst.serviceId, norm);
     if (key != null) {
-      final now = nowUnixSecs();
       final existed = _followLedger.accounts.containsKey(key);
       final acc = _followLedger.accounts.putIfAbsent(
         key,
@@ -1720,52 +1814,61 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       final devId = _followSyncSettings.deviceId;
       if (prevHandle == null &&
-          (prevToday > 0 ||
-              prevTotal > 0 ||
-              prevUfToday > 0 ||
-              prevUfTotal > 0) &&
+          (prevFollowEvents.isNotEmpty || prevUnfollowEvents.isNotEmpty) &&
           devId.isNotEmpty) {
-        final existingDev = acc.devices[devId];
-        if (existingDev == null) {
-          acc.devices[devId] = DeviceFollowEntry(
-            today: prevToday,
-            total: prevTotal,
+        final entry = acc.devices.putIfAbsent(
+          devId,
+          () => DeviceFollowEntry(
             todayEpoch: acc.resetEpoch,
             totalEpoch: acc.totalResetEpoch,
-            unfollowToday: prevUfToday,
-            unfollowTotal: prevUfTotal,
             unfollowTodayEpoch: acc.unfollowResetEpoch,
             unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
             updatedAt: now,
-          );
-        } else {
-          // 既に同一端末エントリがあってもハンドル検出前のローカル加算分を取りこぼさない
-          if (existingDev.todayEpoch < acc.resetEpoch) {
-            existingDev.today = 0;
-            existingDev.todayEpoch = acc.resetEpoch;
+          ),
+        );
+        for (final ts in prevFollowEvents) {
+          if (ts > acc.followResetAt && ts >= retentionCutoff) {
+            entry.followEvents.add(ts);
           }
-          if (existingDev.totalEpoch < acc.totalResetEpoch) {
-            existingDev.total = 0;
-            existingDev.totalEpoch = acc.totalResetEpoch;
-          }
-          if (existingDev.unfollowTodayEpoch < acc.unfollowResetEpoch) {
-            existingDev.unfollowToday = 0;
-            existingDev.unfollowTodayEpoch = acc.unfollowResetEpoch;
-          }
-          if (existingDev.unfollowTotalEpoch < acc.unfollowTotalResetEpoch) {
-            existingDev.unfollowTotal = 0;
-            existingDev.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
-          }
-          existingDev.today =
-              (existingDev.today + prevToday).clamp(-999999, 999999);
-          existingDev.total =
-              (existingDev.total + prevTotal).clamp(-99999999, 99999999);
-          existingDev.unfollowToday =
-              (existingDev.unfollowToday + prevUfToday).clamp(-999999, 999999);
-          existingDev.unfollowTotal = (existingDev.unfollowTotal + prevUfTotal)
-              .clamp(-99999999, 99999999);
-          existingDev.updatedAt = max(now, existingDev.updatedAt + 1);
         }
+        for (final ts in prevUnfollowEvents) {
+          if (ts > acc.unfollowResetAt && ts >= retentionCutoff) {
+            entry.unfollowEvents.add(ts);
+          }
+        }
+        entry.followEvents = pruneEventTimestamps(
+          entry.followEvents,
+          acc.followResetAt,
+          retentionCutoff,
+        );
+        entry.unfollowEvents = pruneEventTimestamps(
+          entry.unfollowEvents,
+          acc.unfollowResetAt,
+          retentionCutoff,
+        );
+        final fNet = (countEventsInWindow(
+                    entry.followEvents, acc.followResetAt, cutoff) -
+                countEventsInWindow(
+                    entry.followDeductions, acc.followResetAt, cutoff))
+            .clamp(-999999, 999999);
+        final uNet = (countEventsInWindow(
+                    entry.unfollowEvents, acc.unfollowResetAt, cutoff) -
+                countEventsInWindow(
+                    entry.unfollowDeductions, acc.unfollowResetAt, cutoff))
+            .clamp(-999999, 999999);
+        entry.today = fNet;
+        entry.total = fNet;
+        entry.todayEpoch = acc.resetEpoch;
+        entry.totalEpoch = acc.totalResetEpoch;
+        entry.unfollowToday = uNet;
+        entry.unfollowTotal = uNet;
+        entry.unfollowTodayEpoch = acc.unfollowResetEpoch;
+        entry.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
+        entry.updatedAt = max(now, entry.updatedAt + 1);
+        nextInst = nextInst.copyWith(
+          followEvents: const [],
+          unfollowEvents: const [],
+        );
         ledgerChanged = true;
       }
 
@@ -1781,8 +1884,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final updatedList = List<ServiceInstance>.from(_instances);
     updatedList[idx] = nextInst;
-    final (projected, projChanged) =
-        projectLedgerToInstances(updatedList, _followLedger, today);
+    final (projected, projChanged) = projectLedgerToInstances(
+      updatedList,
+      _followLedger,
+      today,
+      windowHours: winH,
+      nowSecs: now,
+    );
 
     if (uiChanged || projChanged || ledgerChanged) {
       if (mounted) {
@@ -1806,14 +1914,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (idx == -1) return '対象アカウントが見つかりません';
     if (trimmed.isEmpty) {
       // 旧アカウントの投影済みカウント・SNS実数が次のアカウントに混入しないようリセット
+      final cur = _instances[idx];
+      final clearAutoLabel = cur.detectedHandle != null &&
+          cur.accountLabel?.trim().replaceFirst(RegExp(r'^@+'), '').toLowerCase() ==
+              cur.detectedHandle!.toLowerCase();
       setState(() {
-        _instances[idx] = _instances[idx].copyWith(
+        _instances[idx] = cur.copyWith(
           clearDetectedHandle: true,
+          clearAccountLabel: clearAutoLabel,
           clearSnsStats: true,
           followCountToday: 0,
           followCountTotal: 0,
           unfollowCountToday: 0,
           unfollowCountTotal: 0,
+          followEvents: const [],
+          unfollowEvents: const [],
         );
       });
       await _persist();
@@ -1830,18 +1945,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _adjustFollowCount(String instanceId, int delta) async {
     final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
     if (idx == -1) return;
-    final today = formatLocalYmd(DateTime.now());
+    final nowDt = DateTime.now();
+    final today = formatLocalYmd(nowDt);
+    final now = nowDt.millisecondsSinceEpoch ~/ 1000;
+    final winH = _settings.followWindowHours;
+    final cutoff = now > winH * 3600 ? now - winH * 3600 : 0;
+    final retentionCutoff =
+        now > maxEventRetentionSecs ? now - maxEventRetentionSecs : 0;
     final inst = _instances[idx];
     final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
 
     if (syncKey != null && _followSyncSettings.deviceId.isNotEmpty) {
       final devId = _followSyncSettings.deviceId;
-      final now = nowUnixSecs();
-      final prevToday = inst.effectiveFollowCountToday();
-      final prevTotal = inst.followCountTotal;
-      final prevUfToday = inst.effectiveUnfollowCountToday();
-      final prevUfTotal = inst.unfollowCountTotal;
-
       final acc = _followLedger.accounts.putIfAbsent(
         syncKey,
         () => AccountFollowLedger(date: today),
@@ -1849,46 +1964,77 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       acc.rollDate(today);
 
       if (!acc.devices.containsKey(devId)) {
-        final seed = acc.devices.isEmpty &&
-            (prevToday > 0 ||
-                prevTotal > 0 ||
-                prevUfToday > 0 ||
-                prevUfTotal > 0);
+        final seedF = acc.devices.isEmpty
+            ? pruneEventTimestamps(
+                inst.followEvents, acc.followResetAt, retentionCutoff)
+            : <int>[];
+        final seedU = acc.devices.isEmpty
+            ? pruneEventTimestamps(
+                inst.unfollowEvents, acc.unfollowResetAt, retentionCutoff)
+            : <int>[];
+        final fCnt = countEventsInWindow(seedF, acc.followResetAt, cutoff);
+        final uCnt = countEventsInWindow(seedU, acc.unfollowResetAt, cutoff);
         acc.devices[devId] = DeviceFollowEntry(
-          today: seed ? prevToday : 0,
-          total: seed ? prevTotal : 0,
+          today: fCnt,
+          total: fCnt,
           todayEpoch: acc.resetEpoch,
           totalEpoch: acc.totalResetEpoch,
-          unfollowToday: seed ? prevUfToday : 0,
-          unfollowTotal: seed ? prevUfTotal : 0,
+          unfollowToday: uCnt,
+          unfollowTotal: uCnt,
           unfollowTodayEpoch: acc.unfollowResetEpoch,
           unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
+          followEvents: seedF,
+          unfollowEvents: seedU,
           updatedAt: now,
         );
       }
 
-      final (curToday, curTotal) = acc.effectiveCounts(today);
+      final curEffective = acc.effectiveWindowFollowCount(now, winH);
       final entry = acc.devices[devId]!;
-      if (entry.todayEpoch < acc.resetEpoch) {
-        entry.today = 0;
-        entry.todayEpoch = acc.resetEpoch;
+      if (entry.followEvents.isEmpty &&
+          entry.followDeductions.isEmpty &&
+          entry.today > 0 &&
+          entry.todayEpoch >= acc.resetEpoch &&
+          entry.updatedAt > acc.followResetAt &&
+          entry.updatedAt >= cutoff) {
+        final seedTs = entry.updatedAt > acc.followResetAt
+            ? entry.updatedAt
+            : acc.followResetAt + 1;
+        entry.followEvents =
+            List<int>.filled(entry.today > 1000 ? 1000 : entry.today, seedTs);
       }
-      if (entry.totalEpoch < acc.totalResetEpoch) {
-        entry.total = 0;
-        entry.totalEpoch = acc.totalResetEpoch;
-      }
-      if (delta >= 0) {
-        entry.today += delta;
-        entry.total += delta;
-      } else {
-        final absDelta = -delta;
-        entry.today -= min(absDelta, curToday);
-        entry.total -= min(absDelta, curTotal);
-      }
+      applyWindowDelta(
+        events: entry.followEvents,
+        deductions: entry.followDeductions,
+        resetAt: acc.followResetAt,
+        now: now,
+        cutoff: cutoff,
+        curEffective: curEffective,
+        delta: delta,
+      );
+      final devNet = (countEventsInWindow(
+                  entry.followEvents, acc.followResetAt, cutoff) -
+              countEventsInWindow(
+                  entry.followDeductions, acc.followResetAt, cutoff))
+          .clamp(-999999, 999999);
+      entry.today = devNet;
+      entry.total = devNet;
+      entry.todayEpoch = acc.resetEpoch;
+      entry.totalEpoch = acc.totalResetEpoch;
       entry.updatedAt = max(now, entry.updatedAt + 1);
 
-      final (projected, _) =
-          projectLedgerToInstances(_instances, _followLedger, today);
+      final updatedList = List<ServiceInstance>.from(_instances);
+      updatedList[idx] = updatedList[idx].copyWith(
+        followEvents: const [],
+        unfollowEvents: const [],
+      );
+      final (projected, _) = projectLedgerToInstances(
+        updatedList,
+        _followLedger,
+        today,
+        windowHours: winH,
+        nowSecs: now,
+      );
       if (mounted) {
         setState(() {
           _instances = projected;
@@ -1901,7 +2047,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (mounted) {
       setState(() {
-        _instances[idx] = _instances[idx].withFollowDelta(delta);
+        _instances[idx] = _instances[idx].withFollowWindowDelta(
+          delta,
+          windowHours: winH,
+          now: nowDt,
+        );
       });
     }
     await _persist();
@@ -1913,60 +2063,68 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }) async {
     final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
     if (idx == -1) return;
-    final today = formatLocalYmd(DateTime.now());
+    final nowDt = DateTime.now();
+    final today = formatLocalYmd(nowDt);
+    final now = nowDt.millisecondsSinceEpoch ~/ 1000;
+    final winH = _settings.followWindowHours;
+    final cutoff = now > winH * 3600 ? now - winH * 3600 : 0;
+    final retentionCutoff =
+        now > maxEventRetentionSecs ? now - maxEventRetentionSecs : 0;
     final inst = _instances[idx];
     final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
 
     if (syncKey != null) {
       final devId = _followSyncSettings.deviceId;
-      final now = nowUnixSecs();
-      final prevToday = inst.effectiveFollowCountToday();
-      final prevTotal = inst.followCountTotal;
-      final prevUfToday = inst.effectiveUnfollowCountToday();
-      final prevUfTotal = inst.unfollowCountTotal;
       final acc = _followLedger.accounts.putIfAbsent(
         syncKey,
         () => AccountFollowLedger(date: today),
       );
       acc.rollDate(today);
-      // 部分リセット（今日のみリセット）で既存累計を失わないよう未シードなら先に反映
       if (devId.isNotEmpty &&
           acc.devices.isEmpty &&
-          (prevToday > 0 ||
-              prevTotal > 0 ||
-              prevUfToday > 0 ||
-              prevUfTotal > 0)) {
+          inst.unfollowEvents.isNotEmpty) {
+        final seedU = pruneEventTimestamps(
+          inst.unfollowEvents,
+          acc.unfollowResetAt,
+          retentionCutoff,
+        );
+        final uCnt = countEventsInWindow(seedU, acc.unfollowResetAt, cutoff);
         acc.devices[devId] = DeviceFollowEntry(
-          today: prevToday,
-          total: prevTotal,
           todayEpoch: acc.resetEpoch,
           totalEpoch: acc.totalResetEpoch,
-          unfollowToday: prevUfToday,
-          unfollowTotal: prevUfTotal,
+          unfollowToday: uCnt,
+          unfollowTotal: uCnt,
           unfollowTodayEpoch: acc.unfollowResetEpoch,
           unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
+          unfollowEvents: seedU,
           updatedAt: now,
         );
       }
-      // エポックのみ更新し、他端末エントリの updatedAt は絶対に書き換えない（並行更新の上書き防止）
+      final resetAt = max(now, acc.maxFollowEventTs());
+      acc.followResetAt = resetAt;
       acc.resetEpoch += 1;
-      if (resetTotal) {
-        acc.totalResetEpoch += 1;
-      }
+      acc.totalResetEpoch += 1;
       if (devId.isNotEmpty) {
         final local = acc.devices[devId];
         if (local != null) {
+          local.followEvents.removeWhere((t) => t <= resetAt);
+          local.followDeductions.removeWhere((t) => t <= resetAt);
           local.today = 0;
+          local.total = 0;
           local.todayEpoch = acc.resetEpoch;
-          if (resetTotal) {
-            local.total = 0;
-            local.totalEpoch = acc.totalResetEpoch;
-          }
+          local.totalEpoch = acc.totalResetEpoch;
           local.updatedAt = max(now, local.updatedAt + 1);
         }
       }
-      final (projected, _) =
-          projectLedgerToInstances(_instances, _followLedger, today);
+      final updatedList = List<ServiceInstance>.from(_instances);
+      updatedList[idx] = updatedList[idx].copyWith(followEvents: const []);
+      final (projected, _) = projectLedgerToInstances(
+        updatedList,
+        _followLedger,
+        today,
+        windowHours: winH,
+        nowSecs: now,
+      );
       if (mounted) {
         setState(() {
           _instances = projected;
@@ -1979,8 +2137,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (mounted) {
       setState(() {
-        _instances[idx] =
-            _instances[idx].withFollowReset(resetTotal: resetTotal);
+        _instances[idx] = _instances[idx].withFollowWindowReset(
+          windowHours: winH,
+          now: nowDt,
+        );
       });
     }
     await _persist();
@@ -1989,18 +2149,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _adjustUnfollowCount(String instanceId, int delta) async {
     final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
     if (idx == -1) return;
-    final today = formatLocalYmd(DateTime.now());
+    final nowDt = DateTime.now();
+    final today = formatLocalYmd(nowDt);
+    final now = nowDt.millisecondsSinceEpoch ~/ 1000;
+    final winH = _settings.followWindowHours;
+    final cutoff = now > winH * 3600 ? now - winH * 3600 : 0;
+    final retentionCutoff =
+        now > maxEventRetentionSecs ? now - maxEventRetentionSecs : 0;
     final inst = _instances[idx];
     final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
 
     if (syncKey != null && _followSyncSettings.deviceId.isNotEmpty) {
       final devId = _followSyncSettings.deviceId;
-      final now = nowUnixSecs();
-      final prevToday = inst.effectiveFollowCountToday();
-      final prevTotal = inst.followCountTotal;
-      final prevUfToday = inst.effectiveUnfollowCountToday();
-      final prevUfTotal = inst.unfollowCountTotal;
-
       final acc = _followLedger.accounts.putIfAbsent(
         syncKey,
         () => AccountFollowLedger(date: today),
@@ -2008,46 +2168,79 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       acc.rollDate(today);
 
       if (!acc.devices.containsKey(devId)) {
-        final seed = acc.devices.isEmpty &&
-            (prevToday > 0 ||
-                prevTotal > 0 ||
-                prevUfToday > 0 ||
-                prevUfTotal > 0);
+        final seedF = acc.devices.isEmpty
+            ? pruneEventTimestamps(
+                inst.followEvents, acc.followResetAt, retentionCutoff)
+            : <int>[];
+        final seedU = acc.devices.isEmpty
+            ? pruneEventTimestamps(
+                inst.unfollowEvents, acc.unfollowResetAt, retentionCutoff)
+            : <int>[];
+        final fCnt = countEventsInWindow(seedF, acc.followResetAt, cutoff);
+        final uCnt = countEventsInWindow(seedU, acc.unfollowResetAt, cutoff);
         acc.devices[devId] = DeviceFollowEntry(
-          today: seed ? prevToday : 0,
-          total: seed ? prevTotal : 0,
+          today: fCnt,
+          total: fCnt,
           todayEpoch: acc.resetEpoch,
           totalEpoch: acc.totalResetEpoch,
-          unfollowToday: seed ? prevUfToday : 0,
-          unfollowTotal: seed ? prevUfTotal : 0,
+          unfollowToday: uCnt,
+          unfollowTotal: uCnt,
           unfollowTodayEpoch: acc.unfollowResetEpoch,
           unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
+          followEvents: seedF,
+          unfollowEvents: seedU,
           updatedAt: now,
         );
       }
 
-      final (curToday, curTotal) = acc.effectiveUnfollowCounts(today);
+      final curEffective = acc.effectiveWindowUnfollowCount(now, winH);
       final entry = acc.devices[devId]!;
-      if (entry.unfollowTodayEpoch < acc.unfollowResetEpoch) {
-        entry.unfollowToday = 0;
-        entry.unfollowTodayEpoch = acc.unfollowResetEpoch;
+      if (entry.unfollowEvents.isEmpty &&
+          entry.unfollowDeductions.isEmpty &&
+          entry.unfollowToday > 0 &&
+          entry.unfollowTodayEpoch >= acc.unfollowResetEpoch &&
+          entry.updatedAt > acc.unfollowResetAt &&
+          entry.updatedAt >= cutoff) {
+        final seedTs = entry.updatedAt > acc.unfollowResetAt
+            ? entry.updatedAt
+            : acc.unfollowResetAt + 1;
+        entry.unfollowEvents = List<int>.filled(
+          entry.unfollowToday > 1000 ? 1000 : entry.unfollowToday,
+          seedTs,
+        );
       }
-      if (entry.unfollowTotalEpoch < acc.unfollowTotalResetEpoch) {
-        entry.unfollowTotal = 0;
-        entry.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
-      }
-      if (delta >= 0) {
-        entry.unfollowToday += delta;
-        entry.unfollowTotal += delta;
-      } else {
-        final absDelta = -delta;
-        entry.unfollowToday -= min(absDelta, curToday);
-        entry.unfollowTotal -= min(absDelta, curTotal);
-      }
+      applyWindowDelta(
+        events: entry.unfollowEvents,
+        deductions: entry.unfollowDeductions,
+        resetAt: acc.unfollowResetAt,
+        now: now,
+        cutoff: cutoff,
+        curEffective: curEffective,
+        delta: delta,
+      );
+      final devNet = (countEventsInWindow(
+                  entry.unfollowEvents, acc.unfollowResetAt, cutoff) -
+              countEventsInWindow(
+                  entry.unfollowDeductions, acc.unfollowResetAt, cutoff))
+          .clamp(-999999, 999999);
+      entry.unfollowToday = devNet;
+      entry.unfollowTotal = devNet;
+      entry.unfollowTodayEpoch = acc.unfollowResetEpoch;
+      entry.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
       entry.updatedAt = max(now, entry.updatedAt + 1);
 
-      final (projected, _) =
-          projectLedgerToInstances(_instances, _followLedger, today);
+      final updatedList = List<ServiceInstance>.from(_instances);
+      updatedList[idx] = updatedList[idx].copyWith(
+        followEvents: const [],
+        unfollowEvents: const [],
+      );
+      final (projected, _) = projectLedgerToInstances(
+        updatedList,
+        _followLedger,
+        today,
+        windowHours: winH,
+        nowSecs: now,
+      );
       if (mounted) {
         setState(() {
           _instances = projected;
@@ -2060,7 +2253,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (mounted) {
       setState(() {
-        _instances[idx] = _instances[idx].withUnfollowDelta(delta);
+        _instances[idx] = _instances[idx].withUnfollowWindowDelta(
+          delta,
+          windowHours: winH,
+          now: nowDt,
+        );
       });
     }
     await _persist();
@@ -2072,17 +2269,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }) async {
     final idx = _instances.indexWhere((i) => i.instanceId == instanceId);
     if (idx == -1) return;
-    final today = formatLocalYmd(DateTime.now());
+    final nowDt = DateTime.now();
+    final today = formatLocalYmd(nowDt);
+    final now = nowDt.millisecondsSinceEpoch ~/ 1000;
+    final winH = _settings.followWindowHours;
+    final cutoff = now > winH * 3600 ? now - winH * 3600 : 0;
+    final retentionCutoff =
+        now > maxEventRetentionSecs ? now - maxEventRetentionSecs : 0;
     final inst = _instances[idx];
     final syncKey = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
 
     if (syncKey != null) {
       final devId = _followSyncSettings.deviceId;
-      final now = nowUnixSecs();
-      final prevToday = inst.effectiveFollowCountToday();
-      final prevTotal = inst.followCountTotal;
-      final prevUfToday = inst.effectiveUnfollowCountToday();
-      final prevUfTotal = inst.unfollowCountTotal;
       final acc = _followLedger.accounts.putIfAbsent(
         syncKey,
         () => AccountFollowLedger(date: today),
@@ -2090,41 +2288,49 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       acc.rollDate(today);
       if (devId.isNotEmpty &&
           acc.devices.isEmpty &&
-          (prevToday > 0 ||
-              prevTotal > 0 ||
-              prevUfToday > 0 ||
-              prevUfTotal > 0)) {
+          inst.followEvents.isNotEmpty) {
+        final seedF = pruneEventTimestamps(
+          inst.followEvents,
+          acc.followResetAt,
+          retentionCutoff,
+        );
+        final fCnt = countEventsInWindow(seedF, acc.followResetAt, cutoff);
         acc.devices[devId] = DeviceFollowEntry(
-          today: prevToday,
-          total: prevTotal,
+          today: fCnt,
+          total: fCnt,
           todayEpoch: acc.resetEpoch,
           totalEpoch: acc.totalResetEpoch,
-          unfollowToday: prevUfToday,
-          unfollowTotal: prevUfTotal,
           unfollowTodayEpoch: acc.unfollowResetEpoch,
           unfollowTotalEpoch: acc.unfollowTotalResetEpoch,
+          followEvents: seedF,
           updatedAt: now,
         );
       }
-      // エポックのみ更新し、他端末エントリの updatedAt は書き換えない
+      final resetAt = max(now, acc.maxUnfollowEventTs());
+      acc.unfollowResetAt = resetAt;
       acc.unfollowResetEpoch += 1;
-      if (resetTotal) {
-        acc.unfollowTotalResetEpoch += 1;
-      }
+      acc.unfollowTotalResetEpoch += 1;
       if (devId.isNotEmpty) {
         final local = acc.devices[devId];
         if (local != null) {
+          local.unfollowEvents.removeWhere((t) => t <= resetAt);
+          local.unfollowDeductions.removeWhere((t) => t <= resetAt);
           local.unfollowToday = 0;
+          local.unfollowTotal = 0;
           local.unfollowTodayEpoch = acc.unfollowResetEpoch;
-          if (resetTotal) {
-            local.unfollowTotal = 0;
-            local.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
-          }
+          local.unfollowTotalEpoch = acc.unfollowTotalResetEpoch;
           local.updatedAt = max(now, local.updatedAt + 1);
         }
       }
-      final (projected, _) =
-          projectLedgerToInstances(_instances, _followLedger, today);
+      final updatedList = List<ServiceInstance>.from(_instances);
+      updatedList[idx] = updatedList[idx].copyWith(unfollowEvents: const []);
+      final (projected, _) = projectLedgerToInstances(
+        updatedList,
+        _followLedger,
+        today,
+        windowHours: winH,
+        nowSecs: now,
+      );
       if (mounted) {
         setState(() {
           _instances = projected;
@@ -2137,8 +2343,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (mounted) {
       setState(() {
-        _instances[idx] =
-            _instances[idx].withUnfollowReset(resetTotal: resetTotal);
+        _instances[idx] = _instances[idx].withUnfollowWindowReset(
+          windowHours: winH,
+          now: nowDt,
+        );
       });
     }
     await _persist();
@@ -2198,6 +2406,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     ServiceInstance target, {
     String? crossSiteSourceName,
   }) async {
+    _refreshFollowWindowCounts();
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -2208,6 +2417,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         getInstances: () => _instances,
         getServiceGroups: () => _serviceGroups,
         getFollowSyncSettings: () => _followSyncSettings,
+        getFollowWindowHours: () => _settings.followWindowHours,
+        onChangeFollowWindowHours: _updateFollowWindowHours,
         formatSyncClock: _formatSyncClock,
         onAdjustFollow: _adjustFollowCount,
         onResetFollow: (id, resetTotal) =>
@@ -2451,6 +2662,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           followCountTotal: 0,
           unfollowCountToday: 0,
           unfollowCountTotal: 0,
+          followEvents: const [],
+          unfollowEvents: const [],
         );
       }).toList();
     });
@@ -2475,6 +2688,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           multiProfileSupported: _multiProfileSupported,
           archivedInstances: _archivedInstances,
           initialCategory: initialCategory,
+          catalogOrder: _settings.catalogOrder,
+          onCatalogOrderChanged: _updateCatalogOrder,
+          onRenameArchived: _renameArchivedInstance,
           onPurgeArchived: _purgeArchivedInstance,
           onPurgeAllArchived: _purgeAllArchivedInstances,
         ),
@@ -2574,6 +2790,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       followCountTotal: 0,
                       unfollowCountToday: 0,
                       unfollowCountTotal: 0,
+                      followEvents: const [],
+                      unfollowEvents: const [],
                     ),
                   )
                   .toList();
@@ -2777,7 +2995,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _stepActiveSubTab(1);
       case 'new-tab':
         if (active != null && !_isGmailOpen) {
-          _openUrlInNewSubTab(active, active.url, activate: true);
+          _openUrlInNewSubTab(active, active.url, activate: false);
         }
       case 'close-tab':
         if (active != null && !_isGmailOpen) {
@@ -3391,10 +3609,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           () {
                             final resolved = _resolveCounterTarget(active);
                             final counterInst = resolved.target;
-                            final fCount =
-                                counterInst?.effectiveFollowCountToday() ?? 0;
-                            final ufCount =
-                                counterInst?.effectiveUnfollowCountToday() ?? 0;
+                            final winH = _settings.followWindowHours;
+                            final fCount = counterInst
+                                    ?.effectiveFollowCountInWindow(winH) ??
+                                0;
+                            final ufCount = counterInst
+                                    ?.effectiveUnfollowCountInWindow(winH) ??
+                                0;
                             final prefix = resolved.isCrossSite &&
                                     resolved.effectiveService != null
                                 ? '${_serviceDisplayName(resolved.effectiveService!)} '
@@ -3403,8 +3624,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               value: 'follow-counter',
                               child: Text(
                                 ufCount > 0
-                                    ? '$prefixフォロー/解除 (今日 +$fCount / -$ufCount)'
-                                    : '$prefixフォロー/解除 (今日 $fCount回)',
+                                    ? '$prefixフォロー/解除 (直近${winH}h +$fCount / -$ufCount)'
+                                    : '$prefixフォロー/解除 (直近${winH}h $fCount回)',
                               ),
                             );
                           }(),
@@ -3513,8 +3734,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final resolvedCounter =
         active != null ? _resolveCounterTarget(active) : null;
     final counterTarget = resolvedCounter?.target;
-    final todayFollows = counterTarget?.effectiveFollowCountToday() ?? 0;
-    final todayUnfollows = counterTarget?.effectiveUnfollowCountToday() ?? 0;
+    final winH = _settings.followWindowHours;
+    final todayFollows =
+        counterTarget?.effectiveFollowCountInWindow(winH) ?? 0;
+    final todayUnfollows =
+        counterTarget?.effectiveUnfollowCountInWindow(winH) ?? 0;
     final hasAnyToday = todayFollows > 0 || todayUnfollows > 0;
     final crossSiteBadge = resolvedCounter != null &&
             resolvedCounter.isCrossSite &&
@@ -3644,8 +3868,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     const SizedBox(width: 4),
                     Tooltip(
                       message: todayUnfollows > 0
-                          ? 'フォロー $todayFollows / 解除 $todayUnfollows'
-                          : 'フォロー $todayFollows',
+                          ? '直近$winH時間 · フォロー $todayFollows / 解除 $todayUnfollows'
+                          : '直近$winH時間 · フォロー $todayFollows',
                       child: InkWell(
                         key: const ValueKey('follow-counter-chip'),
                         borderRadius: BorderRadius.circular(99),
@@ -3900,9 +4124,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final colorScheme = Theme.of(context).colorScheme;
     final resolvedCounter = _resolveCounterTarget(active);
     final counterTarget = resolvedCounter.target;
-    final todayFollows = counterTarget?.effectiveFollowCountToday() ?? 0;
-    final todayUnfollows = counterTarget?.effectiveUnfollowCountToday() ?? 0;
-    final hasAnyToday = todayFollows > 0 || todayUnfollows > 0;
+    final winH = _settings.followWindowHours;
+    final windowFollows = counterTarget?.effectiveFollowCountInWindow(winH) ?? 0;
+    final windowUnfollows =
+        counterTarget?.effectiveUnfollowCountInWindow(winH) ?? 0;
+    final hasAnyWindow = windowFollows > 0 || windowUnfollows > 0;
     final crossSitePrefix = resolvedCounter.isCrossSite && counterTarget != null
         ? '${counterTarget.badge} '
         : '';
@@ -4112,9 +4338,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Padding(
               padding: const EdgeInsets.fromLTRB(2, 5, 8, 5),
               child: Tooltip(
-                message: todayUnfollows > 0
-                    ? '$crossSitePrefixフォロー $todayFollows / 解除 $todayUnfollows'
-                    : '$crossSitePrefixフォロー $todayFollows',
+                message: windowUnfollows > 0
+                    ? '$crossSitePrefix直近$winH時間 · フォロー $windowFollows / 解除 $windowUnfollows'
+                    : '$crossSitePrefix直近$winH時間 · フォロー $windowFollows',
                 child: InkWell(
                   key: const ValueKey('follow-counter-chip'),
                   borderRadius: BorderRadius.circular(99),
@@ -4135,12 +4361,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     padding: const EdgeInsets.symmetric(horizontal: 6),
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: hasAnyToday
+                      color: hasAnyWindow
                           ? colorScheme.tertiaryContainer
                           : colorScheme.surface,
                       borderRadius: BorderRadius.circular(99),
                       border: Border.all(
-                        color: hasAnyToday
+                        color: hasAnyWindow
                             ? colorScheme.tertiary
                             : colorScheme.outlineVariant,
                       ),
@@ -4151,19 +4377,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         Icon(
                           Icons.person_add_alt_1_rounded,
                           size: 13,
-                          color: hasAnyToday
+                          color: hasAnyWindow
                               ? colorScheme.onTertiaryContainer
                               : colorScheme.onSurfaceVariant,
                         ),
                         const SizedBox(width: 3),
                         Text(
-                          todayUnfollows > 0
-                              ? '$crossSitePrefix$todayFollows/-$todayUnfollows'
-                              : '$crossSitePrefix$todayFollows',
+                          windowUnfollows > 0
+                              ? '$crossSitePrefix$windowFollows/-$windowUnfollows'
+                              : '$crossSitePrefix$windowFollows',
                           style: TextStyle(
                             fontSize: 10.5,
                             fontWeight: FontWeight.w700,
-                            color: hasAnyToday
+                            color: hasAnyWindow
                                 ? colorScheme.onTertiaryContainer
                                 : colorScheme.onSurfaceVariant,
                           ),
@@ -4697,7 +4923,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                         Text(
-                          'Android · v1.8.2',
+                          'Android · v1.8.5',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],
@@ -4881,6 +5107,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   _buildSubTabPill(
                     label: mainTitle,
                     selected: activeTid == null,
+                    isLoading: mainRt?.isLoading == true,
                     onTap: () {
                       setState(() => _activeSubTabId.remove(active.instanceId));
                       _syncActiveWebViews();
@@ -4892,6 +5119,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ? '新しいタブ'
                           : sub.runtime.title,
                       selected: activeTid == sub.tabId,
+                      isLoading: sub.runtime.isLoading,
                       onTap: () {
                         setState(
                           () => _activeSubTabId[active.instanceId] = sub.tabId,
@@ -4909,9 +5137,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               visualDensity: VisualDensity.compact,
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-              tooltip: '新しいタブを開く',
+              tooltip: '裏タブで新しいタブを開く',
               onPressed: () =>
-                  _openUrlInNewSubTab(active, active.url, activate: true),
+                  _openUrlInNewSubTab(active, active.url, activate: false),
             ),
           ],
         ),
@@ -4922,6 +5150,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget _buildSubTabPill({
     required String label,
     required bool selected,
+    bool isLoading = false,
     required VoidCallback onTap,
     VoidCallback? onClose,
   }) {
@@ -4949,6 +5178,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (isLoading) ...[
+                SizedBox(
+                  width: 10,
+                  height: 10,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5,
+                    color: selected
+                        ? colorScheme.onPrimaryContainer
+                        : colorScheme.primary,
+                  ),
+                ),
+                const SizedBox(width: 5),
+              ],
               Flexible(
                 child: Text(
                   label,
@@ -5384,6 +5626,8 @@ class _FollowCounterSheet extends StatefulWidget {
     required this.getInstances,
     required this.getServiceGroups,
     required this.getFollowSyncSettings,
+    required this.getFollowWindowHours,
+    required this.onChangeFollowWindowHours,
     required this.formatSyncClock,
     required this.onAdjustFollow,
     required this.onResetFollow,
@@ -5402,6 +5646,8 @@ class _FollowCounterSheet extends StatefulWidget {
   final List<ServiceInstance> Function() getInstances;
   final List<_ServiceGroup> Function() getServiceGroups;
   final FollowSyncSettings Function() getFollowSyncSettings;
+  final int Function() getFollowWindowHours;
+  final Future<void> Function(int hours) onChangeFollowWindowHours;
   final String Function(int? unixSecs) formatSyncClock;
   final Future<void> Function(String instanceId, int delta) onAdjustFollow;
   final Future<void> Function(String instanceId, bool resetTotal) onResetFollow;
@@ -5426,6 +5672,7 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
   late final TextEditingController _handleCtrl;
   late final TextEditingController _tokenCtrl;
   late final TextEditingController _gistCtrl;
+  late final TextEditingController _windowHoursCtrl;
   bool _isSyncing = false;
 
   @override
@@ -5439,6 +5686,8 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
     _handleCtrl = TextEditingController(text: initial?.detectedHandle ?? '');
     _tokenCtrl = TextEditingController(text: fs.githubToken);
     _gistCtrl = TextEditingController(text: fs.gistId);
+    _windowHoursCtrl =
+        TextEditingController(text: '${widget.getFollowWindowHours()}');
   }
 
   @override
@@ -5446,7 +5695,15 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
     _handleCtrl.dispose();
     _tokenCtrl.dispose();
     _gistCtrl.dispose();
+    _windowHoursCtrl.dispose();
     super.dispose();
+  }
+
+  Future<void> _applyWindowHours(int hours) async {
+    final clamped = hours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    _windowHoursCtrl.text = '$clamped';
+    await widget.onChangeFollowWindowHours(clamped);
+    if (mounted) setState(() {});
   }
 
   @override
@@ -5477,7 +5734,8 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
     final baseTitle = widget.multiProfileSupported
         ? '${grp?.displayName ?? current.name} · $accLabel'
         : (grp?.displayName ?? current.name);
-    final withHandle = current.detectedHandle != null
+    final withHandle = current.detectedHandle != null &&
+            !baseTitle.contains('@${current.detectedHandle}')
         ? '$baseTitle (@${current.detectedHandle})'
         : baseTitle;
     final title = widget.crossSiteSourceName != null
@@ -5485,15 +5743,15 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
         : withHandle;
 
     final now = DateTime.now();
-    final todayCount = current.effectiveFollowCountToday(now);
-    final totalCount = current.followCountTotal;
-    final unfollowTodayCount = current.effectiveUnfollowCountToday(now);
-    final unfollowTotalCount = current.unfollowCountTotal;
-    var allTodaySum = 0;
-    var allUnfollowTodaySum = 0;
+    final windowHours = widget.getFollowWindowHours();
+    final followCount = current.effectiveFollowCountInWindow(windowHours, now);
+    final unfollowCount =
+        current.effectiveUnfollowCountInWindow(windowHours, now);
+    var allFollowSum = 0;
+    var allUnfollowSum = 0;
     for (final inst in instances) {
-      allTodaySum += inst.effectiveFollowCountToday(now);
-      allUnfollowTodaySum += inst.effectiveUnfollowCountToday(now);
+      allFollowSum += inst.effectiveFollowCountInWindow(windowHours, now);
+      allUnfollowSum += inst.effectiveUnfollowCountInWindow(windowHours, now);
     }
     final colorScheme = Theme.of(context).colorScheme;
     final fs = widget.getFollowSyncSettings();
@@ -5560,12 +5818,96 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
                   ),
                 ],
               ),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: colorScheme.surfaceContainerLow,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: colorScheme.outlineVariant),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '集計時間（指定時間内のフォロー・解除数を集計）',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 4,
+                      children: [
+                        for (final h in const [1, 3, 6, 12, 24])
+                          ChoiceChip(
+                            key: ValueKey('follow-window-preset-$h'),
+                            label: Text('$h時間', style: const TextStyle(fontSize: 11.5)),
+                            visualDensity: VisualDensity.compact,
+                            selected: windowHours == h,
+                            onSelected: (_) => _applyWindowHours(h),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Text('自由指定: 直近', style: TextStyle(fontSize: 12)),
+                        const SizedBox(width: 6),
+                        SizedBox(
+                          width: 66,
+                          child: TextField(
+                            key: const ValueKey('follow-window-hours-input'),
+                            controller: _windowHoursCtrl,
+                            keyboardType: TextInputType.number,
+                            textAlign: TextAlign.center,
+                            decoration: const InputDecoration(
+                              isDense: true,
+                              contentPadding: EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 6,
+                              ),
+                              border: OutlineInputBorder(),
+                            ),
+                            style: const TextStyle(fontSize: 13),
+                            onSubmitted: (v) {
+                              final parsed = int.tryParse(v.trim());
+                              if (parsed != null) _applyWindowHours(parsed);
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        const Text('時間', style: TextStyle(fontSize: 12)),
+                        const SizedBox(width: 8),
+                        OutlinedButton(
+                          key: const ValueKey('follow-window-apply'),
+                          style: OutlinedButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                          ),
+                          onPressed: () {
+                            final parsed =
+                                int.tryParse(_windowHoursCtrl.text.trim());
+                            if (parsed != null) {
+                              _applyWindowHours(parsed);
+                            }
+                          },
+                          child: const Text('適用', style: TextStyle(fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
               const SizedBox(height: 10),
               Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Expanded(
                     child: Container(
-                      padding: const EdgeInsets.all(12),
+                      padding: const EdgeInsets.all(10),
                       decoration: BoxDecoration(
                         color: colorScheme.primaryContainer
                             .withValues(alpha: 0.45),
@@ -5576,19 +5918,79 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
                       ),
                       child: Column(
                         children: [
-                          const Text(
-                            '今日のフォロー数',
-                            style: TextStyle(fontSize: 11.5),
+                          Text(
+                            '直近$windowHours時間のフォロー',
+                            style: const TextStyle(fontSize: 11),
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '$todayCount',
+                            '$followCount',
                             key: const ValueKey('follow-sheet-today'),
                             style: TextStyle(
                               fontSize: 28,
                               fontWeight: FontWeight.w800,
                               color: colorScheme.primary,
                             ),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton(
+                                  key: const ValueKey('follow-sheet-dec'),
+                                  style: OutlinedButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  ),
+                                  onPressed: followCount > 0
+                                      ? () async {
+                                          await widget.onAdjustFollow(
+                                            current.instanceId,
+                                            -1,
+                                          );
+                                          if (mounted) setState(() {});
+                                        }
+                                      : null,
+                                  child: const Text('−1'),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: FilledButton.tonal(
+                                  key: const ValueKey('follow-sheet-inc'),
+                                  style: FilledButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  ),
+                                  onPressed: () async {
+                                    await widget.onAdjustFollow(
+                                      current.instanceId,
+                                      1,
+                                    );
+                                    if (mounted) setState(() {});
+                                  },
+                                  child: const Text('＋1'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          TextButton(
+                            style: TextButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              minimumSize: const Size(0, 28),
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: followCount > 0
+                                ? () async {
+                                    await widget.onResetFollow(
+                                      current.instanceId,
+                                      false,
+                                    );
+                                    if (mounted) setState(() {});
+                                  }
+                                : null,
+                            child: const Text('リセット', style: TextStyle(fontSize: 12)),
                           ),
                         ],
                       ),
@@ -5597,29 +5999,94 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: Container(
-                      padding: const EdgeInsets.all(12),
+                      padding: const EdgeInsets.all(10),
                       decoration: BoxDecoration(
-                        color: colorScheme.surfaceContainerHighest
-                            .withValues(alpha: 0.6),
+                        color: Colors.redAccent.withValues(alpha: 0.12),
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(
-                          color: colorScheme.outlineVariant,
+                          color: Colors.redAccent.withValues(alpha: 0.45),
                         ),
                       ),
                       child: Column(
                         children: [
-                          const Text(
-                            '累計フォロー数',
-                            style: TextStyle(fontSize: 11.5),
+                          Text(
+                            '直近$windowHours時間の解除',
+                            style: const TextStyle(fontSize: 11),
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            '$totalCount',
-                            key: const ValueKey('follow-sheet-total'),
+                            '$unfollowCount',
+                            key: const ValueKey('unfollow-sheet-today'),
                             style: const TextStyle(
                               fontSize: 28,
                               fontWeight: FontWeight.w800,
+                              color: Colors.redAccent,
                             ),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton(
+                                  key: const ValueKey('unfollow-sheet-dec'),
+                                  style: OutlinedButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  ),
+                                  onPressed: unfollowCount > 0
+                                      ? () async {
+                                          await widget.onAdjustUnfollow(
+                                            current.instanceId,
+                                            -1,
+                                          );
+                                          if (mounted) setState(() {});
+                                        }
+                                      : null,
+                                  child: const Text('−1'),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: OutlinedButton(
+                                  key: const ValueKey('unfollow-sheet-inc'),
+                                  style: OutlinedButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                    foregroundColor: Colors.redAccent,
+                                    side: BorderSide(
+                                      color: Colors.redAccent
+                                          .withValues(alpha: 0.55),
+                                    ),
+                                  ),
+                                  onPressed: () async {
+                                    await widget.onAdjustUnfollow(
+                                      current.instanceId,
+                                      1,
+                                    );
+                                    if (mounted) setState(() {});
+                                  },
+                                  child: const Text('＋1'),
+                                ),
+                              ),
+                            ],
+                          ),
+                          TextButton(
+                            style: TextButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              minimumSize: const Size(0, 28),
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            onPressed: unfollowCount > 0
+                                ? () async {
+                                    await widget.onResetUnfollow(
+                                      current.instanceId,
+                                      false,
+                                    );
+                                    if (mounted) setState(() {});
+                                  }
+                                : null,
+                            child: const Text('リセット', style: TextStyle(fontSize: 12)),
                           ),
                         ],
                       ),
@@ -5676,227 +6143,6 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
                 ),
               ],
               const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      key: const ValueKey('follow-sheet-dec'),
-                      onPressed: todayCount > 0 || totalCount > 0
-                          ? () async {
-                              await widget.onAdjustFollow(
-                                current.instanceId,
-                                -1,
-                              );
-                              if (mounted) setState(() {});
-                            }
-                          : null,
-                      icon: const Icon(Icons.remove, size: 18),
-                      label: const Text('−1'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: FilledButton.tonalIcon(
-                      key: const ValueKey('follow-sheet-inc'),
-                      onPressed: () async {
-                        await widget.onAdjustFollow(current.instanceId, 1);
-                        if (mounted) setState(() {});
-                      },
-                      icon: const Icon(Icons.add, size: 18),
-                      label: const Text('＋1'),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextButton(
-                      onPressed: todayCount > 0
-                          ? () async {
-                              await widget.onResetFollow(
-                                current.instanceId,
-                                false,
-                              );
-                              if (mounted) setState(() {});
-                            }
-                          : null,
-                      child: const Text('今日をリセット'),
-                    ),
-                  ),
-                  Expanded(
-                    child: TextButton(
-                      onPressed: totalCount > 0 || todayCount > 0
-                          ? () async {
-                              await widget.onResetFollow(
-                                current.instanceId,
-                                true,
-                              );
-                              if (mounted) setState(() {});
-                            }
-                          : null,
-                      style: TextButton.styleFrom(
-                        foregroundColor: Colors.redAccent,
-                      ),
-                      child: const Text('累計もリセット'),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'アンフォロー（フォロー解除）回数',
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.redAccent,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Expanded(
-                    child: Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: Colors.redAccent.withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: Colors.redAccent.withValues(alpha: 0.45),
-                        ),
-                      ),
-                      child: Column(
-                        children: [
-                          const Text(
-                            '今日のアンフォロー数',
-                            style: TextStyle(fontSize: 11),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            '$unfollowTodayCount',
-                            key: const ValueKey('unfollow-sheet-today'),
-                            style: const TextStyle(
-                              fontSize: 24,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.redAccent,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: colorScheme.surfaceContainerHighest
-                            .withValues(alpha: 0.6),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: colorScheme.outlineVariant,
-                        ),
-                      ),
-                      child: Column(
-                        children: [
-                          const Text(
-                            '累計アンフォロー数',
-                            style: TextStyle(fontSize: 11),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            '$unfollowTotalCount',
-                            key: const ValueKey('unfollow-sheet-total'),
-                            style: const TextStyle(
-                              fontSize: 24,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      key: const ValueKey('unfollow-sheet-dec'),
-                      onPressed:
-                          unfollowTodayCount > 0 || unfollowTotalCount > 0
-                              ? () async {
-                                  await widget.onAdjustUnfollow(
-                                    current.instanceId,
-                                    -1,
-                                  );
-                                  if (mounted) setState(() {});
-                                }
-                              : null,
-                      icon: const Icon(Icons.remove, size: 18),
-                      label: const Text('−1'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      key: const ValueKey('unfollow-sheet-inc'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.redAccent,
-                        side: BorderSide(
-                          color: Colors.redAccent.withValues(alpha: 0.55),
-                        ),
-                      ),
-                      onPressed: () async {
-                        await widget.onAdjustUnfollow(current.instanceId, 1);
-                        if (mounted) setState(() {});
-                      },
-                      icon: const Icon(Icons.add, size: 18),
-                      label: const Text('＋1'),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextButton(
-                      onPressed: unfollowTodayCount > 0
-                          ? () async {
-                              await widget.onResetUnfollow(
-                                current.instanceId,
-                                false,
-                              );
-                              if (mounted) setState(() {});
-                            }
-                          : null,
-                      child: const Text('今日をリセット'),
-                    ),
-                  ),
-                  Expanded(
-                    child: TextButton(
-                      onPressed:
-                          unfollowTotalCount > 0 || unfollowTodayCount > 0
-                              ? () async {
-                                  await widget.onResetUnfollow(
-                                    current.instanceId,
-                                    true,
-                                  );
-                                  if (mounted) setState(() {});
-                                }
-                              : null,
-                      style: TextButton.styleFrom(
-                        foregroundColor: Colors.redAccent,
-                      ),
-                      child: const Text('累計もリセット'),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 6),
               Row(
                 children: [
                   Expanded(
@@ -6165,9 +6411,9 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
               if (instances.length >= 2) ...[
                 const Divider(height: 16),
                 Text(
-                  allUnfollowTodaySum > 0
-                      ? '全アカウント合計（今日）: フォロー $allTodaySum回 / 解除 $allUnfollowTodaySum回'
-                      : '全アカウント合計（今日）: $allTodaySum 回',
+                  allUnfollowSum > 0
+                      ? '全アカウント合計（直近$windowHours時間）: フォロー $allFollowSum回 / 解除 $allUnfollowSum回'
+                      : '全アカウント合計（直近$windowHours時間）: $allFollowSum 回',
                   textAlign: TextAlign.center,
                   style: const TextStyle(
                     fontSize: 12,
@@ -6177,7 +6423,7 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
               ],
               const SizedBox(height: 6),
               Text(
-                'Threads・Instagram・Bluesky 等でフォロー／フォロー解除を押すと自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。',
+                '指定時間内のフォロー・解除（フォロー中ユーザーのブロックを含む）を自動カウントし、同一 @アカウント のPC・スマホ間で合算共有されます。',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       fontSize: 11,
                     ),

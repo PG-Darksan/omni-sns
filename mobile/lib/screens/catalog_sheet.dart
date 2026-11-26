@@ -34,6 +34,9 @@ class CatalogScreen extends StatefulWidget {
     required this.multiProfileSupported,
     this.archivedInstances = const [],
     this.initialCategory = 'all',
+    this.catalogOrder = const [],
+    this.onCatalogOrderChanged,
+    this.onRenameArchived,
     this.onPurgeArchived,
     this.onPurgeAllArchived,
   });
@@ -44,6 +47,10 @@ class CatalogScreen extends StatefulWidget {
   final bool multiProfileSupported;
   final List<ArchivedInstance> archivedInstances;
   final String initialCategory;
+  final List<String> catalogOrder;
+  final Future<void> Function(List<String> newOrder)? onCatalogOrderChanged;
+  final Future<ServiceInstance?> Function(String instanceId, String newLabel)?
+      onRenameArchived;
   final Future<void> Function(String instanceId)? onPurgeArchived;
   final Future<void> Function()? onPurgeAllArchived;
 
@@ -54,6 +61,7 @@ class CatalogScreen extends StatefulWidget {
 class _CatalogScreenState extends State<CatalogScreen> {
   late String _selectedCategory;
   late List<ArchivedInstance> _archived;
+  late List<String> _catalogOrder;
   String _searchQuery = '';
 
   final _customNameController = TextEditingController();
@@ -65,6 +73,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
     super.initState();
     _selectedCategory = widget.initialCategory;
     _archived = List<ArchivedInstance>.from(widget.archivedInstances);
+    _catalogOrder = List<String>.from(widget.catalogOrder);
   }
 
   @override
@@ -85,12 +94,64 @@ class _CatalogScreenState extends State<CatalogScreen> {
   }
 
   String _formatArchivedTitle(ServiceInstance inst) {
-    final label = inst.accountLabel?.trim();
-    final base = (label != null && label.isNotEmpty && label != inst.name)
-        ? '${inst.name} · $label'
-        : inst.name;
-    final h = inst.detectedHandle?.trim();
-    return (h != null && h.isNotEmpty) ? '$base (@$h)' : base;
+    return formatArchivedAccountTitle(inst);
+  }
+
+  Future<void> _promptRenameArchived(ArchivedInstance entry) async {
+    final inst = entry.instance;
+    final initialText = inst.accountLabel?.trim().isNotEmpty == true
+        ? inst.accountLabel!.trim()
+        : (inst.detectedHandle?.trim().isNotEmpty == true
+            ? '@${inst.detectedHandle!.trim()}'
+            : '');
+    final ctrl = TextEditingController(text: initialText);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('${inst.name} のアカウント名を変更'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'アカウント名',
+            hintText: '例: @username / 仕事用 / サブ垢',
+            border: OutlineInputBorder(),
+          ),
+          onSubmitted: (v) => Navigator.of(ctx).pop(v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(ctrl.text),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    if (result == null || !mounted) return;
+    final trimmed = result.trim();
+    final updatedFromHost =
+        await widget.onRenameArchived?.call(inst.instanceId, trimmed);
+    if (!mounted) return;
+    final nextInst = updatedFromHost ??
+        inst.copyWith(
+          accountLabel: trimmed.isEmpty ? null : trimmed,
+          clearAccountLabel: trimmed.isEmpty,
+        );
+    setState(() {
+      final i =
+          _archived.indexWhere((a) => a.instance.instanceId == inst.instanceId);
+      if (i >= 0) {
+        _archived[i] = ArchivedInstance(
+          instance: nextInst,
+          archivedAt: _archived[i].archivedAt,
+        );
+      }
+    });
   }
 
   String _formatArchivedTime(int unixSecs) {
@@ -225,7 +286,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                       ),
                       title: Text(
                         _formatArchivedTitle(entry.instance),
-                        maxLines: 1,
+                        maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
@@ -339,7 +400,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
   @override
   Widget build(BuildContext context) {
     final q = _searchQuery.trim().toLowerCase();
-    final filtered = widget.catalog.where((svc) {
+    final orderedCatalog = sortCatalogServices(widget.catalog, _catalogOrder);
+    final canReorder = q.isEmpty &&
+        _selectedCategory != 'archived' &&
+        _selectedCategory != 'custom';
+    final filtered = orderedCatalog.where((svc) {
       if (_selectedCategory != 'all' && svc.category != _selectedCategory) {
         return false;
       }
@@ -353,9 +418,239 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final visibleCategories = widget.categories;
     final totalAvailable = widget.catalog.length;
 
+    Widget buildCatalogCard(CatalogService svc, int index, {required bool draggable}) {
+      final existing = _existingFor(svc.id);
+      final savedArchived = _archivedFor(svc.id);
+      final count = existing.length;
+      final color = parseHexColor(svc.colorHex);
+      final canAddAnother = count == 0 || widget.multiProfileSupported;
+
+      return Card(
+        key: ValueKey('catalog-card-${svc.id}'),
+        margin: const EdgeInsets.only(bottom: 6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(
+            horizontal: 8,
+            vertical: 6,
+          ),
+          child: Row(
+            children: [
+              if (draggable)
+                ReorderableDragStartListener(
+                  index: index,
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 6, left: 2),
+                    child: Icon(
+                      Icons.drag_indicator_rounded,
+                      size: 18,
+                      color: Theme.of(context)
+                          .colorScheme
+                          .onSurfaceVariant
+                          .withValues(alpha: 0.65),
+                    ),
+                  ),
+                ),
+              Container(
+                width: 30,
+                height: 30,
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  svc.badge,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 11.5,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        svc.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                    if (count > 0) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 1.5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.green.withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(99),
+                        ),
+                        child: Text(
+                          count == 1 || !widget.multiProfileSupported
+                              ? '済'
+                              : '$count垢',
+                          style: const TextStyle(
+                            color: Colors.green,
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                    if (savedArchived.isNotEmpty) ...[
+                      const SizedBox(width: 4),
+                      InkWell(
+                        borderRadius: BorderRadius.circular(99),
+                        onTap: () {
+                          setState(() {
+                            _selectedCategory = 'archived';
+                            _searchQuery = svc.name;
+                          });
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 1.5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.amber.withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(99),
+                          ),
+                          child: Text(
+                            savedArchived.length == 1
+                                ? '記憶あり'
+                                : '記憶${savedArchived.length}',
+                            style: const TextStyle(
+                              color: Colors.amber,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 6),
+              canAddAnother
+                  ? FilledButton(
+                      style: FilledButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        minimumSize: const Size(0, 32),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      onPressed: () {
+                        void createNew() {
+                          if (svc.requiresCustomUrl) {
+                            _openDetailedAddDialog(svc);
+                            return;
+                          }
+                          final accLabel = _nextAccountLabelFor(svc);
+                          Navigator.of(context).pop(
+                            NewInstanceRequest(
+                              serviceId: svc.id,
+                              name: svc.name,
+                              accountLabel: accLabel,
+                              category: svc.category,
+                              url: svc.url,
+                              colorHex: svc.colorHex,
+                              badge: svc.badge,
+                            ),
+                          );
+                        }
+
+                        if (savedArchived.isNotEmpty) {
+                          _openRestoreOrAddSheet(
+                            svc,
+                            savedArchived,
+                            createNew,
+                          );
+                          return;
+                        }
+                        createNew();
+                      },
+                      child: Text(
+                        count > 0 ? '＋別垢' : '＋追加',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    )
+                  : FilledButton.tonal(
+                      style: FilledButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        minimumSize: const Size(0, 32),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      onPressed: () {
+                        Navigator.of(context).pop(
+                          NewInstanceRequest(
+                            serviceId: svc.id,
+                            name: svc.name,
+                            category: svc.category,
+                            url: svc.url,
+                            colorHex: svc.colorHex,
+                            badge: svc.badge,
+                            openExistingInstanceId: existing.first.instanceId,
+                          ),
+                        );
+                      },
+                      child: const Text(
+                        '開く',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
+              if (canAddAnother)
+                IconButton(
+                  icon: const Icon(
+                    Icons.tune_rounded,
+                    size: 18,
+                  ),
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(
+                    minWidth: 32,
+                    minHeight: 32,
+                  ),
+                  tooltip: '詳細設定',
+                  onPressed: () => _openDetailedAddDialog(svc),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('サービス カタログ'),
+        actions: [
+          if (_catalogOrder.isNotEmpty &&
+              _selectedCategory != 'archived' &&
+              _selectedCategory != 'custom')
+            TextButton(
+              onPressed: () {
+                setState(() => _catalogOrder = <String>[]);
+                widget.onCatalogOrderChanged?.call(const <String>[]);
+              },
+              child: const Text('初期順に戻す'),
+            ),
+        ],
       ),
       body: Column(
         children: [
@@ -438,256 +733,78 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 : _selectedCategory == 'custom'
                     ? _buildCustomForm()
                     : filtered.isEmpty
-                    ? Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(Icons.search_off, size: 42),
-                              const SizedBox(height: 10),
-                              const Text(
-                                '該当するサービスがありません。\n「カスタム追加」から任意のURLを登録できます。',
-                                textAlign: TextAlign.center,
-                              ),
-                              const SizedBox(height: 12),
-                              FilledButton.tonal(
-                                onPressed: () => setState(
-                                    () => _selectedCategory = 'custom'),
-                                child: const Text('カスタムURLを追加する'),
-                              ),
-                            ],
-                          ),
-                        ),
-                      )
-                    : ListView.separated(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 8,
-                        ),
-                        itemCount: filtered.length,
-                        separatorBuilder: (_, _) => const SizedBox(height: 6),
-                        itemBuilder: (context, index) {
-                          final svc = filtered[index];
-                          final existing = _existingFor(svc.id);
-                          final savedArchived = _archivedFor(svc.id);
-                          final count = existing.length;
-                          final color = parseHexColor(svc.colorHex);
-                          final canAddAnother =
-                              count == 0 || widget.multiProfileSupported;
-
-                          return Card(
-                            margin: EdgeInsets.zero,
+                        ? Center(
                             child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 6,
-                              ),
-                              child: Row(
+                              padding: const EdgeInsets.all(24),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  Container(
-                                    width: 30,
-                                    height: 30,
-                                    decoration: BoxDecoration(
-                                      color: color,
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                    alignment: Alignment.center,
-                                    child: Text(
-                                      svc.badge,
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 11.5,
-                                      ),
-                                    ),
+                                  const Icon(Icons.search_off, size: 42),
+                                  const SizedBox(height: 10),
+                                  const Text(
+                                    '該当するサービスがありません。\n「カスタム追加」から任意のURLを登録できます。',
+                                    textAlign: TextAlign.center,
                                   ),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: Row(
-                                      children: [
-                                        Flexible(
-                                          child: Text(
-                                            svc.name,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: const TextStyle(
-                                              fontWeight: FontWeight.bold,
-                                              fontSize: 14,
-                                            ),
-                                          ),
-                                        ),
-                                        if (count > 0) ...[
-                                          const SizedBox(width: 6),
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 6,
-                                              vertical: 1.5,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: Colors.green
-                                                  .withValues(alpha: 0.2),
-                                              borderRadius:
-                                                  BorderRadius.circular(99),
-                                            ),
-                                            child: Text(
-                                              count == 1 ||
-                                                      !widget
-                                                          .multiProfileSupported
-                                                  ? '済'
-                                                  : '$count垢',
-                                                style: const TextStyle(
-                                                  color: Colors.green,
-                                                  fontSize: 10,
-                                                  fontWeight: FontWeight.bold,
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                          if (savedArchived.isNotEmpty) ...[
-                                            const SizedBox(width: 4),
-                                            InkWell(
-                                              borderRadius:
-                                                  BorderRadius.circular(99),
-                                              onTap: () {
-                                                setState(() {
-                                                  _selectedCategory = 'archived';
-                                                  _searchQuery = svc.name;
-                                                });
-                                              },
-                                              child: Container(
-                                                padding:
-                                                    const EdgeInsets.symmetric(
-                                                  horizontal: 6,
-                                                  vertical: 1.5,
-                                                ),
-                                                decoration: BoxDecoration(
-                                                  color: Colors.amber
-                                                      .withValues(alpha: 0.2),
-                                                  borderRadius:
-                                                      BorderRadius.circular(99),
-                                                ),
-                                                child: Text(
-                                                  savedArchived.length == 1
-                                                      ? '記憶あり'
-                                                      : '記憶${savedArchived.length}',
-                                                  style: const TextStyle(
-                                                    color: Colors.amber,
-                                                    fontSize: 10,
-                                                    fontWeight: FontWeight.bold,
-                                                  ),
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                        ],
-                                      ),
-                                    ),
-                                    const SizedBox(width: 6),
-                                    canAddAnother
-                                        ? FilledButton(
-                                            style: FilledButton.styleFrom(
-                                              visualDensity:
-                                                  VisualDensity.compact,
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                horizontal: 10,
-                                                vertical: 6,
-                                              ),
-                                              minimumSize: const Size(0, 32),
-                                              tapTargetSize:
-                                                  MaterialTapTargetSize
-                                                      .shrinkWrap,
-                                            ),
-                                            onPressed: () {
-                                              void createNew() {
-                                                if (svc.requiresCustomUrl) {
-                                                  _openDetailedAddDialog(svc);
-                                                  return;
-                                                }
-                                                final accLabel =
-                                                    _nextAccountLabelFor(svc);
-                                                Navigator.of(context).pop(
-                                                  NewInstanceRequest(
-                                                    serviceId: svc.id,
-                                                    name: svc.name,
-                                                    accountLabel: accLabel,
-                                                    category: svc.category,
-                                                    url: svc.url,
-                                                    colorHex: svc.colorHex,
-                                                    badge: svc.badge,
-                                                  ),
-                                                );
-                                              }
-                                              if (savedArchived.isNotEmpty) {
-                                                _openRestoreOrAddSheet(
-                                                  svc,
-                                                  savedArchived,
-                                                  createNew,
-                                                );
-                                                return;
-                                              }
-                                              createNew();
-                                            },
-                                          child: Text(
-                                            count > 0 ? '＋別垢' : '＋追加',
-                                            style:
-                                                const TextStyle(fontSize: 12),
-                                          ),
-                                        )
-                                      : FilledButton.tonal(
-                                          style: FilledButton.styleFrom(
-                                            visualDensity:
-                                                VisualDensity.compact,
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 12,
-                                              vertical: 6,
-                                            ),
-                                            minimumSize: const Size(0, 32),
-                                            tapTargetSize: MaterialTapTargetSize
-                                                .shrinkWrap,
-                                          ),
-                                          onPressed: () {
-                                            Navigator.of(context).pop(
-                                              NewInstanceRequest(
-                                                serviceId: svc.id,
-                                                name: svc.name,
-                                                category: svc.category,
-                                                url: svc.url,
-                                                colorHex: svc.colorHex,
-                                                badge: svc.badge,
-                                                openExistingInstanceId: existing
-                                                    .first.instanceId,
-                                              ),
-                                            );
-                                          },
-                                          child: const Text(
-                                            '開く',
-                                            style: TextStyle(fontSize: 12),
-                                          ),
-                                        ),
-                                  if (canAddAnother)
-                                    IconButton(
-                                      icon: const Icon(
-                                        Icons.tune_rounded,
-                                        size: 18,
-                                      ),
-                                      visualDensity: VisualDensity.compact,
-                                      padding: EdgeInsets.zero,
-                                      constraints: const BoxConstraints(
-                                        minWidth: 32,
-                                        minHeight: 32,
-                                      ),
-                                      tooltip: '詳細設定',
-                                      onPressed: () =>
-                                          _openDetailedAddDialog(svc),
-                                    ),
+                                  const SizedBox(height: 12),
+                                  FilledButton.tonal(
+                                    onPressed: () => setState(
+                                        () => _selectedCategory = 'custom'),
+                                    child: const Text('カスタムURLを追加する'),
+                                  ),
                                 ],
                               ),
                             ),
-                          );
-                        },
-                      ),
+                          )
+                        : canReorder
+                            ? ReorderableListView.builder(
+                                buildDefaultDragHandles: false,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 8,
+                                ),
+                                itemCount: filtered.length,
+                                onReorder: (oldIndex, newIndex) {
+                                  if (newIndex > oldIndex) newIndex -= 1;
+                                  if (oldIndex == newIndex ||
+                                      oldIndex < 0 ||
+                                      newIndex < 0 ||
+                                      oldIndex >= filtered.length ||
+                                      newIndex >= filtered.length) {
+                                    return;
+                                  }
+                                  final movedId = filtered[oldIndex].id;
+                                  final targetId = filtered[newIndex].id;
+                                  final fullIds = orderedCatalog
+                                      .map((s) => s.id)
+                                      .toList();
+                                  final fromFull = fullIds.indexOf(movedId);
+                                  final toFull = fullIds.indexOf(targetId);
+                                  if (fromFull < 0 || toFull < 0) return;
+                                  fullIds.removeAt(fromFull);
+                                  fullIds.insert(toFull, movedId);
+                                  setState(() => _catalogOrder = fullIds);
+                                  widget.onCatalogOrderChanged?.call(fullIds);
+                                },
+                                itemBuilder: (context, index) =>
+                                    buildCatalogCard(
+                                  filtered[index],
+                                  index,
+                                  draggable: true,
+                                ),
+                              )
+                            : ListView.builder(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 8,
+                                ),
+                                itemCount: filtered.length,
+                                itemBuilder: (context, index) =>
+                                    buildCatalogCard(
+                                  filtered[index],
+                                  index,
+                                  draggable: false,
+                                ),
+                              ),
           ),
         ],
       ),
@@ -787,7 +904,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                 children: [
                                   Text(
                                     _formatArchivedTitle(inst),
-                                    maxLines: 1,
+                                    maxLines: 2,
                                     overflow: TextOverflow.ellipsis,
                                     style: const TextStyle(
                                       fontWeight: FontWeight.bold,
@@ -806,7 +923,21 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                 ],
                               ),
                             ),
-                            const SizedBox(width: 6),
+                            const SizedBox(width: 4),
+                            IconButton(
+                              icon: const Icon(
+                                Icons.edit_outlined,
+                                size: 18,
+                              ),
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(
+                                minWidth: 30,
+                                minHeight: 32,
+                              ),
+                              tooltip: 'アカウント名を変更',
+                              onPressed: () => _promptRenameArchived(entry),
+                            ),
                             FilledButton(
                               style: FilledButton.styleFrom(
                                 visualDensity: VisualDensity.compact,

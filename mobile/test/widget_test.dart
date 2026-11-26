@@ -495,9 +495,10 @@ void main() {
     expect(find.text('Instagram DM'), findsNothing);
   });
 
-  test('FollowSyncLedger CRDT merges PC and Android JSON cleanly and supports shared sync copy/paste', () {
+  test('FollowSyncLedger CRDT merges PC and Android JSON cleanly and supports time-window counts & shared sync', () {
     const today = '2026-11-23';
-    // Rust 側から届く JSON 形式そのままを読み込めることを検証
+    const baseNow = 1795400000;
+    // Rust 側から届く JSON 形式（タイムスタンプ配列＋レガシー互換）を読み込めることを検証
     final pcJson = jsonDecode('''
     {
       "version": 1,
@@ -508,16 +509,17 @@ void main() {
           "totalResetEpoch": 0,
           "devices": {
             "win-aaaa": {
-              "today": 11,
+              "today": 3,
               "total": 35,
               "todayEpoch": 0,
               "totalEpoch": 0,
-              "updatedAt": 100
+              "updatedAt": ${baseNow - 100},
+              "followEvents": [${baseNow - 7200}, ${baseNow - 1800}, ${baseNow - 600}]
             }
           },
           "snsFollowing": 180,
           "snsFollowers": 420,
-          "snsUpdatedAt": 100
+          "snsUpdatedAt": ${baseNow - 100}
         }
       }
     }
@@ -530,16 +532,17 @@ void main() {
           date: today,
           devices: {
             'and-bbbb': DeviceFollowEntry(
-              today: 7,
+              today: 2,
               total: 19,
               todayEpoch: 0,
               totalEpoch: 0,
-              updatedAt: 200,
+              updatedAt: baseNow - 50,
+              followEvents: [baseNow - 10800, baseNow - 300],
             ),
           },
           snsFollowing: 187,
           snsFollowers: 425,
-          snsUpdatedAt: 200,
+          snsUpdatedAt: baseNow - 50,
         ),
       },
     );
@@ -548,13 +551,13 @@ void main() {
     expect(androidLedger.mergeFrom(pcLedger, today), isFalse);
 
     final acc = androidLedger.accounts['instagram:darksan560']!;
-    expect(acc.effectiveCounts(today), (18, 54));
+    // 24時間ウィンドウでは 3 + 2 = 5、1時間ウィンドウでは 2 + 1 = 3
+    expect(acc.effectiveWindowFollowCount(baseNow, 24), 5);
+    expect(acc.effectiveWindowFollowCount(baseNow, 1), 3);
     expect(acc.snsFollowing, 187);
     expect(acc.snsFollowers, 425);
-    // 翌日ロールオーバー
-    expect(acc.effectiveCounts('2026-11-24'), (0, 54));
 
-    // インスタンスへの投影
+    // インスタンスへの時間ウィンドウ投影
     const ig = ServiceInstance(
       instanceId: 'svc-ig',
       serviceId: 'instagram',
@@ -567,13 +570,27 @@ void main() {
       order: 0,
       detectedHandle: 'darksan560',
     );
-    final (projected, changed) =
-        projectLedgerToInstances([ig], androidLedger, today);
-    expect(changed, isTrue);
-    expect(projected.first.followCountToday, 18);
-    expect(projected.first.followCountTotal, 54);
-    expect(projected.first.snsFollowingCount, 187);
-    expect(projected.first.snsFollowersCount, 425);
+    final (projected24, changed24) = projectLedgerToInstances(
+      [ig],
+      androidLedger,
+      today,
+      windowHours: 24,
+      nowSecs: baseNow,
+    );
+    expect(changed24, isTrue);
+    expect(projected24.first.followCountToday, 5);
+    expect(projected24.first.snsFollowingCount, 187);
+    expect(projected24.first.snsFollowersCount, 425);
+
+    final (projected1h, changed1h) = projectLedgerToInstances(
+      projected24,
+      androidLedger,
+      today,
+      windowHours: 1,
+      nowSecs: baseNow,
+    );
+    expect(changed1h, isTrue);
+    expect(projected1h.first.followCountToday, 3);
 
     // PC ⇄ スマホ 設定コピー文字列の往復
     final encoded = encodeSharedSyncConfig('ghp_testToken123', 'gist_abc456');
@@ -675,7 +692,7 @@ void main() {
     expect(restored.gesture.actionFor('DL'), 'toggle-gmail');
   });
 
-  testWidgets('GestureSettingsScreen renders 12-direction board and updates toggle', (tester) async {
+  testWidgets('GestureSettingsScreen renders 16-direction board (including diagonals) and updates toggle', (tester) async {
     MobileGestureSettings? latest;
     await tester.pumpWidget(
       MaterialApp(
@@ -688,6 +705,13 @@ void main() {
     expect(find.text('タッチジェスチャー設定'), findsOneWidget);
     expect(find.byKey(const ValueKey('gesture-card-L')), findsOneWidget);
     await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('gesture-card-NW')),
+      200,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.byKey(const ValueKey('gesture-card-NW')), findsOneWidget);
+    expect(find.byKey(const ValueKey('gesture-card-SE')), findsOneWidget);
+    await tester.scrollUntilVisible(
       find.byKey(const ValueKey('gesture-card-DL')),
       200,
       scrollable: find.byType(Scrollable).first,
@@ -696,9 +720,11 @@ void main() {
 
     await tester.scrollUntilVisible(
       find.byKey(const ValueKey('gesture-enabled-switch')),
-      -200,
+      -300,
       scrollable: find.byType(Scrollable).first,
     );
+    await tester.drag(find.byType(Scrollable).first, const Offset(0, 200));
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey('gesture-enabled-switch')));
     await tester.pump();
     expect(latest?.enabled, isFalse);
@@ -1345,7 +1371,7 @@ void main() {
     expect(pickNextActiveSubTabAfterClose(const ['t1', 't2'], 2), 't2');
   });
 
-  test('Mobile GesturePath enforces straight-line segments only and rejects squiggly/diagonal strokes', () {
+  test('Mobile GesturePath recognizes cardinal & diagonal straight strokes and rejects squiggly/zigzag strokes', () {
     // 水平・垂直の直線セグメントのみを頂点として出力（ブレを直線にスナップ）
     final straight = GesturePath(tremorPx: 10);
     straight.reset(const Offset(100, 100));
@@ -1354,12 +1380,38 @@ void main() {
     expect(straight.shape, 'R');
     expect(straight.vertices, const [Offset(100, 100), Offset(180, 100)]);
 
-    // 斜め・曲線（ちょろちょろ線）の開始は即無効化
-    final diag = GesturePath(tremorPx: 10);
-    diag.reset(const Offset(100, 100));
-    diag.push(const Offset(130, 130));
-    expect(diag.invalidated, isTrue);
-    expect(diag.release(), '');
+    // 斜め4方向（SE / NW / NE / SW）を45°直線として認識
+    final se = GesturePath(tremorPx: 10);
+    se.reset(const Offset(100, 100));
+    se.push(const Offset(140, 140));
+    expect(se.invalidated, isFalse);
+    expect(se.shape, 'SE');
+    expect(se.vertices, const [Offset(100, 100), Offset(140, 140)]);
+    expect(se.release(), 'SE');
+
+    final nw = GesturePath(tremorPx: 10);
+    nw.reset(const Offset(200, 200));
+    nw.push(const Offset(150, 150));
+    expect(nw.release(), 'NW');
+
+    final ne = GesturePath(tremorPx: 10);
+    ne.reset(const Offset(200, 200));
+    ne.push(const Offset(250, 150));
+    expect(ne.release(), 'NE');
+
+    final sw = GesturePath(tremorPx: 10);
+    sw.reset(const Offset(200, 200));
+    sw.push(const Offset(150, 250));
+    expect(sw.release(), 'SW');
+
+    // 斜めストローク後に曲がる／ブレる動きは無効化
+    final bentDiag = GesturePath(tremorPx: 10);
+    bentDiag.reset(const Offset(100, 100));
+    bentDiag.push(const Offset(140, 140));
+    expect(bentDiag.shape, 'SE');
+    bentDiag.push(const Offset(140, 220));
+    expect(bentDiag.invalidated, isTrue);
+    expect(bentDiag.release(), '');
 
     // ジグザグ・3方向目の曲がりは無効化
     final zigzag = GesturePath(tremorPx: 10);
@@ -1381,5 +1433,89 @@ void main() {
     scroll.push(const Offset(100, 150));
     scroll.advanceLiveScroll(const Offset(135, 220));
     expect(scroll.vertices, const [Offset(100, 100), Offset(100, 220)]);
+  });
+
+  test('Time-window follow counter, catalog ordering, and archived account naming work cleanly', () {
+    final t0 = DateTime(2026, 11, 26, 10, 0);
+    final t2h = DateTime(2026, 11, 26, 12, 0);
+    const base = ServiceInstance(
+      instanceId: 'svc-ig-win',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      accountLabel: 'アカウント 3',
+      detectedHandle: 'hanako',
+      category: 'major-sns',
+      url: 'https://www.instagram.com/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 0,
+    );
+
+    // 10:00に2回、12:00に1回フォロー -> 1時間枠では1、3時間枠では3
+    final step1 = base
+        .withFollowWindowDelta(1, windowHours: 24, now: t0)
+        .withFollowWindowDelta(1, windowHours: 24, now: t0);
+    final step2 = step1.withFollowWindowDelta(1, windowHours: 24, now: t2h);
+    expect(step2.effectiveFollowCountInWindow(1, t2h), 1);
+    expect(step2.effectiveFollowCountInWindow(3, t2h), 3);
+    final reset1h = step2.withFollowWindowReset(windowHours: 1, now: t2h);
+    expect(reset1h.effectiveFollowCountInWindow(1, t2h), 0);
+    expect(reset1h.effectiveFollowCountInWindow(3, t2h), 0);
+
+    // 汎用ラベル「アカウント 3」より @handle を優先表示
+    expect(formatArchivedAccountTitle(base), 'Instagram · @hanako');
+    expect(
+      formatArchivedAccountTitle(
+        base.copyWith(accountLabel: '仕事用'),
+      ),
+      'Instagram · 仕事用 (@hanako)',
+    );
+    expect(accountDisplayLabel(base, 2, baseServiceName: 'Instagram'), '@hanako');
+
+    // カタログ並び替え & AppSettings ラウンドトリップ
+    const c1 = CatalogService(
+      id: 'instagram',
+      name: 'Instagram',
+      aliases: [],
+      category: 'major-sns',
+      url: 'https://www.instagram.com/',
+      homeUrl: 'https://www.instagram.com/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      description: '',
+    );
+    const c2 = CatalogService(
+      id: 'threads',
+      name: 'Threads',
+      aliases: [],
+      category: 'major-sns',
+      url: 'https://www.threads.com/',
+      homeUrl: 'https://www.threads.com/',
+      colorHex: '#18181B',
+      badge: 'TH',
+      description: '',
+    );
+    const c3 = CatalogService(
+      id: 'bluesky',
+      name: 'Bluesky',
+      aliases: [],
+      category: 'major-sns',
+      url: 'https://bsky.app/',
+      homeUrl: 'https://bsky.app/',
+      colorHex: '#0085FF',
+      badge: 'BS',
+      description: '',
+    );
+    final sorted = sortCatalogServices([c1, c2, c3], const ['bluesky', 'instagram']);
+    expect(sorted.map((s) => s.id).toList(), ['bluesky', 'instagram', 'threads']);
+
+    final settings = const AppSettings(
+      followWindowHours: 6,
+      catalogOrder: ['bluesky', 'threads', 'bluesky'],
+    );
+    final rt = AppSettings.fromJson(settings.toJson());
+    expect(rt.followWindowHours, 6);
+    expect(rt.catalogOrder, ['bluesky', 'threads']);
   });
 }

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
-/// 12 通りの形 (1方向: ← → ↑ ↓ を先にまとめ、2方向を後ろに並べる — HisatorNotebook w387 準拠)
-pub const GESTURE_SHAPES: [&str; 12] = [
-    "L", "R", "U", "D", "LU", "LD", "RU", "RD", "UL", "UR", "DL", "DR",
+/// 16 通りの形 (1方向4種 + 斜め4種 + 直角に1回曲げる2方向8種)
+pub const GESTURE_SHAPES: [&str; 16] = [
+    "L", "R", "U", "D", "NW", "NE", "SW", "SE", "LU", "LD", "RU", "RD", "UL", "UR", "DL", "DR",
 ];
 
 /// 割り当て可能な全操作 ID
@@ -121,6 +121,10 @@ pub fn default_gesture_map() -> HashMap<String, String> {
         ("R", "next-tab"),
         ("U", "scroll:up"),
         ("D", "scroll:down"),
+        ("NW", "none"),
+        ("NE", "none"),
+        ("SW", "none"),
+        ("SE", "none"),
         ("LU", "previous-service"),
         ("LD", "go-forward"),
         ("RU", "next-service"),
@@ -177,6 +181,13 @@ impl GestureSettings {
 }
 
 pub fn shape_arrows(shape: &str) -> String {
+    match shape {
+        "NW" => return "↖".to_string(),
+        "NE" => return "↗".to_string(),
+        "SW" => return "↙".to_string(),
+        "SE" => return "↘".to_string(),
+        _ => {}
+    }
     shape
         .chars()
         .map(|c| match c {
@@ -190,6 +201,13 @@ pub fn shape_arrows(shape: &str) -> String {
 }
 
 pub fn shape_name_ja(shape: &str) -> String {
+    match shape {
+        "NW" => return "左上".to_string(),
+        "NE" => return "右上".to_string(),
+        "SW" => return "左下".to_string(),
+        "SE" => return "右下".to_string(),
+        _ => {}
+    }
     shape
         .chars()
         .filter_map(|c| match c {
@@ -242,7 +260,67 @@ pub fn action_label_ja(action: &str) -> &'static str {
     }
 }
 
-/// 1 回の右ドラッグの経路判定 (HisatorNotebook W246GesturePath 完全準拠)
+/// 1方向開始時の上下左右 vs 斜め境界（cot(22.5°) ≒ 2.4142）
+const FIRST_CARDINAL_RATIO: f64 = 2.4;
+const FIRST_DIAG_MIN_RATIO: f64 = 0.52;
+const RELEASE_OCTANT_RATIO: f64 = 2.414213562373095;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GestureDir {
+    L,
+    R,
+    U,
+    D,
+    NW,
+    NE,
+    SW,
+    SE,
+}
+
+impl GestureDir {
+    fn is_diagonal(self) -> bool {
+        matches!(self, Self::NW | Self::NE | Self::SW | Self::SE)
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::L => "L",
+            Self::R => "R",
+            Self::U => "U",
+            Self::D => "D",
+            Self::NW => "NW",
+            Self::NE => "NE",
+            Self::SW => "SW",
+            Self::SE => "SE",
+        }
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::L => Self::R,
+            Self::R => Self::L,
+            Self::U => Self::D,
+            Self::D => Self::U,
+            Self::NW => Self::SE,
+            Self::SE => Self::NW,
+            Self::NE => Self::SW,
+            Self::SW => Self::NE,
+        }
+    }
+
+    fn diag_unit(self) -> (f64, f64) {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        match self {
+            Self::NW => (-s, -s),
+            Self::NE => (s, -s),
+            Self::SW => (-s, s),
+            Self::SE => (s, s),
+            _ => (0.0, 0.0),
+        }
+    }
+}
+
+/// 1 回の右ドラッグの経路判定 (上下左右 + 斜め4方向 + 直角2方向8種 = 16方向対応)
 pub struct GesturePath {
     tremor: f64,
     origin: Point,
@@ -250,7 +328,7 @@ pub struct GesturePath {
     last: Point,
     end: Point,
     corner: Option<Point>,
-    dirs: Vec<char>,
+    dirs: Vec<GestureDir>,
     max_len: f64,
     count: usize,
     invalid: bool,
@@ -301,7 +379,11 @@ impl GesturePath {
         if self.invalid || self.pending || self.dirs.is_empty() {
             None
         } else {
-            Some(self.dirs.iter().collect())
+            let mut out = String::with_capacity(2);
+            for d in &self.dirs {
+                out.push_str(d.code());
+            }
+            Some(out)
         }
     }
 
@@ -338,18 +420,46 @@ impl GesturePath {
         let tol = self.tolerance();
         let dx = p.x - self.pivot.x;
         let dy = p.y - self.pivot.y;
+
+        // 斜め方向に確定している間は45°軸上への射影で直線継続・逆戻り/横逸れを判定
+        if let Some(&first_dir) = self.dirs.first() {
+            if first_dir.is_diagonal() {
+                let (ux, uy) = first_dir.diag_unit();
+                let along = dx * ux + dy * uy;
+                let perp = (dx * (-uy) + dy * ux).abs();
+                if along.abs().max(perp) <= tol {
+                    self.pending = false;
+                    return;
+                }
+                if along > tol && along > perp * AXIS_RATIO {
+                    self.pending = false;
+                    self.advance_diagonal(p, first_dir, tol);
+                } else if along < -tol || perp > tol * 2.4 {
+                    self.invalid = true;
+                    self.pending = false;
+                } else {
+                    self.pending = true;
+                }
+                return;
+            }
+        }
+
         if dx.abs().max(dy.abs()) <= tol {
             self.pending = false;
             return;
         }
 
-        let Some(dir) = classify_dir(dx, dy, AXIS_RATIO) else {
-            // 開始直後から斜め・曲線（ちょろちょろ線）に大きく逸れた場合は即キャンセル
-            if self.dirs.is_empty() && dx.abs() > tol * 2.2 && dy.abs() > tol * 2.2 {
-                self.invalid = true;
-                self.pending = false;
+        if self.dirs.is_empty() {
+            let Some(dir) = classify_first_dir(dx, dy, tol) else {
+                self.pending = true;
                 return;
-            }
+            };
+            self.pending = false;
+            self.step(p, dir, tol);
+            return;
+        }
+
+        let Some(dir) = classify_cardinal_dir(dx, dy, AXIS_RATIO) else {
             self.pending = true;
             return;
         };
@@ -357,13 +467,25 @@ impl GesturePath {
         self.step(p, dir, tol);
     }
 
-    fn step(&mut self, p: Point, dir: char, tol: f64) {
+    fn step(&mut self, p: Point, dir: GestureDir, tol: f64) {
         if self.dirs.is_empty() {
             self.dirs.push(dir);
-            self.advance(p, dir, tol);
+            if dir.is_diagonal() {
+                self.advance_diagonal(p, dir, tol);
+            } else {
+                self.advance(p, dir, tol);
+            }
         } else if Some(&dir) == self.dirs.last() {
-            self.advance(p, dir, tol);
-        } else if Some(opposite_dir(dir)) == self.dirs.last().copied() || self.dirs.len() >= 2 {
+            if dir.is_diagonal() {
+                self.advance_diagonal(p, dir, tol);
+            } else {
+                self.advance(p, dir, tol);
+            }
+        } else if dir.is_diagonal()
+            || self.dirs.first().map(|d| d.is_diagonal()).unwrap_or(false)
+            || Some(dir.opposite()) == self.dirs.last().copied()
+            || self.dirs.len() >= 2
+        {
             self.invalid = true;
             return;
         } else {
@@ -394,26 +516,44 @@ impl GesturePath {
         let ax = dx.abs();
         let ay = dy.abs();
         let len = ax.max(ay);
-        let dir = if ax >= ay * RELEASE_AXIS_RATIO {
-            Some(if dx > 0.0 { 'R' } else { 'L' })
-        } else if ay >= ax * RELEASE_AXIS_RATIO {
-            Some(if dy > 0.0 { 'D' } else { 'U' })
-        } else {
-            None
-        };
-
+        let dist = (dx * dx + dy * dy).sqrt();
         let tol = self.tolerance();
-        if !self.dirs.is_empty() {
-            let tail = (self.max_len * RELEASE_TAIL_RATIO).clamp(RELEASE_TAIL_MIN, RELEASE_TAIL_MAX);
-            if len <= tail {
-                self.pending = false;
-                if let Some(d) = dir {
-                    if Some(d) == self.dirs.last().copied() {
-                        self.advance(self.last, d, tol);
+
+        if self.dirs.is_empty() {
+            if dist < RELEASE_MIN_LEN {
+                return;
+            }
+            let dir = classify_octant_dir(dx, dy);
+            self.pending = false;
+            self.step(self.last, dir, tol);
+            return;
+        }
+
+        if let Some(&first_dir) = self.dirs.first() {
+            if first_dir.is_diagonal() {
+                let tail =
+                    (self.max_len * RELEASE_TAIL_RATIO).clamp(RELEASE_TAIL_MIN, RELEASE_TAIL_MAX);
+                if dist <= tail {
+                    self.pending = false;
+                    let (ux, uy) = first_dir.diag_unit();
+                    if dx * ux + dy * uy > 0.0 {
+                        self.advance_diagonal(self.last, first_dir, tol);
                     }
                 }
                 return;
             }
+        }
+
+        let dir = classify_cardinal_dir(dx, dy, RELEASE_AXIS_RATIO);
+        let tail = (self.max_len * RELEASE_TAIL_RATIO).clamp(RELEASE_TAIL_MIN, RELEASE_TAIL_MAX);
+        if len <= tail {
+            self.pending = false;
+            if let Some(d) = dir {
+                if Some(d) == self.dirs.last().copied() {
+                    self.advance(self.last, d, tol);
+                }
+            }
+            return;
         }
 
         let Some(d) = dir else {
@@ -426,8 +566,8 @@ impl GesturePath {
         self.step(self.last, d, tol);
     }
 
-    fn advance(&mut self, p: Point, dir: char, tol: f64) {
-        let horizontal = dir == 'L' || dir == 'R';
+    fn advance(&mut self, p: Point, dir: GestureDir, tol: f64) {
+        let horizontal = matches!(dir, GestureDir::L | GestureDir::R);
         let start = self.corner.unwrap_or(self.origin);
         if horizontal {
             let y = p.y - (p.y - self.pivot.y).clamp(-tol, tol);
@@ -441,26 +581,99 @@ impl GesturePath {
             self.max_len = self.max_len.max((p.y - start.y).abs());
         }
     }
+
+    fn advance_diagonal(&mut self, p: Point, dir: GestureDir, tol: f64) {
+        let (ux, uy) = dir.diag_unit();
+        let px = -uy;
+        let py = ux;
+        let dpx = p.x - self.pivot.x;
+        let dpy = p.y - self.pivot.y;
+        let along = dpx * ux + dpy * uy;
+        let perp = dpx * px + dpy * py;
+        let clamped_perp = perp - perp.clamp(-tol, tol);
+        self.pivot = Point::new(
+            self.pivot.x + along * ux + clamped_perp * px,
+            self.pivot.y + along * uy + clamped_perp * py,
+        );
+        let proj = ((p.x - self.origin.x) * ux + (p.y - self.origin.y) * uy).max(0.0);
+        self.end = Point::new(self.origin.x + proj * ux, self.origin.y + proj * uy);
+        self.max_len = self.max_len.max(proj);
+    }
 }
 
-fn classify_dir(dx: f64, dy: f64, ratio: f64) -> Option<char> {
+fn classify_cardinal_dir(dx: f64, dy: f64, ratio: f64) -> Option<GestureDir> {
     let ax = dx.abs();
     let ay = dy.abs();
     if ax > ay * ratio {
-        Some(if dx > 0.0 { 'R' } else { 'L' })
+        Some(if dx > 0.0 {
+            GestureDir::R
+        } else {
+            GestureDir::L
+        })
     } else if ay > ax * ratio {
-        Some(if dy > 0.0 { 'D' } else { 'U' })
+        Some(if dy > 0.0 {
+            GestureDir::D
+        } else {
+            GestureDir::U
+        })
     } else {
         None
     }
 }
 
-fn opposite_dir(dir: char) -> char {
-    match dir {
-        'L' => 'R',
-        'R' => 'L',
-        'U' => 'D',
-        _ => 'U',
+fn classify_diag_quadrant(dx: f64, dy: f64) -> GestureDir {
+    match (dx >= 0.0, dy >= 0.0) {
+        (false, false) => GestureDir::NW,
+        (true, false) => GestureDir::NE,
+        (false, true) => GestureDir::SW,
+        (true, true) => GestureDir::SE,
+    }
+}
+
+fn classify_first_dir(dx: f64, dy: f64, tol: f64) -> Option<GestureDir> {
+    let ax = dx.abs();
+    let ay = dy.abs();
+    if ax > ay * FIRST_CARDINAL_RATIO {
+        return Some(if dx > 0.0 {
+            GestureDir::R
+        } else {
+            GestureDir::L
+        });
+    }
+    if ay > ax * FIRST_CARDINAL_RATIO {
+        return Some(if dy > 0.0 {
+            GestureDir::D
+        } else {
+            GestureDir::U
+        });
+    }
+    let dist = (dx * dx + dy * dy).sqrt();
+    if ax >= ay * FIRST_DIAG_MIN_RATIO
+        && ay >= ax * FIRST_DIAG_MIN_RATIO
+        && dist > tol * 1.4
+    {
+        return Some(classify_diag_quadrant(dx, dy));
+    }
+    None
+}
+
+fn classify_octant_dir(dx: f64, dy: f64) -> GestureDir {
+    let ax = dx.abs();
+    let ay = dy.abs();
+    if ax >= ay * RELEASE_OCTANT_RATIO {
+        if dx > 0.0 {
+            GestureDir::R
+        } else {
+            GestureDir::L
+        }
+    } else if ay >= ax * RELEASE_OCTANT_RATIO {
+        if dy > 0.0 {
+            GestureDir::D
+        } else {
+            GestureDir::U
+        }
+    } else {
+        classify_diag_quadrant(dx, dy)
     }
 }
 
@@ -612,11 +825,32 @@ mod tests {
         assert!(three.invalid());
         assert_eq!(three.release(), None);
 
-        // 開始直後から斜め・曲線（ちょろちょろ線）へ逸れたら即無効化
+        // 斜め4方向（NW / NE / SW / SE）は直線として認識され、逆戻りは無効化
         let mut diag = GesturePath::new(Point::new(100.0, 100.0), 4);
-        diag.add(Point::new(125.0, 125.0));
-        assert!(diag.invalid());
-        assert_eq!(diag.release(), None);
+        diag.add(Point::new(140.0, 140.0));
+        assert!(!diag.invalid());
+        assert_eq!(diag.release().as_deref(), Some("SE"));
+
+        let mut diag_nw = GesturePath::new(Point::new(100.0, 100.0), 4);
+        diag_nw.add(Point::new(50.0, 50.0));
+        assert_eq!(diag_nw.release().as_deref(), Some("NW"));
+
+        let mut diag_ne = GesturePath::new(Point::new(100.0, 100.0), 4);
+        diag_ne.add(Point::new(150.0, 50.0));
+        assert_eq!(diag_ne.release().as_deref(), Some("NE"));
+
+        let mut diag_sw = GesturePath::new(Point::new(100.0, 100.0), 4);
+        diag_sw.add(Point::new(50.0, 150.0));
+        assert_eq!(diag_sw.release().as_deref(), Some("SW"));
+
+        let mut diag_rev = GesturePath::new(Point::new(100.0, 100.0), 4);
+        diag_rev.add(Point::new(150.0, 150.0));
+        diag_rev.add(Point::new(120.0, 120.0));
+        assert!(diag_rev.invalid());
+        assert_eq!(diag_rev.release(), None);
+
+        assert_eq!(shape_arrows("NW"), "↖");
+        assert_eq!(shape_name_ja("SE"), "右下");
     }
 
     #[test]

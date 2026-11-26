@@ -4,6 +4,152 @@ import 'gesture_models.dart';
 /// Android WebView の既定プロファイル名（AndroidX WebKit `Profile.DEFAULT_PROFILE_NAME` 準拠）
 const String defaultWebViewProfileName = 'Default';
 
+const int defaultFollowWindowHours = 24;
+const int minFollowWindowHours = 1;
+const int maxFollowWindowHours = 168;
+const int maxEventRetentionSecs = 7 * 24 * 3600 + 3600;
+const int maxEventsPerDevice = 4000;
+
+List<int> pruneEventTimestamps(
+  Iterable<int> events,
+  int minExclusive,
+  int retentionCutoff,
+) {
+  final out = <int>[
+    for (final t in events)
+      if (t > minExclusive && t >= retentionCutoff) t,
+  ]..sort();
+  if (out.length > maxEventsPerDevice) {
+    return out.sublist(out.length - maxEventsPerDevice);
+  }
+  return out;
+}
+
+int countEventsInWindow(
+  Iterable<int> events,
+  int minExclusive,
+  int cutoff,
+) {
+  var c = 0;
+  for (final t in events) {
+    if (t > minExclusive && t >= cutoff) c++;
+  }
+  return c;
+}
+
+void applyWindowDelta({
+  required List<int> events,
+  required List<int> deductions,
+  required int resetAt,
+  required int now,
+  required int cutoff,
+  required int curEffective,
+  required int delta,
+}) {
+  final retentionCutoff = now > maxEventRetentionSecs
+      ? now - maxEventRetentionSecs
+      : 0;
+  final prunedE = pruneEventTimestamps(events, resetAt, retentionCutoff);
+  final prunedD = pruneEventTimestamps(deductions, resetAt, retentionCutoff);
+  events
+    ..clear()
+    ..addAll(prunedE);
+  deductions
+    ..clear()
+    ..addAll(prunedD);
+  final eventTs = now > resetAt ? now : resetAt + 1;
+
+  if (delta > 0) {
+    final steps = delta > 1000 ? 1000 : delta;
+    for (var i = 0; i < steps; i++) {
+      final idx = deductions.lastIndexWhere((t) => t > resetAt && t >= cutoff);
+      if (idx >= 0) {
+        deductions.removeAt(idx);
+      } else {
+        events.add(eventTs);
+      }
+    }
+  } else if (delta < 0) {
+    final absDelta = -delta;
+    final steps = absDelta < curEffective
+        ? (absDelta > 1000 ? 1000 : absDelta)
+        : (curEffective > 1000 ? 1000 : curEffective);
+    for (var i = 0; i < steps; i++) {
+      final idx = events.lastIndexWhere((t) => t > resetAt && t >= cutoff);
+      if (idx >= 0) {
+        events.removeAt(idx);
+      } else {
+        deductions.add(eventTs);
+      }
+    }
+  }
+
+  final nextE = pruneEventTimestamps(events, resetAt, retentionCutoff);
+  final nextD = pruneEventTimestamps(deductions, resetAt, retentionCutoff);
+  events
+    ..clear()
+    ..addAll(nextE);
+  deductions
+    ..clear()
+    ..addAll(nextD);
+}
+
+List<int> _parseEventList(dynamic raw) {
+  if (raw is! List) return <int>[];
+  final out = <int>[];
+  for (final item in raw) {
+    final v = _clampNonNegInt(item, 0x7FFFFFFFFFFFFFFF);
+    if (v != null && v > 0) out.add(v);
+  }
+  out.sort();
+  if (out.length > maxEventsPerDevice) {
+    return out.sublist(out.length - maxEventsPerDevice);
+  }
+  return out;
+}
+
+bool _intListEquals(List<int> a, List<int> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+List<String> sanitizeCatalogOrder(Iterable<dynamic> raw) {
+  final seen = <String>{};
+  final out = <String>[];
+  for (final item in raw) {
+    if (item is! String) continue;
+    final trimmed = item.trim();
+    if (trimmed.isNotEmpty && seen.add(trimmed)) {
+      out.add(trimmed);
+    }
+  }
+  return out;
+}
+
+List<CatalogService> sortCatalogServices(
+  List<CatalogService> catalog,
+  List<String> catalogOrder,
+) {
+  if (catalogOrder.isEmpty) return List<CatalogService>.from(catalog);
+  final rank = <String, int>{};
+  for (var i = 0; i < catalogOrder.length; i++) {
+    rank.putIfAbsent(catalogOrder[i], () => i);
+  }
+  final out = List<CatalogService>.from(catalog);
+  out.sort((a, b) {
+    final ra = rank[a.id];
+    final rb = rank[b.id];
+    if (ra != null && rb != null) return ra.compareTo(rb);
+    if (ra != null) return -1;
+    if (rb != null) return 1;
+    return 0;
+  });
+  return out;
+}
+
 /// インスタンスIDごとに独立した Android WebView プロファイル名を生成する。
 String makeProfileNameForInstance(String instanceId) {
   final cleaned = instanceId.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '');
@@ -152,6 +298,8 @@ class ServiceInstance {
     this.unfollowCountToday = 0,
     this.unfollowCountTotal = 0,
     this.followCountDate,
+    this.followEvents = const [],
+    this.unfollowEvents = const [],
     this.detectedHandle,
     this.snsFollowingCount,
     this.snsFollowersCount,
@@ -176,6 +324,8 @@ class ServiceInstance {
   final int unfollowCountToday;
   final int unfollowCountTotal;
   final String? followCountDate;
+  final List<int> followEvents;
+  final List<int> unfollowEvents;
   final String? detectedHandle;
   final int? snsFollowingCount;
   final int? snsFollowersCount;
@@ -197,6 +347,161 @@ class ServiceInstance {
   int effectiveUnfollowCountToday([DateTime? now]) {
     final today = formatLocalYmd(now ?? DateTime.now());
     return followCountDate == today ? unfollowCountToday : 0;
+  }
+
+  /// 指定時間内（直近 `windowHours` 時間）の有効なフォロー回数。
+  /// 同期レジャー投影済み（`followEvents` が空で `detectedHandle` がある）場合は投影値を返す。
+  int effectiveFollowCountInWindow(int windowHours, [DateTime? now]) {
+    if (followEvents.isNotEmpty) {
+      final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+      final nowSecs = (now ?? DateTime.now()).millisecondsSinceEpoch ~/ 1000;
+      final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+      return countEventsInWindow(followEvents, 0, cutoff);
+    }
+    return followCountToday;
+  }
+
+  /// 指定時間内（直近 `windowHours` 時間）の有効なアンフォロー（解除）回数。
+  int effectiveUnfollowCountInWindow(int windowHours, [DateTime? now]) {
+    if (unfollowEvents.isNotEmpty) {
+      final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+      final nowSecs = (now ?? DateTime.now()).millisecondsSinceEpoch ~/ 1000;
+      final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+      return countEventsInWindow(unfollowEvents, 0, cutoff);
+    }
+    return unfollowCountToday;
+  }
+
+  /// 指定時間ウィンドウ方式でフォロー回数を delta (+1 / -1) 増減した新しいインスタンスを返す。
+  ServiceInstance withFollowWindowDelta(
+    int delta, {
+    required int windowHours,
+    DateTime? now,
+  }) {
+    final dt = now ?? DateTime.now();
+    final today = formatLocalYmd(dt);
+    final nowSecs = dt.millisecondsSinceEpoch ~/ 1000;
+    final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+    final retentionCutoff =
+        nowSecs > maxEventRetentionSecs ? nowSecs - maxEventRetentionSecs : 0;
+    final nextEvents =
+        pruneEventTimestamps(followEvents, 0, retentionCutoff);
+    if (delta > 0) {
+      final steps = delta > 1000 ? 1000 : delta;
+      for (var i = 0; i < steps; i++) {
+        nextEvents.add(nowSecs);
+      }
+    } else if (delta < 0) {
+      final steps = (-delta) > 1000 ? 1000 : -delta;
+      for (var i = 0; i < steps; i++) {
+        final pos = nextEvents.lastIndexWhere((t) => t >= cutoff);
+        if (pos >= 0) {
+          nextEvents.removeAt(pos);
+        } else {
+          break;
+        }
+      }
+    }
+    final finalEvents =
+        pruneEventTimestamps(nextEvents, 0, retentionCutoff);
+    final nextCount = countEventsInWindow(finalEvents, 0, cutoff);
+    final nextUfCount = countEventsInWindow(unfollowEvents, 0, cutoff);
+    return copyWith(
+      followCountToday: nextCount,
+      followCountTotal: nextCount,
+      unfollowCountToday: nextUfCount,
+      unfollowCountTotal: nextUfCount,
+      followCountDate: today,
+      followEvents: finalEvents,
+    );
+  }
+
+  /// 指定時間ウィンドウ方式でフォロー回数をリセットした新しいインスタンスを返す。
+  ServiceInstance withFollowWindowReset({
+    required int windowHours,
+    DateTime? now,
+  }) {
+    final dt = now ?? DateTime.now();
+    final today = formatLocalYmd(dt);
+    final nowSecs = dt.millisecondsSinceEpoch ~/ 1000;
+    final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+    final nextUfCount = countEventsInWindow(unfollowEvents, 0, cutoff);
+    return copyWith(
+      followCountToday: 0,
+      followCountTotal: 0,
+      unfollowCountToday: nextUfCount,
+      unfollowCountTotal: nextUfCount,
+      followCountDate: today,
+      followEvents: const [],
+    );
+  }
+
+  /// 指定時間ウィンドウ方式でアンフォロー回数を delta (+1 / -1) 増減した新しいインスタンスを返す。
+  ServiceInstance withUnfollowWindowDelta(
+    int delta, {
+    required int windowHours,
+    DateTime? now,
+  }) {
+    final dt = now ?? DateTime.now();
+    final today = formatLocalYmd(dt);
+    final nowSecs = dt.millisecondsSinceEpoch ~/ 1000;
+    final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+    final retentionCutoff =
+        nowSecs > maxEventRetentionSecs ? nowSecs - maxEventRetentionSecs : 0;
+    final nextEvents =
+        pruneEventTimestamps(unfollowEvents, 0, retentionCutoff);
+    if (delta > 0) {
+      final steps = delta > 1000 ? 1000 : delta;
+      for (var i = 0; i < steps; i++) {
+        nextEvents.add(nowSecs);
+      }
+    } else if (delta < 0) {
+      final steps = (-delta) > 1000 ? 1000 : -delta;
+      for (var i = 0; i < steps; i++) {
+        final pos = nextEvents.lastIndexWhere((t) => t >= cutoff);
+        if (pos >= 0) {
+          nextEvents.removeAt(pos);
+        } else {
+          break;
+        }
+      }
+    }
+    final finalEvents =
+        pruneEventTimestamps(nextEvents, 0, retentionCutoff);
+    final nextFCount = countEventsInWindow(followEvents, 0, cutoff);
+    final nextUfCount = countEventsInWindow(finalEvents, 0, cutoff);
+    return copyWith(
+      followCountToday: nextFCount,
+      followCountTotal: nextFCount,
+      unfollowCountToday: nextUfCount,
+      unfollowCountTotal: nextUfCount,
+      followCountDate: today,
+      unfollowEvents: finalEvents,
+    );
+  }
+
+  /// 指定時間ウィンドウ方式でアンフォロー回数をリセットした新しいインスタンスを返す。
+  ServiceInstance withUnfollowWindowReset({
+    required int windowHours,
+    DateTime? now,
+  }) {
+    final dt = now ?? DateTime.now();
+    final today = formatLocalYmd(dt);
+    final nowSecs = dt.millisecondsSinceEpoch ~/ 1000;
+    final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+    final nextFCount = countEventsInWindow(followEvents, 0, cutoff);
+    return copyWith(
+      followCountToday: nextFCount,
+      followCountTotal: nextFCount,
+      unfollowCountToday: 0,
+      unfollowCountTotal: 0,
+      followCountDate: today,
+      unfollowEvents: const [],
+    );
   }
 
   /// フォロー回数を delta (+1 / -1) 増減した新しいインスタンスを返す。
@@ -269,6 +574,8 @@ class ServiceInstance {
     int? unfollowCountToday,
     int? unfollowCountTotal,
     String? followCountDate,
+    List<int>? followEvents,
+    List<int>? unfollowEvents,
     String? detectedHandle,
     bool clearDetectedHandle = false,
     int? snsFollowingCount,
@@ -294,6 +601,8 @@ class ServiceInstance {
       unfollowCountToday: unfollowCountToday ?? this.unfollowCountToday,
       unfollowCountTotal: unfollowCountTotal ?? this.unfollowCountTotal,
       followCountDate: followCountDate ?? this.followCountDate,
+      followEvents: followEvents ?? this.followEvents,
+      unfollowEvents: unfollowEvents ?? this.unfollowEvents,
       detectedHandle: clearDetectedHandle
           ? null
           : (detectedHandle ?? this.detectedHandle),
@@ -325,6 +634,8 @@ class ServiceInstance {
       'unfollowCountTotal': unfollowCountTotal,
       if (followCountDate != null && followCountDate!.isNotEmpty)
         'followCountDate': followCountDate,
+      if (followEvents.isNotEmpty) 'followEvents': followEvents,
+      if (unfollowEvents.isNotEmpty) 'unfollowEvents': unfollowEvents,
       if (detectedHandle != null && detectedHandle!.trim().isNotEmpty)
         'detectedHandle': detectedHandle!.trim(),
       if (snsFollowingCount != null) 'snsFollowingCount': snsFollowingCount,
@@ -337,11 +648,46 @@ class ServiceInstance {
     final rawLabel = _asNonEmptyString(json['accountLabel']);
     final rawProfile = _asNonEmptyString(json['profileName']);
     final rawFollowDate = _asNonEmptyString(json['followCountDate']);
+    final validDate =
+        (rawFollowDate != null && isValidYmd(rawFollowDate))
+            ? rawFollowDate
+            : null;
     final rawHandle = normalizeAccountHandle(
       json['detectedHandle'] is String ? json['detectedHandle'] as String : null,
     );
     final rawUrl = json['url'] is String ? json['url'] as String : '';
     final rawNotif = json['notificationsEnabled'];
+    final today = formatLocalYmd(DateTime.now());
+    final nowSecs = nowUnixSecs();
+    final retentionCutoff =
+        nowSecs > maxEventRetentionSecs ? nowSecs - maxEventRetentionSecs : 0;
+    final rawFollowToday = _clampNonNegInt(json['followCountToday'], 999999) ?? 0;
+    final rawUnfollowToday =
+        _clampNonNegInt(json['unfollowCountToday'], 999999) ?? 0;
+    var parsedFollowEvents = _parseEventList(json['followEvents']);
+    var parsedUnfollowEvents = _parseEventList(json['unfollowEvents']);
+    if (parsedFollowEvents.isEmpty &&
+        !json.containsKey('followEvents') &&
+        validDate == today &&
+        rawFollowToday > 0) {
+      parsedFollowEvents = List<int>.filled(
+        rawFollowToday > 1000 ? 1000 : rawFollowToday,
+        nowSecs,
+      );
+    }
+    if (parsedUnfollowEvents.isEmpty &&
+        !json.containsKey('unfollowEvents') &&
+        validDate == today &&
+        rawUnfollowToday > 0) {
+      parsedUnfollowEvents = List<int>.filled(
+        rawUnfollowToday > 1000 ? 1000 : rawUnfollowToday,
+        nowSecs,
+      );
+    }
+    parsedFollowEvents =
+        pruneEventTimestamps(parsedFollowEvents, 0, retentionCutoff);
+    parsedUnfollowEvents =
+        pruneEventTimestamps(parsedUnfollowEvents, 0, retentionCutoff);
     return ServiceInstance(
       instanceId: _asNonEmptyString(json['instanceId']) ?? 'svc-$index',
       serviceId: _asNonEmptyString(json['serviceId']) ?? 'custom',
@@ -355,17 +701,15 @@ class ServiceInstance {
       notificationsEnabled: rawNotif is bool ? rawNotif : true,
       order: (json['order'] as num?)?.toInt() ?? index,
       uaMode: json['uaMode'] == 'desktop' ? 'desktop' : 'mobile',
-      followCountToday: _clampNonNegInt(json['followCountToday'], 999999) ?? 0,
+      followCountToday: rawFollowToday,
       followCountTotal:
           _clampNonNegInt(json['followCountTotal'], 99999999) ?? 0,
-      unfollowCountToday:
-          _clampNonNegInt(json['unfollowCountToday'], 999999) ?? 0,
+      unfollowCountToday: rawUnfollowToday,
       unfollowCountTotal:
           _clampNonNegInt(json['unfollowCountTotal'], 99999999) ?? 0,
-      followCountDate:
-          (rawFollowDate != null && isValidYmd(rawFollowDate))
-              ? rawFollowDate
-              : null,
+      followCountDate: validDate,
+      followEvents: parsedFollowEvents,
+      unfollowEvents: parsedUnfollowEvents,
       detectedHandle: rawHandle,
       snsFollowingCount: _clampNonNegInt(json['snsFollowingCount']),
       snsFollowersCount: _clampNonNegInt(json['snsFollowersCount']),
@@ -406,6 +750,8 @@ class AppSettings {
     this.activeInstanceId,
     this.isBottomTabsCollapsed = false,
     this.isHeaderCollapsed = false,
+    this.followWindowHours = defaultFollowWindowHours,
+    this.catalogOrder = const [],
     this.gesture = const MobileGestureSettings(),
   });
 
@@ -413,6 +759,8 @@ class AppSettings {
   final String? activeInstanceId;
   final bool isBottomTabsCollapsed;
   final bool isHeaderCollapsed;
+  final int followWindowHours;
+  final List<String> catalogOrder;
   final MobileGestureSettings gesture;
 
   AppSettings copyWith({
@@ -421,6 +769,8 @@ class AppSettings {
     bool clearActive = false,
     bool? isBottomTabsCollapsed,
     bool? isHeaderCollapsed,
+    int? followWindowHours,
+    List<String>? catalogOrder,
     MobileGestureSettings? gesture,
   }) {
     return AppSettings(
@@ -430,6 +780,9 @@ class AppSettings {
       isBottomTabsCollapsed:
           isBottomTabsCollapsed ?? this.isBottomTabsCollapsed,
       isHeaderCollapsed: isHeaderCollapsed ?? this.isHeaderCollapsed,
+      followWindowHours: (followWindowHours ?? this.followWindowHours)
+          .clamp(minFollowWindowHours, maxFollowWindowHours),
+      catalogOrder: catalogOrder ?? this.catalogOrder,
       gesture: gesture ?? this.gesture,
     );
   }
@@ -440,17 +793,26 @@ class AppSettings {
       'activeInstanceId': activeInstanceId,
       'isBottomTabsCollapsed': isBottomTabsCollapsed,
       'isHeaderCollapsed': isHeaderCollapsed,
+      'followWindowHours': followWindowHours,
+      if (catalogOrder.isNotEmpty) 'catalogOrder': catalogOrder,
       'gesture': gesture.toJson(),
     };
   }
 
   factory AppSettings.fromJson(Map<String, dynamic> json) {
     final rawGesture = json['gesture'];
+    final rawHours = (json['followWindowHours'] as num?)?.toInt();
+    final rawCatalogOrder = json['catalogOrder'];
     return AppSettings(
       isDarkMode: json['isDarkMode'] as bool? ?? true,
       activeInstanceId: json['activeInstanceId'] as String?,
       isBottomTabsCollapsed: json['isBottomTabsCollapsed'] as bool? ?? false,
       isHeaderCollapsed: json['isHeaderCollapsed'] as bool? ?? false,
+      followWindowHours: (rawHours ?? defaultFollowWindowHours)
+          .clamp(minFollowWindowHours, maxFollowWindowHours),
+      catalogOrder: rawCatalogOrder is List
+          ? sanitizeCatalogOrder(rawCatalogOrder)
+          : const [],
       gesture: rawGesture is Map<String, dynamic>
           ? MobileGestureSettings.fromJson(rawGesture)
           : const MobileGestureSettings(),
@@ -630,6 +992,40 @@ String serviceGroupKey(ServiceInstance inst) {
   return 'custom:${inst.instanceId}';
 }
 
+/// 「メイン」「アカウント 3」等の自動付与ラベル（未命名状態）かを判定する。
+bool isGenericAccountLabel(String? label, {String? prevHandle}) {
+  final trimmed = label?.trim() ?? '';
+  if (trimmed.isEmpty) return true;
+  if (trimmed == 'メイン') return true;
+  if (RegExp(r'^アカウント\s*\d+$').hasMatch(trimmed)) return true;
+  final ph = prevHandle?.trim().replaceFirst(RegExp(r'^@+'), '');
+  if (ph != null && ph.isNotEmpty) {
+    final stripped = trimmed.replaceFirst(RegExp(r'^@+'), '');
+    if (stripped.toLowerCase() == ph.toLowerCase()) return true;
+  }
+  return false;
+}
+
+/// ログイン記憶（アーカイブ済みアカウント）の分かりやすい表示タイトルを返す。
+String formatArchivedAccountTitle(ServiceInstance inst) {
+  final label = inst.accountLabel?.trim() ?? '';
+  final handle =
+      inst.detectedHandle?.trim().replaceFirst(RegExp(r'^@+'), '') ?? '';
+  if (handle.isNotEmpty) {
+    if (label.isEmpty ||
+        label == inst.name ||
+        isGenericAccountLabel(label) ||
+        label.replaceFirst(RegExp(r'^@+'), '').toLowerCase() ==
+            handle.toLowerCase()) {
+      return '${inst.name} · @$handle';
+    }
+    return '${inst.name} · $label (@$handle)';
+  }
+  return (label.isNotEmpty && label != inst.name)
+      ? '${inst.name} · $label'
+      : inst.name;
+}
+
 /// 同一SNS内でのアカウント表示名（ヘッダー切替チップ用）を返す。
 String accountDisplayLabel(
   ServiceInstance inst,
@@ -637,7 +1033,16 @@ String accountDisplayLabel(
   String? baseServiceName,
 }) {
   final explicit = inst.accountLabel?.trim();
-  if (explicit != null && explicit.isNotEmpty) return explicit;
+  final handle = inst.detectedHandle?.trim().replaceFirst(RegExp(r'^@+'), '');
+  if (explicit != null && explicit.isNotEmpty) {
+    if (handle != null && handle.isNotEmpty && isGenericAccountLabel(explicit)) {
+      return '@$handle';
+    }
+    return explicit;
+  }
+  if (handle != null && handle.isNotEmpty) {
+    return '@$handle';
+  }
 
   final rawName = inst.name.trim();
   final base = baseServiceName?.trim();
@@ -740,8 +1145,15 @@ class DeviceFollowEntry {
     this.unfollowTotal = 0,
     this.unfollowTodayEpoch = 0,
     this.unfollowTotalEpoch = 0,
+    List<int>? followEvents,
+    List<int>? followDeductions,
+    List<int>? unfollowEvents,
+    List<int>? unfollowDeductions,
     this.updatedAt = 0,
-  });
+  })  : followEvents = followEvents ?? <int>[],
+        followDeductions = followDeductions ?? <int>[],
+        unfollowEvents = unfollowEvents ?? <int>[],
+        unfollowDeductions = unfollowDeductions ?? <int>[];
 
   int today;
   int total;
@@ -751,6 +1163,10 @@ class DeviceFollowEntry {
   int unfollowTotal;
   int unfollowTodayEpoch;
   int unfollowTotalEpoch;
+  List<int> followEvents;
+  List<int> followDeductions;
+  List<int> unfollowEvents;
+  List<int> unfollowDeductions;
   int updatedAt;
 
   DeviceFollowEntry clone() => DeviceFollowEntry(
@@ -762,6 +1178,10 @@ class DeviceFollowEntry {
         unfollowTotal: unfollowTotal,
         unfollowTodayEpoch: unfollowTodayEpoch,
         unfollowTotalEpoch: unfollowTotalEpoch,
+        followEvents: List<int>.from(followEvents),
+        followDeductions: List<int>.from(followDeductions),
+        unfollowEvents: List<int>.from(unfollowEvents),
+        unfollowDeductions: List<int>.from(unfollowDeductions),
         updatedAt: updatedAt,
       );
 
@@ -774,6 +1194,10 @@ class DeviceFollowEntry {
       unfollowTotal == other.unfollowTotal &&
       unfollowTodayEpoch == other.unfollowTodayEpoch &&
       unfollowTotalEpoch == other.unfollowTotalEpoch &&
+      _intListEquals(followEvents, other.followEvents) &&
+      _intListEquals(followDeductions, other.followDeductions) &&
+      _intListEquals(unfollowEvents, other.unfollowEvents) &&
+      _intListEquals(unfollowDeductions, other.unfollowDeductions) &&
       updatedAt == other.updatedAt;
 
   Map<String, dynamic> toJson() => {
@@ -785,6 +1209,11 @@ class DeviceFollowEntry {
         'unfollowTotal': unfollowTotal,
         'unfollowTodayEpoch': unfollowTodayEpoch,
         'unfollowTotalEpoch': unfollowTotalEpoch,
+        if (followEvents.isNotEmpty) 'followEvents': followEvents,
+        if (followDeductions.isNotEmpty) 'followDeductions': followDeductions,
+        if (unfollowEvents.isNotEmpty) 'unfollowEvents': unfollowEvents,
+        if (unfollowDeductions.isNotEmpty)
+          'unfollowDeductions': unfollowDeductions,
         'updatedAt': updatedAt,
       };
 
@@ -800,6 +1229,10 @@ class DeviceFollowEntry {
           _clampSignedInt(json['unfollowTotal'], -99999999, 99999999) ?? 0,
       unfollowTodayEpoch: _clampNonNegInt(json['unfollowTodayEpoch']) ?? 0,
       unfollowTotalEpoch: _clampNonNegInt(json['unfollowTotalEpoch']) ?? 0,
+      followEvents: _parseEventList(json['followEvents']),
+      followDeductions: _parseEventList(json['followDeductions']),
+      unfollowEvents: _parseEventList(json['unfollowEvents']),
+      unfollowDeductions: _parseEventList(json['unfollowDeductions']),
       updatedAt: _clampNonNegInt(json['updatedAt'], 0x7FFFFFFFFFFFFFFF) ?? 0,
     );
   }
@@ -813,6 +1246,8 @@ class AccountFollowLedger {
     this.totalResetEpoch = 0,
     this.unfollowResetEpoch = 0,
     this.unfollowTotalResetEpoch = 0,
+    this.followResetAt = 0,
+    this.unfollowResetAt = 0,
     Map<String, DeviceFollowEntry>? devices,
     this.snsFollowing,
     this.snsFollowers,
@@ -824,6 +1259,8 @@ class AccountFollowLedger {
   int totalResetEpoch;
   int unfollowResetEpoch;
   int unfollowTotalResetEpoch;
+  int followResetAt;
+  int unfollowResetAt;
   Map<String, DeviceFollowEntry> devices;
   int? snsFollowing;
   int? snsFollowers;
@@ -835,6 +1272,8 @@ class AccountFollowLedger {
         totalResetEpoch: totalResetEpoch,
         unfollowResetEpoch: unfollowResetEpoch,
         unfollowTotalResetEpoch: unfollowTotalResetEpoch,
+        followResetAt: followResetAt,
+        unfollowResetAt: unfollowResetAt,
         devices: {for (final e in devices.entries) e.key: e.value.clone()},
         snsFollowing: snsFollowing,
         snsFollowers: snsFollowers,
@@ -897,6 +1336,85 @@ class AccountFollowLedger {
       sumToday.clamp(0, 999999),
       sumTotal.clamp(0, 99999999),
     );
+  }
+
+  /// 指定時間内（直近 `windowHours` 時間）の合算フォロー数を返す。
+  int effectiveWindowFollowCount(int nowSecs, int windowHours) {
+    final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+    var sum = 0;
+    for (final entry in devices.values) {
+      final hasEvents =
+          entry.followEvents.isNotEmpty || entry.followDeductions.isNotEmpty;
+      if (hasEvents) {
+        sum += countEventsInWindow(entry.followEvents, followResetAt, cutoff);
+        sum -=
+            countEventsInWindow(entry.followDeductions, followResetAt, cutoff);
+      } else if (entry.today > 0 &&
+          entry.todayEpoch >= resetEpoch &&
+          entry.updatedAt > followResetAt &&
+          entry.updatedAt >= cutoff) {
+        sum += entry.today;
+      }
+    }
+    return sum.clamp(0, 999999);
+  }
+
+  /// 指定時間内（直近 `windowHours` 時間）の合算アンフォロー（解除）数を返す。
+  int effectiveWindowUnfollowCount(int nowSecs, int windowHours) {
+    final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+    var sum = 0;
+    for (final entry in devices.values) {
+      final hasEvents = entry.unfollowEvents.isNotEmpty ||
+          entry.unfollowDeductions.isNotEmpty;
+      if (hasEvents) {
+        sum +=
+            countEventsInWindow(entry.unfollowEvents, unfollowResetAt, cutoff);
+        sum -= countEventsInWindow(
+            entry.unfollowDeductions, unfollowResetAt, cutoff);
+      } else if (entry.unfollowToday > 0 &&
+          entry.unfollowTodayEpoch >= unfollowResetEpoch &&
+          entry.updatedAt > unfollowResetAt &&
+          entry.updatedAt >= cutoff) {
+        sum += entry.unfollowToday;
+      }
+    }
+    return sum.clamp(0, 999999);
+  }
+
+  int maxFollowEventTs() {
+    var mx = followResetAt;
+    for (final entry in devices.values) {
+      for (final t in entry.followEvents) {
+        if (t > mx) mx = t;
+      }
+      for (final t in entry.followDeductions) {
+        if (t > mx) mx = t;
+      }
+      if (entry.followEvents.isEmpty && entry.today > 0 && entry.updatedAt > mx) {
+        mx = entry.updatedAt;
+      }
+    }
+    return mx;
+  }
+
+  int maxUnfollowEventTs() {
+    var mx = unfollowResetAt;
+    for (final entry in devices.values) {
+      for (final t in entry.unfollowEvents) {
+        if (t > mx) mx = t;
+      }
+      for (final t in entry.unfollowDeductions) {
+        if (t > mx) mx = t;
+      }
+      if (entry.unfollowEvents.isEmpty &&
+          entry.unfollowToday > 0 &&
+          entry.updatedAt > mx) {
+        mx = entry.updatedAt;
+      }
+    }
+    return mx;
   }
 
   /// 相手側レジャーを CRDT マージする。ローカルに変化があれば true。
@@ -976,6 +1494,24 @@ class AccountFollowLedger {
       changed = true;
     }
 
+    if (other.followResetAt > followResetAt) {
+      followResetAt = other.followResetAt;
+      for (final entry in devices.values) {
+        entry.followEvents.removeWhere((t) => t <= followResetAt);
+        entry.followDeductions.removeWhere((t) => t <= followResetAt);
+      }
+      changed = true;
+    }
+
+    if (other.unfollowResetAt > unfollowResetAt) {
+      unfollowResetAt = other.unfollowResetAt;
+      for (final entry in devices.values) {
+        entry.unfollowEvents.removeWhere((t) => t <= unfollowResetAt);
+        entry.unfollowDeductions.removeWhere((t) => t <= unfollowResetAt);
+      }
+      changed = true;
+    }
+
     final otherSameDay = remoteDate == targetDate;
     for (final item in other.devices.entries) {
       final normalized = item.value.clone();
@@ -995,6 +1531,18 @@ class AccountFollowLedger {
         normalized.unfollowTotal = 0;
         normalized.unfollowTotalEpoch = unfollowTotalResetEpoch;
       }
+      normalized.followEvents
+        ..removeWhere((t) => t <= followResetAt)
+        ..sort();
+      normalized.followDeductions
+        ..removeWhere((t) => t <= followResetAt)
+        ..sort();
+      normalized.unfollowEvents
+        ..removeWhere((t) => t <= unfollowResetAt)
+        ..sort();
+      normalized.unfollowDeductions
+        ..removeWhere((t) => t <= unfollowResetAt)
+        ..sort();
       final local = devices[item.key];
       if (local == null) {
         devices[item.key] = normalized;
@@ -1037,6 +1585,21 @@ class AccountFollowLedger {
             normalized.unfollowTotal > mergedEntry.unfollowTotal) {
           mergedEntry.unfollowTotal = normalized.unfollowTotal;
         }
+        if (normalized.followEvents.length > mergedEntry.followEvents.length) {
+          mergedEntry.followEvents = normalized.followEvents;
+        }
+        if (normalized.followDeductions.length >
+            mergedEntry.followDeductions.length) {
+          mergedEntry.followDeductions = normalized.followDeductions;
+        }
+        if (normalized.unfollowEvents.length >
+            mergedEntry.unfollowEvents.length) {
+          mergedEntry.unfollowEvents = normalized.unfollowEvents;
+        }
+        if (normalized.unfollowDeductions.length >
+            mergedEntry.unfollowDeductions.length) {
+          mergedEntry.unfollowDeductions = normalized.unfollowDeductions;
+        }
         if (!local.equalsValue(mergedEntry)) {
           devices[item.key] = mergedEntry;
           changed = true;
@@ -1069,6 +1632,8 @@ class AccountFollowLedger {
         'totalResetEpoch': totalResetEpoch,
         'unfollowResetEpoch': unfollowResetEpoch,
         'unfollowTotalResetEpoch': unfollowTotalResetEpoch,
+        'followResetAt': followResetAt,
+        'unfollowResetAt': unfollowResetAt,
         'devices': {for (final e in devices.entries) e.key: e.value.toJson()},
         if (snsFollowing != null) 'snsFollowing': snsFollowing,
         if (snsFollowers != null) 'snsFollowers': snsFollowers,
@@ -1094,6 +1659,10 @@ class AccountFollowLedger {
       unfollowResetEpoch: _clampNonNegInt(json['unfollowResetEpoch']) ?? 0,
       unfollowTotalResetEpoch:
           _clampNonNegInt(json['unfollowTotalResetEpoch']) ?? 0,
+      followResetAt:
+          _clampNonNegInt(json['followResetAt'], 0x7FFFFFFFFFFFFFFF) ?? 0,
+      unfollowResetAt:
+          _clampNonNegInt(json['unfollowResetAt'], 0x7FFFFFFFFFFFFFFF) ?? 0,
       devices: devices,
       snsFollowing: _clampNonNegInt(json['snsFollowing']),
       snsFollowers: _clampNonNegInt(json['snsFollowers']),
@@ -1216,35 +1785,57 @@ class FollowSyncSettings {
   }
 }
 
-/// レジャーの合算値・SNS実数を全インスタンスへ投影する。
+/// レジャーの指定時間内合算値・SNS実数を全インスタンスへ投影する。
 (List<ServiceInstance>, bool) projectLedgerToInstances(
   List<ServiceInstance> instances,
   FollowSyncLedger ledger,
-  String today,
-) {
+  String today, {
+  int windowHours = defaultFollowWindowHours,
+  int? nowSecs,
+}) {
   var changed = false;
+  final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+  final now = nowSecs ?? nowUnixSecs();
+  final cutoff = now > h * 3600 ? now - h * 3600 : 0;
   final out = instances.map((inst) {
     final key = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
-    if (key == null) return inst;
-    final acc = ledger.accounts[key];
-    if (acc == null) return inst;
-    final (sumToday, sumTotal) = acc.effectiveCounts(today);
-    final (ufToday, ufTotal) = acc.effectiveUnfollowCounts(today);
+    final acc = key != null ? ledger.accounts[key] : null;
+    if (acc == null) {
+      final fCnt = countEventsInWindow(inst.followEvents, 0, cutoff);
+      final uCnt = countEventsInWindow(inst.unfollowEvents, 0, cutoff);
+      if (inst.followCountToday != fCnt ||
+          inst.followCountTotal != fCnt ||
+          inst.unfollowCountToday != uCnt ||
+          inst.unfollowCountTotal != uCnt ||
+          inst.followCountDate != today) {
+        changed = true;
+        return inst.copyWith(
+          followCountToday: fCnt,
+          followCountTotal: fCnt,
+          unfollowCountToday: uCnt,
+          unfollowCountTotal: uCnt,
+          followCountDate: today,
+        );
+      }
+      return inst;
+    }
+    final sumFollow = acc.effectiveWindowFollowCount(now, h);
+    final sumUnfollow = acc.effectiveWindowUnfollowCount(now, h);
     final nextFlwng = acc.snsFollowing ?? inst.snsFollowingCount;
     final nextFlwrs = acc.snsFollowers ?? inst.snsFollowersCount;
-    if (inst.followCountToday != sumToday ||
-        inst.followCountTotal != sumTotal ||
-        inst.unfollowCountToday != ufToday ||
-        inst.unfollowCountTotal != ufTotal ||
+    if (inst.followCountToday != sumFollow ||
+        inst.followCountTotal != sumFollow ||
+        inst.unfollowCountToday != sumUnfollow ||
+        inst.unfollowCountTotal != sumUnfollow ||
         inst.followCountDate != today ||
         inst.snsFollowingCount != nextFlwng ||
         inst.snsFollowersCount != nextFlwrs) {
       changed = true;
       return inst.copyWith(
-        followCountToday: sumToday,
-        followCountTotal: sumTotal,
-        unfollowCountToday: ufToday,
-        unfollowCountTotal: ufTotal,
+        followCountToday: sumFollow,
+        followCountTotal: sumFollow,
+        unfollowCountToday: sumUnfollow,
+        unfollowCountTotal: sumUnfollow,
         followCountDate: today,
         snsFollowingCount: nextFlwng,
         snsFollowersCount: nextFlwrs,

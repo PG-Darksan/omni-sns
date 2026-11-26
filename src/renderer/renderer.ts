@@ -15,6 +15,7 @@ import {
 } from '../shared/types';
 import {
   detectPlatformServiceFromUrl,
+  formatArchivedAccountTitle,
   getAccountDisplayLabel,
   getServiceGroupKey,
   isSafeFaviconUrl,
@@ -23,7 +24,8 @@ import {
   makeBadgeText,
   nextDefaultAccountLabel,
   normalizeServiceUrl,
-  parseSharedSyncConfig
+  parseSharedSyncConfig,
+  sortCatalogServices
 } from '../shared/url-utils';
 
 interface ServiceGroup {
@@ -83,6 +85,8 @@ const state: UiState = {
 let toastTimer: number | null = null;
 let dragSourceGroupKey: string | null = null;
 let dragSourceAccountId: string | null = null;
+let dragSourceCatalogId: string | null = null;
+let followModalRefreshTimer: number | null = null;
 let gestureModal: GestureBoardModal | null = null;
 
 function el<T extends HTMLElement>(id: string): T {
@@ -739,9 +743,79 @@ function formatArchivedTimestamp(unixSecs: number): string {
 }
 
 function getArchivedDisplayTitle(inst: ServiceInstance): string {
-  const label = inst.accountLabel?.trim();
-  const base = label && label !== inst.name ? `${inst.name} · ${label}` : inst.name;
-  return inst.detectedHandle ? `${base} (@${inst.detectedHandle})` : base;
+  return formatArchivedAccountTitle(inst);
+}
+
+function attachArchivedInlineRename(
+  inst: ServiceInstance,
+  titleEl: HTMLElement,
+  onRenamed?: (updated: ServiceInstance) => void
+): void {
+  const row = document.createElement('div');
+  row.className = 'archived-rename-row';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'input-compact archived-rename-input';
+  input.placeholder = 'アカウント名（例: @username / 仕事用）';
+  input.value =
+    inst.accountLabel?.trim() || (inst.detectedHandle ? `@${inst.detectedHandle}` : '');
+
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'btn-primary btn-xs';
+  saveBtn.textContent = '保存';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.className = 'btn-secondary btn-xs';
+  cancelBtn.textContent = '戻す';
+
+  const restoreView = (nextInst: ServiceInstance) => {
+    titleEl.textContent = getArchivedDisplayTitle(nextInst);
+    titleEl.title = `${getArchivedDisplayTitle(nextInst)}\n${nextInst.url}`;
+  };
+
+  const commit = async () => {
+    const val = input.value.trim();
+    try {
+      const updated = await omniApi.renameArchivedTab(inst.instanceId, val);
+      restoreView(updated);
+      onRenamed?.(updated);
+      showToast(`ログイン記憶の名前を「${getArchivedDisplayTitle(updated)}」に更新しました`);
+    } catch (err) {
+      showToast(String(err));
+      restoreView(inst);
+    }
+  };
+
+  saveBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    void commit();
+  });
+  cancelBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    restoreView(inst);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation();
+      void commit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      restoreView(inst);
+    }
+  });
+
+  row.appendChild(input);
+  row.appendChild(saveBtn);
+  row.appendChild(cancelBtn);
+  titleEl.textContent = '';
+  titleEl.appendChild(row);
+  input.focus();
+  input.select();
 }
 
 async function closeArchivedPickModal(): Promise<void> {
@@ -782,6 +856,18 @@ async function openArchivedPickModal(
     info.appendChild(title);
     info.appendChild(sub);
 
+    const renameBtn = document.createElement('button');
+    renameBtn.type = 'button';
+    renameBtn.className = 'btn-secondary btn-xs';
+    renameBtn.textContent = '✎';
+    renameBtn.title = 'アカウント名を編集';
+    renameBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      attachArchivedInlineRename(inst, title, (updated) => {
+        entry.instance = updated;
+      });
+    });
+
     const restoreBtn = document.createElement('button');
     restoreBtn.type = 'button';
     restoreBtn.className = 'btn-primary btn-xs';
@@ -790,13 +876,14 @@ async function openArchivedPickModal(
       try {
         await omniApi.restoreArchivedTab(inst.instanceId);
         await closeArchivedPickModal();
-        showToast(`「${getArchivedDisplayTitle(inst)}」をログイン記憶から呼び出しました`);
+        showToast(`「${getArchivedDisplayTitle(entry.instance)}」をログイン記憶から呼び出しました`);
       } catch (err) {
         showToast(String(err));
       }
     });
 
     row.appendChild(info);
+    row.appendChild(renameBtn);
     row.appendChild(restoreBtn);
     list.appendChild(row);
   }
@@ -1071,7 +1158,8 @@ function renderToolbarAndViewport(): void {
     if (typeof counterInst.snsFollowersCount === 'number') {
       liveParts.push(`フォロワー ${counterInst.snsFollowersCount.toLocaleString()}人`);
     }
-    const baseTip = `フォロー: 今日 ${todayFollow} / 累計 ${counterInst.followCountTotal ?? 0} · アンフォロー: 今日 ${todayUnfollow} / 累計 ${counterInst.unfollowCountTotal ?? 0}`;
+    const winH = Math.max(1, Math.min(168, state.config?.settings.followWindowHours ?? 24));
+    const baseTip = `直近${winH}時間 · フォロー ${todayFollow} / アンフォロー ${todayUnfollow}`;
     const followTip = liveParts.length > 0 ? `${baseTip}\n${liveParts.join(' · ')}` : baseTip;
     followBtn.title = followTip;
     collapsedFollowBtn.title = followTip;
@@ -1165,6 +1253,17 @@ function renderArchivedLoginsPanel(): void {
     const actions = document.createElement('div');
     actions.className = 'archived-card-actions';
 
+    const renameBtn = document.createElement('button');
+    renameBtn.type = 'button';
+    renameBtn.className = 'btn-secondary btn-xs';
+    renameBtn.textContent = '✎ 名前';
+    renameBtn.title = 'このログイン記憶のアカウント名を変更';
+    renameBtn.addEventListener('click', () => {
+      attachArchivedInlineRename(entry.instance, title, (updated) => {
+        entry.instance = updated;
+      });
+    });
+
     const restoreBtn = document.createElement('button');
     restoreBtn.type = 'button';
     restoreBtn.className = 'btn-primary btn-xs';
@@ -1174,7 +1273,7 @@ function renderArchivedLoginsPanel(): void {
       try {
         await omniApi.restoreArchivedTab(inst.instanceId);
         await closeCatalogModal();
-        showToast(`「${getArchivedDisplayTitle(inst)}」を呼び出しました`);
+        showToast(`「${getArchivedDisplayTitle(entry.instance)}」を呼び出しました`);
       } catch (err) {
         showToast(String(err));
       }
@@ -1188,7 +1287,7 @@ function renderArchivedLoginsPanel(): void {
     purgeBtn.addEventListener('click', async (e) => {
       const ok = await openConfirmDialog({
         title: 'ログイン記憶を完全削除',
-        message: `「${getArchivedDisplayTitle(inst)}」のログイン記憶（Cookie・セッション）を完全に消去しますか？\n※ この操作は取り消せません。`,
+        message: `「${getArchivedDisplayTitle(entry.instance)}」のログイン記憶（Cookie・セッション）を完全に消去しますか？\n※ この操作は取り消せません。`,
         confirmLabel: '完全削除する',
         danger: true,
         anchorEl: purgeBtn,
@@ -1196,9 +1295,10 @@ function renderArchivedLoginsPanel(): void {
       });
       if (!ok) return;
       await omniApi.purgeArchivedTab(inst.instanceId);
-      showToast(`「${getArchivedDisplayTitle(inst)}」のログイン記憶を完全削除しました`);
+      showToast(`「${getArchivedDisplayTitle(entry.instance)}」のログイン記憶を完全削除しました`);
     });
 
+    actions.appendChild(renameBtn);
     actions.appendChild(restoreBtn);
     actions.appendChild(purgeBtn);
     card.appendChild(avatar);
@@ -1259,10 +1359,16 @@ function renderCatalog(): void {
     catTabs.appendChild(btn);
   }
 
+  const reorderHint = el<HTMLSpanElement>('catalog-reorder-hint');
+  const resetOrderBtn = el<HTMLButtonElement>('btn-catalog-reset-order');
+  const customCatalogOrder = state.config?.settings.catalogOrder ?? [];
+
   if (state.selectedCatalogCategory === 'archived') {
     grid.classList.add('hidden');
     customForm.classList.add('hidden');
     archivedPanel.classList.remove('hidden');
+    reorderHint.classList.add('hidden');
+    resetOrderBtn.classList.add('hidden');
     renderArchivedLoginsPanel();
     return;
   }
@@ -1271,6 +1377,8 @@ function renderCatalog(): void {
     grid.classList.add('hidden');
     archivedPanel.classList.add('hidden');
     customForm.classList.remove('hidden');
+    reorderHint.classList.add('hidden');
+    resetOrderBtn.classList.add('hidden');
     return;
   }
 
@@ -1279,7 +1387,12 @@ function renderCatalog(): void {
   customForm.classList.add('hidden');
 
   const q = state.catalogSearchQuery.trim().toLowerCase();
-  const filtered = state.catalog.filter((svc) => {
+  const orderedCatalog = sortCatalogServices(state.catalog, customCatalogOrder);
+  const canReorder = !q;
+  reorderHint.classList.toggle('hidden', !canReorder);
+  resetOrderBtn.classList.toggle('hidden', customCatalogOrder.length === 0);
+
+  const filtered = orderedCatalog.filter((svc) => {
     if (state.selectedCatalogCategory !== 'all' && svc.category !== state.selectedCatalogCategory) {
       return false;
     }
@@ -1325,10 +1438,51 @@ function renderCatalog(): void {
     const count = addedCounts.get(svc.id) ?? 0;
     const svcArchived = archivedByService.get(svc.id) ?? [];
     const card = document.createElement('div');
-    card.className = 'catalog-card';
+    card.className = canReorder ? 'catalog-card reorderable' : 'catalog-card';
+    card.draggable = canReorder;
+    card.dataset.serviceId = svc.id;
     card.title = svc.note
       ? `${svc.name} (${svc.url})\n${svc.description}\n※ ${svc.note}`
       : `${svc.name} (${svc.url})\n${svc.description}`;
+
+    if (canReorder) {
+      card.addEventListener('dragstart', (e) => {
+        dragSourceCatalogId = svc.id;
+        card.classList.add('dragging');
+        e.dataTransfer?.setData('text/plain', svc.id);
+      });
+      card.addEventListener('dragend', () => {
+        dragSourceCatalogId = null;
+        card.classList.remove('dragging');
+        grid.querySelectorAll('.catalog-card.drag-over').forEach((n) => n.classList.remove('drag-over'));
+      });
+      card.addEventListener('dragover', (e) => {
+        if (!dragSourceCatalogId || dragSourceCatalogId === svc.id) return;
+        e.preventDefault();
+        card.classList.add('drag-over');
+      });
+      card.addEventListener('dragleave', () => {
+        card.classList.remove('drag-over');
+      });
+      card.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        card.classList.remove('drag-over');
+        if (!dragSourceCatalogId || dragSourceCatalogId === svc.id) return;
+        const ids = orderedCatalog.map((item) => item.id);
+        const fromIdx = ids.indexOf(dragSourceCatalogId);
+        const toIdx = ids.indexOf(svc.id);
+        if (fromIdx === -1 || toIdx === -1) return;
+        const [moved] = ids.splice(fromIdx, 1);
+        ids.splice(toIdx, 0, moved);
+        await omniApi.updateSettings({ catalogOrder: ids });
+      });
+
+      const handle = document.createElement('span');
+      handle.className = 'catalog-drag-handle';
+      handle.textContent = '⋮⋮';
+      handle.title = 'ドラッグしてSNSの並び順を変更';
+      card.appendChild(handle);
+    }
 
     const avatar = document.createElement('div');
     avatar.className = 'catalog-card-avatar';
@@ -1576,32 +1730,38 @@ function renderFollowModal(): void {
   const counterInfo = getCounterTargetInfo();
   const active = counterInfo.target;
   if (!active || !state.config) return;
+  const winH = Math.max(1, Math.min(168, state.config.settings.followWindowHours ?? 24));
   const todayCount = active.followCountToday ?? 0;
-  const totalCount = active.followCountTotal ?? 0;
   const unfollowTodayCount = active.unfollowCountToday ?? 0;
-  const unfollowTotalCount = active.unfollowCountTotal ?? 0;
 
   const baseTitle = getInstanceDisplayTitle(active);
-  const withHandle = active.detectedHandle
+  const withHandle = active.detectedHandle && !baseTitle.includes(`@${active.detectedHandle}`)
     ? `${baseTitle} (@${active.detectedHandle})`
     : baseTitle;
   const accountSubtitle = counterInfo.isCrossSite
     ? `${withHandle}（${getActiveDisplayTitle()}タブ内で表示中）`
     : withHandle;
   el<HTMLParagraphElement>('follow-modal-account').textContent = accountSubtitle;
+
+  el<HTMLElement>('follow-window-label').textContent = `直近${winH}時間のフォロー数`;
+  el<HTMLElement>('unfollow-window-label').textContent = `直近${winH}時間のアンフォロー数`;
+  el<HTMLElement>('follow-summary-title').textContent = `全アカウントの合計（直近${winH}時間）`;
+  document.querySelectorAll<HTMLButtonElement>('[data-follow-window-hours]').forEach((btn) => {
+    const h = Number(btn.dataset.followWindowHours);
+    btn.classList.toggle('active', h === winH);
+  });
+  const winInput = el<HTMLInputElement>('follow-window-hours-input');
+  if (document.activeElement !== winInput) {
+    winInput.value = String(winH);
+  }
+
   el<HTMLElement>('follow-modal-today').textContent = String(todayCount);
-  el<HTMLElement>('follow-modal-total').textContent = String(totalCount);
-  el<HTMLButtonElement>('btn-follow-dec').disabled = todayCount <= 0 && totalCount <= 0;
+  el<HTMLButtonElement>('btn-follow-dec').disabled = todayCount <= 0;
   el<HTMLButtonElement>('btn-follow-reset-today').disabled = todayCount <= 0;
-  el<HTMLButtonElement>('btn-follow-reset-all').disabled = todayCount <= 0 && totalCount <= 0;
 
   el<HTMLElement>('unfollow-modal-today').textContent = String(unfollowTodayCount);
-  el<HTMLElement>('unfollow-modal-total').textContent = String(unfollowTotalCount);
-  el<HTMLButtonElement>('btn-unfollow-dec').disabled =
-    unfollowTodayCount <= 0 && unfollowTotalCount <= 0;
+  el<HTMLButtonElement>('btn-unfollow-dec').disabled = unfollowTodayCount <= 0;
   el<HTMLButtonElement>('btn-unfollow-reset-today').disabled = unfollowTodayCount <= 0;
-  el<HTMLButtonElement>('btn-unfollow-reset-all').disabled =
-    unfollowTodayCount <= 0 && unfollowTotalCount <= 0;
 
   // SNS サーバー側の実フォロー中／フォロワー数
   const snsLiveBar = el<HTMLDivElement>('follow-sns-live-bar');
@@ -1725,12 +1885,35 @@ async function openFollowModal(): Promise<void> {
   followModalDraft.handleDirty = false;
   followModalDraft.tokenDirty = false;
   followModalDraft.gistDirty = false;
+  try {
+    state.config = await omniApi.refreshFollowCounts();
+  } catch {
+    // ignore
+  }
   renderFollowModal();
   el('follow-modal').classList.remove('hidden');
+  if (followModalRefreshTimer !== null) {
+    window.clearInterval(followModalRefreshTimer);
+  }
+  followModalRefreshTimer = window.setInterval(() => {
+    if (el('follow-modal').classList.contains('hidden')) return;
+    void omniApi
+      .refreshFollowCounts()
+      .then((cfg) => {
+        state.config = cfg;
+        renderToolbarAndViewport();
+        renderFollowModal();
+      })
+      .catch(() => {});
+  }, 30000);
   await syncOverlayToMain();
 }
 
 async function closeFollowModal(): Promise<void> {
+  if (followModalRefreshTimer !== null) {
+    window.clearInterval(followModalRefreshTimer);
+    followModalRefreshTimer = null;
+  }
   el('follow-modal').classList.add('hidden');
   await syncOverlayToMain();
 }
@@ -2279,6 +2462,10 @@ function bindEvents(): void {
     }
     renderCatalog();
   });
+  el<HTMLButtonElement>('btn-catalog-reset-order').addEventListener('click', async () => {
+    await omniApi.updateSettings({ catalogOrder: [] });
+    showToast('カタログの表示順を初期順に戻しました');
+  });
 
   el<HTMLFormElement>('custom-service-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2374,6 +2561,31 @@ function bindEvents(): void {
       void closeFollowModal();
     }
   });
+  const applyFollowWindowHours = async (rawHours: number) => {
+    if (!Number.isFinite(rawHours)) return;
+    const clamped = Math.max(1, Math.min(168, Math.round(rawHours)));
+    await omniApi.updateSettings({ followWindowHours: clamped });
+    showToast(`フォロー集計時間を直近 ${clamped} 時間に変更しました`);
+  };
+  document.querySelectorAll<HTMLButtonElement>('[data-follow-window-hours]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const h = Number(btn.dataset.followWindowHours);
+      if (Number.isFinite(h)) {
+        void applyFollowWindowHours(h);
+      }
+    });
+  });
+  el<HTMLButtonElement>('btn-follow-window-apply').addEventListener('click', () => {
+    const val = Number(el<HTMLInputElement>('follow-window-hours-input').value);
+    void applyFollowWindowHours(val);
+  });
+  el<HTMLInputElement>('follow-window-hours-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const val = Number((e.target as HTMLInputElement).value);
+      void applyFollowWindowHours(val);
+    }
+  });
   el<HTMLButtonElement>('btn-follow-inc').addEventListener('click', async () => {
     const target = getCounterTargetInfo().target;
     if (!target) return;
@@ -2388,13 +2600,7 @@ function bindEvents(): void {
     const target = getCounterTargetInfo().target;
     if (!target) return;
     await omniApi.resetFollowCount(target.instanceId, false);
-    showToast('今日のフォロー回数をリセットしました');
-  });
-  el<HTMLButtonElement>('btn-follow-reset-all').addEventListener('click', async () => {
-    const target = getCounterTargetInfo().target;
-    if (!target) return;
-    await omniApi.resetFollowCount(target.instanceId, true);
-    showToast('フォロー回数をすべてリセットしました');
+    showToast('指定時間内のフォロー回数をリセットしました');
   });
   el<HTMLButtonElement>('btn-unfollow-inc').addEventListener('click', async () => {
     const target = getCounterTargetInfo().target;
@@ -2410,13 +2616,7 @@ function bindEvents(): void {
     const target = getCounterTargetInfo().target;
     if (!target) return;
     await omniApi.resetUnfollowCount(target.instanceId, false);
-    showToast('今日のアンフォロー回数をリセットしました');
-  });
-  el<HTMLButtonElement>('btn-unfollow-reset-all').addEventListener('click', async () => {
-    const target = getCounterTargetInfo().target;
-    if (!target) return;
-    await omniApi.resetUnfollowCount(target.instanceId, true);
-    showToast('アンフォロー回数をすべてリセットしました');
+    showToast('指定時間内のアンフォロー回数をリセットしました');
   });
 
   const saveFollowHandle = async () => {

@@ -4,12 +4,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub const GIST_FILENAME: &str = "omnisns-follow-sync.json";
+pub const MAX_EVENT_RETENTION_SECS: u64 = 7 * 24 * 3600 + 3600;
+pub const MAX_EVENTS_PER_DEVICE: usize = 4000;
 
 pub fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+pub fn prune_event_timestamps(events: &mut Vec<u64>, min_exclusive: u64, retention_cutoff: u64) {
+    events.retain(|&t| t > min_exclusive && t >= retention_cutoff);
+    events.sort_unstable();
+    if events.len() > MAX_EVENTS_PER_DEVICE {
+        let drop_n = events.len() - MAX_EVENTS_PER_DEVICE;
+        events.drain(0..drop_n);
+    }
+}
+
+pub fn count_events_in_window(events: &[u64], min_exclusive: u64, cutoff: u64) -> usize {
+    events
+        .iter()
+        .filter(|&&t| t > min_exclusive && t >= cutoff)
+        .count()
 }
 
 pub fn normalize_account_handle(raw: &str) -> Option<String> {
@@ -55,6 +73,14 @@ pub struct DeviceFollowEntry {
     pub unfollow_today_epoch: u64,
     #[serde(default)]
     pub unfollow_total_epoch: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub follow_events: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub follow_deductions: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfollow_events: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfollow_deductions: Vec<u64>,
     #[serde(default)]
     pub updated_at: u64,
 }
@@ -72,6 +98,10 @@ pub struct AccountFollowLedger {
     pub unfollow_reset_epoch: u64,
     #[serde(default)]
     pub unfollow_total_reset_epoch: u64,
+    #[serde(default)]
+    pub follow_reset_at: u64,
+    #[serde(default)]
+    pub unfollow_reset_at: u64,
     #[serde(default)]
     pub devices: HashMap<String, DeviceFollowEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +274,7 @@ impl AccountFollowLedger {
         }
     }
 
+    #[allow(dead_code)]
     pub fn effective_counts(&self, today: &str) -> (u32, u32) {
         // タイムゾーン差や数分の時計ズレ（+1日以内）で当日カウントを凍結させない一方、
         // 異常な未来日付（> today+1日）による永続汚染は無効化する。
@@ -267,6 +298,7 @@ impl AccountFollowLedger {
         )
     }
 
+    #[allow(dead_code)]
     pub fn effective_unfollow_counts(&self, today: &str) -> (u32, u32) {
         let max_allowed = next_ymd(today).unwrap_or_else(|| today.to_string());
         let same_day = is_valid_ymd(&self.date)
@@ -286,6 +318,84 @@ impl AccountFollowLedger {
             sum_today.clamp(0, u32::MAX as i64) as u32,
             sum_total.clamp(0, u32::MAX as i64) as u32,
         )
+    }
+
+    /// 指定時間内（直近 `window_hours` 時間）の合算フォロー数を返す。
+    pub fn effective_window_follow_count(&self, now_secs: u64, window_hours: u32) -> u32 {
+        let hours = window_hours.clamp(1, 168) as u64;
+        let cutoff = now_secs.saturating_sub(hours * 3600);
+        let reset_at = self.follow_reset_at;
+        let mut sum: i64 = 0;
+        for entry in self.devices.values() {
+            let has_events = !entry.follow_events.is_empty() || !entry.follow_deductions.is_empty();
+            if has_events {
+                sum += count_events_in_window(&entry.follow_events, reset_at, cutoff) as i64;
+                sum -= count_events_in_window(&entry.follow_deductions, reset_at, cutoff) as i64;
+            } else if entry.today > 0
+                && entry.today_epoch >= self.reset_epoch
+                && entry.updated_at > reset_at
+                && entry.updated_at >= cutoff
+            {
+                // 旧バージョン端末（タイムスタンプ配列未対応）からの同期データを優雅に集計
+                sum += entry.today as i64;
+            }
+        }
+        sum.clamp(0, u32::MAX as i64) as u32
+    }
+
+    /// 指定時間内（直近 `window_hours` 時間）の合算アンフォロー（解除）数を返す。
+    pub fn effective_window_unfollow_count(&self, now_secs: u64, window_hours: u32) -> u32 {
+        let hours = window_hours.clamp(1, 168) as u64;
+        let cutoff = now_secs.saturating_sub(hours * 3600);
+        let reset_at = self.unfollow_reset_at;
+        let mut sum: i64 = 0;
+        for entry in self.devices.values() {
+            let has_events =
+                !entry.unfollow_events.is_empty() || !entry.unfollow_deductions.is_empty();
+            if has_events {
+                sum += count_events_in_window(&entry.unfollow_events, reset_at, cutoff) as i64;
+                sum -= count_events_in_window(&entry.unfollow_deductions, reset_at, cutoff) as i64;
+            } else if entry.unfollow_today > 0
+                && entry.unfollow_today_epoch >= self.unfollow_reset_epoch
+                && entry.updated_at > reset_at
+                && entry.updated_at >= cutoff
+            {
+                sum += entry.unfollow_today as i64;
+            }
+        }
+        sum.clamp(0, u32::MAX as i64) as u32
+    }
+
+    pub fn max_follow_event_ts(&self) -> u64 {
+        let mut mx = self.follow_reset_at;
+        for entry in self.devices.values() {
+            if let Some(&t) = entry.follow_events.iter().max() {
+                mx = mx.max(t);
+            }
+            if let Some(&t) = entry.follow_deductions.iter().max() {
+                mx = mx.max(t);
+            }
+            if entry.follow_events.is_empty() && entry.today > 0 {
+                mx = mx.max(entry.updated_at);
+            }
+        }
+        mx
+    }
+
+    pub fn max_unfollow_event_ts(&self) -> u64 {
+        let mut mx = self.unfollow_reset_at;
+        for entry in self.devices.values() {
+            if let Some(&t) = entry.unfollow_events.iter().max() {
+                mx = mx.max(t);
+            }
+            if let Some(&t) = entry.unfollow_deductions.iter().max() {
+                mx = mx.max(t);
+            }
+            if entry.unfollow_events.is_empty() && entry.unfollow_today > 0 {
+                mx = mx.max(entry.updated_at);
+            }
+        }
+        mx
     }
 
     /// 相手側のレジャーを競合なくマージする。ローカルに変化があれば true。
@@ -378,6 +488,30 @@ impl AccountFollowLedger {
             changed = true;
         }
 
+        if other.follow_reset_at > self.follow_reset_at {
+            self.follow_reset_at = other.follow_reset_at;
+            for entry in self.devices.values_mut() {
+                entry.follow_events.retain(|&t| t > self.follow_reset_at);
+                entry
+                    .follow_deductions
+                    .retain(|&t| t > self.follow_reset_at);
+            }
+            changed = true;
+        }
+
+        if other.unfollow_reset_at > self.unfollow_reset_at {
+            self.unfollow_reset_at = other.unfollow_reset_at;
+            for entry in self.devices.values_mut() {
+                entry
+                    .unfollow_events
+                    .retain(|&t| t > self.unfollow_reset_at);
+                entry
+                    .unfollow_deductions
+                    .retain(|&t| t > self.unfollow_reset_at);
+            }
+            changed = true;
+        }
+
         let other_same_day = valid_other_date && other.date == target_date;
         for (dev_id, remote_entry) in &other.devices {
             let mut normalized = remote_entry.clone();
@@ -397,6 +531,22 @@ impl AccountFollowLedger {
                 normalized.unfollow_total = 0;
                 normalized.unfollow_total_epoch = self.unfollow_total_reset_epoch;
             }
+            normalized
+                .follow_events
+                .retain(|&t| t > self.follow_reset_at);
+            normalized.follow_events.sort_unstable();
+            normalized
+                .follow_deductions
+                .retain(|&t| t > self.follow_reset_at);
+            normalized.follow_deductions.sort_unstable();
+            normalized
+                .unfollow_events
+                .retain(|&t| t > self.unfollow_reset_at);
+            normalized.unfollow_events.sort_unstable();
+            normalized
+                .unfollow_deductions
+                .retain(|&t| t > self.unfollow_reset_at);
+            normalized.unfollow_deductions.sort_unstable();
 
             match self.devices.get_mut(dev_id) {
                 Some(local_entry) => {
@@ -441,6 +591,21 @@ impl AccountFollowLedger {
                             && normalized.unfollow_total > merged_entry.unfollow_total
                         {
                             merged_entry.unfollow_total = normalized.unfollow_total;
+                        }
+                        if normalized.follow_events.len() > merged_entry.follow_events.len() {
+                            merged_entry.follow_events = normalized.follow_events;
+                        }
+                        if normalized.follow_deductions.len() > merged_entry.follow_deductions.len()
+                        {
+                            merged_entry.follow_deductions = normalized.follow_deductions;
+                        }
+                        if normalized.unfollow_events.len() > merged_entry.unfollow_events.len() {
+                            merged_entry.unfollow_events = normalized.unfollow_events;
+                        }
+                        if normalized.unfollow_deductions.len()
+                            > merged_entry.unfollow_deductions.len()
+                        {
+                            merged_entry.unfollow_deductions = normalized.unfollow_deductions;
                         }
                         if *local_entry != merged_entry {
                             *local_entry = merged_entry;
@@ -741,6 +906,7 @@ mod tests {
                 unfollow_today_epoch: 0,
                 unfollow_total_epoch: 0,
                 updated_at: 100,
+                ..Default::default()
             },
         );
         pc.accounts.insert("instagram:darksan560".to_string(), acc_pc);
@@ -765,6 +931,7 @@ mod tests {
                 unfollow_today_epoch: 0,
                 unfollow_total_epoch: 0,
                 updated_at: 200,
+                ..Default::default()
             },
         );
         android

@@ -97,6 +97,10 @@ class _GestureShapeIconPainter extends CustomPainter {
       'R' => [Offset(l, midY), Offset(r, midY)],
       'U' => [Offset(midX, b), Offset(midX, t)],
       'D' => [Offset(midX, t), Offset(midX, b)],
+      'NW' => [Offset(r, b), Offset(l, t)],
+      'NE' => [Offset(l, b), Offset(r, t)],
+      'SW' => [Offset(r, t), Offset(l, b)],
+      'SE' => [Offset(l, t), Offset(r, b)],
       'LU' => [Offset(r, b), Offset(l, b), Offset(l, t)],
       'LD' => [Offset(r, t), Offset(l, t), Offset(l, b)],
       'RU' => [Offset(l, b), Offset(r, b), Offset(r, t)],
@@ -235,7 +239,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
   void _maybeArmLiveScroll() {
     if (_isLiveScrolling) return;
     final shape = _path.shape;
-    if (shape.length != 1) {
+    if (!isSingleStrokeShape(shape)) {
       _liveScrollArmTimer?.cancel();
       _liveScrollArmTimer = null;
       return;
@@ -251,7 +255,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
       _liveScrollArmTimer = null;
       if (!mounted || !_isDraggingGesture || _path.invalidated) return;
       final curShape = _path.shape;
-      if (curShape.length != 1) return;
+      if (!isSingleStrokeShape(curShape)) return;
       final curAct = widget.settings.actionFor(curShape);
       if (!isLiveScrollAction(curAct)) return;
       HapticFeedback.selectionClick();
@@ -663,7 +667,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
       label = 'キャンセル（そのまま離すと中止）';
       borderColor = Colors.grey;
     } else if (shape.isEmpty) {
-      label = '上下左右へドラッグしてジェスチャー';
+      label = '上下左右・斜めへドラッグしてジェスチャー';
       borderColor = kGestureTeal.withValues(alpha: 0.7);
     } else if (action == 'none') {
       label = '${shapeArrows(shape)}  未割り当て';

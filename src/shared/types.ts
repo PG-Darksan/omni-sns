@@ -124,6 +124,10 @@ export type GestureShape =
   | 'R'
   | 'U'
   | 'D'
+  | 'NW'
+  | 'NE'
+  | 'SW'
+  | 'SE'
   | 'LU'
   | 'LD'
   | 'RU'
@@ -170,6 +174,10 @@ export interface AppSettings {
   headerCollapsed?: boolean;
   /** PC版表示領域の下余白（px。画面下端の入力欄を上に持ち上げる） */
   viewportBottomInset?: number;
+  /** フォロー・アンフォロー集計時間（時間単位、1〜168、既定24） */
+  followWindowHours?: number;
+  /** サービスカタログのカスタム並び順（serviceId の配列） */
+  catalogOrder?: string[];
   /** マウスジェスチャー設定 */
   gesture: GestureSettings;
   /** フォロー数クロスデバイス同期設定 */

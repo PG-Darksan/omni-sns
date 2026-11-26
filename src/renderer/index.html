@@ -276,6 +276,10 @@
           placeholder="サービス名・キーワードで検索（例: Instagram, Discord, Tinder, mixi2, SMS...）"
           autocomplete="off"
         />
+        <span id="catalog-reorder-hint" class="catalog-reorder-hint">ドラッグで並び替え可</span>
+        <button id="btn-catalog-reset-order" type="button" class="btn-secondary btn-xs hidden" title="カタログのSNS表示順を初期順に戻す">
+          並び順を戻す
+        </button>
       </div>
 
       <div id="catalog-categories" class="category-tabs"></div>
@@ -458,7 +462,7 @@
           </span>
           <div>
             <h2 id="gesture-title">マウスジェスチャー設定</h2>
-            <p class="modal-subtitle">右ボタンを押したまま上下左右にドラッグして離すと操作を実行。スクロール割り当て時はドラッグ中リアルタイムに進行します。</p>
+            <p class="modal-subtitle">右ボタンを押したまま上下左右・斜めにドラッグして離すと操作を実行。スクロール割り当て時はドラッグ中リアルタイムに進行します。</p>
           </div>
         </div>
         <div class="gesture-header-right">
@@ -498,6 +502,9 @@
 
           <div class="gesture-group-label">1方向（← → ↑ ↓）</div>
           <div id="gesture-grid-single" class="gesture-grid"></div>
+
+          <div class="gesture-group-label">斜め（↖ ↗ ↙ ↘）</div>
+          <div id="gesture-grid-diagonal" class="gesture-grid"></div>
 
           <div class="gesture-group-label">2方向（直角に1回曲げる 8通り · ドラッグで入替可能）</div>
           <div id="gesture-grid-double" class="gesture-grid"></div>
@@ -545,46 +552,52 @@
         <button id="btn-close-follow" type="button" class="btn-icon" aria-label="閉じる">✕</button>
       </div>
       <div class="follow-modal-body">
-        <div class="follow-section-label">フォロー回数</div>
+        <div class="follow-window-bar">
+          <div class="follow-window-head">
+            <span class="follow-window-title">集計時間</span>
+            <div class="follow-window-presets" id="follow-window-presets">
+              <button type="button" class="follow-window-chip" data-follow-window-hours="1">1時間</button>
+              <button type="button" class="follow-window-chip" data-follow-window-hours="3">3時間</button>
+              <button type="button" class="follow-window-chip" data-follow-window-hours="6">6時間</button>
+              <button type="button" class="follow-window-chip" data-follow-window-hours="12">12時間</button>
+              <button type="button" class="follow-window-chip" data-follow-window-hours="24">24時間</button>
+            </div>
+          </div>
+          <div class="follow-window-custom">
+            <span>自由指定: 直近</span>
+            <input
+              id="follow-window-hours-input"
+              type="number"
+              class="input-compact follow-window-input"
+              min="1"
+              max="168"
+              step="1"
+              value="24"
+            />
+            <span>時間（1〜168）</span>
+            <button id="btn-follow-window-apply" type="button" class="btn-secondary btn-xs">適用</button>
+          </div>
+        </div>
+
         <div class="follow-stats-grid">
           <div class="follow-stat-card primary">
-            <span class="follow-stat-label">今日のフォロー数</span>
+            <span id="follow-window-label" class="follow-stat-label">直近24時間のフォロー数</span>
             <strong id="follow-modal-today" class="follow-stat-value">0</strong>
+            <div class="follow-card-actions">
+              <button id="btn-follow-dec" type="button" class="btn-secondary btn-xs">−1</button>
+              <button id="btn-follow-inc" type="button" class="btn-primary btn-xs">＋1</button>
+              <button id="btn-follow-reset-today" type="button" class="btn-secondary btn-xs">リセット</button>
+            </div>
           </div>
-          <div class="follow-stat-card">
-            <span class="follow-stat-label">累計フォロー数</span>
-            <strong id="follow-modal-total" class="follow-stat-value">0</strong>
-          </div>
-        </div>
-
-        <div class="follow-adjust-row">
-          <button id="btn-follow-dec" type="button" class="btn-secondary">−1</button>
-          <button id="btn-follow-inc" type="button" class="btn-primary">＋1</button>
-        </div>
-        <div class="follow-reset-row">
-          <button id="btn-follow-reset-today" type="button" class="btn-secondary btn-xs">今日をリセット</button>
-          <button id="btn-follow-reset-all" type="button" class="btn-secondary btn-xs danger-text">累計もリセット</button>
-        </div>
-
-        <div class="follow-section-label unfollow-section-label">アンフォロー（フォロー解除）回数</div>
-        <div class="follow-stats-grid">
           <div class="follow-stat-card danger">
-            <span class="follow-stat-label">今日のアンフォロー数</span>
+            <span id="unfollow-window-label" class="follow-stat-label">直近24時間のアンフォロー数</span>
             <strong id="unfollow-modal-today" class="follow-stat-value">0</strong>
+            <div class="follow-card-actions">
+              <button id="btn-unfollow-dec" type="button" class="btn-secondary btn-xs">−1</button>
+              <button id="btn-unfollow-inc" type="button" class="btn-secondary btn-xs danger-outline-btn">＋1</button>
+              <button id="btn-unfollow-reset-today" type="button" class="btn-secondary btn-xs">リセット</button>
+            </div>
           </div>
-          <div class="follow-stat-card">
-            <span class="follow-stat-label">累計アンフォロー数</span>
-            <strong id="unfollow-modal-total" class="follow-stat-value">0</strong>
-          </div>
-        </div>
-
-        <div class="follow-adjust-row">
-          <button id="btn-unfollow-dec" type="button" class="btn-secondary">−1</button>
-          <button id="btn-unfollow-inc" type="button" class="btn-secondary danger-outline-btn">＋1</button>
-        </div>
-        <div class="follow-reset-row">
-          <button id="btn-unfollow-reset-today" type="button" class="btn-secondary btn-xs">今日をリセット</button>
-          <button id="btn-unfollow-reset-all" type="button" class="btn-secondary btn-xs danger-text">累計もリセット</button>
         </div>
 
         <div id="follow-sns-live-bar" class="follow-sns-live-bar hidden">
@@ -644,13 +657,13 @@
 
         <div id="follow-summary-box" class="follow-summary-box hidden">
           <div class="follow-summary-header">
-            <span>全アカウントの本日の合計</span>
+            <span id="follow-summary-title">全アカウントの合計（直近24時間）</span>
             <strong id="follow-all-today">0 回</strong>
           </div>
           <div id="follow-summary-list" class="follow-summary-list"></div>
         </div>
         <p class="follow-hint">
-          Instagram・Threads・Bluesky 等でフォロー／フォロー解除を実行すると自動カウントされ、同一 @アカウント のPC・スマホ間で合算共有されます。
+          指定時間内のフォロー・解除（フォロー中ユーザーのブロックを含む）を自動カウントし、同一 @アカウント のPC・スマホ間で合算共有します。
         </p>
       </div>
     </div>

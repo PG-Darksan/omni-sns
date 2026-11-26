@@ -29,8 +29,8 @@ use crate::url_utils::{
 #[cfg(windows)]
 const WEBVIEW2_FAST_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,CalculateNativeWinOcclusion,TranslateUI --enable-quic --enable-gpu-rasterization --enable-zero-copy --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding";
 
-const BG_WARM_MAX_SECS: u64 = 8;
-const BG_WARM_POST_LOAD_MS: u64 = 2500;
+const BG_WARM_MAX_SECS: u64 = 20;
+const BG_WARM_POST_LOAD_MS: u64 = 4000;
 const GMAIL_HOME_URL: &str = "https://mail.google.com/";
 
 pub const ACCOUNTBAR_HEIGHT: f64 = 40.0;
@@ -1046,6 +1046,24 @@ pub fn restore_archived_instance(
     Ok(restored)
 }
 
+/// 保存済みログイン記憶のアカウント表示名を変更する。
+pub fn rename_archived_instance(
+    app: &AppHandle,
+    shared: &SharedState,
+    instance_id: &str,
+    account_label: &str,
+) -> Result<ServiceInstance, String> {
+    let updated = {
+        let mut guard = shared.inner.lock().unwrap();
+        guard
+            .store
+            .rename_archived_instance(instance_id, account_label)
+            .ok_or_else(|| "指定されたログイン記憶が見つかりません".to_string())?
+    };
+    emit_state_updated(app, shared);
+    Ok(updated)
+}
+
 /// 保存済みログイン記憶を1件完全削除し、ディスク上の WebView2 プロファイルも消去する。
 pub fn purge_archived_instance(
     app: &AppHandle,
@@ -1246,6 +1264,7 @@ pub fn refresh_attached_view(app: &AppHandle, shared: &SharedState) {
                     position: LogicalPosition::new(-10000.0, -10000.0).into(),
                     size: LogicalSize::new(bounds.width.max(1.0), bounds.height.max(1.0)).into(),
                 });
+                let _ = wv.show();
             } else {
                 let _ = wv.hide();
             }
@@ -1519,8 +1538,30 @@ pub fn create_subtab(
     instance_id: &str,
     url_override: Option<String>,
 ) -> Result<String, String> {
-    create_subtab_with_options(app, shared, instance_id, url_override, None, true)
-        .map(|(tab_id, _)| tab_id)
+    let wake_only_sleeping = {
+        let guard = shared.inner.lock().unwrap();
+        guard
+            .services
+            .get(instance_id)
+            .map(|s| s.tabs.len() == 1 && s.tabs[0].is_sleeping && s.tabs[0].webview_label.is_none())
+            .unwrap_or(false)
+    };
+    let (tab_id, total) = create_subtab_with_options(
+        app,
+        shared,
+        instance_id,
+        url_override,
+        None,
+        wake_only_sleeping,
+    )?;
+    if !wake_only_sleeping {
+        show_overlay_notice(
+            shared,
+            format!("裏タブで開きました（全{total}タブ）"),
+            false,
+        );
+    }
+    Ok(tab_id)
 }
 
 pub fn navigate_subtab(
@@ -2352,21 +2393,32 @@ fn create_tab_webview(
                 });
                 NewWindowResponse::Deny
             } else if is_same_site_url(target_str, &current_url) {
-                // 同一サービスの target="_blank" リンクは同アカウント内の新しいタブで開く
+                // 同一サービスの target="_blank" リンクは同アカウント内のバックグラウンドタブで開く
                 let app_bg = app_for_popup.clone();
                 let shared_bg = shared_for_popup.clone();
                 let inst_bg = id_for_popup.clone();
                 let after_tid = tid_for_popup.clone();
                 let url_bg = target_str.to_string();
                 tauri::async_runtime::spawn(async move {
-                    let _ = create_subtab_with_options(
+                    match create_subtab_with_options(
                         &app_bg,
                         &shared_bg,
                         &inst_bg,
                         Some(url_bg),
                         Some(&after_tid),
-                        true,
-                    );
+                        false,
+                    ) {
+                        Ok((_, total)) => {
+                            show_overlay_notice(
+                                &shared_bg,
+                                format!("裏タブで開きました（全{total}タブ）"),
+                                false,
+                            );
+                        }
+                        Err(err) => {
+                            show_overlay_notice(&shared_bg, err, true);
+                        }
+                    }
                 });
                 NewWindowResponse::Deny
             } else {
@@ -2593,8 +2645,16 @@ fn attach_windows_handlers(
 
     let callbacks = crate::platform_win::TabWebviewCallbacks {
         on_navigation_starting: Arc::new(move || {
-            let (changed, was_error) = {
+            let (changed, needs_refresh, schedule_warm_end) = {
                 let mut guard = shared_start.inner.lock().unwrap();
+                let is_active_now = !guard.gmail_open
+                    && guard.active_instance_id.as_deref() == Some(id_start.as_str())
+                    && guard
+                        .services
+                        .get(&id_start)
+                        .map(|s| s.active_tab_id == tid_start)
+                        .unwrap_or(false);
+                let overlay = guard.overlay_visible;
                 if let Some(tab) = guard
                     .services
                     .get_mut(&id_start)
@@ -2605,16 +2665,30 @@ fn attach_windows_handlers(
                         tab.is_loading = true;
                         tab.is_sleeping = false;
                         tab.load_error = None;
-                        (true, had_err)
+                        let mut rewarmed = false;
+                        if !is_active_now && !overlay {
+                            tab.warming_until =
+                                Some(Instant::now() + Duration::from_secs(BG_WARM_MAX_SECS));
+                            rewarmed = true;
+                        }
+                        (true, had_err || rewarmed, rewarmed)
                     } else {
-                        (false, false)
+                        (false, false, false)
                     }
                 } else {
-                    (false, false)
+                    (false, false, false)
                 }
             };
-            if was_error {
+            if needs_refresh {
                 refresh_attached_view(&app_start, &shared_start);
+            }
+            if schedule_warm_end {
+                let app_warm = app_start.clone();
+                let shared_warm = shared_start.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(BG_WARM_MAX_SECS * 1000 + 300));
+                    refresh_attached_view(&app_warm, &shared_warm);
+                });
             }
             if changed {
                 emit_runtime_updated(&app_start, &shared_start, &id_start);
