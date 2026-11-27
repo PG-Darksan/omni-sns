@@ -65,8 +65,15 @@
 
     <!-- 右メインエリア -->
     <div id="main-area" class="main-area">
-      <!-- 同一SNS アカウント即時切替ヘッダー (高さ40px固定) -->
-      <div id="accountbar" class="accountbar" role="tablist" aria-label="同一SNSのアカウント切替">
+      <!-- アカウント即時切替ヘッダー (高さ40px固定: 全SNS横断 / 同一SNS 切替対応) -->
+      <div id="accountbar" class="accountbar" role="tablist" aria-label="アカウント切替">
+        <button
+          id="btn-account-scope"
+          type="button"
+          class="account-scope-btn scope-all hidden"
+          title="全SNSのアカウントをヘッダーに並べて表示中（クリックで現在のSNSのみに切替）"
+          aria-label="ヘッダーのアカウント表示範囲を切り替え"
+        >全SNS</button>
         <div id="account-strip" class="account-strip"></div>
         <div class="accountbar-right">
           <button
@@ -460,7 +467,7 @@
             <li><kbd>Ctrl</kbd> + <kbd>クリック</kbd> / <kbd>中クリック</kbd> : 同一アカウントのログイン状態を保ったままリンクを別タブで開く</li>
             <li><kbd>Ctrl</kbd> + <kbd>L</kbd> : 現在のURLをクリップボードにコピー</li>
             <li><kbd>Ctrl</kbd> + <kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> : 表示倍率の拡大 / 縮小 / 100%リセット</li>
-            <li><kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> / <kbd>←</kbd> <kbd>→</kbd> : 同一SNS内のアカウントを瞬時に切り替え</li>
+            <li><kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>1</kbd> 〜 <kbd>9</kbd> / <kbd>←</kbd> <kbd>→</kbd> : ヘッダーのアカウントを瞬時に切り替え</li>
             <li><kbd>Ctrl</kbd> + <kbd>T</kbd> / <kbd>W</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> : 新しいタブ / タブを閉じる / 閉じたタブを復元</li>
             <li><kbd>Ctrl</kbd> + <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> : 次 / 前のタブへ切り替え</li>
             <li><kbd>Ctrl</kbd> + <kbd>K</kbd> : サービス カタログを開く</li>

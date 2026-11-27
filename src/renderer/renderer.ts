@@ -19,6 +19,7 @@ import {
   detectPlatformServiceFromUrl,
   formatArchivedAccountTitle,
   getAccountDisplayLabel,
+  getCrossServiceAccountDisplayLabel,
   getServiceGroupKey,
   isSafeFaviconUrl,
   isValidGistId,
@@ -90,6 +91,7 @@ let toastTimer: number | null = null;
 let dragSourceGroupKey: string | null = null;
 let dragSourceAccountId: string | null = null;
 let dragSourceCatalogId: string | null = null;
+let lastScrolledAccountId: string | null = null;
 let followModalRefreshTimer: number | null = null;
 let gestureModal: GestureBoardModal | null = null;
 
@@ -585,36 +587,79 @@ function renderSidebar(): void {
   });
 }
 
+function isHeaderAllAccountsScope(): boolean {
+  return state.config?.settings.headerAccountScope !== 'service';
+}
+
 function renderAccountBar(): void {
   const stripEl = el<HTMLDivElement>('account-strip');
   const addBtn = el<HTMLButtonElement>('btn-add-account');
+  const scopeBtn = el<HTMLButtonElement>('btn-account-scope');
 
   const active = getActiveInstance();
   const group = getActiveGroup();
+  const allGroups = getServiceGroups();
+  const allInstances = state.config?.instances ?? [];
+  const allScope = isHeaderAllAccountsScope();
 
   stripEl.innerHTML = '';
   if (!active || !group) {
     addBtn.disabled = true;
+    scopeBtn.classList.add('hidden');
     return;
   }
 
   addBtn.disabled = false;
   addBtn.title = `「${group.displayName}」に独立セッションの別アカウントを追加`;
 
-  group.accounts.forEach((inst, idx) => {
+  if (allGroups.length >= 2) {
+    scopeBtn.classList.remove('hidden');
+    scopeBtn.classList.toggle('scope-all', allScope);
+    scopeBtn.textContent = allScope ? '全SNS' : group.badge;
+    scopeBtn.title = allScope
+      ? `全SNSのアカウントをヘッダーに表示中（クリックで「${group.displayName}」のみに切替）`
+      : `「${group.displayName}」のアカウントのみ表示中（クリックで全SNSのアカウントをヘッダーに並べる）`;
+  } else {
+    scopeBtn.classList.add('hidden');
+  }
+
+  const groupByKey = new Map<string, ServiceGroup>();
+  for (const g of allGroups) {
+    groupByKey.set(g.key, g);
+  }
+
+  const targetAccounts = allScope ? allInstances : group.accounts;
+  const canDragReorder = targetAccounts.length >= 2;
+
+  targetAccounts.forEach((inst, idx) => {
     const rt = state.runtimeMap.get(inst.instanceId);
     const isCurrent = inst.instanceId === active.instanceId;
-    const label = getAccountDisplayLabel(inst, idx, group.displayName);
+    const instGroup = allScope ? (groupByKey.get(getServiceGroupKey(inst)) ?? group) : group;
+    const sibIdx = Math.max(
+      0,
+      instGroup.accounts.findIndex((a) => a.instanceId === inst.instanceId)
+    );
+    const label = allScope
+      ? getCrossServiceAccountDisplayLabel(
+          inst,
+          sibIdx,
+          instGroup.accounts.length,
+          instGroup.displayName
+        )
+      : getAccountDisplayLabel(inst, sibIdx, instGroup.displayName);
 
     const pill = document.createElement('div');
-    pill.className = 'account-pill';
+    pill.className = allScope ? 'account-pill with-svc-badge' : 'account-pill';
     pill.setAttribute('role', 'tab');
     pill.setAttribute('aria-selected', String(isCurrent));
+    pill.dataset.instanceId = inst.instanceId;
     if (isCurrent) pill.classList.add('active');
-    pill.draggable = group.accounts.length >= 2;
-    pill.title = `${group.displayName} · ${label}\nクリックで瞬時切替 / ダブルクリックで名前変更${
-      idx < 9 ? ` (Ctrl+Alt+${idx + 1})` : ''
-    }`;
+    pill.draggable = canDragReorder;
+    const titleHead =
+      label === instGroup.displayName ? instGroup.displayName : `${instGroup.displayName} · ${label}`;
+    pill.title = `${titleHead}\nクリックで瞬時切替 / ダブルクリックで名前変更${
+      canDragReorder ? ' / ドラッグで並び替え' : ''
+    }${idx < 9 ? ` (Ctrl+Alt+${idx + 1})` : ''}`;
 
     pill.addEventListener('click', () => {
       if (!isCurrent || rt?.isSleeping || state.gmailOpen) {
@@ -626,8 +671,8 @@ function renderAccountBar(): void {
       void openEditModalForExisting(inst, true);
     });
 
-    // Drag reorder accounts within the same SNS
-    if (group.accounts.length >= 2) {
+    // Drag reorder accounts (across SNS in 'all' mode, or within the same SNS in 'service' mode)
+    if (canDragReorder) {
       pill.addEventListener('dragstart', (e) => {
         dragSourceAccountId = inst.instanceId;
         pill.classList.add('dragging');
@@ -650,17 +695,49 @@ function renderAccountBar(): void {
         e.preventDefault();
         pill.classList.remove('drag-over');
         if (!dragSourceAccountId || dragSourceAccountId === inst.instanceId) return;
-        const allGroups = getServiceGroups();
-        const targetGroup = allGroups.find((g) => g.key === group.key);
-        if (!targetGroup) return;
-        const fromIdx = targetGroup.accounts.findIndex((a) => a.instanceId === dragSourceAccountId);
-        const toIdx = targetGroup.accounts.findIndex((a) => a.instanceId === inst.instanceId);
-        if (fromIdx === -1 || toIdx === -1) return;
-        const [moved] = targetGroup.accounts.splice(fromIdx, 1);
-        targetGroup.accounts.splice(toIdx, 0, moved);
-        const flattenedIds = allGroups.flatMap((g) => g.accounts.map((a) => a.instanceId));
-        await omniApi.reorderTabs(flattenedIds);
+        if (allScope) {
+          const ids = (state.config?.instances ?? []).map((a) => a.instanceId);
+          const fromIdx = ids.indexOf(dragSourceAccountId);
+          const toIdx = ids.indexOf(inst.instanceId);
+          if (fromIdx === -1 || toIdx === -1) return;
+          const [moved] = ids.splice(fromIdx, 1);
+          ids.splice(toIdx, 0, moved);
+          await omniApi.reorderTabs(ids);
+        } else {
+          const groupsNow = getServiceGroups();
+          const targetGroup = groupsNow.find((g) => g.key === group.key);
+          if (!targetGroup) return;
+          const fromIdx = targetGroup.accounts.findIndex(
+            (a) => a.instanceId === dragSourceAccountId
+          );
+          const toIdx = targetGroup.accounts.findIndex((a) => a.instanceId === inst.instanceId);
+          if (fromIdx === -1 || toIdx === -1) return;
+          const [moved] = targetGroup.accounts.splice(fromIdx, 1);
+          targetGroup.accounts.splice(toIdx, 0, moved);
+          const flattenedIds = groupsNow.flatMap((g) => g.accounts.map((a) => a.instanceId));
+          await omniApi.reorderTabs(flattenedIds);
+        }
       });
+    }
+
+    if (allScope) {
+      const svcBadge = document.createElement('span');
+      svcBadge.className = `account-pill-svc-badge${rt?.isSleeping !== false ? ' sleeping' : ''}`;
+      svcBadge.style.background = inst.color;
+      const rawFav = rt?.faviconUrl ?? null;
+      const safeFav = rawFav && isSafeFaviconUrl(rawFav) ? rawFav : null;
+      if (safeFav) {
+        const img = document.createElement('img');
+        img.src = safeFav;
+        img.alt = '';
+        img.onerror = () => {
+          svcBadge.textContent = inst.badge;
+        };
+        svcBadge.appendChild(img);
+      } else {
+        svcBadge.textContent = inst.badge;
+      }
+      pill.appendChild(svcBadge);
     }
 
     const dot = document.createElement('span');
@@ -706,17 +783,18 @@ function renderAccountBar(): void {
     });
     actions.appendChild(editBtn);
 
-    if (group.accounts.length >= 2) {
+    const canDelete = allScope ? allInstances.length >= 2 : group.accounts.length >= 2;
+    if (canDelete) {
       const delBtn = document.createElement('button');
       delBtn.type = 'button';
       delBtn.className = 'account-pill-btn danger';
-      delBtn.title = `アカウント「${label}」を削除`;
+      delBtn.title = `アカウント「${titleHead}」を削除`;
       delBtn.textContent = '✕';
       delBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         const ok = await openConfirmDialog({
           title: 'アカウントを削除',
-          message: `「${group.displayName} / ${label}」を削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。`,
+          message: `「${titleHead}」を削除しますか？\n※ ログイン記憶は保持され、「ログイン記憶」からいつでも呼び出せます。`,
           confirmLabel: '削除する',
           danger: true,
           anchorEl: delBtn,
@@ -724,13 +802,17 @@ function renderAccountBar(): void {
         });
         if (!ok) return;
         await omniApi.removeTab(inst.instanceId);
-        showToast(`「${group.displayName} / ${label}」を削除しました（ログイン記憶は保持）`);
+        showToast(`「${titleHead}」を削除しました（ログイン記憶は保持）`);
       });
       actions.appendChild(delBtn);
     }
 
     pill.appendChild(actions);
     stripEl.appendChild(pill);
+    if (isCurrent && lastScrolledAccountId !== active.instanceId) {
+      lastScrolledAccountId = active.instanceId;
+      pill.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
   });
 }
 
@@ -2526,7 +2608,16 @@ function bindEvents(): void {
     }
   });
 
-  // Header account switcher add button
+  // Header account switcher add & scope buttons
+  el<HTMLButtonElement>('btn-account-scope').addEventListener('click', async () => {
+    const nextScope = isHeaderAllAccountsScope() ? 'service' : 'all';
+    await omniApi.updateSettings({ headerAccountScope: nextScope });
+    showToast(
+      nextScope === 'all'
+        ? 'ヘッダーに全SNSのアカウントを並べて表示します'
+        : 'ヘッダーを現在のSNSのアカウントのみに切り替えました'
+    );
+  });
   el<HTMLButtonElement>('btn-add-account').addEventListener('click', () => {
     void addAccountForActiveService();
   });
@@ -3198,28 +3289,32 @@ function bindEvents(): void {
       return;
     }
 
-    // Ctrl + Alt + 1..9 -> 同一SNS内のアカウント切替
+    // Ctrl + Alt + 1..9 -> ヘッダーのアカウント切替（全SNS横断 or 同一SNS内）
     if (!e.shiftKey && e.altKey && /^[1-9]$/.test(key)) {
       e.preventDefault();
       const idx = Number(key) - 1;
-      const group = getActiveGroup();
-      const target = group?.accounts[idx];
+      const list = isHeaderAllAccountsScope()
+        ? (state.config?.instances ?? [])
+        : (getActiveGroup()?.accounts ?? []);
+      const target = list[idx];
       if (target) {
         void omniApi.activateTab(target.instanceId);
       }
       return;
     }
 
-    // Ctrl + Alt + ArrowLeft / ArrowRight -> 同一SNS内の前/次アカウント切替
+    // Ctrl + Alt + ArrowLeft / ArrowRight -> ヘッダーの前/次アカウント切替
     if (!e.shiftKey && e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
       e.preventDefault();
       const active = getActiveInstance();
-      const group = getActiveGroup();
-      if (active && group && group.accounts.length >= 2) {
-        const curIdx = group.accounts.findIndex((a) => a.instanceId === active.instanceId);
+      const list = isHeaderAllAccountsScope()
+        ? (state.config?.instances ?? [])
+        : (getActiveGroup()?.accounts ?? []);
+      if (active && list.length >= 2) {
+        const curIdx = list.findIndex((a) => a.instanceId === active.instanceId);
         const delta = e.key === 'ArrowLeft' ? -1 : 1;
-        const nextIdx = (curIdx + delta + group.accounts.length) % group.accounts.length;
-        void omniApi.activateTab(group.accounts[nextIdx].instanceId);
+        const nextIdx = (curIdx + delta + list.length) % list.length;
+        void omniApi.activateTab(list[nextIdx].instanceId);
       }
       return;
     }

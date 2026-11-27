@@ -596,6 +596,40 @@ html[data-theme='light'] .hisator-ad-arrow {
   flex-shrink: 0;
 }
 
+.account-scope-btn {
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.account-scope-btn:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.account-scope-btn.scope-all {
+  background: var(--teal-soft);
+  border-color: rgba(21, 156, 171, 0.55);
+  color: #38d9e8;
+}
+
+html[data-theme='light'] .account-scope-btn.scope-all {
+  color: #0e7480;
+}
+
 .account-strip {
   flex: 1;
   min-width: 0;
@@ -614,7 +648,7 @@ html[data-theme='light'] .hisator-ad-arrow {
 
 .account-pill {
   height: 28px;
-  max-width: 200px;
+  max-width: 215px;
   padding: 0 8px 0 9px;
   border-radius: 999px;
   border: 1px solid var(--border-color);
@@ -628,6 +662,38 @@ html[data-theme='light'] .hisator-ad-arrow {
   font-size: 12px;
   font-weight: 600;
   transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.account-pill.with-svc-badge {
+  padding-left: 5px;
+}
+
+.account-pill-svc-badge {
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  border-radius: 5px;
+  background: var(--accent);
+  color: #ffffff;
+  font-size: 9px;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.account-pill-svc-badge.sleeping {
+  opacity: 0.62;
+}
+
+.account-pill-svc-badge img {
+  width: 13px;
+  height: 13px;
+  object-fit: contain;
+  border-radius: 2px;
 }
 
 .account-pill:hover {

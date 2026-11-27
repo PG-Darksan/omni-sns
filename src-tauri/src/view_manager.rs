@@ -2132,11 +2132,13 @@ pub fn step_active_service(app: &AppHandle, shared: &SharedState, delta: isize) 
     Ok(())
 }
 
-/// 同一SNS内のアカウントを前後に瞬時切替する。
+/// ヘッダーのアカウント一覧順（全SNS横断 or 同一SNS内）でアカウントを前後に瞬時切替する。
 pub fn step_active_account(app: &AppHandle, shared: &SharedState, delta: isize) -> Result<(), &'static str> {
     let target_id = {
         let mut guard = shared.inner.lock().unwrap();
-        let wrap = guard.store.get_settings().gesture.wrap_tabs;
+        let settings = guard.store.get_settings();
+        let wrap = settings.gesture.wrap_tabs;
+        let all_scope = settings.header_account_scope != "service";
         let instances = guard.store.get_instances();
         let Some(active_id) = guard.active_instance_id.clone() else {
             return Err("選択中のSNSがありません");
@@ -2144,18 +2146,30 @@ pub fn step_active_account(app: &AppHandle, shared: &SharedState, delta: isize) 
         let Some(active_inst) = instances.iter().find(|i| i.instance_id == active_id) else {
             return Err("選択中のSNSがありません");
         };
-        let gkey = service_group_key(&active_inst.service_id, &active_inst.url, &active_inst.instance_id);
-        let siblings: Vec<String> = instances
-            .iter()
-            .filter(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == gkey)
-            .map(|i| i.instance_id.clone())
-            .collect();
-        if siblings.len() <= 1 {
-            return Err("このSNSのアカウントは1つだけです");
+        let list: Vec<String> = if all_scope {
+            instances.iter().map(|i| i.instance_id.clone()).collect()
+        } else {
+            let gkey = service_group_key(
+                &active_inst.service_id,
+                &active_inst.url,
+                &active_inst.instance_id,
+            );
+            instances
+                .iter()
+                .filter(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == gkey)
+                .map(|i| i.instance_id.clone())
+                .collect()
+        };
+        if list.len() <= 1 {
+            return Err(if all_scope {
+                "切り替えられるアカウントが1つしかありません"
+            } else {
+                "このSNSのアカウントは1つだけです"
+            });
         }
-        let cur_idx = siblings.iter().position(|id| id == &active_id).unwrap_or(0);
-        let next_idx = step_tab_index(siblings.len(), cur_idx, delta, wrap)?;
-        let next_id = siblings[next_idx].clone();
+        let cur_idx = list.iter().position(|id| id == &active_id).unwrap_or(0);
+        let next_idx = step_tab_index(list.len(), cur_idx, delta, wrap)?;
+        let next_id = list[next_idx].clone();
         guard.store.update_settings(UpdateSettingsPatch {
             active_instance_id: Some(Some(next_id.clone())),
             ..Default::default()
@@ -2168,10 +2182,11 @@ pub fn step_active_account(app: &AppHandle, shared: &SharedState, delta: isize) 
     Ok(())
 }
 
-/// 同一SNS内の指定番号（0始まり）アカウントへ瞬時切替する。
+/// ヘッダーのアカウント一覧（全SNS横断 or 同一SNS内）の指定番号（0始まり）へ瞬時切替する。
 pub fn activate_account_by_index(app: &AppHandle, shared: &SharedState, index: usize) {
     let target_id = {
         let mut guard = shared.inner.lock().unwrap();
+        let all_scope = guard.store.get_settings().header_account_scope != "service";
         let instances = guard.store.get_instances();
         let Some(active_id) = guard.active_instance_id.clone() else {
             return;
@@ -2179,13 +2194,21 @@ pub fn activate_account_by_index(app: &AppHandle, shared: &SharedState, index: u
         let Some(active_inst) = instances.iter().find(|i| i.instance_id == active_id) else {
             return;
         };
-        let gkey = service_group_key(&active_inst.service_id, &active_inst.url, &active_inst.instance_id);
-        let siblings: Vec<String> = instances
-            .iter()
-            .filter(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == gkey)
-            .map(|i| i.instance_id.clone())
-            .collect();
-        let Some(next_id) = siblings.get(index).cloned() else {
+        let list: Vec<String> = if all_scope {
+            instances.iter().map(|i| i.instance_id.clone()).collect()
+        } else {
+            let gkey = service_group_key(
+                &active_inst.service_id,
+                &active_inst.url,
+                &active_inst.instance_id,
+            );
+            instances
+                .iter()
+                .filter(|i| service_group_key(&i.service_id, &i.url, &i.instance_id) == gkey)
+                .map(|i| i.instance_id.clone())
+                .collect()
+        };
+        let Some(next_id) = list.get(index).cloned() else {
             return;
         };
         if next_id == active_id {

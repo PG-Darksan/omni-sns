@@ -333,6 +333,7 @@ class MobileGestureSettings {
     this.triggerSide = 'right',
     this.handleXFraction = 0.90,
     this.handleYFraction = 0.62,
+    this.dockedInHeader = false,
     Map<String, String>? gestures,
   }) : _gestures = gestures;
 
@@ -345,6 +346,7 @@ class MobileGestureSettings {
   final String triggerSide; // 'right' | 'left' | 'both'
   final double handleXFraction; // 0.06..0.94
   final double handleYFraction; // 0.14..0.88
+  final bool dockedInHeader;
   final Map<String, String>? _gestures;
 
   Map<String, String> get gestures {
@@ -369,6 +371,7 @@ class MobileGestureSettings {
     String? triggerSide,
     double? handleXFraction,
     double? handleYFraction,
+    bool? dockedInHeader,
     Map<String, String>? gestures,
   }) {
     final nextSide = triggerSide ?? this.triggerSide;
@@ -386,6 +389,7 @@ class MobileGestureSettings {
       triggerSide: safeSide,
       handleXFraction: (handleXFraction ?? this.handleXFraction).clamp(0.06, 0.94),
       handleYFraction: (handleYFraction ?? this.handleYFraction).clamp(0.14, 0.88),
+      dockedInHeader: dockedInHeader ?? this.dockedInHeader,
       gestures: gestures ?? this.gestures,
     );
   }
@@ -401,6 +405,7 @@ class MobileGestureSettings {
       'triggerSide': triggerSide,
       'handleXFraction': handleXFraction,
       'handleYFraction': handleYFraction,
+      'dockedInHeader': dockedInHeader,
       'gestures': gestures,
     };
   }
@@ -439,6 +444,7 @@ class MobileGestureSettings {
           ((json['handleXFraction'] as num?)?.toDouble() ?? 0.90).clamp(0.06, 0.94),
       handleYFraction:
           ((json['handleYFraction'] as num?)?.toDouble() ?? 0.62).clamp(0.14, 0.88),
+      dockedInHeader: json['dockedInHeader'] as bool? ?? false,
       gestures: map,
     );
   }

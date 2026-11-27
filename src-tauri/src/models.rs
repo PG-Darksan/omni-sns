@@ -135,6 +135,10 @@ fn default_follow_window_hours() -> u32 {
     DEFAULT_FOLLOW_WINDOW_HOURS
 }
 
+pub fn default_header_account_scope() -> String {
+    "all".to_string()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AccountFilterSettings {
@@ -215,6 +219,8 @@ pub struct AppSettings {
     pub active_instance_id: Option<String>,
     #[serde(default)]
     pub header_collapsed: bool,
+    #[serde(default = "default_header_account_scope")]
+    pub header_account_scope: String,
     #[serde(default = "default_viewport_bottom_inset")]
     pub viewport_bottom_inset: u32,
     #[serde(default = "default_follow_window_hours")]
@@ -312,6 +318,7 @@ pub struct UpdateSettingsPatch {
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub active_instance_id: Option<Option<String>>,
     pub header_collapsed: Option<bool>,
+    pub header_account_scope: Option<String>,
     pub viewport_bottom_inset: Option<u32>,
     pub follow_window_hours: Option<u32>,
     pub catalog_order: Option<Vec<String>>,

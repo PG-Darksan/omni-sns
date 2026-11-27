@@ -895,6 +895,7 @@ class AppSettings {
     this.activeInstanceId,
     this.isBottomTabsCollapsed = false,
     this.isHeaderCollapsed = false,
+    this.headerAccountScope = 'all',
     this.followWindowHours = defaultFollowWindowHours,
     this.catalogOrder = const [],
     this.gesture = const MobileGestureSettings(),
@@ -905,10 +906,14 @@ class AppSettings {
   final String? activeInstanceId;
   final bool isBottomTabsCollapsed;
   final bool isHeaderCollapsed;
+  /// ヘッダーのアカウント切替バーの表示範囲: 'all'（全SNS横断）または 'service'（現在SNSのみ）
+  final String headerAccountScope;
   final int followWindowHours;
   final List<String> catalogOrder;
   final MobileGestureSettings gesture;
   final AccountFilterSettings accountFilter;
+
+  bool get isHeaderAllAccounts => headerAccountScope != 'service';
 
   AppSettings copyWith({
     bool? isDarkMode,
@@ -916,11 +921,14 @@ class AppSettings {
     bool clearActive = false,
     bool? isBottomTabsCollapsed,
     bool? isHeaderCollapsed,
+    String? headerAccountScope,
     int? followWindowHours,
     List<String>? catalogOrder,
     MobileGestureSettings? gesture,
     AccountFilterSettings? accountFilter,
   }) {
+    final nextScope = headerAccountScope ?? this.headerAccountScope;
+    final safeScope = nextScope == 'service' ? 'service' : 'all';
     return AppSettings(
       isDarkMode: isDarkMode ?? this.isDarkMode,
       activeInstanceId:
@@ -928,6 +936,7 @@ class AppSettings {
       isBottomTabsCollapsed:
           isBottomTabsCollapsed ?? this.isBottomTabsCollapsed,
       isHeaderCollapsed: isHeaderCollapsed ?? this.isHeaderCollapsed,
+      headerAccountScope: safeScope,
       followWindowHours: (followWindowHours ?? this.followWindowHours)
           .clamp(minFollowWindowHours, maxFollowWindowHours),
       catalogOrder: catalogOrder ?? this.catalogOrder,
@@ -942,6 +951,7 @@ class AppSettings {
       'activeInstanceId': activeInstanceId,
       'isBottomTabsCollapsed': isBottomTabsCollapsed,
       'isHeaderCollapsed': isHeaderCollapsed,
+      'headerAccountScope': headerAccountScope,
       'followWindowHours': followWindowHours,
       if (catalogOrder.isNotEmpty) 'catalogOrder': catalogOrder,
       'gesture': gesture.toJson(),
@@ -954,11 +964,13 @@ class AppSettings {
     final rawAccountFilter = json['accountFilter'];
     final rawHours = (json['followWindowHours'] as num?)?.toInt();
     final rawCatalogOrder = json['catalogOrder'];
+    final rawScope = (json['headerAccountScope'] as String?)?.trim();
     return AppSettings(
       isDarkMode: json['isDarkMode'] as bool? ?? true,
       activeInstanceId: json['activeInstanceId'] as String?,
       isBottomTabsCollapsed: json['isBottomTabsCollapsed'] as bool? ?? false,
       isHeaderCollapsed: json['isHeaderCollapsed'] as bool? ?? false,
+      headerAccountScope: rawScope == 'service' ? 'service' : 'all',
       followWindowHours: (rawHours ?? defaultFollowWindowHours)
           .clamp(minFollowWindowHours, maxFollowWindowHours),
       catalogOrder: rawCatalogOrder is List
@@ -1216,6 +1228,37 @@ String accountDisplayLabel(
     return rawName;
   }
   return siblingIndex == 0 ? 'メイン' : 'アカウント ${siblingIndex + 1}';
+}
+
+/// 複数SNSを横断してヘッダーに並べる際のアカウント表示名を返す。
+/// - ユーザー命名のカスタムラベルがあればそれを優先
+/// - 検出済み @handle があれば `@handle` を表示
+/// - 未命名かつ未検出で同一SNSに1垢のみの場合はSNS名（例: Instagram / Bluesky）を返す
+String crossServiceAccountDisplayLabel(
+  ServiceInstance inst,
+  int siblingIndex,
+  int siblingCount, {
+  String? baseServiceName,
+}) {
+  final explicit = inst.accountLabel?.trim();
+  final handle = inst.detectedHandle?.trim().replaceFirst(RegExp(r'^@+'), '');
+  if (explicit != null && explicit.isNotEmpty && !isGenericAccountLabel(explicit)) {
+    return explicit;
+  }
+  if (handle != null && handle.isNotEmpty) {
+    return '@$handle';
+  }
+  final base = baseServiceName?.trim();
+  if (siblingCount <= 1) {
+    if (base != null && base.isNotEmpty) return base;
+    final rawName = inst.name.trim();
+    if (rawName.isNotEmpty) return rawName;
+  }
+  return accountDisplayLabel(
+    inst,
+    siblingIndex,
+    baseServiceName: baseServiceName,
+  );
 }
 
 /// 既存アカウント名と重複しない次の既定アカウント名を返す。

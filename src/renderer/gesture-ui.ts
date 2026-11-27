@@ -124,8 +124,8 @@ export const ACTION_SECTIONS: ActionSection[] = [
     items: [
       { id: 'previous-service', label: '上の項目へ（前のSNS）', badge: '▲', keywords: '上 項目 前 sns サービス サイドバー' },
       { id: 'next-service', label: '下の項目へ（次のSNS）', badge: '▼', keywords: '下 項目 次 sns サービス サイドバー' },
-      { id: 'previous-account', label: '前のアカウントへ（同一SNS）', badge: '◁' },
-      { id: 'next-account', label: '次のアカウントへ（同一SNS）', badge: '▷' },
+      { id: 'previous-account', label: '前のアカウントへ（ヘッダー順）', badge: '◁' },
+      { id: 'next-account', label: '次のアカウントへ（ヘッダー順）', badge: '▷' },
       { id: 'open-catalog', label: 'SNSカタログを開く', badge: '⊞' },
       { id: 'sleep-tab', label: 'このSNSを休止（メモリ解放）', badge: '☾' }
     ]

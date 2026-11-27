@@ -76,6 +76,7 @@ class _GestureSettingsScreenState extends State<GestureSettingsScreen> {
                     handleXFraction:
                         _settings.triggerSide == 'left' ? 0.10 : 0.90,
                     handleYFraction: 0.62,
+                    dockedInHeader: false,
                     tremor: 10,
                   ),
                 );
@@ -99,18 +100,35 @@ class _GestureSettingsScreenState extends State<GestureSettingsScreen> {
         children: [
           Card(
             margin: EdgeInsets.zero,
-            child: SwitchListTile(
-              key: const ValueKey('gesture-enabled-switch'),
-              title: const Text(
-                'タッチジェスチャーを有効にする',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
-              subtitle: const Text(
-                '画面端のジェスチャーボタンから上下左右・斜めにドラッグして操作。ボタン長押しで好きな位置へ移動できます。',
-                style: TextStyle(fontSize: 12),
-              ),
-              value: _settings.enabled,
-              onChanged: (v) => _update(_settings.copyWith(enabled: v)),
+            child: Column(
+              children: [
+                SwitchListTile(
+                  key: const ValueKey('gesture-enabled-switch'),
+                  title: const Text(
+                    'タッチジェスチャーを有効にする',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: const Text(
+                    '画面端のジェスチャーボタンから上下左右・斜めにドラッグして操作。ボタン長押しで好きな位置へ移動、上のヘッダーへドラッグすると収納できます。',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  value: _settings.enabled,
+                  onChanged: (v) => _update(_settings.copyWith(enabled: v)),
+                ),
+                const Divider(height: 1),
+                SwitchListTile(
+                  key: const ValueKey('gesture-docked-switch'),
+                  title: const Text('ジェスチャーボタンをヘッダーに収納'),
+                  subtitle: const Text(
+                    '邪魔な時にヘッダーへしまえます。ヘッダーのアイコンをタップまたは下にドラッグすると画面に戻せます。',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  value: _settings.dockedInHeader,
+                  onChanged: _settings.enabled
+                      ? (v) => _update(_settings.copyWith(dockedInHeader: v))
+                      : null,
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 14),
@@ -134,6 +152,7 @@ class _GestureSettingsScreenState extends State<GestureSettingsScreen> {
                 _settings.copyWith(
                   triggerSide: nextSide,
                   handleXFraction: nextSide == 'left' ? 0.10 : 0.90,
+                  dockedInHeader: false,
                 ),
               );
             },

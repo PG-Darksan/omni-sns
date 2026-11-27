@@ -179,6 +179,8 @@ export interface AccountFilterLiveState {
   autoFetching: boolean;
 }
 
+export type HeaderAccountScope = 'all' | 'service';
+
 export interface AppSettings {
   theme: ThemeMode;
   /** ウィンドウを閉じる際にトレイへ最小化するか */
@@ -189,6 +191,8 @@ export interface AppSettings {
   activeInstanceId: string | null;
   /** ツールバー・タブバー（ヘッダー下部）を折り畳んでいるか */
   headerCollapsed?: boolean;
+  /** ヘッダーのアカウント切替バーの表示範囲（'all': 全SNS横断 / 'service': 現在SNSのみ） */
+  headerAccountScope?: HeaderAccountScope;
   /** PC版表示領域の下余白（px。画面下端の入力欄を上に持ち上げる） */
   viewportBottomInset?: number;
   /** フォロー・アンフォロー集計時間（時間単位、1〜168、既定24） */

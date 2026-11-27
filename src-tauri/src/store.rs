@@ -269,6 +269,7 @@ pub fn create_default_settings() -> AppSettings {
         sidebar_width: 248,
         active_instance_id: None,
         header_collapsed: false,
+        header_account_scope: "all".to_string(),
         viewport_bottom_inset: DEFAULT_VIEWPORT_BOTTOM_INSET,
         follow_window_hours: DEFAULT_FOLLOW_WINDOW_HOURS,
         catalog_order: Vec::new(),
@@ -366,6 +367,7 @@ struct RawSettings {
     sidebar_width: Option<u32>,
     active_instance_id: Option<String>,
     header_collapsed: Option<bool>,
+    header_account_scope: Option<String>,
     viewport_bottom_inset: Option<u32>,
     follow_window_hours: Option<u32>,
     catalog_order: Option<Vec<String>>,
@@ -643,6 +645,13 @@ impl ConfigStore {
             }
             if let Some(hc) = rs.header_collapsed {
                 settings.header_collapsed = hc;
+            }
+            if let Some(scope) = rs.header_account_scope {
+                settings.header_account_scope = if scope == "service" {
+                    "service".to_string()
+                } else {
+                    "all".to_string()
+                };
             }
             if let Some(bi) = rs.viewport_bottom_inset {
                 settings.viewport_bottom_inset = bi.clamp(0, MAX_VIEWPORT_BOTTOM_INSET);
@@ -1405,6 +1414,13 @@ impl ConfigStore {
         }
         if let Some(hc) = patch.header_collapsed {
             self.config.settings.header_collapsed = hc;
+        }
+        if let Some(scope) = patch.header_account_scope {
+            self.config.settings.header_account_scope = if scope == "service" {
+                "service".to_string()
+            } else {
+                "all".to_string()
+            };
         }
         if let Some(bi) = patch.viewport_bottom_inset {
             self.config.settings.viewport_bottom_inset = bi.clamp(0, MAX_VIEWPORT_BOTTOM_INSET);
@@ -3041,6 +3057,68 @@ mod tests {
 
         let reloaded = ConfigStore::new(config_path);
         assert_eq!(reloaded.get_settings().account_filter, saved);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn header_account_scope_and_cross_sns_reorder_persist() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-scope-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+
+        let mut store = ConfigStore::new(config_path.clone());
+        assert_eq!(store.get_settings().header_account_scope, "all");
+
+        store.update_settings(UpdateSettingsPatch {
+            header_account_scope: Some("service".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(store.get_settings().header_account_scope, "service");
+
+        // 不正値は 'all' にフォールバック
+        store.update_settings(UpdateSettingsPatch {
+            header_account_scope: Some("invalid".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(store.get_settings().header_account_scope, "all");
+
+        // SNSをまたいだ自由な並び順（Instagram -> Bluesky -> Instagram2）も永続化される
+        let ig2 = store
+            .add_instance(AddInstancePayload {
+                service_id: "instagram".to_string(),
+                name: "Instagram".to_string(),
+                account_label: Some("サブ垢".to_string()),
+                category: "major-sns".to_string(),
+                url: "https://www.instagram.com/direct/inbox/".to_string(),
+                color: "#E1306C".to_string(),
+                badge: "IG".to_string(),
+                ua_mode: "desktop".to_string(),
+            })
+            .unwrap();
+        store.reorder_instances(&[
+            "svc-instagram-default".to_string(),
+            "svc-bluesky-default".to_string(),
+            ig2.instance_id.clone(),
+        ]);
+
+        let reloaded = ConfigStore::new(config_path);
+        assert_eq!(reloaded.get_settings().header_account_scope, "all");
+        let ids: Vec<String> = reloaded
+            .get_instances()
+            .into_iter()
+            .take(3)
+            .map(|i| i.instance_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "svc-instagram-default".to_string(),
+                "svc-bluesky-default".to_string(),
+                ig2.instance_id,
+            ]
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

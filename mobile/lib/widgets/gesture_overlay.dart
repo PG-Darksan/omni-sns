@@ -130,6 +130,8 @@ class MobileGestureOverlay extends StatefulWidget {
     required this.onLiveScroll,
     required this.onHandleMoved,
     required this.onOpenSettings,
+    this.onDockToHeader,
+    this.onHandleMoveDragChanged,
   });
 
   final MobileGestureSettings settings;
@@ -137,20 +139,27 @@ class MobileGestureOverlay extends StatefulWidget {
   final void Function(double dx, double dy) onLiveScroll;
   final void Function(double xFrac, double yFrac) onHandleMoved;
   final VoidCallback onOpenSettings;
+  final VoidCallback? onDockToHeader;
+  final void Function(Offset? globalPosition, bool isOverHeaderDock)?
+      onHandleMoveDragChanged;
 
   @override
   State<MobileGestureOverlay> createState() => MobileGestureOverlayState();
 }
 
 class MobileGestureOverlayState extends State<MobileGestureOverlay> {
+  static const double _headerDockThresholdY = 34.0;
+
   final GlobalKey _layerKey = GlobalKey();
   final GesturePath _path = GesturePath();
 
   int? _activePointer;
   Offset? _downLocal;
   Offset? _currentLocal;
+  Offset? _lastGlobal;
   bool _isDraggingGesture = false;
   bool _isMovingHandle = false;
+  bool _isOverHeaderDock = false;
   bool _isLiveScrolling = false;
   String _liveScrollAction = '';
 
@@ -181,25 +190,34 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     });
   }
 
-  void _resetActiveGesture() {
+  void _resetActiveGesture({bool notifyParent = false}) {
+    final wasMoving = _isMovingHandle;
     _longPressTimer?.cancel();
     _longPressTimer = null;
     _stopLiveScroll();
     _activePointer = null;
     _downLocal = null;
     _currentLocal = null;
+    _lastGlobal = null;
     _isDraggingGesture = false;
     _isMovingHandle = false;
+    _isOverHeaderDock = false;
     _previewXFrac = null;
     _previewYFrac = null;
+    if (notifyParent && wasMoving && widget.onHandleMoveDragChanged != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        widget.onHandleMoveDragChanged?.call(null, false);
+      });
+    }
   }
 
   @override
   void didUpdateWidget(covariant MobileGestureOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!widget.settings.enabled ||
+        widget.settings.dockedInHeader != oldWidget.settings.dockedInHeader ||
         oldWidget.settings.triggerSide != widget.settings.triggerSide) {
-      _resetActiveGesture();
+      _resetActiveGesture(notifyParent: true);
     }
   }
 
@@ -225,6 +243,10 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
   Size _layerSize() {
     final box = _layerKey.currentContext?.findRenderObject() as RenderBox?;
     return box?.size ?? Size.zero;
+  }
+
+  bool _isLocalInHeaderDockZone(Offset local) {
+    return widget.onDockToHeader != null && local.dy <= _headerDockThresholdY;
   }
 
   void _stopLiveScroll() {
@@ -290,18 +312,24 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     _activePointer = e.pointer;
     _downLocal = local;
     _currentLocal = local;
+    _lastGlobal = e.position;
     _isDraggingGesture = false;
     _isMovingHandle = false;
+    _isOverHeaderDock = false;
     _stopLiveScroll();
     _path.reset(local, tremor: widget.settings.tremor.toDouble());
 
     _longPressTimer?.cancel();
-    _longPressTimer = Timer(const Duration(milliseconds: 460), () {
+    _longPressTimer = Timer(const Duration(milliseconds: 380), () {
       if (_activePointer != e.pointer || _isDraggingGesture || !mounted) return;
       HapticFeedback.mediumImpact();
+      final curLocal = _currentLocal ?? local;
+      final overDock = _isLocalInHeaderDockZone(curLocal);
       setState(() {
         _isMovingHandle = true;
+        _isOverHeaderDock = overDock;
       });
+      widget.onHandleMoveDragChanged?.call(_lastGlobal ?? e.position, overDock);
     });
     if (mounted) setState(() {});
   }
@@ -311,17 +339,28 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     final local = _toLocal(e.position);
     if (local == null) return;
     _currentLocal = local;
+    _lastGlobal = e.position;
 
     if (_isMovingHandle) {
       final sz = _layerSize();
+      final overDock = _isLocalInHeaderDockZone(local);
+      if (overDock != _isOverHeaderDock) {
+        HapticFeedback.selectionClick();
+      }
       if (sz.width > 0 && sz.height > 0) {
         setState(() {
+          _isOverHeaderDock = overDock;
           if (widget.settings.triggerSide != 'both') {
             _previewXFrac = (local.dx / sz.width).clamp(0.06, 0.94);
           }
           _previewYFrac = (local.dy / sz.height).clamp(0.14, 0.88);
         });
+      } else {
+        setState(() {
+          _isOverHeaderDock = overDock;
+        });
       }
+      widget.onHandleMoveDragChanged?.call(e.position, overDock);
       return;
     }
 
@@ -355,6 +394,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     _longPressTimer = null;
 
     final wasMoving = _isMovingHandle;
+    final wasOverDock = _isOverHeaderDock;
     final wasDragging = _isDraggingGesture;
     final wasLiveScroll = _isLiveScrolling;
     final finalShape = cancelled ? '' : _path.release();
@@ -364,18 +404,26 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     _activePointer = null;
     _downLocal = null;
     _currentLocal = null;
+    _lastGlobal = null;
     _isDraggingGesture = false;
     _isMovingHandle = false;
+    _isOverHeaderDock = false;
 
     if (wasMoving) {
       final nextX = _previewXFrac ?? widget.settings.handleXFraction;
       final nextY = _previewYFrac ?? widget.settings.handleYFraction;
       _previewXFrac = null;
       _previewYFrac = null;
+      widget.onHandleMoveDragChanged?.call(null, false);
       if (mounted) setState(() {});
       if (!cancelled) {
-        widget.onHandleMoved(nextX, nextY);
-        showNotice('ジェスチャーボタン位置を保存しました');
+        if (wasOverDock && widget.onDockToHeader != null) {
+          HapticFeedback.mediumImpact();
+          widget.onDockToHeader!();
+        } else {
+          widget.onHandleMoved(nextX, nextY);
+          showNotice('ジェスチャーボタン位置を保存しました');
+        }
       }
       return;
     }
@@ -418,7 +466,11 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
       widget.onOpenSettings();
     } else {
       _lastTapAt = now;
-      showNotice('ドラッグでジェスチャー · 長押しで移動 · 2回タップで設定');
+      showNotice(
+        widget.onDockToHeader != null
+            ? 'ドラッグでジェスチャー · 長押しで移動/ヘッダーへ収納 · 2回タップで設定'
+            : 'ドラッグでジェスチャー · 長押しで移動 · 2回タップで設定',
+      );
     }
   }
 
@@ -439,7 +491,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
               _isDraggingGesture ||
               _isMovingHandle ||
               _isLiveScrolling) {
-            _resetActiveGesture();
+            _resetActiveGesture(notifyParent: true);
           }
           return const SizedBox.shrink();
         }
@@ -454,21 +506,25 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
         final clampedY = (yFrac * h).clamp(minY, maxY).toDouble();
         final orbCenters = <Offset>[];
 
-        if (settings.triggerSide == 'both') {
-          orbCenters.add(Offset(min(26.0, w / 2), clampedY));
-          orbCenters.add(Offset(max(w - 26.0, w / 2), clampedY));
-        } else {
-          orbCenters.add(
-            Offset(
-              (xFrac * w).clamp(minX, maxX).toDouble(),
-              clampedY,
-            ),
-          );
+        if (!settings.dockedInHeader) {
+          if (settings.triggerSide == 'both') {
+            orbCenters.add(Offset(min(26.0, w / 2), clampedY));
+            orbCenters.add(Offset(max(w - 26.0, w / 2), clampedY));
+          } else {
+            orbCenters.add(
+              Offset(
+                (xFrac * w).clamp(minX, maxX).toDouble(),
+                clampedY,
+              ),
+            );
+          }
         }
 
         final shape = _path.shape;
         final mappedAction =
             shape.isNotEmpty ? settings.actionFor(shape) : 'none';
+        final hideLocalOrbWhileMoving =
+            _isMovingHandle && widget.onHandleMoveDragChanged != null;
 
         return Stack(
           clipBehavior: Clip.none,
@@ -519,23 +575,52 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
                 right: 16,
                 child: IgnorePointer(
                   child: Center(
-                    child: Container(
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 120),
                       padding: const EdgeInsets.symmetric(
                         horizontal: 14,
                         vertical: 7,
                       ),
                       decoration: BoxDecoration(
-                        color: const Color(0xE60F172A),
+                        color: _isOverHeaderDock
+                            ? const Color(0xEB0E7490)
+                            : const Color(0xE60F172A),
                         borderRadius: BorderRadius.circular(999),
-                        border: Border.all(color: kGestureAmber, width: 1.4),
-                      ),
-                      child: const Text(
-                        'ドラッグして好きな位置に配置できます',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
+                        border: Border.all(
+                          color: _isOverHeaderDock
+                              ? kGestureTealBright
+                              : kGestureAmber,
+                          width: 1.5,
                         ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (_isOverHeaderDock) ...[
+                            const Icon(
+                              Icons.vertical_align_top_rounded,
+                              size: 15,
+                              color: Colors.white,
+                            ),
+                            const SizedBox(width: 5),
+                          ],
+                          Flexible(
+                            child: Text(
+                              _isOverHeaderDock
+                                  ? '離すとヘッダーに収納します'
+                                  : (widget.onDockToHeader != null
+                                      ? 'ドラッグで配置 · 上のヘッダーへ持っていくと収納'
+                                      : 'ドラッグして好きな位置に配置できます'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ),
@@ -606,20 +691,26 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
                       _handlePointerUpOrCancel(e.pointer, cancelled: true),
                   child: AnimatedOpacity(
                     duration: const Duration(milliseconds: 140),
-                    opacity: (_isDraggingGesture || _isMovingHandle)
-                        ? 0.95
-                        : 0.64,
+                    opacity: hideLocalOrbWhileMoving
+                        ? 0.0
+                        : ((_isDraggingGesture || _isMovingHandle)
+                            ? 0.95
+                            : 0.64),
                     child: Container(
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
                         color: _isMovingHandle
-                            ? const Color(0xEB92400E)
+                            ? (_isOverHeaderDock
+                                ? const Color(0xEB0E7490)
+                                : const Color(0xEB92400E))
                             : (_isDraggingGesture
                                 ? const Color(0xEB0E7490)
                                 : const Color(0xCC0F172A)),
                         border: Border.all(
                           color: _isMovingHandle
-                              ? kGestureAmber
+                              ? (_isOverHeaderDock
+                                  ? kGestureTealBright
+                                  : kGestureAmber)
                               : kGestureTealBright.withValues(alpha: 0.85),
                           width: _isDraggingGesture || _isMovingHandle
                               ? 2.0
@@ -635,8 +726,10 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
                       ),
                       alignment: Alignment.center,
                       child: _isMovingHandle
-                          ? const Icon(
-                              Icons.open_with_rounded,
+                          ? Icon(
+                              _isOverHeaderDock
+                                  ? Icons.vertical_align_top_rounded
+                                  : Icons.open_with_rounded,
                               size: 19,
                               color: Colors.white,
                             )

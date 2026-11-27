@@ -1663,4 +1663,353 @@ void main() {
     await tester.pump();
     expect(find.byKey(const ValueKey('account-filter-status-bar')), findsNothing);
   });
+
+  test('crossServiceAccountDisplayLabel, headerAccountScope, and dockedInHeader roundtrip cleanly', () {
+    const igMain = ServiceInstance(
+      instanceId: 'ig-1',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      accountLabel: 'メイン',
+      category: 'major-sns',
+      url: 'https://www.instagram.com/direct/inbox/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 0,
+    );
+    const igLoggedIn = ServiceInstance(
+      instanceId: 'ig-2',
+      serviceId: 'instagram',
+      name: 'Instagram',
+      accountLabel: 'メイン',
+      detectedHandle: 'alice_ig',
+      category: 'major-sns',
+      url: 'https://www.instagram.com/direct/inbox/',
+      colorHex: '#E1306C',
+      badge: 'IG',
+      notificationsEnabled: true,
+      order: 1,
+    );
+    const bskyCustom = ServiceInstance(
+      instanceId: 'bsky-1',
+      serviceId: 'bluesky',
+      name: 'Bluesky',
+      accountLabel: 'ブルスカ本垢',
+      detectedHandle: 'alice.bsky.social',
+      category: 'major-sns',
+      url: 'https://bsky.app/messages',
+      colorHex: '#0085FF',
+      badge: 'BS',
+      notificationsEnabled: true,
+      order: 2,
+    );
+
+    // 1垢のみ・未検出・汎用ラベルはSNS名を表示
+    expect(
+      crossServiceAccountDisplayLabel(igMain, 0, 1, baseServiceName: 'Instagram'),
+      'Instagram',
+    );
+    // 複数垢で未検出・汎用ラベルは従来通り メイン / アカウント 2
+    expect(
+      crossServiceAccountDisplayLabel(igMain, 0, 2, baseServiceName: 'Instagram'),
+      'メイン',
+    );
+    // ログイン検出済み @handle があれば優先表示
+    expect(
+      crossServiceAccountDisplayLabel(igLoggedIn, 0, 1, baseServiceName: 'Instagram'),
+      '@alice_ig',
+    );
+    // ユーザー命名のカスタムラベルは最優先
+    expect(
+      crossServiceAccountDisplayLabel(bskyCustom, 0, 1, baseServiceName: 'Bluesky'),
+      'ブルスカ本垢',
+    );
+
+    const settings = AppSettings(
+      headerAccountScope: 'service',
+      gesture: MobileGestureSettings(
+        dockedInHeader: true,
+        handleXFraction: 0.25,
+        handleYFraction: 0.70,
+      ),
+    );
+    final restored = AppSettings.fromJson(settings.toJson());
+    expect(restored.headerAccountScope, 'service');
+    expect(restored.isHeaderAllAccounts, isFalse);
+    expect(restored.gesture.dockedInHeader, isTrue);
+    expect(restored.gesture.handleXFraction, closeTo(0.25, 0.001));
+    expect(restored.gesture.handleYFraction, closeTo(0.70, 0.001));
+
+    // 旧JSON（キー無し）は全SNS表示 & フロート状態へフォールバック
+    final legacy = AppSettings.fromJson(const {});
+    expect(legacy.headerAccountScope, 'all');
+    expect(legacy.isHeaderAllAccounts, isTrue);
+    expect(legacy.gesture.dockedInHeader, isFalse);
+  });
+
+  testWidgets('HomeScreen displays Instagram and Bluesky accounts together in header, switches across SNS, and handles collapsed narrow layout', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'omnisns_instances_v1': jsonEncode([
+        {
+          'instanceId': 'ig-main',
+          'serviceId': 'instagram',
+          'name': 'Instagram',
+          'accountLabel': 'メイン',
+          'detectedHandle': 'insta_main',
+          'profileName': 'omnisns_ig-main',
+          'category': 'major-sns',
+          'url': 'https://www.instagram.com/direct/inbox/',
+          'colorHex': '#E1306C',
+          'badge': 'IG',
+          'notificationsEnabled': true,
+          'order': 0,
+        },
+        {
+          'instanceId': 'ig-sub',
+          'serviceId': 'instagram',
+          'name': 'Instagram',
+          'accountLabel': 'サブ垢',
+          'profileName': 'omnisns_ig-sub',
+          'category': 'major-sns',
+          'url': 'https://www.instagram.com/direct/inbox/',
+          'colorHex': '#E1306C',
+          'badge': 'IG',
+          'notificationsEnabled': true,
+          'order': 1,
+        },
+        {
+          'instanceId': 'bsky-main',
+          'serviceId': 'bluesky',
+          'name': 'Bluesky',
+          'accountLabel': 'メイン',
+          'detectedHandle': 'bsky_user',
+          'profileName': 'omnisns_bsky-main',
+          'category': 'major-sns',
+          'url': 'https://bsky.app/messages',
+          'colorHex': '#0085FF',
+          'badge': 'BS',
+          'notificationsEnabled': true,
+          'order': 2,
+        },
+      ]),
+      'omnisns_settings_v1': jsonEncode({
+        'isDarkMode': true,
+        'activeInstanceId': 'ig-main',
+        'headerAccountScope': 'all',
+        'isBottomTabsCollapsed': true,
+        'gesture': {
+          'enabled': true,
+          'dockedInHeader': true,
+        },
+      }),
+    });
+    const mgrChannel = MethodChannel('com.pgdarksan.omnisns/webview_manager');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(mgrChannel, (call) async {
+      if (call.method == 'isMultiProfileSupported') return true;
+      return true;
+    });
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform_views, (call) async => null);
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(mgrChannel, null);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform_views, null);
+    });
+
+    tester.view.physicalSize = const Size(520, 800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final store = AppStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(store: store, onThemeChanged: (_) {}),
+      ),
+    );
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    // デフォルト（全SNSモード）で Instagram 2垢 + Bluesky 1垢 が同じヘッダーに並ぶ
+    expect(find.byKey(const ValueKey('header-account-pill-ig-main')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-account-pill-ig-sub')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-account-pill-bsky-main')), findsOneWidget);
+    expect(find.text('@insta_main'), findsOneWidget);
+    expect(find.text('サブ垢'), findsOneWidget);
+    expect(find.text('@bsky_user'), findsOneWidget);
+
+    // ヘッダーの Bluesky ピルをタップして Instagram -> Bluesky へ瞬時切替
+    await tester.tap(find.byKey(const ValueKey('header-account-pill-bsky-main')));
+    await tester.pump();
+    final savedAfterTap = await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      final catalog = await store.loadCatalog();
+      final (s, _) = await store.loadState(catalog.services);
+      return s;
+    });
+    expect(savedAfterTap?.activeInstanceId, 'bsky-main');
+
+    // スコープ切替チップをタップすると現在SNS（Bluesky）のみ表示に切り替わる
+    await tester.tap(find.byKey(const ValueKey('header-account-scope-toggle')));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('header-account-pill-bsky-main')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-account-pill-ig-main')), findsNothing);
+
+    // もう1回タップすると全SNS表示に戻る
+    await tester.tap(find.byKey(const ValueKey('header-account-scope-toggle')));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('header-account-pill-ig-main')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-account-pill-bsky-main')), findsOneWidget);
+
+    // 狭い 360dp スマホ幅 + 下部タブ折り畳み + ジェスチャー収納済み + ヘッダー折り畳みでも
+    // オーバーフローせず、折り畳みヘッダーバーから Instagram へ切替可能
+    tester.view.physicalSize = const Size(360, 800);
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('header-collapse-button')));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsOneWidget);
+    expect(find.byKey(const ValueKey('collapsed-account-pill-ig-main')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('collapsed-account-pill-ig-main')));
+    await tester.pump();
+    final savedAfterCollapsedTap = await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      final catalog = await store.loadCatalog();
+      final (s, _) = await store.loadState(catalog.services);
+      return s;
+    });
+    expect(savedAfterCollapsedTap?.activeInstanceId, 'ig-main');
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+  });
+
+  testWidgets('Gesture orb drags into header to dock and returns on tap or downward drag', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'omnisns_settings_v1': jsonEncode({
+        'isDarkMode': true,
+        'gesture': {
+          'enabled': true,
+          'triggerSide': 'right',
+          'handleXFraction': 0.85,
+          'handleYFraction': 0.60,
+          'dockedInHeader': false,
+        },
+      }),
+    });
+    const mgrChannel = MethodChannel('com.pgdarksan.omnisns/webview_manager');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(mgrChannel, (call) async => true);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform_views, (call) async => null);
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(mgrChannel, null);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform_views, null);
+    });
+
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final store = AppStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(store: store, onThemeChanged: (_) {}),
+      ),
+    );
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    final orbFinder = find.byKey(const ValueKey('mobile-gesture-orb-0'));
+    expect(orbFinder, findsOneWidget);
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsNothing);
+
+    // 1. オーブを長押しして移動モードに入り、上のヘッダー領域へドラッグして離すとヘッダーに収納される
+    final orbCenter = tester.getCenter(orbFinder);
+    final gesture = await tester.startGesture(orbCenter);
+    await tester.pump(const Duration(milliseconds: 420));
+    expect(find.byKey(const ValueKey('header-gesture-dock-target')), findsOneWidget);
+    expect(find.byKey(const ValueKey('floating-orb-drag-ghost')), findsOneWidget);
+
+    await gesture.moveTo(const Offset(240, 22));
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(find.text('離すとヘッダーに収納します'), findsOneWidget);
+
+    await gesture.up();
+    await tester.pump();
+    final dockedSettings = await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      final catalog = await store.loadCatalog();
+      final (s, _) = await store.loadState(catalog.services);
+      return s;
+    });
+
+    expect(find.byKey(const ValueKey('mobile-gesture-orb-0')), findsNothing);
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsOneWidget);
+    expect(dockedSettings?.gesture.dockedInHeader, isTrue);
+    // 収納しても元の配置座標は壊さず保持される
+    expect(dockedSettings?.gesture.handleXFraction, closeTo(0.85, 0.01));
+    expect(dockedSettings?.gesture.handleYFraction, closeTo(0.60, 0.01));
+
+    // 2. ヘッダーの収納アイコンをタップすると元の位置へ復帰する
+    await tester.tap(find.byKey(const ValueKey('header-gesture-dock-button')));
+    await tester.pump();
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 60)));
+
+    expect(find.byKey(const ValueKey('mobile-gesture-orb-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsNothing);
+
+    // 3. もう一度ヘッダーに収納し、今度はヘッダーから下へドラッグして好きな位置へ配置する
+    final orbCenter2 = tester.getCenter(find.byKey(const ValueKey('mobile-gesture-orb-0')));
+    final gDock = await tester.startGesture(orbCenter2);
+    await tester.pump(const Duration(milliseconds: 420));
+    await gDock.moveTo(const Offset(220, 20));
+    await tester.pump(const Duration(milliseconds: 40));
+    await gDock.up();
+    await tester.pump();
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsOneWidget);
+
+    final dockCenter = tester.getCenter(find.byKey(const ValueKey('header-gesture-dock-button')));
+    final gPull = await tester.startGesture(dockCenter);
+    await tester.pump(const Duration(milliseconds: 40));
+    await gPull.moveTo(const Offset(120, 420));
+    await tester.pump(const Duration(milliseconds: 40));
+    expect(find.byKey(const ValueKey('floating-orb-drag-ghost')), findsOneWidget);
+    await gPull.up();
+    await tester.pump();
+    final pulledSettings = await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      final catalog = await store.loadCatalog();
+      final (s, _) = await store.loadState(catalog.services);
+      return s;
+    });
+
+    expect(find.byKey(const ValueKey('mobile-gesture-orb-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsNothing);
+    expect(pulledSettings?.gesture.dockedInHeader, isFalse);
+    expect(pulledSettings?.gesture.handleXFraction, lessThan(0.5));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+  });
+
+  testWidgets('GestureSettingsScreen toggles header dock state immediately', (tester) async {
+    MobileGestureSettings? updated;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: GestureSettingsScreen(
+          initialSettings: const MobileGestureSettings(enabled: true, dockedInHeader: false),
+          onChanged: (next) => updated = next,
+        ),
+      ),
+    );
+    await tester.tap(find.byKey(const ValueKey('gesture-docked-switch')));
+    await tester.pump();
+    expect(updated?.dockedInHeader, isTrue);
+  });
 }

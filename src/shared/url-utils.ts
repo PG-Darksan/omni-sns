@@ -343,6 +343,35 @@ export function getAccountDisplayLabel(
 }
 
 /**
+ * 複数SNSを横断してヘッダーに並べる際のアカウント表示名を決定する。
+ * - ユーザー命名のカスタムラベルがあれば優先
+ * - 検出済み @handle があれば `@handle` を表示
+ * - 未命名かつ未検出で同一SNSに1垢のみの場合はSNS名（例: Instagram / Bluesky）を表示
+ */
+export function getCrossServiceAccountDisplayLabel(
+  inst: { name: string; accountLabel?: string; detectedHandle?: string },
+  siblingIndex: number,
+  siblingCount: number,
+  baseServiceName?: string
+): string {
+  const explicit = inst.accountLabel?.trim();
+  const handle = inst.detectedHandle?.trim().replace(/^@+/, '');
+  if (explicit && !isGenericAccountLabel(explicit)) {
+    return explicit;
+  }
+  if (handle) {
+    return `@${handle}`;
+  }
+  const base = baseServiceName?.trim();
+  if (siblingCount <= 1) {
+    if (base) return base;
+    const rawName = inst.name.trim();
+    if (rawName) return rawName;
+  }
+  return getAccountDisplayLabel(inst, siblingIndex, baseServiceName);
+}
+
+/**
  * ログイン記憶（アーカイブ済みアカウント）の分かりやすい表示タイトルを生成する。
  * 検出済み @handle がある場合は「アカウント 3」より @handle を優先表示する。
  */

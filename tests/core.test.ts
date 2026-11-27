@@ -9,6 +9,7 @@ import {
   detectPlatformServiceFromUrl,
   formatArchivedAccountTitle,
   getAccountDisplayLabel,
+  getCrossServiceAccountDisplayLabel,
   getServiceGroupKey,
   isGenericAccountLabel,
   isSafeFaviconUrl,
@@ -642,3 +643,43 @@ test('catalog reordering and archived account title helpers work cleanly', () =>
     '@hanako'
   );
 });
+
+test('getCrossServiceAccountDisplayLabel differentiates Instagram and Bluesky accounts clearly in header', () => {
+  assert.equal(
+    getCrossServiceAccountDisplayLabel(
+      { name: 'Instagram', accountLabel: 'メイン' },
+      0,
+      1,
+      'Instagram'
+    ),
+    'Instagram'
+  );
+  assert.equal(
+    getCrossServiceAccountDisplayLabel(
+      { name: 'Bluesky', accountLabel: 'メイン', detectedHandle: 'alice.bsky.social' },
+      0,
+      1,
+      'Bluesky'
+    ),
+    '@alice.bsky.social'
+  );
+  assert.equal(
+    getCrossServiceAccountDisplayLabel(
+      { name: 'Instagram', accountLabel: 'サブ垢', detectedHandle: 'sub_ig' },
+      1,
+      2,
+      'Instagram'
+    ),
+    'サブ垢'
+  );
+  assert.equal(
+    getCrossServiceAccountDisplayLabel(
+      { name: 'Instagram', accountLabel: 'メイン' },
+      0,
+      2,
+      'Instagram'
+    ),
+    'メイン'
+  );
+});
+

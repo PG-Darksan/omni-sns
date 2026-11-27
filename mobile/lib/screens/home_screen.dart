@@ -150,6 +150,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final Map<String, ({String service, String handle})> _crossSiteIdentities = {};
   final Map<String, List<int>> _bridgeEventTimestamps = {};
   final GlobalKey<MobileGestureOverlayState> _gestureOverlayKey = GlobalKey();
+  final GlobalKey _rootStackKey = GlobalKey();
+  final GlobalKey _viewportKey = GlobalKey();
+  Offset? _movingOrbGlobalPos;
+  bool _isOrbOverHeaderDock = false;
+  bool _isDraggingFromHeaderDock = false;
+  int? _headerDockPointer;
+  Offset? _headerDockDownGlobal;
+  Timer? _headerDockLongPressTimer;
+  bool _headerDockLongPressFired = false;
 
   @override
   void initState() {
@@ -216,6 +225,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _cloudSyncPeriodic?.cancel();
     _followWindowRefreshTimer?.cancel();
     _snackDismissTimer?.cancel();
+    _headerDockLongPressTimer?.cancel();
     _gmailController?.dispose();
     _gmailController = null;
     for (final ctrl in _controllers.values) {
@@ -3043,19 +3053,677 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return true;
   }
 
-  bool _stepActiveAccount(int delta) {
-    final group = _activeGroup;
+  _ServiceGroup? _groupForInstance(ServiceInstance inst) {
+    final key = serviceGroupKey(inst);
+    for (final grp in _serviceGroups) {
+      if (grp.key == key) return grp;
+    }
+    return null;
+  }
+
+  String _headerLabelForInstance(
+    ServiceInstance inst, {
+    required bool allScope,
+    _ServiceGroup? knownGroup,
+  }) {
+    final grp = knownGroup ?? _groupForInstance(inst);
+    final accounts = grp?.accounts ?? [inst];
+    final sibIdx = max(
+      0,
+      accounts.indexWhere((a) => a.instanceId == inst.instanceId),
+    );
+    if (allScope) {
+      return crossServiceAccountDisplayLabel(
+        inst,
+        sibIdx,
+        accounts.length,
+        baseServiceName: grp?.displayName ?? inst.name,
+      );
+    }
+    return accountDisplayLabel(
+      inst,
+      sibIdx,
+      baseServiceName: grp?.displayName ?? inst.name,
+    );
+  }
+
+  Future<void> _toggleHeaderAccountScope() async {
+    final nextScope = _settings.isHeaderAllAccounts ? 'service' : 'all';
+    setState(() {
+      _settings = _settings.copyWith(headerAccountScope: nextScope);
+    });
+    await _persist();
+    _showSnack(
+      nextScope == 'all'
+          ? 'ヘッダーに全SNSのアカウントを並べて表示します'
+          : 'ヘッダーを現在のSNSのアカウントのみに切り替えました',
+    );
+  }
+
+  Future<void> _showCrossServiceAddAccountSheet() async {
     final active = _activeInstance;
-    if (group == null || active == null || group.accounts.length <= 1) {
-      _showGestureNotice('このSNSのアカウントは1つだけです');
+    final activeGroup = _activeGroup;
+    final archived = List<ArchivedInstance>.from(_archivedInstances);
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'ヘッダーにアカウントを追加',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '別SNSやログイン済みアカウントを追加して、同じヘッダーからワンタップで切り替えられます。',
+                style: Theme.of(ctx).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 12),
+              if (_multiProfileSupported &&
+                  active != null &&
+                  activeGroup != null) ...[
+                FilledButton.tonalIcon(
+                  key: const ValueKey('cross-add-same-service-btn'),
+                  onPressed: () => Navigator.of(ctx).pop('__SAME_SERVICE__'),
+                  icon: const Icon(Icons.person_add_alt_1_rounded, size: 18),
+                  label: Text('「${activeGroup.displayName}」に別アカウントを追加'),
+                ),
+                const SizedBox(height: 8),
+              ],
+              FilledButton.icon(
+                key: const ValueKey('cross-add-catalog-btn'),
+                onPressed: () => Navigator.of(ctx).pop('__CATALOG__'),
+                icon: const Icon(Icons.apps_rounded, size: 18),
+                label: const Text('別SNSを追加（Instagram / Bluesky など）'),
+              ),
+              if (_instances.length >= 2) ...[
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  key: const ValueKey('cross-reorder-accounts-btn'),
+                  onPressed: () => Navigator.of(ctx).pop('__REORDER__'),
+                  icon: const Icon(Icons.swap_horiz_rounded, size: 18),
+                  label: const Text('ヘッダーの並び順を変更'),
+                ),
+              ],
+              if (archived.isNotEmpty) ...[
+                const SizedBox(height: 14),
+                Text(
+                  'ログイン記憶から呼び出す（${archived.length}件）',
+                  style: Theme.of(ctx).textTheme.labelLarge?.copyWith(
+                        fontWeight: FontWeight.bold,
+                      ),
+                ),
+                const SizedBox(height: 6),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 210),
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: archived.length,
+                    separatorBuilder: (_, _) => const SizedBox(height: 6),
+                    itemBuilder: (_, idx) {
+                      final entry = archived[idx];
+                      final inst = entry.instance;
+                      return ListTile(
+                        dense: true,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          side: BorderSide(
+                            color: Theme.of(ctx)
+                                .dividerColor
+                                .withValues(alpha: 0.4),
+                          ),
+                        ),
+                        leading: Container(
+                          width: 26,
+                          height: 26,
+                          decoration: BoxDecoration(
+                            color: parseHexColor(inst.colorHex),
+                            borderRadius: BorderRadius.circular(7),
+                          ),
+                          alignment: Alignment.center,
+                          child: Text(
+                            inst.badge,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 9.5,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        title: Text(
+                          _formatArchivedDisplayTitle(inst),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        trailing: FilledButton(
+                          style: FilledButton.styleFrom(
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: () =>
+                              Navigator.of(ctx).pop('RESTORE:${inst.instanceId}'),
+                          child: const Text('呼び出す'),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+    if (!mounted || selected == null) return;
+    if (selected == '__SAME_SERVICE__') {
+      await _addAccountForActiveService();
+    } else if (selected == '__CATALOG__') {
+      await _openCatalog();
+    } else if (selected == '__REORDER__') {
+      await _showAccountReorderSheet();
+    } else if (selected.startsWith('RESTORE:')) {
+      await _restoreArchivedInstance(selected.substring('RESTORE:'.length));
+    }
+  }
+
+  Future<void> _showAccountReorderSheet() async {
+    if (_instances.length < 2) return;
+    final working = List<ServiceInstance>.from(_instances);
+    final saved = await showModalBottomSheet<List<ServiceInstance>>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) => SafeArea(
+          child: SizedBox(
+            height: min(MediaQuery.of(ctx).size.height * 0.72, 480),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 12, 8),
+                  child: Row(
+                    children: [
+                      const Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'ヘッダーのアカウント並び替え',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            SizedBox(height: 2),
+                            Text(
+                              'ドラッグしてSNSをまたいで好きな順に並べ替えられます',
+                              style: TextStyle(fontSize: 11.5),
+                            ),
+                          ],
+                        ),
+                      ),
+                      FilledButton(
+                        key: const ValueKey('account-reorder-save-btn'),
+                        onPressed: () => Navigator.of(ctx).pop(working),
+                        child: const Text('保存'),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: ReorderableListView.builder(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    itemCount: working.length,
+                    onReorder: (oldIndex, newIndex) {
+                      if (newIndex > oldIndex) newIndex -= 1;
+                      setSheetState(() {
+                        final moved = working.removeAt(oldIndex);
+                        working.insert(newIndex, moved);
+                      });
+                    },
+                    itemBuilder: (_, idx) {
+                      final inst = working[idx];
+                      final grp = _groupForInstance(inst);
+                      final label = _headerLabelForInstance(
+                        inst,
+                        allScope: true,
+                        knownGroup: grp,
+                      );
+                      return ListTile(
+                        key: ValueKey('reorder-acc-${inst.instanceId}'),
+                        dense: true,
+                        leading: Container(
+                          width: 28,
+                          height: 28,
+                          decoration: BoxDecoration(
+                            color: parseHexColor(inst.colorHex),
+                            borderRadius: BorderRadius.circular(7),
+                          ),
+                          alignment: Alignment.center,
+                          child: Text(
+                            inst.badge,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                        title: Text(
+                          label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        subtitle: Text(
+                          grp?.displayName ?? inst.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                        trailing: const Icon(Icons.drag_handle_rounded),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    if (!mounted || saved == null) return;
+    setState(() {
+      _instances = List.generate(
+        saved.length,
+        (i) => saved[i].copyWith(order: i),
+      );
+    });
+    await _persist();
+    _showSnack('ヘッダーのアカウント並び順を保存しました');
+  }
+
+  void _handleOverlayMoveDragChanged(
+    Offset? globalPos,
+    bool isOverHeaderDock,
+  ) {
+    if (!mounted) return;
+    setState(() {
+      _movingOrbGlobalPos = globalPos;
+      _isOrbOverHeaderDock = isOverHeaderDock;
+      if (globalPos == null) {
+        _isDraggingFromHeaderDock = false;
+      }
+    });
+  }
+
+  Future<void> _dockGestureToHeader() async {
+    setState(() {
+      _movingOrbGlobalPos = null;
+      _isOrbOverHeaderDock = false;
+      _isDraggingFromHeaderDock = false;
+    });
+    await _updateGestureSettings(
+      _settings.gesture.copyWith(dockedInHeader: true),
+    );
+    _showSnack('ジェスチャーボタンをヘッダーに収納しました（タップまたは下にドラッグで戻せます）');
+  }
+
+  Future<void> _undockGestureFromHeader({
+    double? xFrac,
+    double? yFrac,
+  }) async {
+    setState(() {
+      _movingOrbGlobalPos = null;
+      _isOrbOverHeaderDock = false;
+      _isDraggingFromHeaderDock = false;
+    });
+    await _updateGestureSettings(
+      _settings.gesture.copyWith(
+        dockedInHeader: false,
+        handleXFraction: xFrac,
+        handleYFraction: yFrac,
+      ),
+    );
+    HapticFeedback.lightImpact();
+    _showGestureNotice(
+      xFrac != null || yFrac != null
+          ? 'ジェスチャーボタンを配置しました'
+          : 'ジェスチャーボタンを表示しました',
+    );
+  }
+
+  void _handleHeaderDockPointerDown(PointerDownEvent e) {
+    if (_headerDockPointer != null) return;
+    _headerDockPointer = e.pointer;
+    _headerDockDownGlobal = e.position;
+    _headerDockLongPressFired = false;
+    _isDraggingFromHeaderDock = false;
+    _headerDockLongPressTimer?.cancel();
+    _headerDockLongPressTimer = Timer(const Duration(milliseconds: 460), () {
+      if (_headerDockPointer != e.pointer ||
+          _isDraggingFromHeaderDock ||
+          !mounted) {
+        return;
+      }
+      _headerDockLongPressFired = true;
+      _headerDockPointer = null;
+      _headerDockDownGlobal = null;
+      HapticFeedback.mediumImpact();
+      unawaited(_openGestureSettings());
+    });
+  }
+
+  void _handleHeaderDockPointerMove(PointerMoveEvent e) {
+    if (_headerDockPointer != e.pointer || _headerDockDownGlobal == null) {
+      return;
+    }
+    if (!_isDraggingFromHeaderDock) {
+      final moved = (e.position - _headerDockDownGlobal!).distance;
+      if (moved < 10.0) return;
+      _headerDockLongPressTimer?.cancel();
+      _headerDockLongPressTimer = null;
+      HapticFeedback.selectionClick();
+      _isDraggingFromHeaderDock = true;
+    }
+    final vpBox =
+        _viewportKey.currentContext?.findRenderObject() as RenderBox?;
+    bool overHeader = true;
+    if (vpBox != null && vpBox.hasSize) {
+      final local = vpBox.globalToLocal(e.position);
+      overHeader = local.dy <= 20.0;
+    }
+    if (mounted) {
+      setState(() {
+        _movingOrbGlobalPos = e.position;
+        _isOrbOverHeaderDock = overHeader;
+      });
+    }
+  }
+
+  void _handleHeaderDockPointerUpOrCancel(
+    int pointer,
+    Offset globalPos, {
+    required bool cancelled,
+  }) {
+    if (_headerDockPointer != pointer) return;
+    _headerDockLongPressTimer?.cancel();
+    _headerDockLongPressTimer = null;
+
+    final wasDragging = _isDraggingFromHeaderDock;
+    final firedLongPress = _headerDockLongPressFired;
+    _headerDockPointer = null;
+    _headerDockDownGlobal = null;
+    _isDraggingFromHeaderDock = false;
+    _headerDockLongPressFired = false;
+
+    if (mounted) {
+      setState(() {
+        _movingOrbGlobalPos = null;
+        _isOrbOverHeaderDock = false;
+      });
+    }
+    if (cancelled || firedLongPress) return;
+
+    if (wasDragging) {
+      final vpBox =
+          _viewportKey.currentContext?.findRenderObject() as RenderBox?;
+      if (vpBox != null &&
+          vpBox.hasSize &&
+          vpBox.size.width > 0 &&
+          vpBox.size.height > 0) {
+        final local = vpBox.globalToLocal(globalPos);
+        if (local.dy > 20.0) {
+          final nextX = _settings.gesture.triggerSide == 'both'
+              ? null
+              : (local.dx / vpBox.size.width).clamp(0.06, 0.94);
+          final nextY = (local.dy / vpBox.size.height).clamp(0.14, 0.88);
+          unawaited(_undockGestureFromHeader(xFrac: nextX, yFrac: nextY));
+        }
+      }
+      return;
+    }
+
+    // 短タップで前回位置に再表示
+    unawaited(_undockGestureFromHeader());
+  }
+
+  Widget _buildHeaderGestureDockSlot({required bool compact}) {
+    if (!_settings.gesture.enabled) return const SizedBox.shrink();
+    final isDocked = _settings.gesture.dockedInHeader;
+    final isIncomingDrag =
+        !isDocked && _movingOrbGlobalPos != null && !_isDraggingFromHeaderDock;
+    if (!isDocked && !isIncomingDrag) return const SizedBox.shrink();
+
+    final sizeW = compact ? 28.0 : 30.0;
+    final sizeH = compact ? 24.0 : 28.0;
+
+    if (isIncomingDrag) {
+      final highlighted = _isOrbOverHeaderDock;
+      return Padding(
+        padding: EdgeInsets.symmetric(horizontal: compact ? 2 : 4),
+        child: AnimatedContainer(
+          key: const ValueKey('header-gesture-dock-target'),
+          duration: const Duration(milliseconds: 120),
+          width: compact ? sizeW : null,
+          height: sizeH,
+          padding: compact ? EdgeInsets.zero : const EdgeInsets.symmetric(horizontal: 7),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: highlighted
+                ? kGestureTeal.withValues(alpha: 0.92)
+                : kGestureTeal.withValues(alpha: 0.20),
+            borderRadius: BorderRadius.circular(99),
+            border: Border.all(
+              color: highlighted ? kGestureTealBright : kGestureAmber,
+              width: highlighted ? 1.8 : 1.3,
+            ),
+          ),
+          child: compact
+              ? Icon(
+                  Icons.vertical_align_top_rounded,
+                  size: 14,
+                  color: highlighted ? Colors.white : kGestureTealBright,
+                )
+              : Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.vertical_align_top_rounded,
+                      size: 15,
+                      color: highlighted ? Colors.white : kGestureTealBright,
+                    ),
+                    const SizedBox(width: 3),
+                    Text(
+                      '収納',
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w700,
+                        color: highlighted ? Colors.white : kGestureTealBright,
+                      ),
+                    ),
+                  ],
+                ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: compact ? 2 : 3),
+      child: Tooltip(
+        message: 'ジェスチャーボタン（タップまたは下にドラッグで画面へ戻す · 長押しで設定）',
+        child: Listener(
+          key: const ValueKey('header-gesture-dock-button'),
+          behavior: HitTestBehavior.opaque,
+          onPointerDown: _handleHeaderDockPointerDown,
+          onPointerMove: _handleHeaderDockPointerMove,
+          onPointerUp: (e) => _handleHeaderDockPointerUpOrCancel(
+            e.pointer,
+            e.position,
+            cancelled: false,
+          ),
+          onPointerCancel: (e) => _handleHeaderDockPointerUpOrCancel(
+            e.pointer,
+            e.position,
+            cancelled: true,
+          ),
+          child: AnimatedOpacity(
+            duration: const Duration(milliseconds: 120),
+            opacity: _isDraggingFromHeaderDock ? 0.35 : 1.0,
+            child: Container(
+              width: sizeW,
+              height: sizeH,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: const Color(0xD90F172A),
+                borderRadius: BorderRadius.circular(99),
+                border: Border.all(
+                  color: kGestureTealBright.withValues(alpha: 0.85),
+                  width: 1.3,
+                ),
+              ),
+              child: GestureShapeIcon(
+                shape: 'DR',
+                size: compact ? 14 : 16,
+                color: kGestureTealBright,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFloatingOrbDragOverlay() {
+    final globalPos = _movingOrbGlobalPos;
+    if (globalPos == null) return const SizedBox.shrink();
+    final stackBox =
+        _rootStackKey.currentContext?.findRenderObject() as RenderBox?;
+    if (stackBox == null || !stackBox.hasSize) return const SizedBox.shrink();
+    final local = stackBox.globalToLocal(globalPos);
+    final isDocking = !_isDraggingFromHeaderDock && _isOrbOverHeaderDock;
+    final isPullReady = _isDraggingFromHeaderDock && !_isOrbOverHeaderDock;
+    final orbSize = isDocking ? 34.0 : 42.0;
+
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            if (_isDraggingFromHeaderDock)
+              Positioned(
+                top: MediaQuery.of(context).padding.top + 48,
+                left: 16,
+                right: 16,
+                child: Center(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 7,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isPullReady
+                          ? const Color(0xEB0E7490)
+                          : const Color(0xE60F172A),
+                      borderRadius: BorderRadius.circular(999),
+                      border: Border.all(
+                        color: isPullReady ? kGestureTealBright : kGestureAmber,
+                        width: 1.4,
+                      ),
+                    ),
+                    child: Text(
+                      isPullReady
+                          ? '離すとこの位置にジェスチャーボタンを配置します'
+                          : '下へドラッグして画面に配置（そのまま離すと収納維持）',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            Positioned(
+              left: local.dx - orbSize / 2,
+              top: local.dy - orbSize / 2,
+              width: orbSize,
+              height: orbSize,
+              child: Container(
+                key: const ValueKey('floating-orb-drag-ghost'),
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: isDocking || isPullReady
+                      ? const Color(0xEB0E7490)
+                      : const Color(0xEB92400E),
+                  border: Border.all(
+                    color: isDocking || isPullReady
+                        ? kGestureTealBright
+                        : kGestureAmber,
+                    width: 2.0,
+                  ),
+                  boxShadow: const [
+                    BoxShadow(
+                      color: Color(0x66000000),
+                      blurRadius: 10,
+                      offset: Offset(0, 3),
+                    ),
+                  ],
+                ),
+                alignment: Alignment.center,
+                child: isDocking
+                    ? const Icon(
+                        Icons.vertical_align_top_rounded,
+                        size: 18,
+                        color: Colors.white,
+                      )
+                    : (_isDraggingFromHeaderDock
+                        ? const GestureShapeIcon(
+                            shape: 'DR',
+                            size: 20,
+                            color: kGestureTealBright,
+                          )
+                        : const Icon(
+                            Icons.open_with_rounded,
+                            size: 19,
+                            color: Colors.white,
+                          )),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  bool _stepActiveAccount(int delta) {
+    final active = _activeInstance;
+    if (active == null) return false;
+    final allScope = _settings.isHeaderAllAccounts;
+    final group = _activeGroup;
+    final list = allScope ? _visibleInstances : (group?.accounts ?? const []);
+    if (list.length <= 1) {
+      _showGestureNotice(
+        allScope ? '切り替えられるアカウントが1つしかありません' : 'このSNSのアカウントは1つだけです',
+      );
       return false;
     }
     final curIdx = max(
       0,
-      group.accounts.indexWhere((a) => a.instanceId == active.instanceId),
+      list.indexWhere((a) => a.instanceId == active.instanceId),
     );
     final nextIdx = stepTabIndex(
-      group.accounts.length,
+      list.length,
       curIdx,
       delta,
       _settings.gesture.wrapTabs,
@@ -3064,14 +3732,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _showGestureNotice(delta < 0 ? '先頭のアカウントです' : '末尾のアカウントです');
       return false;
     }
-    final nextInst = group.accounts[nextIdx];
-    final label = accountDisplayLabel(
+    final nextInst = list[nextIdx];
+    final nextGroup = _groupForInstance(nextInst);
+    final label = _headerLabelForInstance(
       nextInst,
-      nextIdx,
-      baseServiceName: group.displayName,
+      allScope: allScope,
+      knownGroup: nextGroup,
     );
     _activateInstance(nextInst);
-    _showGestureNotice('${group.displayName} · $label');
+    final svcName = nextGroup?.displayName ?? nextInst.name;
+    _showGestureNotice(label == svcName ? svcName : '$svcName · $label');
     return true;
   }
 
@@ -3480,91 +4150,97 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           SystemNavigator.pop();
         }
       },
-      child: Scaffold(
-        drawer: _buildDrawer(groups, activeGroup),
-        appBar: headerCollapsed
-            ? null
-            : AppBar(
-                toolbarHeight: 44,
-                titleSpacing: 4,
-                title: _isGmailOpen
-                    ? const Text(
-                        'Gmail',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 13.5,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      )
-                    : active == null
-                    ? const Text('OmniSNS')
-                    : active.isDesktopUa
-                    ? Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(5),
-                        ),
-                        child: Text(
-                          'PC',
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.w700,
-                            color: Theme.of(context)
-                                .colorScheme
-                                .onPrimaryContainer,
+      child: Stack(
+        key: _rootStackKey,
+        children: [
+          Scaffold(
+            drawer: _buildDrawer(groups, activeGroup),
+            appBar: headerCollapsed
+                ? null
+                : AppBar(
+                    toolbarHeight: 44,
+                    titleSpacing: 4,
+                    title: _isGmailOpen
+                        ? const Text(
+                            'Gmail',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          )
+                        : active == null
+                        ? const Text('OmniSNS')
+                        : active.isDesktopUa
+                        ? Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color:
+                                  Theme.of(context).colorScheme.primaryContainer,
+                              borderRadius: BorderRadius.circular(5),
+                            ),
+                            child: Text(
+                              'PC',
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w700,
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onPrimaryContainer,
+                              ),
+                            ),
+                          )
+                        : const SizedBox.shrink(),
+                    actions: [
+                      if (tabsCollapsed)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 2),
+                          child: ActionChip(
+                            visualDensity: VisualDensity.compact,
+                            labelPadding:
+                                const EdgeInsets.symmetric(horizontal: 4),
+                            avatar: const Icon(
+                              Icons.keyboard_arrow_up_rounded,
+                              size: 16,
+                            ),
+                            label: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Text('タブ', style: TextStyle(fontSize: 11)),
+                                if (otherUnread > 0) ...[
+                                  const SizedBox(width: 4),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 4,
+                                      vertical: 0.5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Colors.redAccent,
+                                      borderRadius: BorderRadius.circular(99),
+                                    ),
+                                    child: Text(
+                                      otherUnread > 99 ? '99+' : '$otherUnread',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 9,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                            tooltip: '下部タブを展開',
+                            onPressed: _toggleBottomTabsCollapsed,
                           ),
                         ),
-                      )
-                    : const SizedBox.shrink(),
-                actions: [
-                  if (tabsCollapsed)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 2),
-                      child: ActionChip(
-                        visualDensity: VisualDensity.compact,
-                        labelPadding: const EdgeInsets.symmetric(horizontal: 4),
-                        avatar: const Icon(
-                          Icons.keyboard_arrow_up_rounded,
-                          size: 16,
-                        ),
-                        label: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Text('タブ', style: TextStyle(fontSize: 11)),
-                            if (otherUnread > 0) ...[
-                              const SizedBox(width: 4),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 4,
-                                  vertical: 0.5,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: Colors.redAccent,
-                                  borderRadius: BorderRadius.circular(99),
-                                ),
-                                child: Text(
-                                  otherUnread > 99 ? '99+' : '$otherUnread',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 9,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                        tooltip: '下部タブを展開',
-                        onPressed: _toggleBottomTabsCollapsed,
-                      ),
-                    ),
-                  IconButton(
-                    key: const ValueKey('header-gmail-button'),
+                      _buildHeaderGestureDockSlot(compact: false),
+                      IconButton(
+                        key: const ValueKey('header-gmail-button'),
                     icon: Icon(
                       _isGmailOpen
                           ? Icons.mark_email_read_rounded
@@ -3865,7 +4541,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: SafeArea(
                 top: false,
                 bottom: tabsCollapsed,
-                child: _buildViewport(visible, active, activeRt),
+                child: KeyedSubtree(
+                  key: _viewportKey,
+                  child: _buildViewport(visible, active, activeRt),
+                ),
               ),
             ),
             AnimatedSize(
@@ -3879,6 +4558,180 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ],
         ),
       ),
+          if (_movingOrbGlobalPos != null) _buildFloatingOrbDragOverlay(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCollapsedAccountStrip(
+    ServiceInstance active,
+    _ServiceGroup? activeGroup,
+  ) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final allScope = _settings.isHeaderAllAccounts;
+    final accounts = allScope
+        ? _visibleInstances
+        : (activeGroup?.accounts ?? <ServiceInstance>[active]);
+    if (accounts.isEmpty) return const SizedBox.shrink();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final iconOnly = allScope && constraints.maxWidth < 110;
+        return ListView.builder(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 5),
+          itemCount: accounts.length,
+          itemBuilder: (context, idx) {
+            final inst = accounts[idx];
+            final isCurrent = inst.instanceId == active.instanceId;
+            final rt = _runtimeMap[inst.instanceId];
+            final unread =
+                inst.notificationsEnabled ? (rt?.unreadCount ?? 0) : 0;
+            final grp = _groupForInstance(inst);
+            final label = _headerLabelForInstance(
+              inst,
+              allScope: allScope,
+              knownGroup: grp,
+            );
+            final svcColor = parseHexColor(inst.colorHex);
+            return Padding(
+              padding: EdgeInsets.only(right: iconOnly ? 3 : 4),
+              child: Tooltip(
+                message: '${grp?.displayName ?? inst.name} · $label',
+                child: InkWell(
+                  key: ValueKey('collapsed-account-pill-${inst.instanceId}'),
+                  borderRadius: BorderRadius.circular(99),
+                  onTap: () {
+                    if (!isCurrent) _activateInstance(inst);
+                  },
+                  onLongPress: () => _showInstanceActionSheet(inst),
+                  child: iconOnly
+                      ? Container(
+                          width: 24,
+                          height: 24,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: svcColor.withValues(
+                              alpha: rt?.isSleeping == true && !isCurrent
+                                  ? 0.55
+                                  : 1.0,
+                            ),
+                            borderRadius: BorderRadius.circular(7),
+                            border: Border.all(
+                              color: isCurrent
+                                  ? colorScheme.primary
+                                  : Colors.transparent,
+                              width: isCurrent ? 1.8 : 0,
+                            ),
+                          ),
+                          child: Text(
+                            inst.badge,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 8.5,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        )
+                      : Container(
+                          padding:
+                              EdgeInsets.fromLTRB(allScope ? 4 : 7, 0, 7, 0),
+                          decoration: BoxDecoration(
+                            color: isCurrent
+                                ? colorScheme.primaryContainer
+                                : colorScheme.surface,
+                            borderRadius: BorderRadius.circular(99),
+                            border: Border.all(
+                              color: isCurrent
+                                  ? colorScheme.primary
+                                  : colorScheme.outlineVariant,
+                              width: isCurrent ? 1.2 : 1,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (allScope) ...[
+                                Container(
+                                  width: 16,
+                                  height: 16,
+                                  decoration: BoxDecoration(
+                                    color: svcColor.withValues(
+                                      alpha:
+                                          rt?.isSleeping == true ? 0.55 : 1.0,
+                                    ),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  alignment: Alignment.center,
+                                  child: Text(
+                                    inst.badge,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 7.5,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                              ] else ...[
+                                Container(
+                                  width: 6,
+                                  height: 6,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: rt?.isLoading == true
+                                        ? colorScheme.primary
+                                        : rt?.isSleeping == true
+                                            ? Colors.grey
+                                            : Colors.green,
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                              ],
+                              ConstrainedBox(
+                                constraints: const BoxConstraints(maxWidth: 72),
+                                child: Text(
+                                  label,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 10.5,
+                                    fontWeight: isCurrent
+                                        ? FontWeight.bold
+                                        : FontWeight.w500,
+                                  ),
+                                ),
+                              ),
+                              if (unread > 0) ...[
+                                const SizedBox(width: 3),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 4,
+                                    vertical: 0.5,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.redAccent,
+                                    borderRadius: BorderRadius.circular(99),
+                                  ),
+                                  child: Text(
+                                    unread > 99 ? '99+' : '$unread',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 8.5,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -3928,9 +4781,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     builder: (scaffoldCtx) => IconButton(
                       icon: const Icon(Icons.menu, size: 19),
                       visualDensity: VisualDensity.compact,
+                      style: IconButton.styleFrom(
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
                       padding: EdgeInsets.zero,
                       constraints:
-                          const BoxConstraints(minWidth: 34, minHeight: 34),
+                          const BoxConstraints(minWidth: 30, minHeight: 34),
                       tooltip: 'メニュー',
                       onPressed: () => Scaffold.of(scaffoldCtx).openDrawer(),
                     ),
@@ -3974,7 +4830,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
                     ),
                   ] else if (active != null) ...[
-                    const Spacer(),
+                    Expanded(
+                      child: _buildCollapsedAccountStrip(active, activeGroup),
+                    ),
+                    const SizedBox(width: 2),
                     Tooltip(
                       message: _settings.accountFilter.isActive
                           ? '条件フィルタ ON（${_settings.accountFilter.summaryLabel}）· 長押しで設定'
@@ -3985,7 +4844,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         onTap: _quickToggleAccountFilter,
                         onLongPress: _showAccountFilterSheet,
                         child: Container(
-                          width: 28,
+                          width: 26,
                           height: 24,
                           alignment: Alignment.center,
                           decoration: BoxDecoration(
@@ -4001,7 +4860,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                           child: Icon(
                             Icons.tune_rounded,
-                            size: 15,
+                            size: 14.5,
                             color: _settings.accountFilter.isActive
                                 ? colorScheme.onTertiaryContainer
                                 : colorScheme.onSurfaceVariant,
@@ -4009,7 +4868,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 4),
+                    const SizedBox(width: 3),
                     Tooltip(
                       message: _jev.isActive
                           ? '分類フィルタ ON（${_jev.category}）· 長押しで設定'
@@ -4033,7 +4892,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         },
                         onLongPress: _showJevSettingsSheet,
                         child: Container(
-                          width: 28,
+                          width: 26,
                           height: 24,
                           alignment: Alignment.center,
                           decoration: BoxDecoration(
@@ -4051,7 +4910,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             _jev.isActive
                                 ? Icons.filter_alt_rounded
                                 : Icons.filter_alt_outlined,
-                            size: 15,
+                            size: 14.5,
                             color: _jev.isActive
                                 ? colorScheme.onPrimaryContainer
                                 : colorScheme.onSurfaceVariant,
@@ -4059,7 +4918,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 4),
+                    const SizedBox(width: 3),
                     Tooltip(
                       message: todayUnfollows > 0
                           ? '直近$winH時間 · フォロー $todayFollows / 解除 $todayUnfollows'
@@ -4084,7 +4943,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         },
                         child: Container(
                           padding: const EdgeInsets.symmetric(
-                            horizontal: 6,
+                            horizontal: 5,
                             vertical: 3,
                           ),
                           decoration: BoxDecoration(
@@ -4108,7 +4967,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                     ? colorScheme.onTertiaryContainer
                                     : colorScheme.onSurfaceVariant,
                               ),
-                              const SizedBox(width: 2.5),
+                              const SizedBox(width: 2),
                               Text(
                                 todayUnfollows > 0
                                     ? '$crossSiteBadge$todayFollows/-$todayUnfollows'
@@ -4137,13 +4996,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
                     ),
                   if (tabsCollapsed) ...[
-                    const SizedBox(width: 4),
+                    const SizedBox(width: 3),
                     InkWell(
                       borderRadius: BorderRadius.circular(99),
                       onTap: _toggleBottomTabsCollapsed,
                       child: Container(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 7,
+                          horizontal: 6,
                           vertical: 3,
                         ),
                         decoration: BoxDecoration(
@@ -4154,7 +5013,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const Text('タブ', style: TextStyle(fontSize: 10.5)),
+                            const Text('タブ', style: TextStyle(fontSize: 10)),
                             if (otherUnread > 0) ...[
                               const SizedBox(width: 3),
                               Container(
@@ -4181,6 +5040,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
                     ),
                   ],
+                  _buildHeaderGestureDockSlot(compact: true),
                   IconButton(
                     key: const ValueKey('header-gmail-button'),
                     icon: Icon(
@@ -4191,9 +5051,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       color: _isGmailOpen ? const Color(0xFFEA4335) : null,
                     ),
                     visualDensity: VisualDensity.compact,
+                    style: IconButton.styleFrom(
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
                     padding: EdgeInsets.zero,
                     constraints:
-                        const BoxConstraints(minWidth: 32, minHeight: 34),
+                        const BoxConstraints(minWidth: 28, minHeight: 34),
                     tooltip: _isGmailOpen
                         ? 'Gmail を閉じて元のSNSへ戻る'
                         : 'アプリ内で Gmail を開く（SNS認証メール確認用）',
@@ -4204,9 +5067,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       key: const ValueKey('header-reload-button'),
                       icon: const Icon(Icons.refresh_rounded, size: 19),
                       visualDensity: VisualDensity.compact,
+                      style: IconButton.styleFrom(
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
                       padding: EdgeInsets.zero,
                       constraints:
-                          const BoxConstraints(minWidth: 34, minHeight: 34),
+                          const BoxConstraints(minWidth: 28, minHeight: 34),
                       tooltip: '再読み込み',
                       onPressed: _reloadActiveTab,
                     ),
@@ -4214,9 +5080,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     key: const ValueKey('header-expand-button'),
                     icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 22),
                     visualDensity: VisualDensity.compact,
+                    style: IconButton.styleFrom(
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
                     padding: EdgeInsets.zero,
                     constraints:
-                        const BoxConstraints(minWidth: 34, minHeight: 34),
+                        const BoxConstraints(minWidth: 28, minHeight: 34),
                     tooltip: 'ヘッダーを展開',
                     onPressed: _toggleHeaderCollapsed,
                   ),
@@ -4326,6 +5195,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final crossSitePrefix = resolvedCounter.isCrossSite && counterTarget != null
         ? '${counterTarget.badge} '
         : '';
+    final allScope = _settings.isHeaderAllAccounts;
+    final headerAccounts = allScope ? _visibleInstances : group.accounts;
+    final hasMultipleServices = _serviceGroups.length >= 2;
+    final showStrip = allScope
+        ? headerAccounts.isNotEmpty
+        : (_multiProfileSupported || group.accounts.length >= 2);
     return Material(
       color: colorScheme.surfaceContainerLow,
       child: Container(
@@ -4339,30 +5214,102 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         ),
         child: Row(
           children: [
+            if (hasMultipleServices)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(6, 6, 2, 6),
+                child: Tooltip(
+                  message: allScope
+                      ? '全SNSのアカウントをヘッダーに表示中（タップで「${group.displayName}」のみに切替）'
+                      : '「${group.displayName}」のアカウントのみ表示中（タップで全SNSのアカウントを表示）',
+                  child: InkWell(
+                    key: const ValueKey('header-account-scope-toggle'),
+                    borderRadius: BorderRadius.circular(99),
+                    onTap: _toggleHeaderAccountScope,
+                    child: Container(
+                      height: 28,
+                      padding: const EdgeInsets.symmetric(horizontal: 7),
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: allScope
+                            ? colorScheme.secondaryContainer
+                            : colorScheme.surface,
+                        borderRadius: BorderRadius.circular(99),
+                        border: Border.all(
+                          color: allScope
+                              ? colorScheme.secondary
+                              : colorScheme.outlineVariant,
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            allScope
+                                ? Icons.layers_rounded
+                                : Icons.filter_list_rounded,
+                            size: 13,
+                            color: allScope
+                                ? colorScheme.onSecondaryContainer
+                                : colorScheme.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 2.5),
+                          Text(
+                            allScope ? '全' : group.badge,
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w800,
+                              color: allScope
+                                  ? colorScheme.onSecondaryContainer
+                                  : colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
             Expanded(
-              child: (_multiProfileSupported || group.accounts.length >= 2)
+              child: showStrip
                   ? ListView(
                       scrollDirection: Axis.horizontal,
-                      padding: const EdgeInsets.fromLTRB(8, 5, 4, 5),
+                      padding: EdgeInsets.fromLTRB(
+                        hasMultipleServices ? 4 : 8,
+                        5,
+                        4,
+                        5,
+                      ),
                       children: [
-                        for (var i = 0; i < group.accounts.length; i++)
+                        for (var i = 0; i < headerAccounts.length; i++)
                           Builder(
                             builder: (context) {
-                              final inst = group.accounts[i];
+                              final inst = headerAccounts[i];
                               final isCurrent =
                                   inst.instanceId == active.instanceId;
                               final rt = _runtimeMap[inst.instanceId];
                               final unread = inst.notificationsEnabled
                                   ? (rt?.unreadCount ?? 0)
                                   : 0;
-                              final label = accountDisplayLabel(
+                              final instGroup = allScope
+                                  ? _groupForInstance(inst)
+                                  : group;
+                              final label = _headerLabelForInstance(
                                 inst,
-                                i,
-                                baseServiceName: group.displayName,
+                                allScope: allScope,
+                                knownGroup: instGroup,
                               );
+                              final svcColor = parseHexColor(inst.colorHex);
+                              final statusColor = rt?.isLoading == true
+                                  ? colorScheme.primary
+                                  : rt?.isSleeping == true
+                                      ? Colors.grey
+                                      : Colors.green;
                               return Padding(
                                 padding: const EdgeInsets.only(right: 6),
                                 child: InkWell(
+                                  key: ValueKey(
+                                    'header-account-pill-${inst.instanceId}',
+                                  ),
                                   borderRadius: BorderRadius.circular(99),
                                   onTap: () {
                                     if (!isCurrent) _activateInstance(inst);
@@ -4370,8 +5317,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   onLongPress: () =>
                                       _showInstanceActionSheet(inst),
                                   child: Container(
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 10,
+                                    padding: EdgeInsets.fromLTRB(
+                                      allScope ? 4 : 9,
+                                      0,
+                                      8,
+                                      0,
                                     ),
                                     decoration: BoxDecoration(
                                       color: isCurrent
@@ -4388,26 +5338,88 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                     child: Row(
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
-                                        Container(
-                                          width: 7,
-                                          height: 7,
-                                          decoration: BoxDecoration(
-                                            shape: BoxShape.circle,
-                                            color: rt?.isLoading == true
-                                                ? colorScheme.primary
-                                                : rt?.isSleeping == true
-                                                    ? Colors.grey
-                                                    : Colors.green,
+                                        if (allScope) ...[
+                                          SizedBox(
+                                            width: 19,
+                                            height: 19,
+                                            child: Stack(
+                                              clipBehavior: Clip.none,
+                                              children: [
+                                                Container(
+                                                  width: 18,
+                                                  height: 18,
+                                                  decoration: BoxDecoration(
+                                                    color: svcColor.withValues(
+                                                      alpha:
+                                                          rt?.isSleeping == true
+                                                              ? 0.62
+                                                              : 1.0,
+                                                    ),
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                      5,
+                                                    ),
+                                                  ),
+                                                  alignment: Alignment.center,
+                                                  child: Text(
+                                                    inst.badge,
+                                                    style: const TextStyle(
+                                                      color: Colors.white,
+                                                      fontSize: 8.5,
+                                                      fontWeight:
+                                                          FontWeight.w800,
+                                                    ),
+                                                  ),
+                                                ),
+                                                Positioned(
+                                                  right: -1.5,
+                                                  bottom: -1.5,
+                                                  child: Container(
+                                                    width: 7,
+                                                    height: 7,
+                                                    decoration: BoxDecoration(
+                                                      shape: BoxShape.circle,
+                                                      color: statusColor,
+                                                      border: Border.all(
+                                                        color: isCurrent
+                                                            ? colorScheme
+                                                                .primaryContainer
+                                                            : colorScheme
+                                                                .surface,
+                                                        width: 1.2,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
                                           ),
-                                        ),
-                                        const SizedBox(width: 6),
-                                        Text(
-                                          label,
-                                          style: TextStyle(
-                                            fontSize: 12,
-                                            fontWeight: isCurrent
-                                                ? FontWeight.bold
-                                                : FontWeight.w500,
+                                          const SizedBox(width: 5),
+                                        ] else ...[
+                                          Container(
+                                            width: 7,
+                                            height: 7,
+                                            decoration: BoxDecoration(
+                                              shape: BoxShape.circle,
+                                              color: statusColor,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 5),
+                                        ],
+                                        ConstrainedBox(
+                                          constraints: const BoxConstraints(
+                                            maxWidth: 112,
+                                          ),
+                                          child: Text(
+                                            label,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: TextStyle(
+                                              fontSize: 12,
+                                              fontWeight: isCurrent
+                                                  ? FontWeight.bold
+                                                  : FontWeight.w500,
+                                            ),
                                           ),
                                         ),
                                         if (unread > 0) ...[
@@ -4439,10 +5451,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                               );
                             },
                           ),
-                        if (_multiProfileSupported)
+                        if (allScope || _multiProfileSupported)
                           InkWell(
+                            key: const ValueKey('header-add-account-button'),
                             borderRadius: BorderRadius.circular(99),
-                            onTap: _addAccountForActiveService,
+                            onTap: allScope
+                                ? _showCrossServiceAddAccountSheet
+                                : _addAccountForActiveService,
                             child: Container(
                               padding:
                                   const EdgeInsets.symmetric(horizontal: 10),
@@ -4462,7 +5477,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   ),
                                   const SizedBox(width: 3),
                                   Text(
-                                    'アカウント追加',
+                                    allScope ? '追加' : 'アカウント追加',
                                     style: TextStyle(
                                       fontSize: 11.5,
                                       fontWeight: FontWeight.w600,
@@ -4846,6 +5861,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 );
               },
               onOpenSettings: _openGestureSettings,
+              onDockToHeader: _dockGestureToHeader,
+              onHandleMoveDragChanged: _handleOverlayMoveDragChanged,
             ),
           ),
       ],
@@ -5048,6 +6065,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 _editInstance(inst);
               },
             ),
+            if (_instances.length >= 2)
+              ListTile(
+                title: const Text('ヘッダーの並び順を変更'),
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  _showAccountReorderSheet();
+                },
+              ),
             ListTile(
               title: Text(
                 inst.isDesktopUa ? 'スマホ版サイトに戻す（現在PC版）' : 'PC版サイトで表示',
