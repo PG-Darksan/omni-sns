@@ -885,6 +885,7 @@ pub struct TabWebviewCallbacks {
     /// 新規タブ要求（第2引数 true の場合は開いた直後にそのタブへ切り替える）
     pub on_open_new_tab: Arc<dyn Fn(String, bool) + Send + Sync>,
     pub on_jev_message: Arc<dyn Fn(String) + Send + Sync>,
+    pub on_account_filter_message: Arc<dyn Fn(String) + Send + Sync>,
 }
 
 /// WebView 単位で予測不能な認証トークン（128bit 相当）を生成する。
@@ -960,8 +961,11 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       lastNetworkStartAt: 0,
       lastNetworkAt: 0,
       lastDomEmitAt: 0,
+      lastDomTargetKey: '',
       lastAnyEmitAt: 0,
       inFlight: 0,
+      inFlightTargets: Object.create(null),
+      interactionNetworkStarted: Object.create(null),
       recentTargetKeys: Object.create(null),
       emittedInteractions: Object.create(null)
     };
@@ -978,6 +982,8 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
   var lastClickedTargetHandle = '';
   var lastClickedTargetAt = 0;
   var lastBlockFollowContext = { handle: '', isFollowing: null, ts: 0 };
+  var pendingAsyncAtproto = 0;
+  var lastAsyncAtprotoAt = 0;
 
   function bumpUserInteraction(fromPointerDown) {
     var now = Date.now();
@@ -1026,57 +1032,106 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     return '';
   }
 
+  function canonicalizeTargetKey(rawKey, fallbackHandle) {
+    try {
+      if (typeof window.__omniCanonicalTargetKey === 'function') {
+        var c = window.__omniCanonicalTargetKey(rawKey || '', fallbackHandle || '');
+        if (c) return String(c).trim().toLowerCase();
+      }
+    } catch (_) {}
+    var k = String(rawKey || '').trim().toLowerCase();
+    if (k) return k;
+    return String(fallbackHandle || '').trim().toLowerCase();
+  }
+
+  function pruneOldMap(map, now, maxAgeMs) {
+    for (var k in map) {
+      var v = map[k];
+      var ts = typeof v === 'number' ? v : (v && v.ts ? v.ts : 0);
+      if (now - ts > maxAgeMs) delete map[k];
+    }
+  }
+
+  function markInteractionEmitted(st, interactionId, cKey, source, now) {
+    if (!interactionId || interactionId <= 0) return;
+    var rec = st.emittedInteractions[interactionId];
+    if (!rec || typeof rec !== 'object') {
+      rec = { ts: now, keys: Object.create(null), anyUntargeted: false, source: source };
+      st.emittedInteractions[interactionId] = rec;
+    } else {
+      rec.ts = now;
+    }
+    if (cKey) rec.keys[cKey] = true;
+    else rec.anyUntargeted = true;
+  }
+
   function emitRelation(action, source, targetKey, interactionId) {
     var st = states[action];
     if (!st) return;
     var now = Date.now();
+    var cKey = canonicalizeTargetKey(targetKey, '');
+    pruneOldMap(st.emittedInteractions, now, 15000);
+    pruneOldMap(st.recentTargetKeys, now, 15000);
+    pruneOldMap(st.interactionNetworkStarted, now, 15000);
+
+    if (cKey && st.recentTargetKeys[cKey] && now - st.recentTargetKeys[cKey] < 4500) {
+      if (source === 'network') st.lastNetworkAt = now;
+      return;
+    }
+
     if (interactionId && interactionId > 0) {
-      for (var ik in st.emittedInteractions) {
-        if (now - st.emittedInteractions[ik] > 15000) delete st.emittedInteractions[ik];
-      }
-      if (st.emittedInteractions[interactionId]) {
+      var irec = st.emittedInteractions[interactionId];
+      if (irec) {
         if (source === 'network') {
-          st.lastNetworkAt = now;
-          if (targetKey) st.recentTargetKeys[targetKey] = now;
+          var alreadySameKey = !!(cKey && irec.keys && irec.keys[cKey]);
+          var alreadyUntargetedOrDom = !cKey || irec.anyUntargeted || (irec.source === 'dom' && (!cKey || !st.lastDomTargetKey || st.lastDomTargetKey === cKey));
+          if (alreadySameKey || alreadyUntargetedOrDom) {
+            st.lastNetworkAt = now;
+            if (cKey) st.recentTargetKeys[cKey] = now;
+            return;
+          }
+        } else {
+          return;
         }
-        return;
       }
     }
-    if (targetKey) {
-      for (var k in st.recentTargetKeys) {
-        if (now - st.recentTargetKeys[k] > 15000) delete st.recentTargetKeys[k];
-      }
-      if (st.recentTargetKeys[targetKey] && now - st.recentTargetKeys[targetKey] < 5000) {
-        return;
-      }
-    }
+
     if (source === 'network') {
-      if (now - st.lastDomEmitAt < 2500) {
+      if (now - st.lastDomEmitAt < 2500 && (!cKey || !st.lastDomTargetKey || st.lastDomTargetKey === cKey)) {
         st.lastNetworkAt = now;
-        if (targetKey) st.recentTargetKeys[targetKey] = now;
-        if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
+        if (cKey) st.recentTargetKeys[cKey] = now;
+        markInteractionEmitted(st, interactionId, cKey, source, now);
         return;
       }
-      if (!targetKey && now - st.lastAnyEmitAt < 1200) {
+      if (!cKey && now - st.lastAnyEmitAt < 1200) {
         st.lastNetworkAt = now;
         return;
       }
       st.lastNetworkAt = now;
       st.lastAnyEmitAt = now;
-      if (targetKey) st.recentTargetKeys[targetKey] = now;
-      if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
+      if (cKey) st.recentTargetKeys[cKey] = now;
+      markInteractionEmitted(st, interactionId, cKey, source, now);
     } else {
-      if (now - st.lastAnyEmitAt < 2500) return;
+      if (!cKey && now - st.lastAnyEmitAt < 2500) return;
       st.lastDomEmitAt = now;
+      st.lastDomTargetKey = cKey;
       st.lastAnyEmitAt = now;
-      if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
+      if (cKey) st.recentTargetKeys[cKey] = now;
+      markInteractionEmitted(st, interactionId, cKey, source, now);
     }
+
+    // 同一ユーザーへのフォロー⇔解除の連続トグルを正確に計測するため、逆アクションの重複抑制を解除する
+    if (cKey) {
+      var opp = action === 'follow' ? states.unfollow : (action === 'unfollow' ? states.follow : null);
+      if (opp) delete opp.recentTargetKeys[cKey];
+    }
+
     try {
       if (typeof window.__omniOnFollowAction === 'function') {
-        var fallbackHandle = (lastClickedTargetHandle && now - lastClickedTargetAt <= 5000)
+        var fallbackHandle = (!cKey && lastClickedTargetHandle && now - lastClickedTargetAt <= 5000)
           ? lastClickedTargetHandle
           : '';
-        window.__omniOnFollowAction(action, targetKey || '', fallbackHandle);
+        window.__omniOnFollowAction(action, cKey || targetKey || '', fallbackHandle);
       }
     } catch (_) {}
     try {
@@ -1092,22 +1147,72 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     } catch (_) {}
   }
 
+  function extractFetchUrl(input) {
+    try {
+      if (typeof input === 'string') return input;
+      if (!input) return '';
+      if (typeof URL !== 'undefined' && input instanceof URL) return input.href || String(input);
+      if (typeof input === 'object') {
+        if (typeof input.url === 'string' && input.url) return input.url;
+        if (typeof input.href === 'string' && input.href) return input.href;
+        if (typeof input.toString === 'function') {
+          var s = String(input);
+          if (s && s !== '[object Object]' && s !== '[object Request]') return s;
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function decodeBytesToString(bytes) {
+    try {
+      var slice = bytes.length > 16384 ? bytes.subarray(0, 16384) : bytes;
+      if (typeof TextDecoder === 'function') {
+        return new TextDecoder('utf-8').decode(slice);
+      }
+      var out = '';
+      for (var i = 0; i < slice.length; i++) out += String.fromCharCode(slice[i]);
+      return out;
+    } catch (_) {}
+    return '';
+  }
+
   function bodyToSearchString(body) {
     if (!body) return '';
     try {
-      if (typeof body === 'string') return body.slice(0, 8192);
+      if (typeof body === 'string') return body.slice(0, 16384);
       if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
-        return body.toString().slice(0, 8192);
+        return body.toString().slice(0, 16384);
+      }
+      if (typeof ArrayBuffer !== 'undefined') {
+        if (body instanceof ArrayBuffer) {
+          return decodeBytesToString(new Uint8Array(body));
+        }
+        if (typeof ArrayBuffer.isView === 'function' && ArrayBuffer.isView(body)) {
+          return decodeBytesToString(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+        }
       }
       if (typeof FormData !== 'undefined' && body instanceof FormData) {
         var parts = [];
         body.forEach(function(v, k) {
           if (typeof v === 'string') parts.push(k + '=' + v.slice(0, 256));
         });
-        return parts.join('&').slice(0, 8192);
+        return parts.join('&').slice(0, 16384);
       }
     } catch (_) {}
     return '';
+  }
+
+  function isCandidateAsyncBodyUrl(rawUrl) {
+    var u = String(rawUrl || '').toLowerCase();
+    return u.indexOf('com.atproto.repo.') >= 0 ||
+           u.indexOf('/graphql') >= 0 ||
+           u.indexOf('/friendships/') >= 0 ||
+           u.indexOf('/api/v1/accounts/') >= 0 ||
+           u.indexOf('/api/following/') >= 0 ||
+           u.indexOf('/api/blocking/') >= 0 ||
+           u.indexOf('/api/commit/follow') >= 0 ||
+           u.indexOf('/blocks/create') >= 0;
   }
 
   function extractTargetKey(url, decodedBody) {
@@ -1281,17 +1386,77 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
         return null;
       }
 
-      if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
-          lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
-        return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+      if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0) {
+        var trimmedCreate = decodedBody.trim();
+        if (trimmedCreate && trimmedCreate[0] === '{') {
+          try {
+            var cObj = JSON.parse(trimmedCreate);
+            var cCol = cObj && typeof cObj.collection === 'string' ? cObj.collection.toLowerCase() : '';
+            var cSubj = (cObj && cObj.record && typeof cObj.record.subject === 'string') ? cObj.record.subject.trim().toLowerCase() : '';
+            if (cCol === 'app.bsky.graph.follow') {
+              return { action: 'follow', targetKey: cSubj || extractTargetKey(url, decodedBody), atprotoCreate: true };
+            }
+            if (cCol === 'app.bsky.graph.block') {
+              return { action: 'block', targetKey: cSubj || extractTargetKey(url, decodedBody), atprotoCreate: true };
+            }
+            return null;
+          } catch (_) {}
+        }
+        if (lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
+          return { action: 'follow', targetKey: extractTargetKey(url, decodedBody), atprotoCreate: true };
+        }
+        if (lowerBody.indexOf('app.bsky.graph.block') >= 0) {
+          return { action: 'block', targetKey: extractTargetKey(url, decodedBody), atprotoCreate: true };
+        }
+        return null;
       }
-      if (lowerUrl.indexOf('com.atproto.repo.deleterecord') >= 0 &&
-          lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
-        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+      if (lowerUrl.indexOf('com.atproto.repo.deleterecord') >= 0) {
+        var trimmedDel = decodedBody.trim();
+        if (trimmedDel && trimmedDel[0] === '{') {
+          try {
+            var dObj = JSON.parse(trimmedDel);
+            var dCol = dObj && typeof dObj.collection === 'string' ? dObj.collection.toLowerCase() : '';
+            var dRkey = dObj && typeof dObj.rkey === 'string' ? dObj.rkey.trim().toLowerCase() : '';
+            if (dCol === 'app.bsky.graph.follow') {
+              return { action: 'unfollow', targetKey: dRkey || extractTargetKey(url, decodedBody) };
+            }
+            return null;
+          } catch (_) {}
+        }
+        if (lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
+          return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+        }
+        return null;
       }
-      if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
-          lowerBody.indexOf('app.bsky.graph.block') >= 0) {
-        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      if (lowerUrl.indexOf('com.atproto.repo.applywrites') >= 0) {
+        var trimmedAw = decodedBody.trim();
+        if (trimmedAw && trimmedAw[0] === '{') {
+          try {
+            var awObj = JSON.parse(trimmedAw);
+            if (awObj && Array.isArray(awObj.writes)) {
+              var awActions = [];
+              for (var wi = 0; wi < awObj.writes.length; wi++) {
+                var w = awObj.writes[wi];
+                if (!w || typeof w !== 'object') continue;
+                var wType = String(w['\x24type'] || '').toLowerCase();
+                var wCol = String(w.collection || '').toLowerCase();
+                var wSubj = (w.value && typeof w.value.subject === 'string') ? w.value.subject.trim().toLowerCase() : '';
+                var wRkey = typeof w.rkey === 'string' ? w.rkey.trim().toLowerCase() : '';
+                if (wCol === 'app.bsky.graph.follow' && wType.indexOf('#create') >= 0) {
+                  awActions.push({ action: 'follow', targetKey: wSubj || wRkey });
+                } else if (wCol === 'app.bsky.graph.follow' && wType.indexOf('#delete') >= 0) {
+                  awActions.push({ action: 'unfollow', targetKey: wRkey });
+                } else if (wCol === 'app.bsky.graph.block' && wType.indexOf('#create') >= 0) {
+                  awActions.push({ action: 'block', targetKey: wSubj || wRkey });
+                }
+              }
+              if (awActions.length === 1) return awActions[0];
+              if (awActions.length > 1) return { action: awActions[0].action, targetKey: awActions[0].targetKey, batch: awActions };
+            }
+            return null;
+          } catch (_) {}
+        }
+        return null;
       }
 
       if (/\/api\/v1\/accounts\/[^\/?#]+\/block(?:\?|$)/i.test(lowerUrl)) {
@@ -1332,6 +1497,73 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
     return null;
   }
 
+  function beginTrackedRelationReq(relReq, reqInteractionId) {
+    var items = (relReq && Array.isArray(relReq.batch) && relReq.batch.length > 0) ? relReq.batch : (relReq ? [relReq] : []);
+    var now = Date.now();
+    var tracked = [];
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var st = item ? states[item.action] : null;
+      if (!st) continue;
+      st.lastNetworkStartAt = now;
+      st.inFlight++;
+      if (reqInteractionId > 0) st.interactionNetworkStarted[reqInteractionId] = now;
+      var cKey = canonicalizeTargetKey(item.targetKey, '');
+      if (cKey) st.inFlightTargets[cKey] = (st.inFlightTargets[cKey] || 0) + 1;
+      var blockFbHandle = '';
+      var blockWasFollowing = false;
+      if (item.action === 'block') {
+        blockFbHandle = (lastClickedTargetHandle && now - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '';
+        blockWasFollowing = isTargetFollowedForBlock(item.targetKey, blockFbHandle);
+      }
+      tracked.push({
+        item: item,
+        st: st,
+        cKey: cKey,
+        blockFbHandle: blockFbHandle,
+        blockWasFollowing: blockWasFollowing,
+        atprotoCreate: !!relReq.atprotoCreate
+      });
+    }
+    return tracked;
+  }
+
+  function finishTrackedRelationReq(tracked, ok, reqInteractionId, resObj) {
+    for (var i = 0; i < tracked.length; i++) {
+      var tr = tracked[i];
+      tr.st.inFlight = Math.max(0, tr.st.inFlight - 1);
+      if (tr.cKey && tr.st.inFlightTargets[tr.cKey]) {
+        tr.st.inFlightTargets[tr.cKey] = Math.max(0, tr.st.inFlightTargets[tr.cKey] - 1);
+        if (tr.st.inFlightTargets[tr.cKey] === 0) delete tr.st.inFlightTargets[tr.cKey];
+      }
+      if (!ok) continue;
+      if (tr.atprotoCreate && tr.item.action === 'follow' && resObj && typeof resObj.clone === 'function') {
+        try {
+          var clonedRes = resObj.clone();
+          (function(targetKeyForBind, cr) {
+            var parseP = typeof cr.json === 'function'
+              ? cr.json()
+              : (typeof cr.text === 'function' ? cr.text().then(function(t) { return JSON.parse(t); }) : null);
+            if (parseP && typeof parseP.then === 'function') {
+              parseP.then(function(d) {
+                if (d && typeof d.uri === 'string' && typeof window.__omniBindBlueskyFollowUri === 'function') {
+                  window.__omniBindBlueskyFollowUri(targetKeyForBind, d.uri);
+                }
+              }).catch(function() {});
+            }
+          })(tr.item.targetKey, clonedRes);
+        } catch (_) {}
+      }
+      try {
+        if (tr.item.action === 'block') {
+          handleBlockCompleted('network', tr.item.targetKey, reqInteractionId, tr.blockWasFollowing, tr.blockFbHandle);
+        } else {
+          emitRelation(tr.item.action, 'network', tr.item.targetKey, reqInteractionId);
+        }
+      } catch (_) {}
+    }
+  }
+
   try {
     var origFetch = window.fetch;
     if (typeof origFetch === 'function') {
@@ -1342,49 +1574,88 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
         var reqMethod = 'GET';
         var reqBody = null;
         try {
-          if (typeof input === 'string') {
-            reqUrl = input;
-          } else if (input && typeof input === 'object') {
-            reqUrl = input.url || '';
-            if (input.method) reqMethod = input.method;
-          }
+          reqUrl = extractFetchUrl(input);
+          if (input && typeof input === 'object' && input.method) reqMethod = input.method;
           if (init && typeof init === 'object') {
             if (init.method) reqMethod = init.method;
             if (init.body !== undefined) reqBody = init.body;
           }
         } catch (_) {}
-        var relReq = detectRelationApiRequest(reqUrl, reqMethod, reqBody);
-        var reqInteractionId = 0;
-        var st = relReq ? states[relReq.action] : null;
-        var blockWasFollowing = false;
-        var blockFbHandle = '';
-        if (relReq && st) {
-          st.lastNetworkStartAt = Date.now();
-          st.inFlight++;
-          reqInteractionId = currentInteractionId();
-          if (relReq.action === 'block') {
-            blockFbHandle = (lastClickedTargetHandle && Date.now() - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '';
-            blockWasFollowing = isTargetFollowedForBlock(relReq.targetKey, blockFbHandle);
+
+        var reqInteractionId = currentInteractionId();
+        var asyncBodyPromise = null;
+        var isPost = String(reqMethod || 'GET').toUpperCase() === 'POST';
+        var lowerReqUrl = String(reqUrl || '').toLowerCase();
+        var isAtprotoWrite = isPost && (
+          lowerReqUrl.indexOf('com.atproto.repo.createrecord') >= 0 ||
+          lowerReqUrl.indexOf('com.atproto.repo.deleterecord') >= 0 ||
+          lowerReqUrl.indexOf('com.atproto.repo.applywrites') >= 0
+        );
+
+        if (isPost && isCandidateAsyncBodyUrl(reqUrl)) {
+          try {
+            if (reqBody === null && input && typeof input === 'object' && typeof input.clone === 'function') {
+              asyncBodyPromise = input.clone().text().catch(function() { return ''; });
+            } else if (reqBody && typeof Blob !== 'undefined' && reqBody instanceof Blob && typeof reqBody.text === 'function') {
+              asyncBodyPromise = reqBody.text().catch(function() { return ''; });
+            }
+          } catch (_) {}
+        }
+
+        var relReq = asyncBodyPromise ? null : detectRelationApiRequest(reqUrl, reqMethod, reqBody);
+        var tracked = relReq ? beginTrackedRelationReq(relReq, reqInteractionId) : [];
+        if (asyncBodyPromise && isAtprotoWrite) {
+          pendingAsyncAtproto++;
+          lastAsyncAtprotoAt = Date.now();
+          if (reqInteractionId > 0) {
+            states.follow.interactionNetworkStarted[reqInteractionId] = lastAsyncAtprotoAt;
+            states.unfollow.interactionNetworkStarted[reqInteractionId] = lastAsyncAtprotoAt;
           }
         }
+
         var promise = origFetch.apply(this, arguments);
-        if (relReq && st && promise && typeof promise.then === 'function') {
-          promise.then(function(res) {
-            st.inFlight = Math.max(0, st.inFlight - 1);
-            try {
-              if (res && res.ok) {
-                if (relReq.action === 'block') {
-                  handleBlockCompleted('network', relReq.targetKey, reqInteractionId, blockWasFollowing, blockFbHandle);
-                } else {
-                  emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
-                }
-              }
-            } catch (_) {}
+        if (asyncBodyPromise && promise && typeof promise.then === 'function') {
+          var asyncTracked = null;
+          var bodyResolved = asyncBodyPromise.then(function(bodyText) {
+            var detected = detectRelationApiRequest(reqUrl, reqMethod, bodyText);
+            if (detected) {
+              asyncTracked = beginTrackedRelationReq(detected, reqInteractionId);
+            }
+            return { detected: detected, bodyText: bodyText };
           }, function() {
-            st.inFlight = Math.max(0, st.inFlight - 1);
+            return { detected: null, bodyText: '' };
           });
-        } else if (relReq && st) {
-          st.inFlight = Math.max(0, st.inFlight - 1);
+          promise.then(function(res) {
+            bodyResolved.then(function(info) {
+              if (isAtprotoWrite) pendingAsyncAtproto = Math.max(0, pendingAsyncAtproto - 1);
+              if (asyncTracked && asyncTracked.length > 0) {
+                finishTrackedRelationReq(asyncTracked, !!(res && res.ok), reqInteractionId, res);
+              } else if (res && res.ok && isAtprotoWrite && lowerReqUrl.indexOf('com.atproto.repo.createrecord') >= 0 && !info.bodyText && typeof res.clone === 'function') {
+                // リクエストボディが読めなかった場合のフォールバック: createRecord 応答の AT-URI から判定
+                res.clone().text().then(function(rtxt) {
+                  var lowerR = String(rtxt || '').toLowerCase();
+                  if (lowerR.indexOf('/app.bsky.graph.follow/') >= 0) {
+                    emitRelation('follow', 'network', '', reqInteractionId);
+                  }
+                }).catch(function() {});
+              }
+            });
+          }, function() {
+            bodyResolved.then(function() {
+              if (isAtprotoWrite) pendingAsyncAtproto = Math.max(0, pendingAsyncAtproto - 1);
+              if (asyncTracked && asyncTracked.length > 0) {
+                finishTrackedRelationReq(asyncTracked, false, reqInteractionId, null);
+              }
+            });
+          });
+        } else if (tracked.length > 0 && promise && typeof promise.then === 'function') {
+          promise.then(function(res) {
+            finishTrackedRelationReq(tracked, !!(res && res.ok), reqInteractionId, res);
+          }, function() {
+            finishTrackedRelationReq(tracked, false, reqInteractionId, null);
+          });
+        } else if (tracked.length > 0) {
+          finishTrackedRelationReq(tracked, false, reqInteractionId, null);
         }
         return promise;
       };
@@ -1398,46 +1669,31 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       XMLHttpRequest.prototype.open = function(method, url) {
         try {
           this.__omniMethod = method;
-          this.__omniUrl = url;
+          this.__omniUrl = typeof url === 'string' ? url : extractFetchUrl(url);
         } catch (_) {}
         return origOpen.apply(this, arguments);
       };
       XMLHttpRequest.prototype.send = function(body) {
         try {
           var relReq = detectRelationApiRequest(this.__omniUrl, this.__omniMethod, body);
-          var st = relReq ? states[relReq.action] : null;
-          if (relReq && st) {
-            st.lastNetworkStartAt = Date.now();
-            st.inFlight++;
+          if (relReq) {
             var reqInteractionId = currentInteractionId();
-            var blockWasFollowing = false;
-            var blockFbHandle = '';
-            if (relReq.action === 'block') {
-              blockFbHandle = (lastClickedTargetHandle && Date.now() - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '';
-              blockWasFollowing = isTargetFollowedForBlock(relReq.targetKey, blockFbHandle);
-            }
-            var done = false;
-            var finish = function() {
-              if (!done) {
-                done = true;
-                st.inFlight = Math.max(0, st.inFlight - 1);
-              }
-            };
-            this.addEventListener('load', function() {
-              finish();
-              try {
-                if (this.status >= 200 && this.status < 300) {
-                  if (relReq.action === 'block') {
-                    handleBlockCompleted('network', relReq.targetKey, reqInteractionId, blockWasFollowing, blockFbHandle);
-                  } else {
-                    emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
-                  }
+            var tracked = beginTrackedRelationReq(relReq, reqInteractionId);
+            if (tracked.length > 0) {
+              var done = false;
+              var finishXhr = function(ok) {
+                if (!done) {
+                  done = true;
+                  finishTrackedRelationReq(tracked, ok, reqInteractionId, null);
                 }
-              } catch (_) {}
-            }, { once: true });
-            this.addEventListener('error', finish, { once: true });
-            this.addEventListener('abort', finish, { once: true });
-            this.addEventListener('timeout', finish, { once: true });
+              };
+              this.addEventListener('load', function() {
+                finishXhr(this.status >= 200 && this.status < 300);
+              }, { once: true });
+              this.addEventListener('error', function() { finishXhr(false); }, { once: true });
+              this.addEventListener('abort', function() { finishXhr(false); }, { once: true });
+              this.addEventListener('timeout', function() { finishXhr(false); }, { once: true });
+            }
           }
         } catch (_) {}
         return origSend.apply(this, arguments);
@@ -1474,15 +1730,19 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
       }
       var labels = readElementLabels(el);
       if (labels.text && NEGATIVE_FOLLOW_RE.test(labels.text)) return false;
-      if (labels.aria && NEGATIVE_FOLLOW_RE.test(labels.aria)) return false;
       if (labels.text && labels.text.length <= 24 && EXACT_FOLLOW_TEXT_RE.test(labels.text)) {
         return true;
       }
+      if (labels.aria && NEGATIVE_FOLLOW_RE.test(labels.aria)) return false;
       if (!labels.text && labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
         return true;
       }
       if (labels.text && labels.text.length <= 4 && /^[+＋]$/.test(labels.text) &&
           labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
+        return true;
+      }
+      var tid = (el.getAttribute('data-testid') || '').toLowerCase();
+      if (tid === 'followbtn' && (!labels.text || !POST_FOLLOW_STATE_RE.test(labels.text))) {
         return true;
       }
     } catch (_) {}
@@ -1663,11 +1923,24 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
         return;
       }
 
+      var domDelayMs = detectCurrentService() === 'bluesky' ? 1400 : 1000;
+      var clickedKey = canonicalizeTargetKey(clickedHandle, '');
+
       if (isFollowBtn) {
         var fst = states.follow;
         setTimeout(function() {
           try {
-            if (fst.inFlight > 0 ||
+            var nowCheck = Date.now();
+            if (clickInteractionId > 0 && (fst.emittedInteractions[clickInteractionId] || fst.interactionNetworkStarted[clickInteractionId])) {
+              return;
+            }
+            if (pendingAsyncAtproto > 0 || lastAsyncAtprotoAt >= clickedAt - 200) {
+              return;
+            }
+            if (clickedKey) {
+              if ((fst.inFlightTargets[clickedKey] || 0) > 0) return;
+              if (fst.recentTargetKeys[clickedKey] && nowCheck - fst.recentTargetKeys[clickedKey] < 5000) return;
+            } else if (fst.inFlight > 0 ||
                 fst.lastNetworkStartAt >= clickedAt - 300 ||
                 fst.lastNetworkAt >= clickedAt - 300 ||
                 fst.lastAnyEmitAt >= clickedAt - 300) {
@@ -1703,13 +1976,23 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
               emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
             }
           } catch (_) {}
-        }, 1000);
+        }, domDelayMs);
       } else if (isUnfollowBtn) {
         var ust = states.unfollow;
         var isConfirmBtn = inDialog && CONFIRM_UNFOLLOW_TEXT_RE.test(initialLabels.text || '');
         setTimeout(function() {
           try {
-            if (ust.inFlight > 0 ||
+            var nowCheckU = Date.now();
+            if (clickInteractionId > 0 && (ust.emittedInteractions[clickInteractionId] || ust.interactionNetworkStarted[clickInteractionId])) {
+              return;
+            }
+            if (pendingAsyncAtproto > 0 || lastAsyncAtprotoAt >= clickedAt - 200) {
+              return;
+            }
+            if (clickedKey) {
+              if ((ust.inFlightTargets[clickedKey] || 0) > 0) return;
+              if (ust.recentTargetKeys[clickedKey] && nowCheckU - ust.recentTargetKeys[clickedKey] < 5000) return;
+            } else if (ust.inFlight > 0 ||
                 ust.lastNetworkStartAt >= clickedAt - 300 ||
                 ust.lastNetworkAt >= clickedAt - 300 ||
                 ust.lastAnyEmitAt >= clickedAt - 300) {
@@ -1731,7 +2014,7 @@ pub const FOLLOW_TRACKER_JS: &str = r#"(function() {
               emitRelation('unfollow', 'dom', clickedHandle, clickInteractionId);
             }
           } catch (_) {}
-        }, 1000);
+        }, domDelayMs);
       }
     } catch (_) {}
   }, true);
@@ -1819,6 +2102,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   var followedAtMap = Object.create(null);
   var userIdMap = Object.create(null);
   var idToHandleMap = Object.create(null);
+  var followRkeyMap = Object.create(null);
   var privateMap = Object.create(null);
   var failedMap = Object.create(null);
   var inFlight = Object.create(null);
@@ -1848,6 +2132,58 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   var appliedThemeMode = '';
   var pageBooted = false;
   var lastScrollScanAt = 0;
+
+  var accountFilterConfig = {
+    enabled: false,
+    minFollowing: null,
+    maxFollowing: null,
+    minFollowers: null,
+    maxFollowers: null,
+    followingGreaterThanFollowers: false
+  };
+  var afLastStateKey = '';
+  var afActiveContextKey = '';
+  var afPulseInProgress = false;
+  var afAutoFetching = false;
+  var afLastPulseAt = 0;
+  var afEmptyPulseCount = 0;
+  var afReachedEnd = false;
+  var afCooldownTimer = null;
+  var afLastUserScrollAt = 0;
+  var afApiBatchSeq = 0;
+  var AF_MIN_VISIBLE_MATCHES = 12;
+  var AF_PULSE_COOLDOWN_MS = 900;
+  var AF_MAX_EMPTY_PULSES = 5;
+
+  function isAccountFilterActive() {
+    if (!accountFilterConfig || !accountFilterConfig.enabled) return false;
+    return accountFilterConfig.minFollowing !== null ||
+      accountFilterConfig.maxFollowing !== null ||
+      accountFilterConfig.minFollowers !== null ||
+      accountFilterConfig.maxFollowers !== null ||
+      !!accountFilterConfig.followingGreaterThanFollowers;
+  }
+
+  function extractFetchUrl(input) {
+    try {
+      if (typeof input === 'string') return input;
+      if (!input) return '';
+      if (typeof URL !== 'undefined' && input instanceof URL) return input.href || String(input);
+      if (typeof input === 'object') {
+        if (typeof input.url === 'string' && input.url) return input.url;
+        if (typeof input.href === 'string' && input.href) return input.href;
+        if (typeof input.toString === 'function') {
+          var s = String(input);
+          if (s && s !== '[object Object]' && s !== '[object Request]') return s;
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function stripInvisibleChars(s) {
+    return String(s || '').replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '');
+  }
 
   var capturedHeaders = Object.create(null);
   var capturedProfileGql = null;
@@ -2093,11 +2429,12 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   function isValidHandle(h) {
     if (!h || typeof h !== 'string') return false;
-    var clean = h.replace(/^@+/, '').trim().toLowerCase();
+    var clean = stripInvisibleChars(h).replace(/^@+/, '').trim().toLowerCase();
     if (!clean || clean.length > 80) return false;
     if (RESERVED_SEGMENTS[clean]) return false;
     if (platform === 'bluesky') {
-      return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(clean) || /^did:[a-z0-9:._-]+$/.test(clean);
+      if (clean === 'handle.invalid') return false;
+      return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(clean) || /^did:[a-z0-9:._-]+$/.test(clean);
     }
     if (platform === 'mastodon' || platform === 'misskey') {
       return /^[a-z0-9._-]{1,40}(?:@[a-z0-9.-]+\.[a-z]{2,})?$/.test(clean);
@@ -2113,7 +2450,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   function normalizeHandle(h) {
     if (!h || typeof h !== 'string') return '';
-    var clean = h.replace(/^@+/, '').trim().toLowerCase();
+    var clean = stripInvisibleChars(h).replace(/^@+/, '').trim().toLowerCase();
     return isValidHandle(clean) ? clean : '';
   }
 
@@ -2123,10 +2460,51 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     if (!idStr) return;
     if (/^\d{3,24}$/.test(idStr) || /^did:[a-z0-9:._-]+$/i.test(idStr) ||
         ((platform === 'mastodon' || platform === 'misskey') && /^[a-z0-9_-]{4,36}$/i.test(idStr))) {
-      userIdMap[handle] = idStr;
-      idToHandleMap[idStr] = handle;
-      idToHandleMap[idStr.toLowerCase()] = handle;
+      var idLower = idStr.toLowerCase();
+      if (handle !== idLower) {
+        userIdMap[handle] = idStr;
+        idToHandleMap[idStr] = handle;
+        idToHandleMap[idLower] = handle;
+      }
     }
+  }
+
+  function extractRkeyFromAtUri(uri) {
+    if (!uri || typeof uri !== 'string') return '';
+    var m = /\/app\.bsky\.graph\.follow\/([^\/?#]+)$/i.exec(uri.trim());
+    return m && m[1] ? m[1].trim().toLowerCase() : '';
+  }
+
+  function bindBlueskyFollowUri(handleOrDid, uri) {
+    var rkey = extractRkeyFromAtUri(uri);
+    if (!rkey || !handleOrDid) return;
+    var key = String(handleOrDid).trim().toLowerCase();
+    var resolved = idToHandleMap[key] || normalizeHandle(key) || key;
+    if (resolved) followRkeyMap[rkey] = resolved;
+  }
+
+  function resolveAliasHandle(rawHandle) {
+    var h = normalizeHandle(rawHandle);
+    if (!h) return '';
+    if (idToHandleMap[h]) return idToHandleMap[h];
+    return h;
+  }
+
+  function getStatsEntry(rawHandle) {
+    if (!rawHandle) return null;
+    var direct = statsMap[rawHandle];
+    if (direct && hasUsableStats(direct)) return direct;
+    var alias = idToHandleMap[rawHandle];
+    if (alias && statsMap[alias]) {
+      if (hasUsableStats(statsMap[alias]) || !direct) return statsMap[alias];
+    }
+    var did = userIdMap[rawHandle];
+    if (did) {
+      var didLower = did.toLowerCase();
+      var byDid = statsMap[didLower] || statsMap[did];
+      if (byDid && (hasUsableStats(byDid) || !direct)) return byDid;
+    }
+    return direct || null;
   }
 
   function formatCompactCount(n) {
@@ -2296,6 +2674,26 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     return recordStats(rawHandle, null, null, null, null, iFollow, followsMe);
   }
 
+  window.__omniBindBlueskyFollowUri = function(handleOrDid, uri) {
+    try { bindBlueskyFollowUri(handleOrDid, uri); } catch (_) {}
+  };
+
+  window.__omniCanonicalTargetKey = function(rawKey, fallbackHandle) {
+    try {
+      var k = String(rawKey || '').trim().toLowerCase();
+      if (k) {
+        if (followRkeyMap[k]) k = followRkeyMap[k];
+        if (idToHandleMap[k]) return idToHandleMap[k];
+        var nh = normalizeHandle(k);
+        if (nh) return idToHandleMap[nh] || nh;
+        return k;
+      }
+      var fb = normalizeHandle(fallbackHandle || '');
+      if (fb) return idToHandleMap[fb] || fb;
+    } catch (_) {}
+    return '';
+  };
+
   // フォロー／アンフォロー操作を即座に記憶・バッジへ反映するフック
   window.__omniOnFollowAction = function(action, targetKey, fallbackHandle) {
     try {
@@ -2303,6 +2701,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var key = String(targetKey || '').trim().toLowerCase();
       var h = '';
       if (key) {
+        if (followRkeyMap[key]) key = followRkeyMap[key];
         if (idToHandleMap[key]) h = idToHandleMap[key];
         else if (!/^\d+$/.test(key)) h = normalizeHandle(key);
       }
@@ -2324,6 +2723,10 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           forgetFollowedAt(h);
         }
         recordRelation(h, isFollow, null);
+        var mappedDid = userIdMap[h];
+        if (mappedDid && /^did:/i.test(mappedDid)) {
+          recordRelation(mappedDid.toLowerCase(), isFollow, null);
+        }
         if (isFollow) {
           enqueueFetch(h, true, false);
           scheduleRelBatch(120);
@@ -2339,6 +2742,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var key = String(targetKey || '').trim().toLowerCase();
       var h = '';
       if (key) {
+        if (followRkeyMap[key]) key = followRkeyMap[key];
         if (idToHandleMap[key]) h = idToHandleMap[key];
         else if (!/^\d+$/.test(key)) h = normalizeHandle(key);
       }
@@ -2351,7 +2755,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       }
       if (!h) h = getCurrentProfileHandleFromUrl();
       if (!h || h === selfHandle) return null;
-      var ent = statsMap[h];
+      var ent = getStatsEntry(h);
       if (ent && typeof ent.iFollow === 'boolean') return ent.iFollow;
       if (selfFollowingSet[h]) return true;
       if (followedAtMap[h]) return true;
@@ -2487,12 +2891,15 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       // Bluesky app.bsky.graph.getRelationships response item: { did, following, followedBy }
       if (typeof obj.did === 'string' && obj.did.indexOf('did:') === 0 &&
           ('following' in obj || 'followedBy' in obj) && !obj.handle) {
-        var bskyHandle = idToHandleMap[obj.did] || idToHandleMap[obj.did.toLowerCase()];
+        var didKey = obj.did.toLowerCase();
+        var bskyHandle = idToHandleMap[obj.did] || idToHandleMap[didKey];
+        var bOut = typeof obj.following === 'string' ? true : (obj.following === undefined ? false : !!obj.following);
+        var bIn = typeof obj.followedBy === 'string' ? true : (obj.followedBy === undefined ? false : !!obj.followedBy);
+        if (typeof obj.following === 'string') bindBlueskyFollowUri(bskyHandle || didKey, obj.following);
         if (bskyHandle) {
-          var bOut = typeof obj.following === 'string' ? true : (obj.following === undefined ? false : !!obj.following);
-          var bIn = typeof obj.followedBy === 'string' ? true : (obj.followedBy === undefined ? false : !!obj.followedBy);
           if (recordRelation(bskyHandle, bOut, bIn)) foundStats = true;
         }
+        if (recordRelation(didKey, bOut, bIn)) foundStats = true;
       }
 
       // Mastodon /api/v1/accounts/relationships item: { id, following: bool, followed_by: bool }
@@ -2512,12 +2919,20 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         (typeof obj.screenName === 'string' && obj.screenName) ||
         (typeof obj.userName === 'string' && obj.userName) ||
         (platform === 'pixiv' && typeof obj.userId === 'string' && obj.userId) ||
+        (platform === 'bluesky' && typeof obj.did === 'string' && obj.did.indexOf('did:') === 0 && obj.did) ||
         '';
       if (candidateHandle) {
         var normH = normalizeHandle(candidateHandle);
+        var bskyDidNorm = (platform === 'bluesky' && typeof obj.did === 'string' && obj.did.indexOf('did:') === 0)
+          ? obj.did.trim().toLowerCase()
+          : '';
+        if (!normH && bskyDidNorm) normH = bskyDidNorm;
         if (normH) {
           var rawId = obj.pk || obj.pk_id || obj.did || obj.id || obj.fbid_v2 || obj.userId;
           bindUserId(normH, rawId);
+          if (platform === 'bluesky' && obj.viewer && typeof obj.viewer === 'object' && typeof obj.viewer.following === 'string') {
+            bindBlueskyFollowUri(normH, obj.viewer.following);
+          }
           var privFlag = typeof obj.is_private === 'boolean' ? obj.is_private
             : (typeof obj.locked === 'boolean' ? obj.locked
             : (typeof obj.isLocked === 'boolean' ? obj.isLocked
@@ -2553,6 +2968,9 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           if (flwrs !== null || flwng !== null || rel.iFollow !== null || rel.followsMe !== null) {
             if (recordStats(normH, flwrs, flwng, null, privFlag, rel.iFollow, rel.followsMe)) {
               foundStats = true;
+            }
+            if (bskyDidNorm && bskyDidNorm !== normH) {
+              recordStats(bskyDidNorm, flwrs, flwng, null, privFlag, rel.iFollow, rel.followsMe);
             }
           }
         }
@@ -2739,7 +3157,9 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       return u.indexOf('/graphql') >= 0 || u.indexOf('/api/v1/') >= 0;
     }
     if (platform === 'bluesky') {
-      return u.indexOf('/xrpc/app.bsky.') >= 0;
+      return u.indexOf('/xrpc/app.bsky.') >= 0 ||
+             u.indexOf('/xrpc/com.atproto.server.getsession') >= 0 ||
+             u.indexOf('/xrpc/com.atproto.server.refreshsession') >= 0;
     }
     if (platform === 'mastodon') {
       return u.indexOf('/api/v1/') >= 0 || u.indexOf('/api/v2/') >= 0;
@@ -2755,23 +3175,44 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
            u.indexOf('friend') >= 0 || u.indexOf('relation') >= 0;
   }
 
-  function sniffJsonText(txt) {
+  function sniffJsonText(txt, reqUrl) {
     if (!txt || txt.length > 1800000) return;
-    if (txt.indexOf('follower') < 0 && txt.indexOf('edge_followed_by') < 0 &&
+    var uLower = String(reqUrl || '').toLowerCase();
+    var isBskySession = platform === 'bluesky' &&
+      (uLower.indexOf('com.atproto.server.getsession') >= 0 || uLower.indexOf('com.atproto.server.refreshsession') >= 0);
+    if (!isBskySession &&
+        txt.indexOf('follower') < 0 && txt.indexOf('edge_followed_by') < 0 &&
         txt.indexOf('followersCount') < 0 && txt.indexOf('followsCount') < 0 &&
         txt.indexOf('followed_by') < 0 && txt.indexOf('followedBy') < 0 &&
         txt.indexOf('friendship_status') < 0 && txt.indexOf('follows_viewer') < 0 &&
         txt.indexOf('isFollowed') < 0 && txt.indexOf('is_followed') < 0 &&
         txt.indexOf('viewer_username') < 0 && txt.indexOf('"username"') < 0 &&
-        txt.indexOf('"uniqueId"') < 0 && txt.indexOf('"acct"') < 0) {
+        txt.indexOf('"uniqueId"') < 0 && txt.indexOf('"acct"') < 0 &&
+        !(platform === 'bluesky' && txt.indexOf('"handle"') >= 0)) {
       return;
+    }
+    if (/(?:getfollowers|getfollows|getknownfollowers|searchactors|getlikes|getrepostedby|friendships|followers|following|user\/list)/i.test(uLower)) {
+      afApiBatchSeq++;
     }
     try {
       var clean = txt.indexOf('for (;;);') === 0 ? txt.slice(9) : txt;
       var parsed = JSON.parse(clean);
-      extractFromJsonObject(parsed);
+      if (isBskySession && parsed && typeof parsed === 'object') {
+        if (typeof parsed.did === 'string' && parsed.did.indexOf('did:') === 0) {
+          selfDid = parsed.did;
+        }
+        if (typeof parsed.handle === 'string' && parsed.handle) {
+          var sh = normalizeHandle(parsed.handle);
+          if (sh && selfDid) bindUserId(sh, selfDid);
+          setSelfHandle(parsed.handle);
+        }
+      }
+      var found = extractFromJsonObject(parsed);
       if (platform === 'instagram' || platform === 'bluesky' || platform === 'mastodon') {
         scheduleRelBatch(140);
+      }
+      if (platform === 'bluesky' && (found || isAccountFilterActive())) {
+        scheduleRenderBadges(50);
       }
     } catch (_) {
       try {
@@ -2794,7 +3235,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         if (isInternal) {
           return origFetchRef.apply(this, arguments);
         }
-        var reqUrl = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        var reqUrl = extractFetchUrl(input);
         try {
           if (init && init.headers) captureRequestHeaders(init.headers);
           if (input && typeof input === 'object' && input.headers) captureRequestHeaders(input.headers);
@@ -2807,7 +3248,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
               if (!res || !res.ok || typeof res.clone !== 'function') return;
               var ct = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
               if (ct.indexOf('json') >= 0 || ct.indexOf('text/plain') >= 0 || ct.indexOf('javascript') >= 0) {
-                res.clone().text().then(sniffJsonText, function() {});
+                res.clone().text().then(function(txt) { sniffJsonText(txt, reqUrl); }, function() {});
               }
             } catch (_) {}
           }, function() {});
@@ -2823,7 +3264,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     var origSend = XMLHttpRequest.prototype.send;
     if (typeof origOpen === 'function' && typeof origSend === 'function') {
       XMLHttpRequest.prototype.open = function(method, url) {
-        try { this.__omniStatsUrl = url; } catch (_) {}
+        try { this.__omniStatsUrl = extractFetchUrl(url); } catch (_) {}
         return origOpen.apply(this, arguments);
       };
       if (typeof origSetHeader === 'function') {
@@ -2834,14 +3275,15 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       }
       XMLHttpRequest.prototype.send = function(body) {
         try {
-          captureRequestMeta(this.__omniStatsUrl, body);
-          if (shouldSniffUrl(this.__omniStatsUrl)) {
+          var xhrUrl = this.__omniStatsUrl;
+          captureRequestMeta(xhrUrl, body);
+          if (shouldSniffUrl(xhrUrl)) {
             this.addEventListener('load', function() {
               try {
                 if (this.status >= 200 && this.status < 300 &&
                     (!this.responseType || this.responseType === 'text') &&
                     typeof this.responseText === 'string') {
-                  sniffJsonText(this.responseText);
+                  sniffJsonText(this.responseText, xhrUrl);
                 }
               } catch (_) {}
             }, { once: true });
@@ -2996,9 +3438,18 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           var rawBsky = window.localStorage && window.localStorage.getItem('BSKY_STORAGE');
           if (rawBsky) {
             var parsedBsky = JSON.parse(rawBsky);
-            var bHandle = parsedBsky && parsedBsky.session && parsedBsky.session.currentAccount && parsedBsky.session.currentAccount.handle;
-            if (typeof bHandle === 'string' && bHandle) {
-              setSelfHandle(bHandle);
+            var curAcc = parsedBsky && parsedBsky.session && parsedBsky.session.currentAccount;
+            if (curAcc && typeof curAcc.did === 'string' && curAcc.did.indexOf('did:') === 0) {
+              selfDid = curAcc.did;
+            }
+            if (curAcc && typeof curAcc.handle === 'string' && curAcc.handle) {
+              var bNorm = normalizeHandle(curAcc.handle);
+              if (bNorm && selfDid) bindUserId(bNorm, selfDid);
+              setSelfHandle(curAcc.handle);
+              return;
+            }
+            if (selfDid) {
+              setSelfHandle(selfDid);
               return;
             }
           }
@@ -3167,7 +3618,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       if (Date.now() < backoffUntil) return;
       if (failedMap[h] && Date.now() - failedMap[h] < 45000) return;
     }
-    var existing = statsMap[h];
+    var existing = getStatsEntry(h);
     var needRel = h !== selfHandle && (!existing || existing.followsMe === null);
     if (!forceRetry && hasUsableStats(existing) && !needRel && (Date.now() - existing.ts) < CACHE_TTL_MS) {
       return;
@@ -3175,7 +3626,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     if (!forceRetry && hasUsableStats(existing) && needRel) {
       scheduleRelBatch();
       if (platform !== 'instagram' && platform !== 'bluesky' && platform !== 'mastodon') return;
-      if (userIdMap[h]) return;
+      if (userIdMap[h] || (platform === 'bluesky' && h.indexOf('did:') === 0)) return;
     }
     if (inFlight[h]) return;
     if (queuedSet[h]) {
@@ -3191,7 +3642,8 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     queuedSet[h] = true;
     if (priority) queue.unshift(h);
     else queue.push(h);
-    if (queue.length > 80) {
+    var maxQueue = isAccountFilterActive() ? 360 : 240;
+    if (queue.length > maxQueue) {
       var dropped = queue.pop();
       if (dropped) delete queuedSet[dropped];
     }
@@ -3200,7 +3652,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       queueStartTimer = setTimeout(function() {
         queueStartTimer = null;
         processQueue();
-      }, platform === 'bluesky' ? 30 : 20);
+      }, platform === 'bluesky' ? 25 : 20);
     }
   }
 
@@ -3226,15 +3678,15 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       var h = rows[i].getAttribute('data-omni-ff-row') || rows[i].getAttribute('data-omni-ff-handle') || '';
       if (!h || h === selfHandle || seen[h]) continue;
       seen[h] = true;
-      var e = statsMap[h];
+      var e = getStatsEntry(h);
       if (e && e.followsMe !== null && e.iFollow !== null) continue;
       if (relQueriedMap[h] && now - relQueriedMap[h] < 120000) continue;
-      if (!userIdMap[h]) continue;
+      if (!userIdMap[h] && !(platform === 'bluesky' && h.indexOf('did:') === 0)) continue;
       targetHandles.push(h);
     }
     var curH = getCurrentProfileHandleFromUrl();
-    if (curH && curH !== selfHandle && !seen[curH] && userIdMap[curH]) {
-      var ce = statsMap[curH];
+    if (curH && curH !== selfHandle && !seen[curH] && (userIdMap[curH] || (platform === 'bluesky' && curH.indexOf('did:') === 0))) {
+      var ce = getStatsEntry(curH);
       if ((!ce || ce.followsMe === null || ce.iFollow === null) && (!relQueriedMap[curH] || now - relQueriedMap[curH] >= 120000)) {
         targetHandles.unshift(curH);
       }
@@ -3248,10 +3700,11 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       }
       var dids = [];
       for (var bi = 0; bi < targetHandles.length; bi++) {
-        var d = userIdMap[targetHandles[bi]];
+        var th = targetHandles[bi];
+        var d = userIdMap[th] || (th.indexOf('did:') === 0 ? th : '');
         if (d && d.indexOf('did:') === 0 && d !== selfDid) {
           dids.push(d);
-          relQueriedMap[targetHandles[bi]] = now;
+          relQueriedMap[th] = now;
         }
       }
       if (dids.length === 0) return;
@@ -3266,10 +3719,13 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
             for (var r = 0; r < data.relationships.length; r++) {
               var rel = data.relationships[r];
               if (rel && rel.did) {
-                var bh = idToHandleMap[rel.did] || idToHandleMap[rel.did.toLowerCase()];
-                if (bh) {
-                  recordRelation(bh, !!rel.following, !!rel.followedBy);
+                var didKey = rel.did.toLowerCase();
+                var bh = idToHandleMap[rel.did] || idToHandleMap[didKey];
+                if (typeof rel.following === 'string') {
+                  bindBlueskyFollowUri(bh || didKey, rel.following);
                 }
+                if (bh) recordRelation(bh, !!rel.following, !!rel.followedBy);
+                recordRelation(didKey, !!rel.following, !!rel.followedBy);
               }
             }
           }
@@ -3538,55 +3994,146 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     });
   }
 
+  function recordBlueskyProfile(p, requestedKey, resolvedSet) {
+    if (!p || typeof p !== 'object') return '';
+    var nh = p.handle ? normalizeHandle(p.handle) : '';
+    var didRaw = typeof p.did === 'string' && p.did.indexOf('did:') === 0 ? p.did.trim() : '';
+    var didNorm = didRaw ? didRaw.toLowerCase() : '';
+    if (nh && didRaw) {
+      bindUserId(nh, didRaw);
+    }
+    if (didRaw && ((nh && nh === selfHandle) || (selfDid && didNorm === selfDid.toLowerCase()))) {
+      selfDid = didRaw;
+    }
+    if (p.viewer && typeof p.viewer === 'object' && typeof p.viewer.following === 'string') {
+      bindBlueskyFollowUri(nh || didNorm, p.viewer.following);
+    }
+    var rel = extractRelationFromObject(p);
+    if (nh) {
+      recordStats(nh, p.followersCount, p.followsCount, null, null, rel.iFollow, rel.followsMe);
+      if (resolvedSet) resolvedSet[nh] = true;
+    }
+    if (didNorm && didNorm !== nh) {
+      recordStats(didNorm, p.followersCount, p.followsCount, null, null, rel.iFollow, rel.followsMe);
+      if (resolvedSet) resolvedSet[didNorm] = true;
+    }
+    if (requestedKey && requestedKey !== nh && requestedKey !== didNorm) {
+      recordStats(requestedKey, p.followersCount, p.followsCount, null, null, rel.iFollow, rel.followsMe);
+      if (resolvedSet) resolvedSet[requestedKey] = true;
+    }
+    return (didRaw && didRaw !== selfDid) ? didRaw : '';
+  }
+
+  function fetchBlueskySingleFallback(handle) {
+    var actor = (userIdMap[handle] && userIdMap[handle].indexOf('did:') === 0) ? userIdMap[handle] : handle;
+    return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' + encodeURIComponent(actor), {
+      method: 'GET'
+    }).then(function(res) {
+      if (!res) { failedMap[handle] = Date.now(); return; }
+      if (res.status === 429) { backoffUntil = Date.now() + 30000; return; }
+      if (!res.ok) { failedMap[handle] = Date.now(); return; }
+      return res.json().then(function(p) {
+        if (p && (p.handle || p.did)) {
+          var d = recordBlueskyProfile(p, handle, null);
+          if (selfDid && d) {
+            scheduleRelBatch(80);
+          } else if (selfHandle && !selfDid) {
+            fetchBlueskySelfDid(selfHandle);
+          }
+        } else {
+          failedMap[handle] = Date.now();
+        }
+      }).catch(function() { failedMap[handle] = Date.now(); });
+    }).catch(function() { failedMap[handle] = Date.now(); });
+  }
+
   function fetchBlueskyBatch(handles) {
+    if (!handles || handles.length === 0) return Promise.resolve();
     var qs = handles.map(function(h) { return 'actors=' + encodeURIComponent(h); }).join('&');
     return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles?' + qs, {
       method: 'GET'
     }).then(function(res) {
-      if (res.status === 429) {
-        backoffUntil = Date.now() + 45000;
+      if (!res) {
+        for (var ni = 0; ni < handles.length; ni++) failedMap[handles[ni]] = Date.now();
         return;
       }
-      if (!res.ok) return;
+      if (res.status === 429) {
+        backoffUntil = Date.now() + 30000;
+        return;
+      }
+      if (!res.ok) {
+        if (handles.length > 1) {
+          var mid = Math.ceil(handles.length / 2);
+          var left = handles.slice(0, mid);
+          var right = handles.slice(mid);
+          return fetchBlueskyBatch(left).then(function() {
+            if (Date.now() < backoffUntil) return;
+            return fetchBlueskyBatch(right);
+          });
+        }
+        return fetchBlueskySingleFallback(handles[0]);
+      }
       return res.json().then(function(data) {
         var dids = [];
+        var resolvedSet = Object.create(null);
         if (data && Array.isArray(data.profiles)) {
           for (var i = 0; i < data.profiles.length; i++) {
-            var p = data.profiles[i];
-            if (p && p.handle) {
-              var nh = normalizeHandle(p.handle);
-              if (nh && p.did) {
-                bindUserId(nh, p.did);
-                if (nh === selfHandle) selfDid = p.did;
-                else dids.push(p.did);
-              }
-              recordStats(p.handle, p.followersCount, p.followsCount, null, null, null, null);
+            var d = recordBlueskyProfile(data.profiles[i], null, resolvedSet);
+            if (d) dids.push(d);
+          }
+        }
+        var missingSingle = [];
+        for (var m = 0; m < handles.length; m++) {
+          var reqH = handles[m];
+          var mappedDid = userIdMap[reqH] ? userIdMap[reqH].toLowerCase() : '';
+          var mappedHandle = idToHandleMap[reqH] || '';
+          if (!resolvedSet[reqH] && !(mappedDid && resolvedSet[mappedDid]) && !(mappedHandle && resolvedSet[mappedHandle])) {
+            if (mappedDid && mappedDid.indexOf('did:') === 0 && missingSingle.length < 3) {
+              missingSingle.push(reqH);
+            } else {
+              failedMap[reqH] = Date.now();
             }
           }
         }
+        var postChain = Promise.resolve();
+        if (missingSingle.length > 0) {
+          postChain = missingSingle.reduce(function(acc, mh) {
+            return acc.then(function() { return fetchBlueskySingleFallback(mh); });
+          }, postChain);
+        }
         if (selfDid && dids.length > 0) {
           var rQs = 'actor=' + encodeURIComponent(selfDid) + '&' + dids.slice(0, 25).map(function(d) { return 'others=' + encodeURIComponent(d); }).join('&');
-          return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.graph.getRelationships?' + rQs, {
-            method: 'GET'
-          }).then(function(rRes) {
-            if (!rRes || !rRes.ok) return;
-            return rRes.json().then(function(rData) {
-              if (rData && Array.isArray(rData.relationships)) {
-                for (var r = 0; r < rData.relationships.length; r++) {
-                  var rel = rData.relationships[r];
-                  if (rel && rel.did) {
-                    var bh = idToHandleMap[rel.did] || idToHandleMap[rel.did.toLowerCase()];
-                    if (bh) recordRelation(bh, !!rel.following, !!rel.followedBy);
+          postChain = postChain.then(function() {
+            return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.graph.getRelationships?' + rQs, {
+              method: 'GET'
+            }).then(function(rRes) {
+              if (!rRes || !rRes.ok) return;
+              return rRes.json().then(function(rData) {
+                if (rData && Array.isArray(rData.relationships)) {
+                  for (var r = 0; r < rData.relationships.length; r++) {
+                    var rel = rData.relationships[r];
+                    if (rel && rel.did) {
+                      var didKey = rel.did.toLowerCase();
+                      var bh = idToHandleMap[rel.did] || idToHandleMap[didKey];
+                      if (typeof rel.following === 'string') {
+                        bindBlueskyFollowUri(bh || didKey, rel.following);
+                      }
+                      if (bh) recordRelation(bh, !!rel.following, !!rel.followedBy);
+                      recordRelation(didKey, !!rel.following, !!rel.followedBy);
+                    }
                   }
                 }
-              }
+              }).catch(function() {});
             }).catch(function() {});
-          }).catch(function() {});
+          });
         } else if (selfHandle && !selfDid) {
           fetchBlueskySelfDid(selfHandle);
         }
+        return postChain;
       });
-    }).catch(function() {});
+    }).catch(function() {
+      for (var ci = 0; ci < handles.length; ci++) failedMap[handles[ci]] = Date.now();
+    });
   }
 
   function fetchMastodonProfile(handle) {
@@ -3681,17 +4228,18 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     if (platform === 'bluesky') {
       if (activeWorkers > 0) return;
       activeWorkers++;
-      var batch = queue.splice(0, 20);
+      var batch = queue.splice(0, 25);
       for (var i = 0; i < batch.length; i++) {
         delete queuedSet[batch[i]];
         inFlight[batch[i]] = true;
       }
       var doneBatch = function() {
         for (var j = 0; j < batch.length; j++) delete inFlight[batch[j]];
+        scheduleRenderBadges(30);
         setTimeout(function() {
           activeWorkers = Math.max(0, activeWorkers - 1);
           processQueue();
-        }, 220);
+        }, 140);
       };
       Promise.resolve(fetchBlueskyBatch(batch)).then(doneBatch, doneBatch);
       return;
@@ -3843,6 +4391,14 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       '[data-omni-ff-heavy="1"]{' +
       'box-shadow:inset 3px 0 0 rgba(245,158,11,0.9) !important;' +
       'background-color:rgba(245,158,11,0.06) !important;' +
+      '}' +
+      'html.omni-af-active [data-omni-af-state="hide"],' +
+      'html.omni-af-active [data-omni-af-state="pending"]{' +
+      'display:none !important;' +
+      '}' +
+      'html.omni-af-active [data-omni-af-state="hide"][data-omni-af-tail-probe="1"]{' +
+      'display:block !important;height:1px !important;min-height:1px !important;max-height:1px !important;' +
+      'overflow:hidden !important;opacity:0 !important;pointer-events:none !important;margin:0 !important;padding:0 !important;border:0 !important;' +
       '}';
     (document.head || document.documentElement).appendChild(style);
   }
@@ -4100,8 +4656,9 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   function isBadgeTargetLink(a, handle) {
     try {
       if (a.closest('nav, [role="navigation"]')) return false;
-      var txt = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!txt || txt.length > 48) return false;
+      var txt = stripInvisibleChars(a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+      var maxLen = platform === 'bluesky' ? 96 : 48;
+      if (!txt || txt.length > maxLen) return false;
       if (NON_USER_TEXT_RE.test(txt)) return false;
       var curH = getCurrentProfileHandleFromUrl();
       if (curH === handle && a.closest('header')) return false;
@@ -4120,20 +4677,20 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       }
       var imgs = row.querySelectorAll('img[alt]');
       for (var j = 0; j < imgs.length; j++) {
-        var alt = (imgs[j].getAttribute('alt') || '').trim();
-        var am = /^@?([a-z0-9._-]{1,40})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
+        var alt = stripInvisibleChars(imgs[j].getAttribute('alt') || '').trim();
+        var am = /^@?([a-z0-9._-]{1,64})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
         if (am) {
           var ah = normalizeHandle(am[1]);
           if (ah) return ah;
         }
       }
       var spans = row.querySelectorAll('span, div');
-      for (var k = 0; k < spans.length && k < 40; k++) {
+      for (var k = 0; k < spans.length && k < 50; k++) {
         var s = spans[k];
         if (s.children && s.children.length > 0) continue;
         if (s.closest('button, [role="button"], .omni-ff-wrap')) continue;
-        var t = (s.textContent || '').trim();
-        if (!t || t.length > 40 || /\s/.test(t) || NON_USER_TEXT_RE.test(t)) continue;
+        var t = stripInvisibleChars(s.textContent || '').trim();
+        if (!t || t.length > 80 || /\s/.test(t) || NON_USER_TEXT_RE.test(t)) continue;
         var nh = normalizeHandle(t);
         if (nh && (userIdMap[nh] || t[0] === '@' || /[._0-9]/.test(nh) || /^[a-z][a-z0-9._]{2,30}$/.test(nh))) {
           return nh;
@@ -4146,39 +4703,54 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   function findRowTextColumn(row, btn, handle) {
     try {
       var anchor = null;
+      var fallbackLink = null;
       var links = row.querySelectorAll('a[href]');
       for (var i = 0; i < links.length; i++) {
-        if (extractHandleFromLink(links[i]) === handle && !links[i].querySelector('img, video, canvas')) {
-          anchor = links[i];
-          break;
+        if (extractHandleFromLink(links[i]) === handle) {
+          if (!links[i].querySelector('img, video, canvas')) {
+            anchor = links[i];
+            break;
+          }
+          if (!fallbackLink && stripInvisibleChars(links[i].textContent || '').trim()) {
+            fallbackLink = links[i];
+          }
         }
       }
       if (!anchor) {
+        var aliasH = idToHandleMap[handle] || '';
         var leaves = row.querySelectorAll('span, div');
-        for (var j = 0; j < leaves.length && j < 40; j++) {
+        for (var j = 0; j < leaves.length && j < 50; j++) {
           var el = leaves[j];
           if (el.children && el.children.length > 0) continue;
           if (el.closest('button, [role="button"], .omni-ff-wrap')) continue;
-          var txt = (el.textContent || '').trim().replace(/^@+/, '').toLowerCase();
-          if (txt === handle) {
+          var txt = stripInvisibleChars(el.textContent || '').trim().replace(/^@+/, '').toLowerCase();
+          if (txt && (txt === handle || (aliasH && txt === aliasH))) {
             anchor = el;
             break;
           }
         }
       }
+      if (!anchor && fallbackLink) {
+        anchor = fallbackLink;
+      }
       if (!anchor) return null;
       var cur = anchor;
-      var best = anchor.parentElement || anchor;
-      for (var step = 0; step < 5 && cur && cur !== row; step++) {
+      var best = anchor.parentElement && anchor.parentElement !== row ? anchor.parentElement : anchor;
+      var anchorHasImg = !!anchor.querySelector('img[width], canvas');
+      var maxColH = platform === 'bluesky' ? 340 : 180;
+      for (var step = 0; step < 6 && cur && cur !== row; step++) {
         var p = cur.parentElement;
         if (!p || p === row) break;
-        if (p.contains(btn)) break;
-        if (p.querySelector('img[width], canvas')) break;
+        if (btn && p.contains(btn)) break;
+        if (!anchorHasImg && p.querySelector('img[width], canvas')) break;
         var r = p.getBoundingClientRect();
-        if (r.width >= 90 && r.height >= 24 && r.height <= 130) {
+        if (r.width >= 90 && r.height >= 20 && r.height <= maxColH) {
           best = p;
         }
         cur = p;
+      }
+      if (btn && best.contains(btn)) {
+        best = anchor;
       }
       return best;
     } catch (_) {
@@ -4248,7 +4820,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
   function upsertRowBadge(row, container, handle, btn, placements) {
     ensureStyles();
-    var entry = statsMap[handle];
+    var entry = getStatsEntry(handle);
     var display = formatBadgeDisplay(entry, handle, true);
 
     if (display && display.isFollowingHeavy) {
@@ -4610,32 +5182,56 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     }
   }
 
+  function clearStaleRowWraps(row, keepHandle) {
+    try {
+      var wraps = row.querySelectorAll('.omni-ff-wrap');
+      for (var i = 0; i < wraps.length; i++) {
+        if (wraps[i].getAttribute('data-omni-ff-user') !== keepHandle) {
+          wraps[i].remove();
+        }
+      }
+    } catch (_) {}
+  }
+
   function scanFollowListRows(rootScope) {
     var listContext = detectSelfListPageContext();
     var scope = rootScope || document;
     var placements = [];
+    var processedRows = typeof Set === 'function' ? new Set() : null;
+    var afActive = isAccountFilterActive();
     try {
       var btns = scope.querySelectorAll('button, [role="button"]');
-      var maxBtns = rootScope ? 320 : 280;
+      var maxBtns = rootScope ? 2500 : 2500;
       for (var i = 0; i < btns.length && i < maxBtns; i++) {
         var btn = btns[i];
         if (btn.closest('nav, [role="navigation"], .omni-ff-wrap')) continue;
-        var bTxt = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+        var bTxt = stripInvisibleChars(btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
         if (!bTxt || bTxt.length > 22 || !FOLLOW_LIST_BTN_RE.test(bTxt)) continue;
 
-        // すでに特定済みの行はレイアウト計算(getBoundingClientRect)をスキップして高速更新
+        // すでに特定済みの行は React 仮想リストの DOM 再利用がないかだけ検証して高速更新
         var row = btn.closest('[data-omni-ff-row]');
         var handle = row ? (row.getAttribute('data-omni-ff-row') || '') : '';
+        if (row && handle) {
+          var freshH = extractHandleFromRow(row);
+          if (freshH && freshH !== handle) {
+            handle = freshH;
+            row.setAttribute('data-omni-ff-row', handle);
+            clearStaleRowWraps(row, handle);
+            if (rowColCache) rowColCache.delete(row);
+            if (rowWrapCache) rowWrapCache.delete(row);
+          }
+        }
         if (!row || !handle) {
           row = null;
           var cur = btn.parentElement;
-          for (var depth = 0; depth < 7 && cur && cur !== document.body; depth++) {
+          var maxRowH = platform === 'bluesky' ? 440 : 280;
+          for (var depth = 0; depth < 10 && cur && cur !== document.body; depth++) {
             var rect = cur.getBoundingClientRect();
-            if (rect.height >= 40 && rect.height <= 200 && rect.width >= 200) {
+            if (rect.height >= 36 && rect.height <= maxRowH && rect.width >= 180) {
               var followBtnCount = 0;
               var subBtns = cur.querySelectorAll('button, [role="button"]');
               for (var sb = 0; sb < subBtns.length; sb++) {
-                var st = (subBtns[sb].innerText || subBtns[sb].textContent || '').replace(/\s+/g, ' ').trim();
+                var st = stripInvisibleChars(subBtns[sb].innerText || subBtns[sb].textContent || '').replace(/\s+/g, ' ').trim();
                 if (st && st.length <= 22 && FOLLOW_LIST_BTN_RE.test(st)) followBtnCount++;
               }
               if (followBtnCount === 1) {
@@ -4643,6 +5239,10 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
                 if (hCand) {
                   row = cur;
                   handle = hCand;
+                  var curTid = (cur.getAttribute('data-testid') || '').toLowerCase();
+                  if (platform === 'bluesky' && curTid.indexOf('profilecard') >= 0) {
+                    break;
+                  }
                   break;
                 }
               }
@@ -4653,15 +5253,16 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           row.setAttribute('data-omni-ff-row', handle);
         }
 
+        if (processedRows) processedRows.add(row);
         var col = getRowTextColumn(row, btn, handle);
         if (!col) continue;
 
         inferRelationFromRowDom(row, bTxt, handle, listContext);
 
-        var ent = statsMap[handle];
+        var ent = getStatsEntry(handle);
         var needStats = !hasUsableStats(ent);
-        var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && !!userIdMap[handle];
-        if ((needStats || needRel) && isInViewport(row)) {
+        var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && (!!userIdMap[handle] || (platform === 'bluesky' && handle.indexOf('did:') === 0));
+        if ((needStats || needRel) && (afActive || isInViewport(row))) {
           if (needStats) {
             enqueueFetch(handle, false, false);
           } else if (needRel) {
@@ -4669,6 +5270,45 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           }
         }
         upsertRowBadge(row, col, handle, btn, placements);
+      }
+
+      // Bluesky: フォローボタンが無い ProfileCard 行（自分自身・ミュート・特殊カード等）も確実に拾う
+      if (platform === 'bluesky') {
+        var cards = scope.querySelectorAll('[data-testid*="profileCard"], [data-testid*="ProfileCard"]');
+        for (var ci = 0; ci < cards.length && ci < 2000; ci++) {
+          var card = cards[ci];
+          if (processedRows && processedRows.has(card)) continue;
+          if (card.closest('nav, [role="navigation"], header, .omni-ff-wrap')) continue;
+          if (card.querySelector('[data-omni-ff-row]')) continue;
+          var ch = extractHandleFromRow(card);
+          if (!ch) continue;
+          var prevCh = card.getAttribute('data-omni-ff-row') || '';
+          if (prevCh && prevCh !== ch) {
+            clearStaleRowWraps(card, ch);
+            if (rowColCache) rowColCache.delete(card);
+            if (rowWrapCache) rowWrapCache.delete(card);
+          }
+          card.setAttribute('data-omni-ff-row', ch);
+          var cBtn = null;
+          var cBtns = card.querySelectorAll('button, [role="button"]');
+          for (var cbi = 0; cbi < cBtns.length; cbi++) {
+            var cbt = stripInvisibleChars(cBtns[cbi].innerText || cBtns[cbi].textContent || '').replace(/\s+/g, ' ').trim();
+            if (cbt && cbt.length <= 22 && FOLLOW_LIST_BTN_RE.test(cbt)) {
+              cBtn = cBtns[cbi];
+              break;
+            }
+          }
+          var cCol = getRowTextColumn(card, cBtn, ch);
+          if (!cCol) continue;
+          var cEnt = getStatsEntry(ch);
+          var cNeedStats = !hasUsableStats(cEnt);
+          var cNeedRel = ch !== selfHandle && (!cEnt || cEnt.followsMe === null) && (!!userIdMap[ch] || ch.indexOf('did:') === 0);
+          if ((cNeedStats || cNeedRel) && (afActive || isInViewport(card))) {
+            if (cNeedStats) enqueueFetch(ch, false, false);
+            else if (cNeedRel) scheduleRelBatch(160);
+          }
+          upsertRowBadge(card, cCol, ch, cBtn, placements);
+        }
       }
     } catch (_) {}
     try {
@@ -4679,6 +5319,11 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   // 現在開いているプロフィールページのDOMから人数＆相互状態を読み取り、ヘッダーにインライン表示する（全SNS対応）
   function scanCurrentProfilePage() {
     try {
+      var pathname = (window.location && window.location.pathname) || '';
+      // フォロー・フォロワー一覧やいいね一覧などのサブページでは一覧カードの数字を誤ってプロフィール主へ記録しない
+      if (/\/(?:followers|following|follows|known-followers|liked-by|reposted-by|quotes|mutuals|friends)(?:\/|$)/i.test(pathname)) {
+        return;
+      }
       var curHandle = getCurrentProfileHandleFromUrl();
       if (!curHandle) return;
       var root = document.querySelector('main, header, [role="main"]') || document.body;
@@ -4706,7 +5351,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         }
         var headerBtns = headerScope.querySelectorAll('button, [role="button"]');
         for (var i = 0; i < headerBtns.length && i < 30; i++) {
-          var bt = (headerBtns[i].innerText || headerBtns[i].textContent || '').replace(/\s+/g, ' ').trim();
+          var bt = stripInvisibleChars(headerBtns[i].innerText || headerBtns[i].textContent || '').replace(/\s+/g, ' ').trim();
           if (!bt || bt.length > 22) continue;
           if (BTN_IS_MUTUAL_RE.test(bt)) { iFollow = true; followsMe = true; break; }
           if (BTN_IS_FOLLOW_BACK_RE.test(bt)) { iFollow = false; followsMe = true; break; }
@@ -4721,7 +5366,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
 
       if (curHandle === selfHandle) return;
 
-      var entry = statsMap[curHandle];
+      var entry = getStatsEntry(curHandle);
       if (!hasUsableStats(entry) || (entry && entry.followsMe === null)) {
         enqueueFetch(curHandle, true, false);
         scheduleRelBatch();
@@ -4768,12 +5413,12 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
             if (h) enqueueFetch(h, false, false);
           }
         }
-      }, { rootMargin: '160px' });
+      }, { rootMargin: '200px' });
     }
   } catch (_) {}
 
   function applyBadgeToLink(a, handle) {
-    var entry = statsMap[handle];
+    var entry = getStatsEntry(handle);
     var display = formatBadgeDisplay(entry, handle, false);
     if (!display) return;
 
@@ -4805,6 +5450,440 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     } catch (_) {}
   }
 
+  // ==================== アカウント条件フィルタ（F/FW・フォロー多め絞り込み） ====================
+  function postAccountFilterMessage(type, payload) {
+    try {
+      var poster = __omniPostMessage || (window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function' ? window.chrome.webview.postMessage.bind(window.chrome.webview) : null);
+      if (poster) {
+        poster(JSON.stringify(Object.assign({ token: __OMNI_TOKEN__, type: type }, payload || {})));
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function reportAccountFilterState(active, matched, hidden, pending, autoFetching) {
+    var key = (active ? '1' : '0') + ':' + (matched | 0) + ':' + (hidden | 0) + ':' + (pending | 0) + ':' + (autoFetching ? '1' : '0');
+    if (key === afLastStateKey) return false;
+    afLastStateKey = key;
+    postAccountFilterMessage('omnisns:account-filter-state', {
+      active: !!active,
+      matched: matched | 0,
+      hidden: hidden | 0,
+      pending: pending | 0,
+      autoFetching: !!autoFetching
+    });
+    try {
+      window.dispatchEvent(new CustomEvent('omnisns:af-updated', {
+        detail: { active: !!active, matched: matched | 0, hidden: hidden | 0, pending: pending | 0, autoFetching: !!autoFetching }
+      }));
+    } catch (_) {}
+    return true;
+  }
+
+  function afResetPagination(nextKey) {
+    afActiveContextKey = nextKey || '';
+    afEmptyPulseCount = 0;
+    afReachedEnd = false;
+    afPulseInProgress = false;
+    afAutoFetching = false;
+    if (afCooldownTimer) {
+      clearTimeout(afCooldownTimer);
+      afCooldownTimer = null;
+    }
+  }
+
+  function afIsScrollableBox(el) {
+    if (!el || el === document.body || el === document.documentElement) return true;
+    try {
+      var oy = window.getComputedStyle(el).overflowY;
+      return oy === 'auto' || oy === 'scroll' || oy === 'overlay';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function afFindScrollContainer(ctx) {
+    try {
+      var candidates = [ctx.root].concat(Array.prototype.slice.call(ctx.root.querySelectorAll('div, ul')));
+      var best = null;
+      var bestScore = 0;
+      for (var i = 0; i < candidates.length && i < 200; i++) {
+        var el = candidates[i];
+        if (el === document.body || el === document.documentElement) continue;
+        if (!afIsScrollableBox(el)) continue;
+        var ch = el.clientHeight || 0;
+        if (ch < 100) continue;
+        var hasRow = !!el.querySelector('[data-omni-ff-row]');
+        var score = ch + (hasRow ? 10000 : 0);
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+      if (best) return best;
+    } catch (_) {}
+    return ctx.isDialog ? ctx.root : (document.scrollingElement || document.documentElement);
+  }
+
+  function findAccountFilterListContext(activeDialog) {
+    var pathname = (window.location && window.location.pathname) || '';
+    var search = (window.location && window.location.search) || '';
+    var full = pathname + search;
+    if (activeDialog && activeDialog.querySelector('[data-omni-ff-row]')) {
+      return {
+        root: activeDialog,
+        isDialog: true,
+        owner: getCurrentProfileHandleFromUrl() || '',
+        key: 'afdlg:' + full
+      };
+    }
+    var mainEl = document.querySelector('main, [role="main"]') || document.body;
+    if (!mainEl) return null;
+    if (platform === 'bluesky') {
+      var bsMatch = /^\/profile\/([^\/?#]+)\/(followers|follows|known-followers|lists\/[^\/?#]+|post\/[^\/?#]+\/(?:liked-by|reposted-by|quotes))(\/|$)/i.exec(pathname);
+      if (bsMatch || /^\/(?:search|starter-pack)(?:\/|$)/i.test(pathname)) {
+        var owner = bsMatch ? normalizeHandle(bsMatch[1]) : '';
+        return { root: mainEl, isDialog: false, owner: owner, key: 'afbsky:' + full };
+      }
+    }
+    if (/(?:followers|following|follows|known-followers|liked-by|reposted-by|starter-pack|friends|members|people|users|search|lists)/i.test(full)) {
+      return {
+        root: mainEl,
+        isDialog: false,
+        owner: getCurrentProfileHandleFromUrl() || '',
+        key: 'afpage:' + full
+      };
+    }
+    var rows = mainEl.querySelectorAll('[data-omni-ff-row]');
+    var listRowCount = 0;
+    for (var i = 0; i < rows.length && listRowCount < 2; i++) {
+      if (!rows[i].closest('header, nav, [role="navigation"], [data-testid*="feedItem"], [data-testid*="postThreadItem"]')) {
+        listRowCount++;
+      }
+    }
+    if (listRowCount >= 2) {
+      return {
+        root: mainEl,
+        isDialog: false,
+        owner: getCurrentProfileHandleFromUrl() || '',
+        key: 'afrows:' + full
+      };
+    }
+    return null;
+  }
+
+  function resolveFilterHideTarget(row, listRoot, handle, owner) {
+    var cur = row;
+    try {
+      for (var step = 0; step < 3 && cur && cur.parentElement && cur.parentElement !== listRoot && cur.parentElement !== document.body; step++) {
+        var parent = cur.parentElement;
+        var tag = parent.tagName;
+        if (tag === 'MAIN' || tag === 'UL' || tag === 'OL' || tag === 'SECTION' || tag === 'HEADER' || tag === 'NAV' || tag === 'ARTICLE') break;
+        if (afIsScrollableBox(parent)) break;
+        if (parent.children && parent.children.length > 2) break;
+        if (parent.querySelector('input, h1, h2, [role="heading"], [role="tablist"]')) break;
+        if (parent.querySelectorAll('[data-omni-ff-row]').length !== 1) break;
+        var pLinks = parent.querySelectorAll('a[href]');
+        var hasOtherUser = false;
+        for (var li = 0; li < pLinks.length && li < 12; li++) {
+          var lh = extractHandleFromLink(pLinks[li]);
+          if (lh && lh !== handle && lh !== owner) {
+            hasOtherUser = true;
+            break;
+          }
+        }
+        if (hasOtherUser) break;
+        cur = parent;
+      }
+    } catch (_) {}
+    return cur;
+  }
+
+  function evaluateAccountFilter(entry, handle) {
+    if (!isAccountFilterActive()) return 'match';
+    if (!handle || handle === selfHandle) return 'match';
+    var cfg = accountFilterConfig;
+    var needFollowing = cfg.minFollowing !== null || cfg.maxFollowing !== null || !!cfg.followingGreaterThanFollowers;
+    var needFollowers = cfg.minFollowers !== null || cfg.maxFollowers !== null || !!cfg.followingGreaterThanFollowers;
+    var hasFollowing = !!(entry && typeof entry.following === 'number');
+    var hasFollowers = !!(entry && typeof entry.followers === 'number');
+    if ((needFollowing && !hasFollowing) || (needFollowers && !hasFollowers)) {
+      var alias = idToHandleMap[handle] || '';
+      var isBusy = !!(inFlight[handle] || queuedSet[handle] || (alias && (inFlight[alias] || queuedSet[alias])));
+      var hasFailed = !!(failedMap[handle] || (alias && failedMap[alias]));
+      if (hasFailed && !isBusy) return 'hide';
+      return 'pending';
+    }
+    if (cfg.minFollowing !== null && entry.following < cfg.minFollowing) return 'hide';
+    if (cfg.maxFollowing !== null && entry.following > cfg.maxFollowing) return 'hide';
+    if (cfg.minFollowers !== null && entry.followers < cfg.minFollowers) return 'hide';
+    if (cfg.maxFollowers !== null && entry.followers > cfg.maxFollowers) return 'hide';
+    if (cfg.followingGreaterThanFollowers && !(entry.following > entry.followers)) return 'hide';
+    return 'match';
+  }
+
+  function clearAccountFilterDom() {
+    try {
+      if (document.documentElement) {
+        document.documentElement.classList.remove('omni-af-active');
+      }
+      var marked = document.querySelectorAll('[data-omni-af-state], [data-omni-af-tail-probe]');
+      for (var i = 0; i < marked.length; i++) {
+        marked[i].removeAttribute('data-omni-af-state');
+        marked[i].removeAttribute('data-omni-af-tail-probe');
+      }
+      var sp = document.getElementById('omni-af-spacer');
+      if (sp && sp.parentNode) sp.parentNode.removeChild(sp);
+    } catch (_) {}
+  }
+
+  function triggerAfPaginationPulse(ctx, scrollEl, matchedTargets, allTargets, statsSnap) {
+    afPulseInProgress = true;
+    afAutoFetching = true;
+    afLastPulseAt = Date.now();
+    var beforeTotal = allTargets.length;
+    var beforeSeq = afApiBatchSeq;
+    reportAccountFilterState(true, statsSnap.matched, statsSnap.hidden, statsSnap.pending, true);
+
+    var anchorRow = matchedTargets.length > 0 ? matchedTargets[matchedTargets.length - 1] : allTargets[allTargets.length - 1];
+    var spacer = document.getElementById('omni-af-spacer');
+    if (!spacer) {
+      spacer = document.createElement('div');
+      spacer.id = 'omni-af-spacer';
+      spacer.setAttribute('aria-hidden', 'true');
+    }
+    var pushPx = Math.max(1400, (window.innerHeight || 800) * 2);
+    spacer.style.cssText = 'display:block;width:1px;height:' + pushPx + 'px;flex-shrink:0;pointer-events:none;opacity:0;';
+    try {
+      if (anchorRow && anchorRow.parentNode) anchorRow.after(spacer);
+      else ctx.root.appendChild(spacer);
+    } catch (_) {}
+
+    var raf = window.requestAnimationFrame || function(fn) { setTimeout(fn, 16); };
+    raf(function() {
+      raf(function() {
+        try {
+          spacer.style.height = '0px';
+          var tailRows = allTargets.slice(-3);
+          for (var ti = 0; ti < tailRows.length; ti++) {
+            if (tailRows[ti].getAttribute('data-omni-af-state') === 'hide') {
+              tailRows[ti].setAttribute('data-omni-af-tail-probe', '1');
+            }
+          }
+          var isDocScroll = scrollEl === document.scrollingElement || scrollEl === document.documentElement || scrollEl === document.body;
+          if (!isDocScroll && scrollEl && matchedTargets.length < AF_MIN_VISIBLE_MATCHES) {
+            var maxTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+            if (maxTop > 0 && maxTop <= 240) scrollEl.scrollTop = maxTop;
+          }
+          if (scrollEl && scrollEl !== window) scrollEl.dispatchEvent(new Event('scroll', { bubbles: true }));
+          ctx.root.dispatchEvent(new Event('scroll', { bubbles: true }));
+          window.dispatchEvent(new Event('scroll'));
+          setTimeout(function() {
+            try {
+              if (spacer.parentNode) spacer.parentNode.removeChild(spacer);
+              for (var k = 0; k < tailRows.length; k++) tailRows[k].removeAttribute('data-omni-af-tail-probe');
+            } catch (_) {}
+          }, 150);
+        } catch (_) {}
+
+        setTimeout(function() {
+          afPulseInProgress = false;
+          var nowRows = ctx.root ? ctx.root.querySelectorAll('[data-omni-ff-row]').length : 0;
+          if (nowRows > beforeTotal || afApiBatchSeq > beforeSeq) {
+            afEmptyPulseCount = 0;
+          } else {
+            afEmptyPulseCount++;
+            if (afEmptyPulseCount >= AF_MAX_EMPTY_PULSES) {
+              afReachedEnd = true;
+              afAutoFetching = false;
+            }
+          }
+          scheduleRenderBadges(40);
+        }, 760);
+      });
+    });
+  }
+
+  function maybeAfAutoFetchNextPage(ctx, matchedTargets, allTargets, statsSnap) {
+    if (!isAccountFilterActive() || !ctx || !ctx.root) {
+      afAutoFetching = false;
+      return;
+    }
+    if (afPulseInProgress || statsSnap.pending > 0 || afReachedEnd || allTargets.length === 0) {
+      if (afReachedEnd) afAutoFetching = false;
+      return;
+    }
+    var scrollEl = afFindScrollContainer(ctx);
+    var isDocScroll = scrollEl === document.scrollingElement || scrollEl === document.documentElement || scrollEl === document.body;
+    var viewportBottom = isDocScroll
+      ? (window.innerHeight || document.documentElement.clientHeight || 700)
+      : scrollEl.getBoundingClientRect().bottom;
+    var needsMore = false;
+    if (matchedTargets.length === 0) {
+      needsMore = true;
+    } else {
+      var lastRect = matchedTargets[matchedTargets.length - 1].getBoundingClientRect();
+      if (viewportBottom - lastRect.bottom > -180) {
+        needsMore = true;
+      } else if (matchedTargets.length < AF_MIN_VISIBLE_MATCHES) {
+        var viewH = isDocScroll ? viewportBottom : (scrollEl.clientHeight || 0);
+        var scrollH = isDocScroll
+          ? Math.max(scrollEl.scrollHeight || 0, document.body ? document.body.scrollHeight : 0)
+          : (scrollEl.scrollHeight || 0);
+        if (scrollH <= viewH + 100) needsMore = true;
+      }
+    }
+    if (!needsMore) {
+      afAutoFetching = false;
+      return;
+    }
+    var elapsed = Date.now() - afLastPulseAt;
+    if (elapsed < AF_PULSE_COOLDOWN_MS) {
+      afAutoFetching = true;
+      if (!afCooldownTimer) {
+        afCooldownTimer = setTimeout(function() {
+          afCooldownTimer = null;
+          scheduleRenderBadges(20);
+        }, AF_PULSE_COOLDOWN_MS - elapsed + 20);
+      }
+      return;
+    }
+    triggerAfPaginationPulse(ctx, scrollEl, matchedTargets, allTargets, statsSnap);
+  }
+
+  function applyAccountFilter(activeDialog) {
+    if (!isAccountFilterActive()) {
+      var hadActive = !!(document.documentElement && document.documentElement.classList.contains('omni-af-active'));
+      if (hadActive || document.querySelector('[data-omni-af-state]')) {
+        clearAccountFilterDom();
+      }
+      afResetPagination('');
+      reportAccountFilterState(false, 0, 0, 0, false);
+      return;
+    }
+
+    ensureStyles();
+    if (document.documentElement) {
+      document.documentElement.classList.add('omni-af-active');
+    }
+
+    var ctx = findAccountFilterListContext(activeDialog);
+    if (!ctx || !ctx.root) {
+      var stray = document.querySelectorAll('[data-omni-af-state]');
+      for (var si = 0; si < stray.length; si++) {
+        stray[si].removeAttribute('data-omni-af-state');
+        stray[si].removeAttribute('data-omni-af-tail-probe');
+      }
+      afResetPagination('');
+      reportAccountFilterState(false, 0, 0, 0, false);
+      return;
+    }
+
+    if (ctx.key !== afActiveContextKey) {
+      afResetPagination(ctx.key);
+    }
+
+    var rows = ctx.root.querySelectorAll('[data-omni-ff-row]');
+    var activeTargets = typeof Set === 'function' ? new Set() : null;
+    var allTargets = [];
+    var matchedTargets = [];
+    var matched = 0;
+    var hidden = 0;
+    var pending = 0;
+
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (row.closest('header, nav, [role="navigation"], [data-testid*="feedItem"], [data-testid*="postThreadItem"]')) continue;
+      var handle = (row.getAttribute('data-omni-ff-row') || '').trim();
+      if (!handle) continue;
+      if (ctx.owner && handle === ctx.owner) continue;
+      var target = resolveFilterHideTarget(row, ctx.root, handle, ctx.owner);
+      if (activeTargets) {
+        if (activeTargets.has(target)) continue;
+        activeTargets.add(target);
+      }
+      var entry = getStatsEntry(handle);
+      var state = evaluateAccountFilter(entry, handle);
+      if (state === 'pending') {
+        enqueueFetch(handle, false, false);
+        pending++;
+      } else if (state === 'hide') {
+        hidden++;
+      } else {
+        matched++;
+        matchedTargets.push(target);
+      }
+      if (target.getAttribute('data-omni-af-state') !== state) {
+        target.setAttribute('data-omni-af-state', state);
+      }
+      if (state === 'match' && target.hasAttribute('data-omni-af-tail-probe')) {
+        target.removeAttribute('data-omni-af-tail-probe');
+      }
+      allTargets.push(target);
+    }
+
+    // コンテキスト外や再利用で不要になった古い属性を除去
+    var prevMarked = document.querySelectorAll('[data-omni-af-state]');
+    for (var pi = 0; pi < prevMarked.length; pi++) {
+      var pm = prevMarked[pi];
+      if (activeTargets && !activeTargets.has(pm)) {
+        pm.removeAttribute('data-omni-af-state');
+        pm.removeAttribute('data-omni-af-tail-probe');
+      }
+    }
+
+    var snap = { matched: matched, hidden: hidden, pending: pending };
+    if (pending === 0 && allTargets.length > 0) {
+      maybeAfAutoFetchNextPage(ctx, matchedTargets, allTargets, snap);
+    } else if (pending > 0) {
+      afAutoFetching = false;
+    }
+    reportAccountFilterState(true, matched, hidden, pending, afAutoFetching);
+  }
+
+  function sanitizeAfBound(val) {
+    if (val === null || val === undefined || val === '') return null;
+    var n = Number(val);
+    if (!isFinite(n) || n < 0) return null;
+    return Math.min(1000000000, Math.floor(n));
+  }
+
+  window.__omniAccountFilterApplyConfig = function(cfg) {
+    if (!cfg || typeof cfg !== 'object') return;
+    var minF = sanitizeAfBound(cfg.minFollowing);
+    var maxF = sanitizeAfBound(cfg.maxFollowing);
+    if (minF !== null && maxF !== null && minF > maxF) { var tmp1 = minF; minF = maxF; maxF = tmp1; }
+    var minFw = sanitizeAfBound(cfg.minFollowers);
+    var maxFw = sanitizeAfBound(cfg.maxFollowers);
+    if (minFw !== null && maxFw !== null && minFw > maxFw) { var tmp2 = minFw; minFw = maxFw; maxFw = tmp2; }
+    accountFilterConfig = {
+      enabled: !!cfg.enabled,
+      minFollowing: minF,
+      maxFollowing: maxF,
+      minFollowers: minFw,
+      maxFollowers: maxFw,
+      followingGreaterThanFollowers: !!cfg.followingGreaterThanFollowers
+    };
+    afLastStateKey = '';
+    afReachedEnd = false;
+    afEmptyPulseCount = 0;
+    if (!isAccountFilterActive()) {
+      clearAccountFilterDom();
+      reportAccountFilterState(false, 0, 0, 0, false);
+    } else {
+      ensureStyles();
+      if (pageBooted) {
+        scanAndRender();
+      } else {
+        scheduleRenderBadges(30);
+      }
+    }
+  };
+  window.__omniEvaluateAccountFilter = function(entry, handle) {
+    return evaluateAccountFilter(entry, handle);
+  };
+
   function scanAndRender() {
     detectDynamicPlatformFromDom();
     detectPageTheme();
@@ -4815,6 +5894,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     var activeDialog = document.querySelector('[role="dialog"]');
     if (activeDialog && activeDialog.querySelector('a[href], button, [role="button"]')) {
       scanFollowListRows(activeDialog);
+      applyAccountFilter(activeDialog);
       scheduleRelBatch(160);
       return;
     }
@@ -4823,22 +5903,37 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
     scanFollowListRows(null);
 
     var links = document.querySelectorAll('a[href]');
-    var maxLinks = platform === 'instagram' ? 600 : 1200;
+    var maxLinks = platform === 'instagram' ? 1200 : 4000;
     for (var i = 0; i < links.length && i < maxLinks; i++) {
       var a = links[i];
       if (a.closest('[data-omni-ff-row], .omni-ff-wrap')) continue;
+      var curHref = a.getAttribute('href') || '';
+      var prevHref = a.getAttribute('data-omni-ff-href');
       var handle = a.getAttribute('data-omni-ff-handle');
+      if (prevHref !== null && prevHref !== curHref) {
+        // React 仮想リスト等で <a> の href が差し替わった場合は再解析し、旧バッジを掃除
+        var oldNext = a.nextElementSibling;
+        if (oldNext && oldNext.classList && oldNext.classList.contains('omni-ff-wrap')) {
+          oldNext.remove();
+        }
+        a.removeAttribute('data-omni-ff-handle');
+        a.removeAttribute('data-omni-ff-target');
+        handle = null;
+      }
       if (handle === '') continue;
       if (handle === null) {
         handle = extractHandleFromLink(a);
+        a.setAttribute('data-omni-ff-href', curHref);
         a.setAttribute('data-omni-ff-handle', handle || '');
-        if (handle) {
-          (function(linkEl, h) {
-            linkEl.addEventListener('pointerenter', function() {
-              enqueueFetch(h, true, false);
+        if (handle && !a.__omniFfHoverBound) {
+          a.__omniFfHoverBound = true;
+          a.addEventListener('pointerenter', function() {
+            var hh = this.getAttribute('data-omni-ff-handle');
+            if (hh) {
+              enqueueFetch(hh, true, false);
               scheduleRelBatch(120);
-            }, { passive: true });
-          })(a, handle);
+            }
+          }, { passive: true });
         }
       }
       if (handle) {
@@ -4854,12 +5949,12 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
           }
         }
         if (targetState === '1') {
-          var ent = statsMap[handle];
+          var ent = getStatsEntry(handle);
           if (hasAnyDisplayData(ent, handle)) {
             applyBadgeToLink(a, handle);
           }
           var needStats = !hasUsableStats(ent);
-          var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && !!userIdMap[handle];
+          var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && (!!userIdMap[handle] || (platform === 'bluesky' && handle.indexOf('did:') === 0));
           if ((needStats || needRel) && isInViewport(a)) {
             if (needStats) {
               enqueueFetch(handle, false, false);
@@ -4870,6 +5965,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
         }
       }
     }
+    applyAccountFilter(null);
     scheduleRelBatch();
   }
 
@@ -4928,8 +6024,13 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
       scanAndRender();
     }, 900);
     try {
-      window.addEventListener('scroll', function() {
+      window.addEventListener('scroll', function(ev) {
         var now = Date.now();
+        if (ev && ev.isTrusted && afReachedEnd && now - afLastPulseAt > 1500 && now - afLastUserScrollAt > 800) {
+          afReachedEnd = false;
+          afEmptyPulseCount = Math.max(0, AF_MAX_EMPTY_PULSES - 2);
+        }
+        if (!ev || ev.isTrusted) afLastUserScrollAt = now;
         if (now - lastScrollScanAt < 260) return;
         lastScrollScanAt = now;
         scheduleRenderBadges(260);
@@ -4980,6 +6081,7 @@ pub const PROFILE_STATS_JS: &str = r#"(function() {
   function boot() {
     window.__omniResolveProfileHandle = getCurrentProfileHandleFromUrl;
     window.__omniExtractHandleFromRow = extractHandleFromRow;
+    postAccountFilterMessage('omnisns:account-filter-get-config', {});
     try {
       window.addEventListener('storage', function(ev) {
         if (ev && ev.key === FOLLOWED_AT_KEY) {
@@ -6415,6 +7517,12 @@ pub const JEV_FILTER_JS: &str = r#"(function() {
     byUser.forEach(function(ent, uLowerKey) {
       var row = findRowElement(ent.links, uLowerKey, ctx);
       if (!row) return;
+      var afEl = row.hasAttribute('data-omni-af-state') ? row : row.closest('[data-omni-af-state]');
+      var afState = afEl ? afEl.getAttribute('data-omni-af-state') : '';
+      if (document.documentElement && document.documentElement.classList.contains('omni-af-active') &&
+          (afState === 'hide' || afState === 'pending')) {
+        return;
+      }
       seenInContext.add(uLowerKey);
       var cached = judged.get(uLowerKey);
       if (cached !== undefined) {
@@ -6522,6 +7630,7 @@ pub const JEV_FILTER_JS: &str = r#"(function() {
   };
 
   hookNetwork();
+  window.addEventListener('omnisns:af-updated', function() { if (enabled) scheduleScan(30); });
   window.addEventListener('popstate', function() { if (enabled) scheduleScan(30); });
   window.addEventListener('scroll', function(ev) {
     if (!enabled) return;
@@ -6650,6 +7759,7 @@ pub fn attach_tab_handlers(
             let cb_identity = callbacks.on_account_identity.clone();
             let cb_open_new_tab = callbacks.on_open_new_tab.clone();
             let cb_jev = callbacks.on_jev_message.clone();
+            let cb_af = callbacks.on_account_filter_message.clone();
             let expected_token = bridge_token;
             let home_url_for_msg = instance_home_url;
             let rate_state = std::sync::Mutex::new((std::time::Instant::now(), 0u32));
@@ -6663,14 +7773,14 @@ pub fn attach_tab_handlers(
                         return Ok(());
                     }
 
-                    // レート制限（1秒あたり最大25メッセージ）
+                    // レート制限（1秒あたり最大60メッセージ）
                     if let Ok(mut rl) = rate_state.lock() {
                         if rl.0.elapsed() >= std::time::Duration::from_secs(1) {
                             rl.0 = std::time::Instant::now();
                             rl.1 = 1;
                         } else {
                             rl.1 = rl.1.saturating_add(1);
-                            if rl.1 > 25 {
+                            if rl.1 > 60 {
                                 return Ok(());
                             }
                         }
@@ -6773,6 +7883,9 @@ pub fn attach_tab_handlers(
                         }
                         t if t.starts_with("omnisns:jev-") => {
                             cb_jev(msg);
+                        }
+                        t if t.starts_with("omnisns:account-filter-") => {
+                            cb_af(msg);
                         }
                         _ => {}
                     }

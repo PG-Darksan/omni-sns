@@ -12,6 +12,8 @@ class SettingsScreen extends StatefulWidget {
     this.activeServiceName,
     this.activeDesktopMode,
     this.onToggleDesktopMode,
+    this.accountFilterSummary,
+    this.onOpenAccountFilterSettings,
     this.jevSummary,
     this.onOpenJevSettings,
   });
@@ -22,6 +24,8 @@ class SettingsScreen extends StatefulWidget {
   final String? activeServiceName;
   final bool? activeDesktopMode;
   final Future<void> Function(bool desktopMode)? onToggleDesktopMode;
+  final String? accountFilterSummary;
+  final Future<void> Function()? onOpenAccountFilterSettings;
   final String? jevSummary;
   final Future<void> Function()? onOpenJevSettings;
 
@@ -88,6 +92,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onChanged: (v) async {
                 setState(() => _desktopMode = v);
                 await widget.onToggleDesktopMode!(v);
+              },
+            ),
+          ],
+          if (widget.onOpenAccountFilterSettings != null) ...[
+            const Divider(),
+            ListTile(
+              title: const Text('アカウント条件フィルタ（F / FW）'),
+              subtitle: Text(
+                widget.accountFilterSummary ??
+                    'フォロー数・フォロワー数・フォロー多めで絞り込み（無料）',
+              ),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () async {
+                await widget.onOpenAccountFilterSettings!();
               },
             ),
           ],

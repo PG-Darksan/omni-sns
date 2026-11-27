@@ -135,6 +135,77 @@ fn default_follow_window_hours() -> u32 {
     DEFAULT_FOLLOW_WINDOW_HOURS
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AccountFilterSettings {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_following: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_following: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_followers: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_followers: Option<u32>,
+    pub following_greater_than_followers: bool,
+}
+
+impl AccountFilterSettings {
+    pub fn has_any_condition(&self) -> bool {
+        self.min_following.is_some()
+            || self.max_following.is_some()
+            || self.min_followers.is_some()
+            || self.max_followers.is_some()
+            || self.following_greater_than_followers
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.has_any_condition()
+    }
+
+    pub fn sanitized(mut self) -> Self {
+        const MAX_COUNT: u32 = 1_000_000_000;
+        self.min_following = self.min_following.map(|v| v.min(MAX_COUNT));
+        self.max_following = self.max_following.map(|v| v.min(MAX_COUNT));
+        self.min_followers = self.min_followers.map(|v| v.min(MAX_COUNT));
+        self.max_followers = self.max_followers.map(|v| v.min(MAX_COUNT));
+        if let (Some(lo), Some(hi)) = (self.min_following, self.max_following) {
+            if lo > hi {
+                self.min_following = Some(hi);
+                self.max_following = Some(lo);
+            }
+        }
+        if let (Some(lo), Some(hi)) = (self.min_followers, self.max_followers) {
+            if lo > hi {
+                self.min_followers = Some(hi);
+                self.max_followers = Some(lo);
+            }
+        }
+        self
+    }
+
+    pub fn to_js_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.is_active(),
+            "minFollowing": self.min_following,
+            "maxFollowing": self.max_following,
+            "minFollowers": self.min_followers,
+            "maxFollowers": self.max_followers,
+            "followingGreaterThanFollowers": self.following_greater_than_followers,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AccountFilterLiveState {
+    pub active: bool,
+    pub matched: u32,
+    pub hidden: u32,
+    pub pending: u32,
+    pub auto_fetching: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -154,6 +225,8 @@ pub struct AppSettings {
     pub gesture: GestureSettings,
     #[serde(default)]
     pub follow_sync: FollowSyncSettings,
+    #[serde(default)]
+    pub account_filter: AccountFilterSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,6 +316,7 @@ pub struct UpdateSettingsPatch {
     pub follow_window_hours: Option<u32>,
     pub catalog_order: Option<Vec<String>>,
     pub gesture: Option<GestureSettings>,
+    pub account_filter: Option<AccountFilterSettings>,
 }
 
 fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -265,6 +339,7 @@ pub struct BootstrapPayload {
     pub gmail_open: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gmail_runtime: Option<BrowserTabInfo>,
+    pub account_filter_live: AccountFilterLiveState,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -276,6 +351,7 @@ pub struct StateUpdatedPayload {
     pub gmail_open: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gmail_runtime: Option<BrowserTabInfo>,
+    pub account_filter_live: AccountFilterLiveState,
 }
 
 #[derive(Debug, Clone, Serialize)]

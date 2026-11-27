@@ -14,7 +14,8 @@ use tauri::{
 use crate::follow_sync::{FollowSyncSettings, UpdateFollowSyncPatch};
 use crate::gesture::{step_tab_index, GestureSettings};
 use crate::models::{
-    BrowserTabInfo, SavedSubTab, ServiceInstance, TabRuntimeState, UpdateSettingsPatch,
+    AccountFilterLiveState, BrowserTabInfo, SavedSubTab, ServiceInstance, TabRuntimeState,
+    UpdateSettingsPatch,
 };
 use crate::store::ConfigStore;
 use crate::url_utils::{
@@ -271,6 +272,7 @@ pub struct AppStateInner {
     pub bounds_persist_gen: Arc<AtomicU64>,
     pub bounds_persist_worker_running: Arc<AtomicBool>,
     pub jev: crate::jev::JevService,
+    pub account_filter_live_by_tab: HashMap<String, AccountFilterLiveState>,
     #[cfg(windows)]
     pub gesture_host: Option<crate::gesture_win::GestureWinHost>,
 }
@@ -334,6 +336,7 @@ impl SharedState {
                 bounds_persist_gen: Arc::new(AtomicU64::new(0)),
                 bounds_persist_worker_running: Arc::new(AtomicBool::new(false)),
                 jev,
+                account_filter_live_by_tab: HashMap::new(),
                 #[cfg(windows)]
                 gesture_host: None,
             })),
@@ -529,6 +532,117 @@ pub fn update_window_title(app: &AppHandle, shared: &SharedState) {
     }
 }
 
+pub fn active_account_filter_live_inner(guard: &AppStateInner) -> AccountFilterLiveState {
+    if guard.gmail_open {
+        return AccountFilterLiveState::default();
+    }
+    guard
+        .active_instance_id
+        .as_deref()
+        .and_then(|id| guard.services.get(id))
+        .and_then(|s| guard.account_filter_live_by_tab.get(&s.active_tab_id))
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub fn emit_account_filter_updated(app: &AppHandle, shared: &SharedState) {
+    let live = {
+        let guard = shared.inner.lock().unwrap();
+        active_account_filter_live_inner(&guard)
+    };
+    let _ = app.emit_to(
+        EventTarget::webview("shell"),
+        "app:account-filter-updated",
+        live,
+    );
+}
+
+pub fn push_account_filter_to_webview(app: &AppHandle, shared: &SharedState, label: &str) {
+    let payload = {
+        let guard = shared.inner.lock().unwrap();
+        guard.store.get_settings().account_filter.to_js_payload()
+    };
+    if let Some(wv) = app.get_webview(label) {
+        let js = format!(
+            "window.__omniAccountFilterApplyConfig && window.__omniAccountFilterApplyConfig({payload});"
+        );
+        let _ = wv.eval(&js);
+    }
+}
+
+pub fn sync_account_filter_to_all_tabs(app: &AppHandle, shared: &SharedState) {
+    let (labels, payload) = {
+        let mut guard = shared.inner.lock().unwrap();
+        let af = guard.store.get_settings().account_filter;
+        if !af.is_active() {
+            guard.account_filter_live_by_tab.clear();
+        }
+        let labels: Vec<String> = guard
+            .services
+            .values()
+            .flat_map(|s| s.tabs.iter())
+            .filter_map(|t| t.webview_label.clone())
+            .collect();
+        (labels, af.to_js_payload())
+    };
+    let js = format!(
+        "window.__omniAccountFilterApplyConfig && window.__omniAccountFilterApplyConfig({payload});"
+    );
+    for label in labels {
+        if let Some(wv) = app.get_webview(&label) {
+            let _ = wv.eval(&js);
+        }
+    }
+    emit_account_filter_updated(app, shared);
+}
+
+fn handle_account_filter_message_from_tab(
+    app: &AppHandle,
+    shared: &SharedState,
+    tab_id: &str,
+    wv_label: &str,
+    raw_msg: &str,
+) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_msg) else {
+        return;
+    };
+    let msg_type = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    match msg_type {
+        "omnisns:account-filter-get-config" => {
+            push_account_filter_to_webview(app, shared, wv_label);
+        }
+        "omnisns:account-filter-state" => {
+            let active = v.get("active").and_then(|x| x.as_bool()).unwrap_or(false);
+            let matched = v.get("matched").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let hidden = v.get("hidden").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let pending = v.get("pending").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let auto_fetching = v
+                .get("autoFetching")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            {
+                let mut guard = shared.inner.lock().unwrap();
+                if active {
+                    guard.account_filter_live_by_tab.insert(
+                        tab_id.to_string(),
+                        AccountFilterLiveState {
+                            active,
+                            matched,
+                            hidden,
+                            pending,
+                            auto_fetching,
+                        },
+                    );
+                } else {
+                    guard.account_filter_live_by_tab.remove(tab_id);
+                }
+            }
+            emit_account_filter_updated(app, shared);
+        }
+        _ => {}
+    }
+}
+
 pub fn emit_state_updated(app: &AppHandle, shared: &SharedState) {
     let payload = {
         let guard = shared.inner.lock().unwrap();
@@ -538,11 +652,13 @@ pub fn emit_state_updated(app: &AppHandle, shared: &SharedState) {
             closed_tabs_count: guard.closed_tabs.len(),
             gmail_open: guard.gmail_open,
             gmail_runtime: guard.gmail_tab.as_ref().map(|t| t.to_info()),
+            account_filter_live: active_account_filter_live_inner(&guard),
         }
     };
 
     let _ = app.emit_to(EventTarget::webview("shell"), "app:state-updated", payload);
     emit_jev_updated(app, shared);
+    emit_account_filter_updated(app, shared);
     update_window_title(app, shared);
 }
 
@@ -2643,6 +2759,11 @@ fn attach_windows_handlers(
     let tid_jev = tid.clone();
     let label_jev = wv_label.clone();
 
+    let app_af = app.clone();
+    let shared_af = shared.clone();
+    let tid_af = tid.clone();
+    let label_af = wv_label.clone();
+
     let callbacks = crate::platform_win::TabWebviewCallbacks {
         on_navigation_starting: Arc::new(move || {
             let (changed, needs_refresh, schedule_warm_end) = {
@@ -3025,6 +3146,9 @@ fn attach_windows_handlers(
         }),
         on_jev_message: Arc::new(move |raw_msg| {
             handle_jev_message_from_tab(&app_jev, &shared_jev, &tid_jev, &label_jev, &raw_msg);
+        }),
+        on_account_filter_message: Arc::new(move |raw_msg| {
+            handle_account_filter_message_from_tab(&app_af, &shared_af, &tid_af, &label_af, &raw_msg);
         }),
     };
 
@@ -3663,6 +3787,7 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
                 }
             }),
             on_jev_message: Arc::new(move |_| {}),
+            on_account_filter_message: Arc::new(move |_| {}),
         };
 
         let _ = webview.with_webview(move |platform_wv| {

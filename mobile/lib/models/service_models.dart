@@ -744,6 +744,151 @@ class ArchivedInstance {
   }
 }
 
+/// アカウント条件フィルタ設定（フォロー数・フォロワー数・フォロー多め絞り込み）。
+class AccountFilterSettings {
+  const AccountFilterSettings({
+    this.enabled = false,
+    this.minFollowing,
+    this.maxFollowing,
+    this.minFollowers,
+    this.maxFollowers,
+    this.followingGreaterThanFollowers = false,
+  });
+
+  static const int maxBound = 1000000000;
+
+  final bool enabled;
+  final int? minFollowing;
+  final int? maxFollowing;
+  final int? minFollowers;
+  final int? maxFollowers;
+  final bool followingGreaterThanFollowers;
+
+  bool get hasAnyCondition =>
+      minFollowing != null ||
+      maxFollowing != null ||
+      minFollowers != null ||
+      maxFollowers != null ||
+      followingGreaterThanFollowers;
+
+  bool get isActive => enabled && hasAnyCondition;
+
+  AccountFilterSettings sanitized() {
+    var minF = minFollowing?.clamp(0, maxBound);
+    var maxF = maxFollowing?.clamp(0, maxBound);
+    if (minF != null && maxF != null && minF > maxF) {
+      final t = minF;
+      minF = maxF;
+      maxF = t;
+    }
+    var minFw = minFollowers?.clamp(0, maxBound);
+    var maxFw = maxFollowers?.clamp(0, maxBound);
+    if (minFw != null && maxFw != null && minFw > maxFw) {
+      final t = minFw;
+      minFw = maxFw;
+      maxFw = t;
+    }
+    final hasAny = minF != null ||
+        maxF != null ||
+        minFw != null ||
+        maxFw != null ||
+        followingGreaterThanFollowers;
+    return AccountFilterSettings(
+      enabled: enabled && hasAny,
+      minFollowing: minF,
+      maxFollowing: maxF,
+      minFollowers: minFw,
+      maxFollowers: maxFw,
+      followingGreaterThanFollowers: followingGreaterThanFollowers,
+    );
+  }
+
+  String get summaryLabel {
+    final parts = <String>[];
+    if (minFollowing != null && maxFollowing != null) {
+      parts.add('F $minFollowing〜$maxFollowing');
+    } else if (minFollowing != null) {
+      parts.add('F $minFollowing以上');
+    } else if (maxFollowing != null) {
+      parts.add('F $maxFollowing以下');
+    }
+    if (minFollowers != null && maxFollowers != null) {
+      parts.add('FW $minFollowers〜$maxFollowers');
+    } else if (minFollowers != null) {
+      parts.add('FW $minFollowers以上');
+    } else if (maxFollowers != null) {
+      parts.add('FW $maxFollowers以下');
+    }
+    if (followingGreaterThanFollowers) {
+      parts.add('F>FW');
+    }
+    return parts.join(' · ');
+  }
+
+  AccountFilterSettings copyWith({
+    bool? enabled,
+    int? minFollowing,
+    bool clearMinFollowing = false,
+    int? maxFollowing,
+    bool clearMaxFollowing = false,
+    int? minFollowers,
+    bool clearMinFollowers = false,
+    int? maxFollowers,
+    bool clearMaxFollowers = false,
+    bool? followingGreaterThanFollowers,
+  }) {
+    return AccountFilterSettings(
+      enabled: enabled ?? this.enabled,
+      minFollowing:
+          clearMinFollowing ? null : (minFollowing ?? this.minFollowing),
+      maxFollowing:
+          clearMaxFollowing ? null : (maxFollowing ?? this.maxFollowing),
+      minFollowers:
+          clearMinFollowers ? null : (minFollowers ?? this.minFollowers),
+      maxFollowers:
+          clearMaxFollowers ? null : (maxFollowers ?? this.maxFollowers),
+      followingGreaterThanFollowers:
+          followingGreaterThanFollowers ?? this.followingGreaterThanFollowers,
+    );
+  }
+
+  Map<String, dynamic> toJsConfig() {
+    final s = sanitized();
+    return {
+      'enabled': s.isActive,
+      'minFollowing': s.minFollowing,
+      'maxFollowing': s.maxFollowing,
+      'minFollowers': s.minFollowers,
+      'maxFollowers': s.maxFollowers,
+      'followingGreaterThanFollowers': s.followingGreaterThanFollowers,
+    };
+  }
+
+  Map<String, dynamic> toJson() {
+    final s = sanitized();
+    return {
+      'enabled': s.enabled,
+      if (s.minFollowing != null) 'minFollowing': s.minFollowing,
+      if (s.maxFollowing != null) 'maxFollowing': s.maxFollowing,
+      if (s.minFollowers != null) 'minFollowers': s.minFollowers,
+      if (s.maxFollowers != null) 'maxFollowers': s.maxFollowers,
+      'followingGreaterThanFollowers': s.followingGreaterThanFollowers,
+    };
+  }
+
+  factory AccountFilterSettings.fromJson(Map<String, dynamic> json) {
+    return AccountFilterSettings(
+      enabled: json['enabled'] as bool? ?? false,
+      minFollowing: _clampNonNegInt(json['minFollowing'], maxBound),
+      maxFollowing: _clampNonNegInt(json['maxFollowing'], maxBound),
+      minFollowers: _clampNonNegInt(json['minFollowers'], maxBound),
+      maxFollowers: _clampNonNegInt(json['maxFollowers'], maxBound),
+      followingGreaterThanFollowers:
+          json['followingGreaterThanFollowers'] as bool? ?? false,
+    ).sanitized();
+  }
+}
+
 class AppSettings {
   const AppSettings({
     this.isDarkMode = true,
@@ -753,6 +898,7 @@ class AppSettings {
     this.followWindowHours = defaultFollowWindowHours,
     this.catalogOrder = const [],
     this.gesture = const MobileGestureSettings(),
+    this.accountFilter = const AccountFilterSettings(),
   });
 
   final bool isDarkMode;
@@ -762,6 +908,7 @@ class AppSettings {
   final int followWindowHours;
   final List<String> catalogOrder;
   final MobileGestureSettings gesture;
+  final AccountFilterSettings accountFilter;
 
   AppSettings copyWith({
     bool? isDarkMode,
@@ -772,6 +919,7 @@ class AppSettings {
     int? followWindowHours,
     List<String>? catalogOrder,
     MobileGestureSettings? gesture,
+    AccountFilterSettings? accountFilter,
   }) {
     return AppSettings(
       isDarkMode: isDarkMode ?? this.isDarkMode,
@@ -784,6 +932,7 @@ class AppSettings {
           .clamp(minFollowWindowHours, maxFollowWindowHours),
       catalogOrder: catalogOrder ?? this.catalogOrder,
       gesture: gesture ?? this.gesture,
+      accountFilter: (accountFilter ?? this.accountFilter).sanitized(),
     );
   }
 
@@ -796,11 +945,13 @@ class AppSettings {
       'followWindowHours': followWindowHours,
       if (catalogOrder.isNotEmpty) 'catalogOrder': catalogOrder,
       'gesture': gesture.toJson(),
+      'accountFilter': accountFilter.toJson(),
     };
   }
 
   factory AppSettings.fromJson(Map<String, dynamic> json) {
     final rawGesture = json['gesture'];
+    final rawAccountFilter = json['accountFilter'];
     final rawHours = (json['followWindowHours'] as num?)?.toInt();
     final rawCatalogOrder = json['catalogOrder'];
     return AppSettings(
@@ -816,6 +967,9 @@ class AppSettings {
       gesture: rawGesture is Map<String, dynamic>
           ? MobileGestureSettings.fromJson(rawGesture)
           : const MobileGestureSettings(),
+      accountFilter: rawAccountFilter is Map<String, dynamic>
+          ? AccountFilterSettings.fromJson(rawAccountFilter)
+          : const AccountFilterSettings(),
     );
   }
 }

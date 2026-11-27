@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
+  AccountFilterLiveState,
   AddInstancePayload,
   AppConfig,
   AppSettings,
@@ -26,6 +27,7 @@ export interface BootstrapPayload {
   closedTabsCount: number;
   gmailOpen: boolean;
   gmailRuntime?: BrowserTabInfo | null;
+  accountFilterLive?: AccountFilterLiveState;
 }
 
 export interface StateUpdatedPayload {
@@ -34,6 +36,7 @@ export interface StateUpdatedPayload {
   closedTabsCount: number;
   gmailOpen: boolean;
   gmailRuntime?: BrowserTabInfo | null;
+  accountFilterLive?: AccountFilterLiveState;
 }
 
 export interface ShortcutEventPayload {
@@ -91,6 +94,7 @@ export interface OmniApi {
   onStateUpdated: (listener: (payload: StateUpdatedPayload) => void) => () => void;
   onRuntimeUpdated: (listener: (state: TabRuntimeState) => void) => () => void;
   onJevUpdated: (listener: (snapshot: JevStateSnapshot) => void) => () => void;
+  onAccountFilterUpdated: (listener: (live: AccountFilterLiveState) => void) => () => void;
   onShortcut: (listener: (payload: ShortcutEventPayload) => void) => () => void;
 }
 
@@ -178,5 +182,7 @@ export const omniApi: OmniApi = {
   onStateUpdated: (listener) => subscribe<StateUpdatedPayload>('app:state-updated', listener),
   onRuntimeUpdated: (listener) => subscribe<TabRuntimeState>('tab:runtime-updated', listener),
   onJevUpdated: (listener) => subscribe<JevStateSnapshot>('app:jev-updated', listener),
+  onAccountFilterUpdated: (listener) =>
+    subscribe<AccountFilterLiveState>('app:account-filter-updated', listener),
   onShortcut: (listener) => subscribe<ShortcutEventPayload>('app:shortcut', listener)
 };

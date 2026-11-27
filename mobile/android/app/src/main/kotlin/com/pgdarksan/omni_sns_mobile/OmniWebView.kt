@@ -187,6 +187,8 @@ private class OmniFollowBridge(
     private val onJevGetConfigCb: () -> Unit,
     private val onJevCheckAccountsCb: (String, String) -> Unit,
     private val onJevStateCb: (Boolean, Int, Int, Boolean) -> Unit,
+    private val onAccountFilterGetConfigCb: () -> Unit,
+    private val onAccountFilterStateCb: (Boolean, Int, Int, Int, Boolean) -> Unit,
 ) {
     @JavascriptInterface
     fun onFollowDetected(token: String?, source: String?, service: String?) {
@@ -247,6 +249,25 @@ private class OmniFollowBridge(
     fun onJevState(token: String?, active: Boolean, matched: Int, hidden: Int, autoFetching: Boolean) {
         if (token != expectedToken) return
         onJevStateCb(active, matched, hidden, autoFetching)
+    }
+
+    @JavascriptInterface
+    fun onAccountFilterGetConfig(token: String?) {
+        if (token != expectedToken) return
+        onAccountFilterGetConfigCb()
+    }
+
+    @JavascriptInterface
+    fun onAccountFilterState(
+        token: String?,
+        active: Boolean,
+        matched: Int,
+        hidden: Int,
+        pending: Int,
+        autoFetching: Boolean,
+    ) {
+        if (token != expectedToken) return
+        onAccountFilterStateCb(active, matched, hidden, pending, autoFetching)
     }
 }
 
@@ -588,830 +609,1102 @@ class OmniWebViewManager(
          * fetch / XMLHttpRequest のAPI成功を優先検知し、DOMボタン状態遷移をフォールバックとする。
          */
         val FOLLOW_TRACKER_JS: String = """
-            (function() {
-              if (window !== window.top) return;
-              if (window.__omniFollowTrackerInstalled) return;
-              window.__omniFollowTrackerInstalled = true;
-              var __omniFollowToken = "__OMNISNS_FOLLOW_TOKEN__";
-              var __omniFollowChannel = window.OmniFollowChannel;
-              var __omniFollowBridge = window.OmniFollowBridge;
+(function() {
+  if (window !== window.top) return;
+  if (window.__omniFollowTrackerInstalled) return;
+  window.__omniFollowTrackerInstalled = true;
 
-              var NEGATIVE_FOLLOW_RE = /(フォロー中|フォロー済|フォロー解除|フォローをやめる|フォローを外す|フォロワー|リクエスト済|リクエスト中|承認待ち|解除|following|unfollow|followers|requested|pending|remove|cancel|block|mute)/i;
-              var EXACT_FOLLOW_TEXT_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォローを返す|follow|follow\s+back)$/i;
-              var ARIA_FOLLOW_RE = /^(?:(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|follow|follow\s+back)|.+?(?:をフォロー|をフォローする|をフォローバック)|follow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
-              var POST_FOLLOW_STATE_RE = /(フォロー中|フォロー済|フォロー解除|リクエスト済|リクエスト中|承認待ち|following|unfollow|requested|pending|チェック|check)/i;
+  var __omniFollowToken = "__OMNISNS_FOLLOW_TOKEN__";
+  var __omniFollowChannel = window.OmniFollowChannel;
+  var __omniFollowBridge = window.OmniFollowBridge;
 
-              var EXACT_UNFOLLOW_TEXT_RE = /^(?:フォロー中|フォロー済|フォロー済み|フォロー解除|フォローを解除|フォローをやめる|フォローを外す|リクエスト済|リクエスト済み|リクエスト中|承認待ち|following|unfollow|requested)$/i;
-              var CONFIRM_UNFOLLOW_TEXT_RE = /^(?:フォロー解除|フォローを解除|フォローをやめる|フォローを外す|unfollow)$/i;
-              var ARIA_UNFOLLOW_RE = /^(?:(?:フォロー中|フォロー解除|フォローをやめる|following|unfollow)|.+?(?:のフォローを解除|のフォローをやめる|をアンフォロー)|unfollow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
-              var NON_UNFOLLOW_RE = /(フォロワー|followers|ブロック|block|ミュート|mute|報告|report|削除|remove\s+follower)/i;
-              var FOLLOWING_STATE_BTN_RE = /^(?:フォロー中|フォロー済|フォロー済み|相互フォロー|友達|リクエスト済|リクエスト済み|リクエスト中|承認待ち|following|friends|mutual|requested)$/i;
-              var EXACT_BLOCK_CONFIRM_RE = /^(?:ブロック|ブロックする|ブロックを実行|block|block\s+user|block\s+account)$/i;
-              var NON_BLOCK_RE = /(ブロック解除|ブロックを解除|ブロックリスト|ブロック中|unblock|blocked\s+accounts|blocked\s+users)/i;
+  var NEGATIVE_FOLLOW_RE = /(フォロー中|フォロー済|フォロー解除|フォローをやめる|フォローを外す|フォロワー|リクエスト済|リクエスト中|承認待ち|解除|following|unfollow|followers|requested|pending|remove|cancel|block|mute)/i;
+  var EXACT_FOLLOW_TEXT_RE = /^(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|フォローバックする|フォローを返す|follow|follow\s+back)$/i;
+  var ARIA_FOLLOW_RE = /^(?:(?:[+＋]\s*)?(?:フォロー|フォローする|フォローバック|follow|follow\s+back)|.+?(?:をフォロー|をフォローする|をフォローバック)|follow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
+  var POST_FOLLOW_STATE_RE = /(フォロー中|フォロー済|フォロー解除|リクエスト済|リクエスト中|承認待ち|following|unfollow|requested|pending|チェック|check)/i;
 
-              function makeChannelState() {
-                return {
-                  lastNetworkStartAt: 0,
-                  lastNetworkAt: 0,
-                  lastDomEmitAt: 0,
-                  lastAnyEmitAt: 0,
-                  inFlight: 0,
-                  recentTargetKeys: Object.create(null),
-                  emittedInteractions: Object.create(null)
-                };
+  var EXACT_UNFOLLOW_TEXT_RE = /^(?:フォロー中|フォロー済|フォロー済み|フォロー解除|フォローを解除|フォローをやめる|フォローを外す|リクエスト済|リクエスト済み|リクエスト中|承認待ち|following|unfollow|requested)$/i;
+  var CONFIRM_UNFOLLOW_TEXT_RE = /^(?:フォロー解除|フォローを解除|フォローをやめる|フォローを外す|unfollow)$/i;
+  var ARIA_UNFOLLOW_RE = /^(?:(?:フォロー中|フォロー解除|フォローをやめる|following|unfollow)|.+?(?:のフォローを解除|のフォローをやめる|をアンフォロー)|unfollow\s+@?[\w.\-\u3040-\u30ff\u4e00-\u9faf]+.*)$/i;
+  var NON_UNFOLLOW_RE = /(フォロワー|followers|ブロック|block|ミュート|mute|報告|report|削除|remove\s+follower)/i;
+  var FOLLOWING_STATE_BTN_RE = /^(?:フォロー中|フォロー済|フォロー済み|相互フォロー|友達|リクエスト済|リクエスト済み|リクエスト中|承認待ち|following|friends|mutual|requested)$/i;
+  var EXACT_BLOCK_CONFIRM_RE = /^(?:ブロック|ブロックする|ブロックを実行|block|block\s+user|block\s+account)$/i;
+  var NON_BLOCK_RE = /(ブロック解除|ブロックを解除|ブロックリスト|ブロック中|unblock|blocked\s+accounts|blocked\s+users)/i;
+
+  function makeChannelState() {
+    return {
+      lastNetworkStartAt: 0,
+      lastNetworkAt: 0,
+      lastDomEmitAt: 0,
+      lastDomTargetKey: '',
+      lastAnyEmitAt: 0,
+      inFlight: 0,
+      inFlightTargets: Object.create(null),
+      interactionNetworkStarted: Object.create(null),
+      recentTargetKeys: Object.create(null),
+      emittedInteractions: Object.create(null)
+    };
+  }
+  var states = {
+    follow: makeChannelState(),
+    unfollow: makeChannelState(),
+    block: makeChannelState()
+  };
+
+  var userInteractionSeq = 0;
+  var lastUserInteractionAt = 0;
+  var lastPointerDownAt = 0;
+  var lastClickedTargetHandle = '';
+  var lastClickedTargetAt = 0;
+  var lastBlockFollowContext = { handle: '', isFollowing: null, ts: 0 };
+  var pendingAsyncAtproto = 0;
+  var lastAsyncAtprotoAt = 0;
+
+  function bumpUserInteraction(fromPointerDown) {
+    var now = Date.now();
+    if (fromPointerDown) {
+      userInteractionSeq++;
+      lastPointerDownAt = now;
+      lastUserInteractionAt = now;
+    } else if (now - lastPointerDownAt > 500) {
+      userInteractionSeq++;
+      lastUserInteractionAt = now;
+    } else {
+      lastUserInteractionAt = now;
+    }
+  }
+
+  document.addEventListener('pointerdown', function(e) {
+    if (e && (e.isTrusted === false || (typeof e.button === 'number' && e.button !== 0))) return;
+    bumpUserInteraction(true);
+  }, true);
+
+  document.addEventListener('keydown', function(e) {
+    if (e && e.isTrusted !== false && (e.key === 'Enter' || e.key === ' ')) {
+      bumpUserInteraction(true);
+    }
+  }, true);
+
+  function currentInteractionId() {
+    var now = Date.now();
+    if (userInteractionSeq > 0 && now - lastUserInteractionAt <= 3000) {
+      return userInteractionSeq;
+    }
+    return 0;
+  }
+
+  function detectCurrentService() {
+    try {
+      var h = (window.location && window.location.hostname ? window.location.hostname : '').toLowerCase();
+      if (h === 'instagram.com' || h.slice(-14) === '.instagram.com') return 'instagram';
+      if (h === 'threads.net' || h.slice(-12) === '.threads.net' || h === 'threads.com' || h.slice(-12) === '.threads.com') return 'threads';
+      if (h === 'bsky.app' || h.slice(-9) === '.bsky.app') return 'bluesky';
+      if (h === 'mixi.social' || h.slice(-12) === '.mixi.social') return 'mixi2';
+      if (h === 'x.com' || h.slice(-6) === '.x.com' || h === 'twitter.com' || h.slice(-12) === '.twitter.com') return 'x';
+      if (h === 'tiktok.com' || h.slice(-11) === '.tiktok.com') return 'tiktok';
+      if (h === 'facebook.com' || h.slice(-13) === '.facebook.com') return 'facebook';
+    } catch (_) {}
+    return '';
+  }
+
+  function canonicalizeTargetKey(rawKey, fallbackHandle) {
+    try {
+      if (typeof window.__omniCanonicalTargetKey === 'function') {
+        var c = window.__omniCanonicalTargetKey(rawKey || '', fallbackHandle || '');
+        if (c) return String(c).trim().toLowerCase();
+      }
+    } catch (_) {}
+    var k = String(rawKey || '').trim().toLowerCase();
+    if (k) return k;
+    return String(fallbackHandle || '').trim().toLowerCase();
+  }
+
+  function pruneOldMap(map, now, maxAgeMs) {
+    for (var k in map) {
+      var v = map[k];
+      var ts = typeof v === 'number' ? v : (v && v.ts ? v.ts : 0);
+      if (now - ts > maxAgeMs) delete map[k];
+    }
+  }
+
+  function markInteractionEmitted(st, interactionId, cKey, source, now) {
+    if (!interactionId || interactionId <= 0) return;
+    var rec = st.emittedInteractions[interactionId];
+    if (!rec || typeof rec !== 'object') {
+      rec = { ts: now, keys: Object.create(null), anyUntargeted: false, source: source };
+      st.emittedInteractions[interactionId] = rec;
+    } else {
+      rec.ts = now;
+    }
+    if (cKey) rec.keys[cKey] = true;
+    else rec.anyUntargeted = true;
+  }
+
+  function emitRelation(action, source, targetKey, interactionId) {
+    var st = states[action];
+    if (!st) return;
+    var now = Date.now();
+    var cKey = canonicalizeTargetKey(targetKey, '');
+    pruneOldMap(st.emittedInteractions, now, 15000);
+    pruneOldMap(st.recentTargetKeys, now, 15000);
+    pruneOldMap(st.interactionNetworkStarted, now, 15000);
+
+    if (cKey && st.recentTargetKeys[cKey] && now - st.recentTargetKeys[cKey] < 4500) {
+      if (source === 'network') st.lastNetworkAt = now;
+      return;
+    }
+
+    if (interactionId && interactionId > 0) {
+      var irec = st.emittedInteractions[interactionId];
+      if (irec) {
+        if (source === 'network') {
+          var alreadySameKey = !!(cKey && irec.keys && irec.keys[cKey]);
+          var alreadyUntargetedOrDom = !cKey || irec.anyUntargeted || (irec.source === 'dom' && (!cKey || !st.lastDomTargetKey || st.lastDomTargetKey === cKey));
+          if (alreadySameKey || alreadyUntargetedOrDom) {
+            st.lastNetworkAt = now;
+            if (cKey) st.recentTargetKeys[cKey] = now;
+            return;
+          }
+        } else {
+          return;
+        }
+      }
+    }
+
+    if (source === 'network') {
+      if (now - st.lastDomEmitAt < 2500 && (!cKey || !st.lastDomTargetKey || st.lastDomTargetKey === cKey)) {
+        st.lastNetworkAt = now;
+        if (cKey) st.recentTargetKeys[cKey] = now;
+        markInteractionEmitted(st, interactionId, cKey, source, now);
+        return;
+      }
+      if (!cKey && now - st.lastAnyEmitAt < 1200) {
+        st.lastNetworkAt = now;
+        return;
+      }
+      st.lastNetworkAt = now;
+      st.lastAnyEmitAt = now;
+      if (cKey) st.recentTargetKeys[cKey] = now;
+      markInteractionEmitted(st, interactionId, cKey, source, now);
+    } else {
+      if (!cKey && now - st.lastAnyEmitAt < 2500) return;
+      st.lastDomEmitAt = now;
+      st.lastDomTargetKey = cKey;
+      st.lastAnyEmitAt = now;
+      if (cKey) st.recentTargetKeys[cKey] = now;
+      markInteractionEmitted(st, interactionId, cKey, source, now);
+    }
+
+    // 同一ユーザーへのフォロー⇔解除の連続トグルを正確に計測するため、逆アクションの重複抑制を解除する
+    if (cKey) {
+      var opp = action === 'follow' ? states.unfollow : (action === 'unfollow' ? states.follow : null);
+      if (opp) delete opp.recentTargetKeys[cKey];
+    }
+
+    try {
+      if (typeof window.__omniOnFollowAction === 'function') {
+        var fallbackHandle = (!cKey && lastClickedTargetHandle && now - lastClickedTargetAt <= 5000)
+          ? lastClickedTargetHandle
+          : '';
+        window.__omniOnFollowAction(action, cKey || targetKey || '', fallbackHandle);
+      }
+    } catch (_) {}
+    try {
+      var svc = detectCurrentService();
+      var ch = __omniFollowChannel || window.OmniFollowChannel;
+      if (ch && typeof ch.postMessage === 'function') {
+        ch.postMessage(JSON.stringify({
+          token: __omniFollowToken,
+          type: action === 'unfollow' ? 'unfollow' : 'follow',
+          source: source || 'auto',
+          service: svc
+        }));
+      } else {
+        var br = __omniFollowBridge || window.OmniFollowBridge;
+        if (br) {
+          if (action === 'unfollow' && typeof br.onUnfollowDetected === 'function') {
+            br.onUnfollowDetected(__omniFollowToken, source || 'auto', svc);
+          } else if (action === 'follow' && typeof br.onFollowDetected === 'function') {
+            br.onFollowDetected(__omniFollowToken, source || 'auto', svc);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  function extractFetchUrl(input) {
+    try {
+      if (typeof input === 'string') return input;
+      if (!input) return '';
+      if (typeof URL !== 'undefined' && input instanceof URL) return input.href || String(input);
+      if (typeof input === 'object') {
+        if (typeof input.url === 'string' && input.url) return input.url;
+        if (typeof input.href === 'string' && input.href) return input.href;
+        if (typeof input.toString === 'function') {
+          var s = String(input);
+          if (s && s !== '[object Object]' && s !== '[object Request]') return s;
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function decodeBytesToString(bytes) {
+    try {
+      var slice = bytes.length > 16384 ? bytes.subarray(0, 16384) : bytes;
+      if (typeof TextDecoder === 'function') {
+        return new TextDecoder('utf-8').decode(slice);
+      }
+      var out = '';
+      for (var i = 0; i < slice.length; i++) out += String.fromCharCode(slice[i]);
+      return out;
+    } catch (_) {}
+    return '';
+  }
+
+  function bodyToSearchString(body) {
+    if (!body) return '';
+    try {
+      if (typeof body === 'string') return body.slice(0, 16384);
+      if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+        return body.toString().slice(0, 16384);
+      }
+      if (typeof ArrayBuffer !== 'undefined') {
+        if (body instanceof ArrayBuffer) {
+          return decodeBytesToString(new Uint8Array(body));
+        }
+        if (typeof ArrayBuffer.isView === 'function' && ArrayBuffer.isView(body)) {
+          return decodeBytesToString(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+        }
+      }
+      if (typeof FormData !== 'undefined' && body instanceof FormData) {
+        var parts = [];
+        body.forEach(function(v, k) {
+          if (typeof v === 'string') parts.push(k + '=' + v.slice(0, 256));
+        });
+        return parts.join('&').slice(0, 16384);
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function isCandidateAsyncBodyUrl(rawUrl) {
+    var u = String(rawUrl || '').toLowerCase();
+    return u.indexOf('com.atproto.repo.') >= 0 ||
+           u.indexOf('/graphql') >= 0 ||
+           u.indexOf('/friendships/') >= 0 ||
+           u.indexOf('/api/v1/accounts/') >= 0 ||
+           u.indexOf('/api/following/') >= 0 ||
+           u.indexOf('/api/blocking/') >= 0 ||
+           u.indexOf('/api/commit/follow') >= 0 ||
+           u.indexOf('/blocks/create') >= 0;
+  }
+
+  function extractTargetKey(url, decodedBody) {
+    try {
+      var m = /\/friendships\/(?:create|destroy|block)\/([^\/?#]+)/i.exec(url) ||
+              /\/web\/friendships\/([^\/?#]+)\/(?:follow|unfollow|block)/i.exec(url) ||
+              /\/api\/v1\/accounts\/([^\/?#]+)\/(?:follow|unfollow|block)/i.exec(url);
+      if (m && m[1]) return String(m[1]).trim().toLowerCase();
+
+      m = /"(?:target_user_id|targetUserId|blocked_user_id|blockedUserId|to_user_id|toUserId|target_id|subscribee_id|subject|rkey)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
+          /(?:^|&)(?:target_user_id|blocked_user_id|to_user_id|target_id)=([a-z0-9._-]+)/i.exec(decodedBody);
+      if (m && m[1]) return String(m[1]).trim().toLowerCase();
+
+      m = /"(?:user_id|profile_id|userId)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
+          /(?:^|&)user_id=([a-z0-9._-]+)/i.exec(decodedBody) ||
+          /[?&]user_id=([a-z0-9._-]+)/i.exec(url);
+      if (m && m[1]) return String(m[1]).trim().toLowerCase();
+    } catch (_) {}
+    return '';
+  }
+
+  function detectDomFollowingInScope(scope, excludeDialog) {
+    try {
+      if (!scope || !scope.querySelectorAll) return null;
+      var btns = scope.querySelectorAll('button, [role="button"]');
+      var sawUnfollowed = false;
+      for (var i = 0; i < btns.length && i < 60; i++) {
+        var b = btns[i];
+        if (b.closest && b.closest('nav, [role="navigation"]')) continue;
+        if (excludeDialog && b.closest && b.closest('[role="dialog"], [role="alertdialog"]')) continue;
+        if (isElementHidden(b)) continue;
+        var lbl = readElementLabels(b);
+        var txt = lbl.text || '';
+        if (txt && txt.length <= 24) {
+          if (FOLLOWING_STATE_BTN_RE.test(txt)) return true;
+          if (EXACT_FOLLOW_TEXT_RE.test(txt)) sawUnfollowed = true;
+        }
+      }
+      if (sawUnfollowed) return false;
+    } catch (_) {}
+    return null;
+  }
+
+  function detectProfileDomFollowingState() {
+    try {
+      var header = document.querySelector('main header, [role="main"] header, header');
+      var res = header ? detectDomFollowingInScope(header, true) : null;
+      if (res !== null) return res;
+      var main = document.querySelector('main, [role="main"]');
+      if (main) return detectDomFollowingInScope(main, true);
+    } catch (_) {}
+    return null;
+  }
+
+  function isTargetFollowedForBlock(targetKey, fallbackHandle) {
+    try {
+      var now = Date.now();
+      var fb = fallbackHandle || ((lastClickedTargetHandle && now - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '');
+      var curProfile = (typeof window.__omniResolveProfileHandle === 'function')
+        ? String(window.__omniResolveProfileHandle() || '').trim().toLowerCase()
+        : '';
+      var key = String(targetKey || '').trim().toLowerCase();
+      var targetH = fb ? String(fb).trim().toLowerCase() : (!/^\d+$/.test(key) ? key : '');
+
+      if (curProfile && (!targetH || targetH === curProfile)) {
+        var liveDom = detectProfileDomFollowingState();
+        if (liveDom !== null) return liveDom;
+      }
+      if (typeof window.__omniIsFollowingUser === 'function') {
+        var cached = window.__omniIsFollowingUser(key, fb);
+        if (typeof cached === 'boolean') return cached;
+      }
+      if (lastBlockFollowContext.isFollowing !== null &&
+          now - lastBlockFollowContext.ts <= 30000 &&
+          (!targetH || !lastBlockFollowContext.handle || lastBlockFollowContext.handle === targetH)) {
+        return lastBlockFollowContext.isFollowing;
+      }
+      if (!curProfile) {
+        var fallbackDom = detectProfileDomFollowingState();
+        if (fallbackDom === true) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function handleBlockCompleted(source, targetKey, interactionId, wasFollowing, fallbackHandle) {
+    var bst = states.block;
+    var now = Date.now();
+    if (source === 'network') {
+      bst.lastNetworkAt = now;
+    } else {
+      bst.lastDomEmitAt = now;
+    }
+    bst.lastAnyEmitAt = now;
+    if (wasFollowing) {
+      emitRelation('unfollow', source, targetKey, interactionId);
+    } else {
+      try {
+        if (typeof window.__omniOnFollowAction === 'function') {
+          window.__omniOnFollowAction('unfollow', targetKey || '', fallbackHandle || '');
+        }
+      } catch (_) {}
+    }
+  }
+
+  function detectRelationApiRequest(rawUrl, method, rawBody) {
+    try {
+      var m = (method || 'GET').toUpperCase();
+      if (m !== 'POST') return null;
+      var url = String(rawUrl || '');
+      var lowerUrl = url.toLowerCase();
+      var body = bodyToSearchString(rawBody);
+      var decodedBody = body;
+      try {
+        if (body.indexOf('%') >= 0) decodedBody = decodeURIComponent(body.replace(/\+/g, ' '));
+      } catch (_) {}
+      var lowerBody = decodedBody.toLowerCase();
+
+      if ((/\/friendships\/block(?:\/|\?|$)/i.test(lowerUrl) ||
+           /\/web\/friendships\/[^\/?#]+\/block(?:\/|\?|$)/i.test(lowerUrl)) &&
+          !/unblock/i.test(lowerUrl)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
+
+      if (/\/friendships\/destroy(?:\/|\?|$)/i.test(lowerUrl) ||
+          /\/web\/friendships\/[^\/?#]+\/unfollow(?:\/|\?|$)/i.test(lowerUrl)) {
+        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+
+      if (/\/friendships\/create(?:\/|\?|$)/i.test(lowerUrl) ||
+          /\/web\/friendships\/[^\/?#]+\/follow(?:\/|\?|$)/i.test(lowerUrl)) {
+        if (!/unfollow|destroy/i.test(lowerUrl)) {
+          return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+        }
+        return null;
+      }
+
+      if (/\/(?:api\/)?graphql(?:\/|\?|$)/i.test(lowerUrl)) {
+        var fnameMatch = /(?:fb_api_req_friendly_name|friendlyname)["'=\s:]+([a-z0-9_]+)/i.exec(decodedBody);
+        var fname = fnameMatch ? fnameMatch[1] : '';
+        if (fname) {
+          if (/block/i.test(fname) &&
+              !/unblock|remove.?block|delete.?block|destroy|list|count|query|fetch|load|get|status|info|show|check|modal|dialog|sheet|suggest|setting|privacy|history|blocked.?account|blocked.?user|blocked.?list/i.test(fname) &&
+              /(?:mutation|create|add|blockuser|blockaccount|userblock|block_user|block_account)/i.test(fname)) {
+            return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+          }
+          if (/remove.?follower|block|mute|restrict|suggestion|recommend|list|count|query|fetch|load|get|status|info|chaining|similar|show|check|batch|many|bulk|sync|refresh|feed|timeline|modal|dialog|sheet/i.test(fname)) {
+            return null;
+          }
+          if (/unfollow/i.test(fname) ||
+              (/(?:friendship|follow)/i.test(fname) && /(?:destroy|delete|cancel)/i.test(fname))) {
+            return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+          }
+          if (/follow/i.test(fname) && /(?:mutation|create|add)/i.test(fname) &&
+              !/unfollow|destroy|remove|cancel|follower|following/i.test(fname)) {
+            return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+          }
+          return null;
+        }
+        if (/usebarcelonablockmutation|barcelonablockmutation|polarisblockusermutation|usepolarisblockmutation|polarisblockmutation|textpostappblockmutation|igwebprofileblockmutation|cometblockusermutation|usecometblockmutation|friendingcometblockmutation|polarisfriendshipsblock/i.test(lowerBody) &&
+            !/unblock/i.test(lowerBody)) {
+          return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+        }
+        if (/usebarcelonaunfollowmutation|barcelonaunfollowmutation|polarisfriendshipsunfollow|polarisunfollowmutation|usepolarisunfollowmutation|polarisuserunfollowmutation|igwebprofileunfollowmutation|textpostappunfollowmutation|friendingcometunfollowmutation|polarisfriendshipsdestroy/i.test(lowerBody)) {
+          return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+        }
+        if (/usebarcelonafollowmutation|barcelonafollowmutation|polarisfriendshipsfollow|polarisfollowmutation|usepolarisfollowmutation|polarisuserfollowmutation|igwebprofilefollowmutation|textpostappfollowmutation|friendingcometfollowmutation/i.test(lowerBody) &&
+            !/unfollow|destroy/i.test(lowerBody)) {
+          return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+        }
+        return null;
+      }
+
+      if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0) {
+        var trimmedCreate = decodedBody.trim();
+        if (trimmedCreate && trimmedCreate[0] === '{') {
+          try {
+            var cObj = JSON.parse(trimmedCreate);
+            var cCol = cObj && typeof cObj.collection === 'string' ? cObj.collection.toLowerCase() : '';
+            var cSubj = (cObj && cObj.record && typeof cObj.record.subject === 'string') ? cObj.record.subject.trim().toLowerCase() : '';
+            if (cCol === 'app.bsky.graph.follow') {
+              return { action: 'follow', targetKey: cSubj || extractTargetKey(url, decodedBody), atprotoCreate: true };
+            }
+            if (cCol === 'app.bsky.graph.block') {
+              return { action: 'block', targetKey: cSubj || extractTargetKey(url, decodedBody), atprotoCreate: true };
+            }
+            return null;
+          } catch (_) {}
+        }
+        if (lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
+          return { action: 'follow', targetKey: extractTargetKey(url, decodedBody), atprotoCreate: true };
+        }
+        if (lowerBody.indexOf('app.bsky.graph.block') >= 0) {
+          return { action: 'block', targetKey: extractTargetKey(url, decodedBody), atprotoCreate: true };
+        }
+        return null;
+      }
+      if (lowerUrl.indexOf('com.atproto.repo.deleterecord') >= 0) {
+        var trimmedDel = decodedBody.trim();
+        if (trimmedDel && trimmedDel[0] === '{') {
+          try {
+            var dObj = JSON.parse(trimmedDel);
+            var dCol = dObj && typeof dObj.collection === 'string' ? dObj.collection.toLowerCase() : '';
+            var dRkey = dObj && typeof dObj.rkey === 'string' ? dObj.rkey.trim().toLowerCase() : '';
+            if (dCol === 'app.bsky.graph.follow') {
+              return { action: 'unfollow', targetKey: dRkey || extractTargetKey(url, decodedBody) };
+            }
+            return null;
+          } catch (_) {}
+        }
+        if (lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
+          return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+        }
+        return null;
+      }
+      if (lowerUrl.indexOf('com.atproto.repo.applywrites') >= 0) {
+        var trimmedAw = decodedBody.trim();
+        if (trimmedAw && trimmedAw[0] === '{') {
+          try {
+            var awObj = JSON.parse(trimmedAw);
+            if (awObj && Array.isArray(awObj.writes)) {
+              var awActions = [];
+              for (var wi = 0; wi < awObj.writes.length; wi++) {
+                var w = awObj.writes[wi];
+                if (!w || typeof w !== 'object') continue;
+                var wType = String(w['\x24type'] || '').toLowerCase();
+                var wCol = String(w.collection || '').toLowerCase();
+                var wSubj = (w.value && typeof w.value.subject === 'string') ? w.value.subject.trim().toLowerCase() : '';
+                var wRkey = typeof w.rkey === 'string' ? w.rkey.trim().toLowerCase() : '';
+                if (wCol === 'app.bsky.graph.follow' && wType.indexOf('#create') >= 0) {
+                  awActions.push({ action: 'follow', targetKey: wSubj || wRkey });
+                } else if (wCol === 'app.bsky.graph.follow' && wType.indexOf('#delete') >= 0) {
+                  awActions.push({ action: 'unfollow', targetKey: wRkey });
+                } else if (wCol === 'app.bsky.graph.block' && wType.indexOf('#create') >= 0) {
+                  awActions.push({ action: 'block', targetKey: wSubj || wRkey });
+                }
               }
-              var states = {
-                follow: makeChannelState(),
-                unfollow: makeChannelState(),
-                block: makeChannelState()
+              if (awActions.length === 1) return awActions[0];
+              if (awActions.length > 1) return { action: awActions[0].action, targetKey: awActions[0].targetKey, batch: awActions };
+            }
+            return null;
+          } catch (_) {}
+        }
+        return null;
+      }
+
+      if (/\/api\/v1\/accounts\/[^\/?#]+\/block(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/api\/v1\/accounts\/[^\/?#]+\/unfollow(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/api\/blocking\/create(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/api\/following\/delete(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/(?:api|aweme\/v\d+)\/commit\/block/i.test(lowerUrl) &&
+          !/unblock|block_type=0/i.test(lowerUrl) &&
+          !/"block_type"\s*:\s*0/i.test(lowerBody)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/blocks\/create\.json(?:\?|$)/i.test(lowerUrl)) {
+        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
+      }
+      if (/\/api\/commit\/follow\/user/i.test(lowerUrl)) {
+        if (/[?&]type=1(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=1(?:&|$)|"type"\s*:\s*1/i.test(lowerBody)) {
+          return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
+        }
+        if (/[?&]type=0(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=0(?:&|$)|"type"\s*:\s*0/i.test(lowerBody)) {
+          return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function beginTrackedRelationReq(relReq, reqInteractionId) {
+    var items = (relReq && Array.isArray(relReq.batch) && relReq.batch.length > 0) ? relReq.batch : (relReq ? [relReq] : []);
+    var now = Date.now();
+    var tracked = [];
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var st = item ? states[item.action] : null;
+      if (!st) continue;
+      st.lastNetworkStartAt = now;
+      st.inFlight++;
+      if (reqInteractionId > 0) st.interactionNetworkStarted[reqInteractionId] = now;
+      var cKey = canonicalizeTargetKey(item.targetKey, '');
+      if (cKey) st.inFlightTargets[cKey] = (st.inFlightTargets[cKey] || 0) + 1;
+      var blockFbHandle = '';
+      var blockWasFollowing = false;
+      if (item.action === 'block') {
+        blockFbHandle = (lastClickedTargetHandle && now - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '';
+        blockWasFollowing = isTargetFollowedForBlock(item.targetKey, blockFbHandle);
+      }
+      tracked.push({
+        item: item,
+        st: st,
+        cKey: cKey,
+        blockFbHandle: blockFbHandle,
+        blockWasFollowing: blockWasFollowing,
+        atprotoCreate: !!relReq.atprotoCreate
+      });
+    }
+    return tracked;
+  }
+
+  function finishTrackedRelationReq(tracked, ok, reqInteractionId, resObj) {
+    for (var i = 0; i < tracked.length; i++) {
+      var tr = tracked[i];
+      tr.st.inFlight = Math.max(0, tr.st.inFlight - 1);
+      if (tr.cKey && tr.st.inFlightTargets[tr.cKey]) {
+        tr.st.inFlightTargets[tr.cKey] = Math.max(0, tr.st.inFlightTargets[tr.cKey] - 1);
+        if (tr.st.inFlightTargets[tr.cKey] === 0) delete tr.st.inFlightTargets[tr.cKey];
+      }
+      if (!ok) continue;
+      if (tr.atprotoCreate && tr.item.action === 'follow' && resObj && typeof resObj.clone === 'function') {
+        try {
+          var clonedRes = resObj.clone();
+          (function(targetKeyForBind, cr) {
+            var parseP = typeof cr.json === 'function'
+              ? cr.json()
+              : (typeof cr.text === 'function' ? cr.text().then(function(t) { return JSON.parse(t); }) : null);
+            if (parseP && typeof parseP.then === 'function') {
+              parseP.then(function(d) {
+                if (d && typeof d.uri === 'string' && typeof window.__omniBindBlueskyFollowUri === 'function') {
+                  window.__omniBindBlueskyFollowUri(targetKeyForBind, d.uri);
+                }
+              }).catch(function() {});
+            }
+          })(tr.item.targetKey, clonedRes);
+        } catch (_) {}
+      }
+      try {
+        if (tr.item.action === 'block') {
+          handleBlockCompleted('network', tr.item.targetKey, reqInteractionId, tr.blockWasFollowing, tr.blockFbHandle);
+        } else {
+          emitRelation(tr.item.action, 'network', tr.item.targetKey, reqInteractionId);
+        }
+      } catch (_) {}
+    }
+  }
+
+  try {
+    var origFetch = window.fetch;
+    if (typeof origFetch === 'function') {
+      window.fetch = function(input, init) {
+        var isInternal = !!(init && init.__omniStatsInternal);
+        if (isInternal) return origFetch.apply(this, arguments);
+        var reqUrl = '';
+        var reqMethod = 'GET';
+        var reqBody = null;
+        try {
+          reqUrl = extractFetchUrl(input);
+          if (input && typeof input === 'object' && input.method) reqMethod = input.method;
+          if (init && typeof init === 'object') {
+            if (init.method) reqMethod = init.method;
+            if (init.body !== undefined) reqBody = init.body;
+          }
+        } catch (_) {}
+
+        var reqInteractionId = currentInteractionId();
+        var asyncBodyPromise = null;
+        var isPost = String(reqMethod || 'GET').toUpperCase() === 'POST';
+        var lowerReqUrl = String(reqUrl || '').toLowerCase();
+        var isAtprotoWrite = isPost && (
+          lowerReqUrl.indexOf('com.atproto.repo.createrecord') >= 0 ||
+          lowerReqUrl.indexOf('com.atproto.repo.deleterecord') >= 0 ||
+          lowerReqUrl.indexOf('com.atproto.repo.applywrites') >= 0
+        );
+
+        if (isPost && isCandidateAsyncBodyUrl(reqUrl)) {
+          try {
+            if (reqBody === null && input && typeof input === 'object' && typeof input.clone === 'function') {
+              asyncBodyPromise = input.clone().text().catch(function() { return ''; });
+            } else if (reqBody && typeof Blob !== 'undefined' && reqBody instanceof Blob && typeof reqBody.text === 'function') {
+              asyncBodyPromise = reqBody.text().catch(function() { return ''; });
+            }
+          } catch (_) {}
+        }
+
+        var relReq = asyncBodyPromise ? null : detectRelationApiRequest(reqUrl, reqMethod, reqBody);
+        var tracked = relReq ? beginTrackedRelationReq(relReq, reqInteractionId) : [];
+        if (asyncBodyPromise && isAtprotoWrite) {
+          pendingAsyncAtproto++;
+          lastAsyncAtprotoAt = Date.now();
+          if (reqInteractionId > 0) {
+            states.follow.interactionNetworkStarted[reqInteractionId] = lastAsyncAtprotoAt;
+            states.unfollow.interactionNetworkStarted[reqInteractionId] = lastAsyncAtprotoAt;
+          }
+        }
+
+        var promise = origFetch.apply(this, arguments);
+        if (asyncBodyPromise && promise && typeof promise.then === 'function') {
+          var asyncTracked = null;
+          var bodyResolved = asyncBodyPromise.then(function(bodyText) {
+            var detected = detectRelationApiRequest(reqUrl, reqMethod, bodyText);
+            if (detected) {
+              asyncTracked = beginTrackedRelationReq(detected, reqInteractionId);
+            }
+            return { detected: detected, bodyText: bodyText };
+          }, function() {
+            return { detected: null, bodyText: '' };
+          });
+          promise.then(function(res) {
+            bodyResolved.then(function(info) {
+              if (isAtprotoWrite) pendingAsyncAtproto = Math.max(0, pendingAsyncAtproto - 1);
+              if (asyncTracked && asyncTracked.length > 0) {
+                finishTrackedRelationReq(asyncTracked, !!(res && res.ok), reqInteractionId, res);
+              } else if (res && res.ok && isAtprotoWrite && lowerReqUrl.indexOf('com.atproto.repo.createrecord') >= 0 && !info.bodyText && typeof res.clone === 'function') {
+                // リクエストボディが読めなかった場合のフォールバック: createRecord 応答の AT-URI から判定
+                res.clone().text().then(function(rtxt) {
+                  var lowerR = String(rtxt || '').toLowerCase();
+                  if (lowerR.indexOf('/app.bsky.graph.follow/') >= 0) {
+                    emitRelation('follow', 'network', '', reqInteractionId);
+                  }
+                }).catch(function() {});
+              }
+            });
+          }, function() {
+            bodyResolved.then(function() {
+              if (isAtprotoWrite) pendingAsyncAtproto = Math.max(0, pendingAsyncAtproto - 1);
+              if (asyncTracked && asyncTracked.length > 0) {
+                finishTrackedRelationReq(asyncTracked, false, reqInteractionId, null);
+              }
+            });
+          });
+        } else if (tracked.length > 0 && promise && typeof promise.then === 'function') {
+          promise.then(function(res) {
+            finishTrackedRelationReq(tracked, !!(res && res.ok), reqInteractionId, res);
+          }, function() {
+            finishTrackedRelationReq(tracked, false, reqInteractionId, null);
+          });
+        } else if (tracked.length > 0) {
+          finishTrackedRelationReq(tracked, false, reqInteractionId, null);
+        }
+        return promise;
+      };
+    }
+  } catch (_) {}
+
+  try {
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+    if (typeof origOpen === 'function' && typeof origSend === 'function') {
+      XMLHttpRequest.prototype.open = function(method, url) {
+        try {
+          this.__omniMethod = method;
+          this.__omniUrl = typeof url === 'string' ? url : extractFetchUrl(url);
+        } catch (_) {}
+        return origOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        try {
+          var relReq = detectRelationApiRequest(this.__omniUrl, this.__omniMethod, body);
+          if (relReq) {
+            var reqInteractionId = currentInteractionId();
+            var tracked = beginTrackedRelationReq(relReq, reqInteractionId);
+            if (tracked.length > 0) {
+              var done = false;
+              var finishXhr = function(ok) {
+                if (!done) {
+                  done = true;
+                  finishTrackedRelationReq(tracked, ok, reqInteractionId, null);
+                }
               };
+              this.addEventListener('load', function() {
+                finishXhr(this.status >= 200 && this.status < 300);
+              }, { once: true });
+              this.addEventListener('error', function() { finishXhr(false); }, { once: true });
+              this.addEventListener('abort', function() { finishXhr(false); }, { once: true });
+              this.addEventListener('timeout', function() { finishXhr(false); }, { once: true });
+            }
+          }
+        } catch (_) {}
+        return origSend.apply(this, arguments);
+      };
+    }
+  } catch (_) {}
 
-              var userInteractionSeq = 0;
-              var lastUserInteractionAt = 0;
-              var lastPointerDownAt = 0;
-              var lastClickedTargetHandle = '';
-              var lastClickedTargetAt = 0;
-              var lastBlockFollowContext = { handle: '', isFollowing: null, ts: 0 };
+  function normalizeLabel(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim();
+  }
 
-              function bumpUserInteraction(fromPointerDown) {
-                var now = Date.now();
-                if (fromPointerDown) {
-                  userInteractionSeq++;
-                  lastPointerDownAt = now;
-                  lastUserInteractionAt = now;
-                } else if (now - lastPointerDownAt > 500) {
-                  userInteractionSeq++;
-                  lastUserInteractionAt = now;
-                } else {
-                  lastUserInteractionAt = now;
-                }
+  function readElementLabels(el) {
+    var text = '';
+    var aria = '';
+    try {
+      text = normalizeLabel(el.innerText || el.textContent || '');
+      aria = normalizeLabel(el.getAttribute('aria-label') || '');
+      if (!aria) {
+        var svg = el.querySelector('svg[aria-label], [aria-label]');
+        if (svg) aria = normalizeLabel(svg.getAttribute('aria-label') || '');
+      }
+    } catch (_) {}
+    return { text: text, aria: aria };
+  }
+
+  function isFollowButtonElement(el) {
+    if (!el || el.disabled) return false;
+    try {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      if (el.closest('nav')) return false;
+      if (el.tagName && el.tagName.toUpperCase() === 'A') {
+        var href = (el.getAttribute('href') || '').toLowerCase();
+        if (/\/(following|followers)(?:\/|\?|$)/.test(href)) return false;
+      }
+      var labels = readElementLabels(el);
+      if (labels.text && NEGATIVE_FOLLOW_RE.test(labels.text)) return false;
+      if (labels.text && labels.text.length <= 24 && EXACT_FOLLOW_TEXT_RE.test(labels.text)) {
+        return true;
+      }
+      if (labels.aria && NEGATIVE_FOLLOW_RE.test(labels.aria)) return false;
+      if (!labels.text && labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
+        return true;
+      }
+      if (labels.text && labels.text.length <= 4 && /^[+＋]$/.test(labels.text) &&
+          labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
+        return true;
+      }
+      var tid = (el.getAttribute('data-testid') || '').toLowerCase();
+      if (tid === 'followbtn' && (!labels.text || !POST_FOLLOW_STATE_RE.test(labels.text))) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function isUnfollowButtonElement(el) {
+    if (!el || el.disabled) return false;
+    try {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      if (el.closest('nav')) return false;
+      if (el.tagName && el.tagName.toUpperCase() === 'A') {
+        var href = (el.getAttribute('href') || '').toLowerCase();
+        if (/\/(following|followers)(?:\/|\?|$)/.test(href)) return false;
+      }
+      var labels = readElementLabels(el);
+      if (labels.text && NON_UNFOLLOW_RE.test(labels.text)) return false;
+      if (labels.aria && NON_UNFOLLOW_RE.test(labels.aria)) return false;
+      if (labels.text && labels.text.length <= 24 && EXACT_UNFOLLOW_TEXT_RE.test(labels.text)) {
+        return true;
+      }
+      if (!labels.text && labels.aria && labels.aria.length <= 64 && ARIA_UNFOLLOW_RE.test(labels.aria)) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function isElementHidden(el) {
+    try {
+      if (!el.isConnected) return true;
+      var style = window.getComputedStyle(el);
+      if (!style || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+        return true;
+      }
+      var rect = el.getBoundingClientRect();
+      return rect.width < 1 || rect.height < 1;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function extractHandleNearButton(btn) {
+    try {
+      if (!btn) return '';
+      var row = btn.closest ? btn.closest('[data-omni-ff-row]') : null;
+      if (row) {
+        var rh = (row.getAttribute('data-omni-ff-row') || '').trim().toLowerCase();
+        if (rh) return rh;
+      }
+      var labels = readElementLabels(btn);
+      var aria = labels.aria || '';
+      var am = /^@?([a-z0-9._-]{1,40})\s*(?:をフォロー|のフォロー)/i.exec(aria) ||
+               /^(?:follow|unfollow)\s+@?([a-z0-9._-]{1,40})/i.exec(aria);
+      if (am && am[1]) return am[1].toLowerCase();
+      var cur = btn.parentElement;
+      for (var d = 0; d < 6 && cur && cur !== document.body; d++) {
+        if (typeof window.__omniExtractHandleFromRow === 'function') {
+          var eh = window.__omniExtractHandleFromRow(cur);
+          if (eh) return eh;
+        }
+        var imgs = cur.querySelectorAll ? cur.querySelectorAll('img[alt]') : [];
+        for (var j = 0; j < imgs.length && j < 4; j++) {
+          var alt = (imgs[j].getAttribute('alt') || '').trim();
+          var im = /^@?([a-z0-9._-]{1,40})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
+          if (im && im[1]) return im[1].toLowerCase();
+        }
+        cur = cur.parentElement;
+      }
+      if (typeof window.__omniResolveProfileHandle === 'function') {
+        return window.__omniResolveProfileHandle() || '';
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function isBlockButtonElement(el) {
+    if (!el || el.disabled) return false;
+    try {
+      if (el.getAttribute('aria-disabled') === 'true') return false;
+      if (el.closest('nav')) return false;
+      var labels = readElementLabels(el);
+      if (labels.text && NON_BLOCK_RE.test(labels.text)) return false;
+      if (labels.aria && NON_BLOCK_RE.test(labels.aria)) return false;
+      if (labels.text && labels.text.length <= 24 && EXACT_BLOCK_CONFIRM_RE.test(labels.text)) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function captureBlockFollowContext(btn, clickedHandle) {
+    try {
+      var now = Date.now();
+      var h = clickedHandle || '';
+      var state = null;
+      var row = btn && btn.closest ? btn.closest('[data-omni-ff-row]') : null;
+      if (row) {
+        state = detectDomFollowingInScope(row, false);
+      }
+      if (state === null) {
+        var curProfile = (typeof window.__omniResolveProfileHandle === 'function')
+          ? String(window.__omniResolveProfileHandle() || '').trim().toLowerCase()
+          : '';
+        if (curProfile && (!h || h === curProfile)) {
+          state = detectProfileDomFollowingState();
+          if (!h) h = curProfile;
+        }
+      }
+      if (state === null && h && typeof window.__omniIsFollowingUser === 'function') {
+        var cached = window.__omniIsFollowingUser(h, h);
+        if (typeof cached === 'boolean') state = cached;
+      }
+      if (state !== null) {
+        lastBlockFollowContext = { handle: h, isFollowing: state, ts: now };
+      }
+    } catch (_) {}
+  }
+
+  document.addEventListener('click', function(e) {
+    try {
+      if (e && (e.isTrusted === false || e.button !== 0 || e.ctrlKey || e.metaKey)) return;
+      bumpUserInteraction(false);
+      var clickInteractionId = currentInteractionId();
+      var target = e.target;
+      if (!target) return;
+      if (target.nodeType !== 1) target = target.parentElement;
+      if (!target || typeof target.closest !== 'function') return;
+      var btn = target.closest('button, [role="button"], [role="menuitem"], a');
+      if (!btn) return;
+
+      var clickedAt = Date.now();
+      var clickedHandle = extractHandleNearButton(btn);
+      var inDialog = !!btn.closest('[role="dialog"], [role="alertdialog"]');
+      var isFollowBtn = isFollowButtonElement(btn);
+      var isUnfollowBtn = !isFollowBtn && isUnfollowButtonElement(btn);
+      var isBlockBtn = !isFollowBtn && !isUnfollowBtn && isBlockButtonElement(btn);
+
+      if (!inDialog || !isBlockBtn) {
+        captureBlockFollowContext(btn, clickedHandle);
+      }
+      if (!isFollowBtn && !isUnfollowBtn && !isBlockBtn) {
+        if (clickedHandle) {
+          lastClickedTargetHandle = clickedHandle;
+          lastClickedTargetAt = clickedAt;
+        }
+        return;
+      }
+
+      if (clickedHandle) {
+        lastClickedTargetHandle = clickedHandle;
+        lastClickedTargetAt = clickedAt;
+      }
+      var hadDialog = !!document.querySelector('[role="dialog"], [role="alertdialog"]');
+      var initialLabels = readElementLabels(btn);
+
+      if (isBlockBtn) {
+        var wasFollowingAtClick = isTargetFollowedForBlock(clickedHandle, clickedHandle);
+        if (inDialog && wasFollowingAtClick) {
+          var bst = states.block;
+          var ustB = states.unfollow;
+          setTimeout(function() {
+            try {
+              if (bst.inFlight > 0 || ustB.inFlight > 0 ||
+                  bst.lastNetworkStartAt >= clickedAt - 300 ||
+                  bst.lastNetworkAt >= clickedAt - 300 ||
+                  ustB.lastNetworkStartAt >= clickedAt - 300 ||
+                  ustB.lastNetworkAt >= clickedAt - 300 ||
+                  ustB.lastAnyEmitAt >= clickedAt - 300) {
+                return;
               }
-
-              document.addEventListener('pointerdown', function(e) {
-                if (e && (e.isTrusted === false || (typeof e.button === 'number' && e.button !== 0))) return;
-                bumpUserInteraction(true);
-              }, true);
-
-              document.addEventListener('keydown', function(e) {
-                if (e && e.isTrusted !== false && (e.key === 'Enter' || e.key === ' ')) {
-                  bumpUserInteraction(true);
-                }
-              }, true);
-
-              function currentInteractionId() {
-                var now = Date.now();
-                if (userInteractionSeq > 0 && now - lastUserInteractionAt <= 3000) {
-                  return userInteractionSeq;
-                }
-                return 0;
+              if (isElementHidden(btn)) {
+                handleBlockCompleted('dom', clickedHandle, clickInteractionId, true, clickedHandle);
               }
+            } catch (_) {}
+          }, 1000);
+        }
+        return;
+      }
 
-              function detectCurrentService() {
-                try {
-                  var h = (window.location && window.location.hostname ? window.location.hostname : '').toLowerCase();
-                  function matchDom(d) { return h === d || (h.length > d.length && h.slice(-(d.length + 1)) === '.' + d); }
-                  if (matchDom('instagram.com')) return 'instagram';
-                  if (matchDom('threads.net') || matchDom('threads.com')) return 'threads';
-                  if (matchDom('bsky.app') || matchDom('bsky.social')) return 'bluesky';
-                  if (matchDom('mixi.social')) return 'mixi2';
-                  if (matchDom('x.com') || matchDom('twitter.com')) return 'x';
-                  if (matchDom('tiktok.com')) return 'tiktok';
-                  if (matchDom('facebook.com') || matchDom('messenger.com')) return 'facebook';
-                  if (matchDom('note.com')) return 'note';
-                  if (matchDom('youtube.com')) return 'youtube';
-                  if (matchDom('twitch.tv')) return 'twitch';
-                  if (matchDom('reddit.com')) return 'reddit';
-                  if (matchDom('pinterest.com') || matchDom('pinterest.jp')) return 'pinterest';
-                  if (matchDom('linkedin.com')) return 'linkedin';
-                  if (matchDom('tumblr.com')) return 'tumblr';
-                  if (matchDom('pixiv.net')) return 'pixiv';
-                  if (matchDom('mastodon.social')) return 'mastodon';
-                  if (matchDom('misskey.io')) return 'misskey';
-                } catch (_) {}
-                return '';
-              }
+      var domDelayMs = detectCurrentService() === 'bluesky' ? 1400 : 1000;
+      var clickedKey = canonicalizeTargetKey(clickedHandle, '');
 
-              function emitRelation(action, source, targetKey, interactionId) {
-                var st = states[action];
-                if (!st) return;
-                var now = Date.now();
-                if (interactionId && interactionId > 0) {
-                  for (var ik in st.emittedInteractions) {
-                    if (now - st.emittedInteractions[ik] > 15000) delete st.emittedInteractions[ik];
-                  }
-                  if (st.emittedInteractions[interactionId]) {
-                    if (source === 'network') {
-                      st.lastNetworkAt = now;
-                      if (targetKey) st.recentTargetKeys[targetKey] = now;
-                    }
+      if (isFollowBtn) {
+        var fst = states.follow;
+        setTimeout(function() {
+          try {
+            var nowCheck = Date.now();
+            if (clickInteractionId > 0 && (fst.emittedInteractions[clickInteractionId] || fst.interactionNetworkStarted[clickInteractionId])) {
+              return;
+            }
+            if (pendingAsyncAtproto > 0 || lastAsyncAtprotoAt >= clickedAt - 200) {
+              return;
+            }
+            if (clickedKey) {
+              if ((fst.inFlightTargets[clickedKey] || 0) > 0) return;
+              if (fst.recentTargetKeys[clickedKey] && nowCheck - fst.recentTargetKeys[clickedKey] < 5000) return;
+            } else if (fst.inFlight > 0 ||
+                fst.lastNetworkStartAt >= clickedAt - 300 ||
+                fst.lastNetworkAt >= clickedAt - 300 ||
+                fst.lastAnyEmitAt >= clickedAt - 300) {
+              return;
+            }
+            if (!hadDialog) {
+              var dlg = document.querySelector('[role="dialog"]');
+              if (dlg) {
+                var dlgBtns = dlg.querySelectorAll('button, [role="button"]');
+                for (var i = 0; i < dlgBtns.length; i++) {
+                  if (dlgBtns[i] !== btn && isFollowButtonElement(dlgBtns[i])) {
                     return;
                   }
                 }
-                if (targetKey) {
-                  for (var k in st.recentTargetKeys) {
-                    if (now - st.recentTargetKeys[k] > 15000) delete st.recentTargetKeys[k];
-                  }
-                  if (st.recentTargetKeys[targetKey] && now - st.recentTargetKeys[targetKey] < 5000) {
-                    return;
-                  }
-                }
-                if (source === 'network') {
-                  if (now - st.lastDomEmitAt < 2500) {
-                    st.lastNetworkAt = now;
-                    if (targetKey) st.recentTargetKeys[targetKey] = now;
-                    if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
-                    return;
-                  }
-                  if (!targetKey && now - st.lastAnyEmitAt < 1200) {
-                    st.lastNetworkAt = now;
-                    return;
-                  }
-                  st.lastNetworkAt = now;
-                  st.lastAnyEmitAt = now;
-                  if (targetKey) st.recentTargetKeys[targetKey] = now;
-                  if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
-                } else {
-                  if (now - st.lastAnyEmitAt < 2500) return;
-                  st.lastDomEmitAt = now;
-                  st.lastAnyEmitAt = now;
-                  if (interactionId && interactionId > 0) st.emittedInteractions[interactionId] = now;
-                }
-                try {
-                  if (typeof window.__omniOnFollowAction === 'function') {
-                    var fallbackHandle = (lastClickedTargetHandle && now - lastClickedTargetAt <= 5000)
-                      ? lastClickedTargetHandle
-                      : '';
-                    window.__omniOnFollowAction(action, targetKey || '', fallbackHandle);
-                  }
-                } catch (_) {}
-                try {
-                  var svc = detectCurrentService();
-                  var ch = __omniFollowChannel || window.OmniFollowChannel;
-                  if (ch && typeof ch.postMessage === 'function') {
-                    ch.postMessage(JSON.stringify({
-                      token: __omniFollowToken,
-                      type: action === 'unfollow' ? 'unfollow' : 'follow',
-                      source: source || 'auto',
-                      service: svc
-                    }));
-                  } else {
-                    var br = __omniFollowBridge || window.OmniFollowBridge;
-                    if (br) {
-                      if (action === 'unfollow' && typeof br.onUnfollowDetected === 'function') {
-                        br.onUnfollowDetected(__omniFollowToken, source || 'auto', svc);
-                      } else if (action === 'follow' && typeof br.onFollowDetected === 'function') {
-                        br.onFollowDetected(__omniFollowToken, source || 'auto', svc);
-                      }
-                    }
-                  }
-                } catch (_) {}
               }
-
-              function bodyToSearchString(body) {
-                if (!body) return '';
-                try {
-                  if (typeof body === 'string') return body.slice(0, 8192);
-                  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
-                    return body.toString().slice(0, 8192);
-                  }
-                  if (typeof FormData !== 'undefined' && body instanceof FormData) {
-                    var parts = [];
-                    body.forEach(function(v, k) {
-                      if (typeof v === 'string') parts.push(k + '=' + v.slice(0, 256));
-                    });
-                    return parts.join('&').slice(0, 8192);
-                  }
-                } catch (_) {}
-                return '';
+            }
+            if (isElementHidden(btn)) {
+              emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
+              return;
+            }
+            if (btn.getAttribute('aria-pressed') === 'true') {
+              emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
+              return;
+            }
+            var after = readElementLabels(btn);
+            if ((after.text && POST_FOLLOW_STATE_RE.test(after.text)) ||
+                (after.aria && POST_FOLLOW_STATE_RE.test(after.aria))) {
+              emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
+              return;
+            }
+            if ((after.text !== initialLabels.text || after.aria !== initialLabels.aria) &&
+                !isFollowButtonElement(btn)) {
+              emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
+            }
+          } catch (_) {}
+        }, domDelayMs);
+      } else if (isUnfollowBtn) {
+        var ust = states.unfollow;
+        var isConfirmBtn = inDialog && CONFIRM_UNFOLLOW_TEXT_RE.test(initialLabels.text || '');
+        setTimeout(function() {
+          try {
+            var nowCheckU = Date.now();
+            if (clickInteractionId > 0 && (ust.emittedInteractions[clickInteractionId] || ust.interactionNetworkStarted[clickInteractionId])) {
+              return;
+            }
+            if (pendingAsyncAtproto > 0 || lastAsyncAtprotoAt >= clickedAt - 200) {
+              return;
+            }
+            if (clickedKey) {
+              if ((ust.inFlightTargets[clickedKey] || 0) > 0) return;
+              if (ust.recentTargetKeys[clickedKey] && nowCheckU - ust.recentTargetKeys[clickedKey] < 5000) return;
+            } else if (ust.inFlight > 0 ||
+                ust.lastNetworkStartAt >= clickedAt - 300 ||
+                ust.lastNetworkAt >= clickedAt - 300 ||
+                ust.lastAnyEmitAt >= clickedAt - 300) {
+              return;
+            }
+            if (!hadDialog) {
+              var dlg2 = document.querySelector('[role="dialog"]');
+              if (dlg2) {
+                return;
               }
-
-              function extractTargetKey(url, decodedBody) {
-                try {
-                  var m = /\/friendships\/(?:create|destroy|block)\/([^\/?#]+)/i.exec(url) ||
-                          /\/web\/friendships\/([^\/?#]+)\/(?:follow|unfollow|block)/i.exec(url) ||
-                          /\/api\/v1\/accounts\/([^\/?#]+)\/(?:follow|unfollow|block)/i.exec(url);
-                  if (m && m[1]) return String(m[1]).trim().toLowerCase();
-
-                  m = /"(?:target_user_id|targetUserId|blocked_user_id|blockedUserId|to_user_id|toUserId|target_id|subscribee_id|subject|rkey)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
-                      /(?:^|&)(?:target_user_id|blocked_user_id|to_user_id|target_id)=([a-z0-9._-]+)/i.exec(decodedBody);
-                  if (m && m[1]) return String(m[1]).trim().toLowerCase();
-
-                  m = /"(?:user_id|profile_id|userId)"\s*:\s*"?([a-z0-9:._-]+)"?/i.exec(decodedBody) ||
-                      /(?:^|&)user_id=([a-z0-9._-]+)/i.exec(decodedBody) ||
-                      /[?&]user_id=([a-z0-9._-]+)/i.exec(url);
-                  if (m && m[1]) return String(m[1]).trim().toLowerCase();
-                } catch (_) {}
-                return '';
-              }
-
-              function detectDomFollowingInScope(scope, excludeDialog) {
-                try {
-                  if (!scope || !scope.querySelectorAll) return null;
-                  var btns = scope.querySelectorAll('button, [role="button"]');
-                  var sawUnfollowed = false;
-                  for (var i = 0; i < btns.length && i < 60; i++) {
-                    var b = btns[i];
-                    if (b.closest && b.closest('nav, [role="navigation"]')) continue;
-                    if (excludeDialog && b.closest && b.closest('[role="dialog"], [role="alertdialog"]')) continue;
-                    if (isElementHidden(b)) continue;
-                    var lbl = readElementLabels(b);
-                    var txt = lbl.text || '';
-                    if (txt && txt.length <= 24) {
-                      if (FOLLOWING_STATE_BTN_RE.test(txt)) return true;
-                      if (EXACT_FOLLOW_TEXT_RE.test(txt)) sawUnfollowed = true;
-                    }
-                  }
-                  if (sawUnfollowed) return false;
-                } catch (_) {}
-                return null;
-              }
-
-              function detectProfileDomFollowingState() {
-                try {
-                  var header = document.querySelector('main header, [role="main"] header, header');
-                  var res = header ? detectDomFollowingInScope(header, true) : null;
-                  if (res !== null) return res;
-                  var main = document.querySelector('main, [role="main"]');
-                  if (main) return detectDomFollowingInScope(main, true);
-                } catch (_) {}
-                return null;
-              }
-
-              function isTargetFollowedForBlock(targetKey, fallbackHandle) {
-                try {
-                  var now = Date.now();
-                  var fb = fallbackHandle || ((lastClickedTargetHandle && now - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '');
-                  var curProfile = (typeof window.__omniResolveProfileHandle === 'function')
-                    ? String(window.__omniResolveProfileHandle() || '').trim().toLowerCase()
-                    : '';
-                  var key = String(targetKey || '').trim().toLowerCase();
-                  var targetH = fb ? String(fb).trim().toLowerCase() : (!/^\d+$/.test(key) ? key : '');
-
-                  if (curProfile && (!targetH || targetH === curProfile)) {
-                    var liveDom = detectProfileDomFollowingState();
-                    if (liveDom !== null) return liveDom;
-                  }
-                  if (typeof window.__omniIsFollowingUser === 'function') {
-                    var cached = window.__omniIsFollowingUser(key, fb);
-                    if (typeof cached === 'boolean') return cached;
-                  }
-                  if (lastBlockFollowContext.isFollowing !== null &&
-                      now - lastBlockFollowContext.ts <= 30000 &&
-                      (!targetH || !lastBlockFollowContext.handle || lastBlockFollowContext.handle === targetH)) {
-                    return lastBlockFollowContext.isFollowing;
-                  }
-                  if (!curProfile) {
-                    var fallbackDom = detectProfileDomFollowingState();
-                    if (fallbackDom === true) return true;
-                  }
-                } catch (_) {}
-                return false;
-              }
-
-              function handleBlockCompleted(source, targetKey, interactionId, wasFollowing, fallbackHandle) {
-                var bst = states.block;
-                var now = Date.now();
-                if (source === 'network') {
-                  bst.lastNetworkAt = now;
-                } else {
-                  bst.lastDomEmitAt = now;
-                }
-                bst.lastAnyEmitAt = now;
-                if (wasFollowing) {
-                  emitRelation('unfollow', source, targetKey, interactionId);
-                } else {
-                  try {
-                    if (typeof window.__omniOnFollowAction === 'function') {
-                      window.__omniOnFollowAction('unfollow', targetKey || '', fallbackHandle || '');
-                    }
-                  } catch (_) {}
-                }
-              }
-
-              function detectRelationApiRequest(rawUrl, method, rawBody) {
-                try {
-                  var m = (method || 'GET').toUpperCase();
-                  if (m !== 'POST') return null;
-                  var url = String(rawUrl || '');
-                  var lowerUrl = url.toLowerCase();
-                  var body = bodyToSearchString(rawBody);
-                  var decodedBody = body;
-                  try {
-                    if (body.indexOf('%') >= 0) decodedBody = decodeURIComponent(body.replace(/\+/g, ' '));
-                  } catch (_) {}
-                  var lowerBody = decodedBody.toLowerCase();
-
-                  if ((/\/friendships\/block(?:\/|\?|$)/i.test(lowerUrl) ||
-                       /\/web\/friendships\/[^\/?#]+\/block(?:\/|\?|$)/i.test(lowerUrl)) &&
-                      !/unblock/i.test(lowerUrl)) {
-                    return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-
-                  if (/\/friendships\/destroy(?:\/|\?|$)/i.test(lowerUrl) ||
-                      /\/web\/friendships\/[^\/?#]+\/unfollow(?:\/|\?|$)/i.test(lowerUrl)) {
-                    return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-
-                  if (/\/friendships\/create(?:\/|\?|$)/i.test(lowerUrl) ||
-                      /\/web\/friendships\/[^\/?#]+\/follow(?:\/|\?|$)/i.test(lowerUrl)) {
-                    if (!/unfollow|destroy/i.test(lowerUrl)) {
-                      return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
-                    }
-                    return null;
-                  }
-
-                  if (/\/(?:api\/)?graphql(?:\/|\?|$)/i.test(lowerUrl)) {
-                    var fnameMatch = /(?:fb_api_req_friendly_name|friendlyname)["'=\s:]+([a-z0-9_]+)/i.exec(decodedBody);
-                    var fname = fnameMatch ? fnameMatch[1] : '';
-                    if (fname) {
-                      if (/block/i.test(fname) &&
-                          !/unblock|remove.?block|delete.?block|destroy|list|count|query|fetch|load|get|status|info|show|check|modal|dialog|sheet|suggest|setting|privacy|history|blocked.?account|blocked.?user|blocked.?list/i.test(fname) &&
-                          /(?:mutation|create|add|blockuser|blockaccount|userblock|block_user|block_account)/i.test(fname)) {
-                        return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
-                      }
-                      if (/remove.?follower|block|mute|restrict|suggestion|recommend|list|count|query|fetch|load|get|status|info|chaining|similar|show|check|batch|many|bulk|sync|refresh|feed|timeline|modal|dialog|sheet/i.test(fname)) {
-                        return null;
-                      }
-                      if (/unfollow/i.test(fname) ||
-                          (/(?:friendship|follow)/i.test(fname) && /(?:destroy|delete|cancel)/i.test(fname))) {
-                        return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
-                      }
-                      if (/follow/i.test(fname) && /(?:mutation|create|add)/i.test(fname) &&
-                          !/unfollow|destroy|remove|cancel|follower|following/i.test(fname)) {
-                        return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
-                      }
-                      return null;
-                    }
-                    if (/usebarcelonablockmutation|barcelonablockmutation|polarisblockusermutation|usepolarisblockmutation|polarisblockmutation|textpostappblockmutation|igwebprofileblockmutation|cometblockusermutation|usecometblockmutation|friendingcometblockmutation|polarisfriendshipsblock/i.test(lowerBody) &&
-                        !/unblock/i.test(lowerBody)) {
-                      return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
-                    }
-                    if (/usebarcelonaunfollowmutation|barcelonaunfollowmutation|polarisfriendshipsunfollow|polarisunfollowmutation|usepolarisunfollowmutation|polarisuserunfollowmutation|igwebprofileunfollowmutation|textpostappunfollowmutation|friendingcometunfollowmutation|polarisfriendshipsdestroy/i.test(lowerBody)) {
-                      return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
-                    }
-                    if (/usebarcelonafollowmutation|barcelonafollowmutation|polarisfriendshipsfollow|polarisfollowmutation|usepolarisfollowmutation|polarisuserfollowmutation|igwebprofilefollowmutation|textpostappfollowmutation|friendingcometfollowmutation/i.test(lowerBody) &&
-                        !/unfollow|destroy/i.test(lowerBody)) {
-                      return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
-                    }
-                    return null;
-                  }
-
-                  if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
-                      lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
-                    return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (lowerUrl.indexOf('com.atproto.repo.deleterecord') >= 0 &&
-                      lowerBody.indexOf('app.bsky.graph.follow') >= 0) {
-                    return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (lowerUrl.indexOf('com.atproto.repo.createrecord') >= 0 &&
-                      lowerBody.indexOf('app.bsky.graph.block') >= 0) {
-                    return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-
-                  if (/\/api\/v1\/accounts\/[^\/?#]+\/block(?:\?|$)/i.test(lowerUrl)) {
-                    return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (/\/api\/v1\/accounts\/[^\/?#]+\/unfollow(?:\?|$)/i.test(lowerUrl)) {
-                    return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (/\/api\/v1\/accounts\/[^\/?#]+\/follow(?:\?|$)/i.test(lowerUrl)) {
-                    return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (/\/api\/blocking\/create(?:\?|$)/i.test(lowerUrl)) {
-                    return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (/\/api\/following\/delete(?:\?|$)/i.test(lowerUrl)) {
-                    return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (/\/api\/following\/create(?:\?|$)/i.test(lowerUrl)) {
-                    return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (/\/(?:api|aweme\/v\d+)\/commit\/block/i.test(lowerUrl) &&
-                      !/unblock|block_type=0/i.test(lowerUrl) &&
-                      !/"block_type"\s*:\s*0/i.test(lowerBody)) {
-                    return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (/\/blocks\/create\.json(?:\?|$)/i.test(lowerUrl)) {
-                    return { action: 'block', targetKey: extractTargetKey(url, decodedBody) };
-                  }
-                  if (/\/api\/commit\/follow\/user/i.test(lowerUrl)) {
-                    if (/[?&]type=1(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=1(?:&|$)|"type"\s*:\s*1/i.test(lowerBody)) {
-                      return { action: 'follow', targetKey: extractTargetKey(url, decodedBody) };
-                    }
-                    if (/[?&]type=0(?:&|$)/i.test(lowerUrl) || /(?:^|&)type=0(?:&|$)|"type"\s*:\s*0/i.test(lowerBody)) {
-                      return { action: 'unfollow', targetKey: extractTargetKey(url, decodedBody) };
-                    }
-                  }
-                } catch (_) {}
-                return null;
-              }
-
-              try {
-                var origFetch = window.fetch;
-                if (typeof origFetch === 'function') {
-                  window.fetch = function(input, init) {
-                    var isInternal = !!(init && init.__omniStatsInternal);
-                    if (isInternal) return origFetch.apply(this, arguments);
-                    var reqUrl = '';
-                    var reqMethod = 'GET';
-                    var reqBody = null;
-                    try {
-                      if (typeof input === 'string') {
-                        reqUrl = input;
-                      } else if (input && typeof input === 'object') {
-                        reqUrl = input.url || '';
-                        if (input.method) reqMethod = input.method;
-                      }
-                      if (init && typeof init === 'object') {
-                        if (init.method) reqMethod = init.method;
-                        if (init.body !== undefined) reqBody = init.body;
-                      }
-                    } catch (_) {}
-                    var relReq = detectRelationApiRequest(reqUrl, reqMethod, reqBody);
-                    var reqInteractionId = 0;
-                    var st = relReq ? states[relReq.action] : null;
-                    var blockWasFollowing = false;
-                    var blockFbHandle = '';
-                    if (relReq && st) {
-                      st.lastNetworkStartAt = Date.now();
-                      st.inFlight++;
-                      reqInteractionId = currentInteractionId();
-                      if (relReq.action === 'block') {
-                        blockFbHandle = (lastClickedTargetHandle && Date.now() - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '';
-                        blockWasFollowing = isTargetFollowedForBlock(relReq.targetKey, blockFbHandle);
-                      }
-                    }
-                    var promise = origFetch.apply(this, arguments);
-                    if (relReq && st && promise && typeof promise.then === 'function') {
-                      promise.then(function(res) {
-                        st.inFlight = Math.max(0, st.inFlight - 1);
-                        try {
-                          if (res && res.ok) {
-                            if (relReq.action === 'block') {
-                              handleBlockCompleted('network', relReq.targetKey, reqInteractionId, blockWasFollowing, blockFbHandle);
-                            } else {
-                              emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
-                            }
-                          }
-                        } catch (_) {}
-                      }, function() {
-                        st.inFlight = Math.max(0, st.inFlight - 1);
-                      });
-                    } else if (relReq && st) {
-                      st.inFlight = Math.max(0, st.inFlight - 1);
-                    }
-                    return promise;
-                  };
-                }
-              } catch (_) {}
-
-              try {
-                var origOpen = XMLHttpRequest.prototype.open;
-                var origSend = XMLHttpRequest.prototype.send;
-                if (typeof origOpen === 'function' && typeof origSend === 'function') {
-                  XMLHttpRequest.prototype.open = function(method, url) {
-                    try {
-                      this.__omniMethod = method;
-                      this.__omniUrl = url;
-                    } catch (_) {}
-                    return origOpen.apply(this, arguments);
-                  };
-                  XMLHttpRequest.prototype.send = function(body) {
-                    try {
-                      var relReq = detectRelationApiRequest(this.__omniUrl, this.__omniMethod, body);
-                      var st = relReq ? states[relReq.action] : null;
-                      if (relReq && st) {
-                        st.lastNetworkStartAt = Date.now();
-                        st.inFlight++;
-                        var reqInteractionId = currentInteractionId();
-                        var blockWasFollowing = false;
-                        var blockFbHandle = '';
-                        if (relReq.action === 'block') {
-                          blockFbHandle = (lastClickedTargetHandle && Date.now() - lastClickedTargetAt <= 15000) ? lastClickedTargetHandle : '';
-                          blockWasFollowing = isTargetFollowedForBlock(relReq.targetKey, blockFbHandle);
-                        }
-                        var done = false;
-                        var finish = function() {
-                          if (!done) {
-                            done = true;
-                            st.inFlight = Math.max(0, st.inFlight - 1);
-                          }
-                        };
-                        this.addEventListener('load', function() {
-                          finish();
-                          try {
-                            if (this.status >= 200 && this.status < 300) {
-                              if (relReq.action === 'block') {
-                                handleBlockCompleted('network', relReq.targetKey, reqInteractionId, blockWasFollowing, blockFbHandle);
-                              } else {
-                                emitRelation(relReq.action, 'network', relReq.targetKey, reqInteractionId);
-                              }
-                            }
-                          } catch (_) {}
-                        }, { once: true });
-                        this.addEventListener('error', finish, { once: true });
-                        this.addEventListener('abort', finish, { once: true });
-                        this.addEventListener('timeout', finish, { once: true });
-                      }
-                    } catch (_) {}
-                    return origSend.apply(this, arguments);
-                  };
-                }
-              } catch (_) {}
-
-              function normalizeLabel(s) {
-                return String(s || '').replace(/\s+/g, ' ').trim();
-              }
-
-              function readElementLabels(el) {
-                var text = '';
-                var aria = '';
-                try {
-                  text = normalizeLabel(el.innerText || el.textContent || '');
-                  aria = normalizeLabel(el.getAttribute('aria-label') || '');
-                  if (!aria) {
-                    var svg = el.querySelector('svg[aria-label], [aria-label]');
-                    if (svg) aria = normalizeLabel(svg.getAttribute('aria-label') || '');
-                  }
-                } catch (_) {}
-                return { text: text, aria: aria };
-              }
-
-              function isFollowButtonElement(el) {
-                if (!el || el.disabled) return false;
-                try {
-                  if (el.getAttribute('aria-disabled') === 'true') return false;
-                  if (el.closest('nav')) return false;
-                  if (el.tagName && el.tagName.toUpperCase() === 'A') {
-                    var href = (el.getAttribute('href') || '').toLowerCase();
-                    if (/\/(following|followers)(?:\/|\?|$)/.test(href)) return false;
-                  }
-                  var labels = readElementLabels(el);
-                  if (labels.text && NEGATIVE_FOLLOW_RE.test(labels.text)) return false;
-                  if (labels.aria && NEGATIVE_FOLLOW_RE.test(labels.aria)) return false;
-                  if (labels.text && labels.text.length <= 24 && EXACT_FOLLOW_TEXT_RE.test(labels.text)) {
-                    return true;
-                  }
-                  if (!labels.text && labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
-                    return true;
-                  }
-                  if (labels.text && labels.text.length <= 4 && /^[+＋]$/.test(labels.text) &&
-                      labels.aria && labels.aria.length <= 64 && ARIA_FOLLOW_RE.test(labels.aria)) {
-                    return true;
-                  }
-                } catch (_) {}
-                return false;
-              }
-
-              function isUnfollowButtonElement(el) {
-                if (!el || el.disabled) return false;
-                try {
-                  if (el.getAttribute('aria-disabled') === 'true') return false;
-                  if (el.closest('nav')) return false;
-                  if (el.tagName && el.tagName.toUpperCase() === 'A') {
-                    var href = (el.getAttribute('href') || '').toLowerCase();
-                    if (/\/(following|followers)(?:\/|\?|$)/.test(href)) return false;
-                  }
-                  var labels = readElementLabels(el);
-                  if (labels.text && NON_UNFOLLOW_RE.test(labels.text)) return false;
-                  if (labels.aria && NON_UNFOLLOW_RE.test(labels.aria)) return false;
-                  if (labels.text && labels.text.length <= 24 && EXACT_UNFOLLOW_TEXT_RE.test(labels.text)) {
-                    return true;
-                  }
-                  if (!labels.text && labels.aria && labels.aria.length <= 64 && ARIA_UNFOLLOW_RE.test(labels.aria)) {
-                    return true;
-                  }
-                } catch (_) {}
-                return false;
-              }
-
-              function isElementHidden(el) {
-                try {
-                  if (!el.isConnected) return true;
-                  var style = window.getComputedStyle(el);
-                  if (!style || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                    return true;
-                  }
-                  var rect = el.getBoundingClientRect();
-                  return rect.width < 1 || rect.height < 1;
-                } catch (_) {
-                  return false;
-                }
-              }
-
-              function extractHandleNearButton(btn) {
-                try {
-                  if (!btn) return '';
-                  var row = btn.closest ? btn.closest('[data-omni-ff-row]') : null;
-                  if (row) {
-                    var rh = (row.getAttribute('data-omni-ff-row') || '').trim().toLowerCase();
-                    if (rh) return rh;
-                  }
-                  var labels = readElementLabels(btn);
-                  var aria = labels.aria || '';
-                  var am = /^@?([a-z0-9._-]{1,40})\s*(?:をフォロー|のフォロー)/i.exec(aria) ||
-                           /^(?:follow|unfollow)\s+@?([a-z0-9._-]{1,40})/i.exec(aria);
-                  if (am && am[1]) return am[1].toLowerCase();
-                  var cur = btn.parentElement;
-                  for (var d = 0; d < 6 && cur && cur !== document.body; d++) {
-                    if (typeof window.__omniExtractHandleFromRow === 'function') {
-                      var eh = window.__omniExtractHandleFromRow(cur);
-                      if (eh) return eh;
-                    }
-                    var imgs = cur.querySelectorAll ? cur.querySelectorAll('img[alt]') : [];
-                    for (var j = 0; j < imgs.length && j < 4; j++) {
-                      var alt = (imgs[j].getAttribute('alt') || '').trim();
-                      var im = /^@?([a-z0-9._-]{1,40})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
-                      if (im && im[1]) return im[1].toLowerCase();
-                    }
-                    cur = cur.parentElement;
-                  }
-                  if (typeof window.__omniResolveProfileHandle === 'function') {
-                    return window.__omniResolveProfileHandle() || '';
-                  }
-                } catch (_) {}
-                return '';
-              }
-
-              function isBlockButtonElement(el) {
-                if (!el || el.disabled) return false;
-                try {
-                  if (el.getAttribute('aria-disabled') === 'true') return false;
-                  if (el.closest('nav')) return false;
-                  var labels = readElementLabels(el);
-                  if (labels.text && NON_BLOCK_RE.test(labels.text)) return false;
-                  if (labels.aria && NON_BLOCK_RE.test(labels.aria)) return false;
-                  if (labels.text && labels.text.length <= 24 && EXACT_BLOCK_CONFIRM_RE.test(labels.text)) {
-                    return true;
-                  }
-                } catch (_) {}
-                return false;
-              }
-
-              function captureBlockFollowContext(btn, clickedHandle) {
-                try {
-                  var now = Date.now();
-                  var h = clickedHandle || '';
-                  var state = null;
-                  var row = btn && btn.closest ? btn.closest('[data-omni-ff-row]') : null;
-                  if (row) {
-                    state = detectDomFollowingInScope(row, false);
-                  }
-                  if (state === null) {
-                    var curProfile = (typeof window.__omniResolveProfileHandle === 'function')
-                      ? String(window.__omniResolveProfileHandle() || '').trim().toLowerCase()
-                      : '';
-                    if (curProfile && (!h || h === curProfile)) {
-                      state = detectProfileDomFollowingState();
-                      if (!h) h = curProfile;
-                    }
-                  }
-                  if (state === null && h && typeof window.__omniIsFollowingUser === 'function') {
-                    var cached = window.__omniIsFollowingUser(h, h);
-                    if (typeof cached === 'boolean') state = cached;
-                  }
-                  if (state !== null) {
-                    lastBlockFollowContext = { handle: h, isFollowing: state, ts: now };
-                  }
-                } catch (_) {}
-              }
-
-              document.addEventListener('click', function(e) {
-                try {
-                  if (e && (e.isTrusted === false || e.button !== 0 || e.ctrlKey || e.metaKey)) return;
-                  bumpUserInteraction(false);
-                  var clickInteractionId = currentInteractionId();
-                  var target = e.target;
-                  if (!target) return;
-                  if (target.nodeType !== 1) target = target.parentElement;
-                  if (!target || typeof target.closest !== 'function') return;
-                  var btn = target.closest('button, [role="button"], [role="menuitem"], a');
-                  if (!btn) return;
-
-                  var clickedAt = Date.now();
-                  var clickedHandle = extractHandleNearButton(btn);
-                  var inDialog = !!btn.closest('[role="dialog"], [role="alertdialog"]');
-                  var isFollowBtn = isFollowButtonElement(btn);
-                  var isUnfollowBtn = !isFollowBtn && isUnfollowButtonElement(btn);
-                  var isBlockBtn = !isFollowBtn && !isUnfollowBtn && isBlockButtonElement(btn);
-
-                  if (!inDialog || !isBlockBtn) {
-                    captureBlockFollowContext(btn, clickedHandle);
-                  }
-                  if (!isFollowBtn && !isUnfollowBtn && !isBlockBtn) {
-                    if (clickedHandle) {
-                      lastClickedTargetHandle = clickedHandle;
-                      lastClickedTargetAt = clickedAt;
-                    }
-                    return;
-                  }
-
-                  if (clickedHandle) {
-                    lastClickedTargetHandle = clickedHandle;
-                    lastClickedTargetAt = clickedAt;
-                  }
-                  var hadDialog = !!document.querySelector('[role="dialog"], [role="alertdialog"]');
-                  var initialLabels = readElementLabels(btn);
-
-                  if (isBlockBtn) {
-                    var wasFollowingAtClick = isTargetFollowedForBlock(clickedHandle, clickedHandle);
-                    if (inDialog && wasFollowingAtClick) {
-                      var bst = states.block;
-                      var ustB = states.unfollow;
-                      setTimeout(function() {
-                        try {
-                          if (bst.inFlight > 0 || ustB.inFlight > 0 ||
-                              bst.lastNetworkStartAt >= clickedAt - 300 ||
-                              bst.lastNetworkAt >= clickedAt - 300 ||
-                              ustB.lastNetworkStartAt >= clickedAt - 300 ||
-                              ustB.lastNetworkAt >= clickedAt - 300 ||
-                              ustB.lastAnyEmitAt >= clickedAt - 300) {
-                            return;
-                          }
-                          if (isElementHidden(btn)) {
-                            handleBlockCompleted('dom', clickedHandle, clickInteractionId, true, clickedHandle);
-                          }
-                        } catch (_) {}
-                      }, 1000);
-                    }
-                    return;
-                  }
-
-                  if (isFollowBtn) {
-                    var fst = states.follow;
-                    setTimeout(function() {
-                      try {
-                        if (fst.inFlight > 0 ||
-                            fst.lastNetworkStartAt >= clickedAt - 300 ||
-                            fst.lastNetworkAt >= clickedAt - 300 ||
-                            fst.lastAnyEmitAt >= clickedAt - 300) {
-                          return;
-                        }
-                        if (!hadDialog) {
-                          var dlg = document.querySelector('[role="dialog"]');
-                          if (dlg) {
-                            var dlgBtns = dlg.querySelectorAll('button, [role="button"]');
-                            for (var i = 0; i < dlgBtns.length; i++) {
-                              if (dlgBtns[i] !== btn && isFollowButtonElement(dlgBtns[i])) {
-                                return;
-                              }
-                            }
-                          }
-                        }
-                        if (isElementHidden(btn)) {
-                          emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
-                          return;
-                        }
-                        if (btn.getAttribute('aria-pressed') === 'true') {
-                          emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
-                          return;
-                        }
-                        var after = readElementLabels(btn);
-                        if ((after.text && POST_FOLLOW_STATE_RE.test(after.text)) ||
-                            (after.aria && POST_FOLLOW_STATE_RE.test(after.aria))) {
-                          emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
-                          return;
-                        }
-                        if ((after.text !== initialLabels.text || after.aria !== initialLabels.aria) &&
-                            !isFollowButtonElement(btn)) {
-                          emitRelation('follow', 'dom', clickedHandle, clickInteractionId);
-                        }
-                      } catch (_) {}
-                    }, 1000);
-                  } else if (isUnfollowBtn) {
-                    var ust = states.unfollow;
-                    var isConfirmBtn = inDialog && CONFIRM_UNFOLLOW_TEXT_RE.test(initialLabels.text || '');
-                    setTimeout(function() {
-                      try {
-                        if (ust.inFlight > 0 ||
-                            ust.lastNetworkStartAt >= clickedAt - 300 ||
-                            ust.lastNetworkAt >= clickedAt - 300 ||
-                            ust.lastAnyEmitAt >= clickedAt - 300) {
-                          return;
-                        }
-                        if (!hadDialog) {
-                          var dlg2 = document.querySelector('[role="dialog"]');
-                          if (dlg2) {
-                            return;
-                          }
-                        }
-                        if (isConfirmBtn && isElementHidden(btn)) {
-                          emitRelation('unfollow', 'dom', clickedHandle, clickInteractionId);
-                          return;
-                        }
-                        var afterU = readElementLabels(btn);
-                        if ((afterU.text && EXACT_FOLLOW_TEXT_RE.test(afterU.text)) ||
-                            (!afterU.text && afterU.aria && ARIA_FOLLOW_RE.test(afterU.aria))) {
-                          emitRelation('unfollow', 'dom', clickedHandle, clickInteractionId);
-                        }
-                      } catch (_) {}
-                    }, 1000);
-                  }
-                } catch (_) {}
-              }, true);
-            })();
-        """.trimIndent()
+            }
+            if (isConfirmBtn && isElementHidden(btn)) {
+              emitRelation('unfollow', 'dom', clickedHandle, clickInteractionId);
+              return;
+            }
+            var afterU = readElementLabels(btn);
+            if ((afterU.text && EXACT_FOLLOW_TEXT_RE.test(afterU.text)) ||
+                (!afterU.text && afterU.aria && ARIA_FOLLOW_RE.test(afterU.aria))) {
+              emitRelation('unfollow', 'dom', clickedHandle, clickInteractionId);
+            }
+          } catch (_) {}
+        }, domDelayMs);
+      }
+    } catch (_) {}
+  }, true);
+})();
+"""
 
         /**
          * Instagram / Threads / Bluesky のフォロワー一覧・フィード等で、ページ遷移なしで
@@ -1423,6 +1716,7 @@ class OmniWebViewManager(
   if (window !== window.top) return;
   if (window.__omniProfileStatsInstalled) return;
   window.__omniProfileStatsInstalled = true;
+
   var __omniFollowToken = "__OMNISNS_FOLLOW_TOKEN__";
   var __omniFollowChannel = window.OmniFollowChannel;
   var __omniFollowBridge = window.OmniFollowBridge;
@@ -1487,12 +1781,13 @@ class OmniWebViewManager(
   var FOLLOWED_AT_KEY = 'omnisns_followed_at_v1_' + platform + '_' + host.replace(/[^a-z0-9.-]/g, '');
   var CACHE_TTL_MS = 6 * 60 * 60 * 1000;
   var FOLLOWED_AT_TTL_MS = 180 * 24 * 60 * 60 * 1000;
-  var MAX_CACHE_ENTRIES = 600;
+  var MAX_CACHE_ENTRIES = 800;
   var MAX_FOLLOWED_AT_ENTRIES = 3000;
   var statsMap = Object.create(null);
   var followedAtMap = Object.create(null);
   var userIdMap = Object.create(null);
   var idToHandleMap = Object.create(null);
+  var followRkeyMap = Object.create(null);
   var privateMap = Object.create(null);
   var failedMap = Object.create(null);
   var inFlight = Object.create(null);
@@ -1522,6 +1817,58 @@ class OmniWebViewManager(
   var appliedThemeMode = '';
   var pageBooted = false;
   var lastScrollScanAt = 0;
+
+  var accountFilterConfig = {
+    enabled: false,
+    minFollowing: null,
+    maxFollowing: null,
+    minFollowers: null,
+    maxFollowers: null,
+    followingGreaterThanFollowers: false
+  };
+  var afLastStateKey = '';
+  var afActiveContextKey = '';
+  var afPulseInProgress = false;
+  var afAutoFetching = false;
+  var afLastPulseAt = 0;
+  var afEmptyPulseCount = 0;
+  var afReachedEnd = false;
+  var afCooldownTimer = null;
+  var afLastUserScrollAt = 0;
+  var afApiBatchSeq = 0;
+  var AF_MIN_VISIBLE_MATCHES = 12;
+  var AF_PULSE_COOLDOWN_MS = 900;
+  var AF_MAX_EMPTY_PULSES = 5;
+
+  function isAccountFilterActive() {
+    if (!accountFilterConfig || !accountFilterConfig.enabled) return false;
+    return accountFilterConfig.minFollowing !== null ||
+      accountFilterConfig.maxFollowing !== null ||
+      accountFilterConfig.minFollowers !== null ||
+      accountFilterConfig.maxFollowers !== null ||
+      !!accountFilterConfig.followingGreaterThanFollowers;
+  }
+
+  function extractFetchUrl(input) {
+    try {
+      if (typeof input === 'string') return input;
+      if (!input) return '';
+      if (typeof URL !== 'undefined' && input instanceof URL) return input.href || String(input);
+      if (typeof input === 'object') {
+        if (typeof input.url === 'string' && input.url) return input.url;
+        if (typeof input.href === 'string' && input.href) return input.href;
+        if (typeof input.toString === 'function') {
+          var s = String(input);
+          if (s && s !== '[object Object]' && s !== '[object Request]') return s;
+        }
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function stripInvisibleChars(s) {
+    return String(s || '').replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '');
+  }
 
   var capturedHeaders = Object.create(null);
   var capturedProfileGql = null;
@@ -1767,11 +2114,12 @@ class OmniWebViewManager(
 
   function isValidHandle(h) {
     if (!h || typeof h !== 'string') return false;
-    var clean = h.replace(/^@+/, '').trim().toLowerCase();
+    var clean = stripInvisibleChars(h).replace(/^@+/, '').trim().toLowerCase();
     if (!clean || clean.length > 80) return false;
     if (RESERVED_SEGMENTS[clean]) return false;
     if (platform === 'bluesky') {
-      return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(clean) || /^did:[a-z0-9:._-]+$/.test(clean);
+      if (clean === 'handle.invalid') return false;
+      return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(clean) || /^did:[a-z0-9:._-]+$/.test(clean);
     }
     if (platform === 'mastodon' || platform === 'misskey') {
       return /^[a-z0-9._-]{1,40}(?:@[a-z0-9.-]+\.[a-z]{2,})?$/.test(clean);
@@ -1787,7 +2135,7 @@ class OmniWebViewManager(
 
   function normalizeHandle(h) {
     if (!h || typeof h !== 'string') return '';
-    var clean = h.replace(/^@+/, '').trim().toLowerCase();
+    var clean = stripInvisibleChars(h).replace(/^@+/, '').trim().toLowerCase();
     return isValidHandle(clean) ? clean : '';
   }
 
@@ -1797,10 +2145,51 @@ class OmniWebViewManager(
     if (!idStr) return;
     if (/^\d{3,24}$/.test(idStr) || /^did:[a-z0-9:._-]+$/i.test(idStr) ||
         ((platform === 'mastodon' || platform === 'misskey') && /^[a-z0-9_-]{4,36}$/i.test(idStr))) {
-      userIdMap[handle] = idStr;
-      idToHandleMap[idStr] = handle;
-      idToHandleMap[idStr.toLowerCase()] = handle;
+      var idLower = idStr.toLowerCase();
+      if (handle !== idLower) {
+        userIdMap[handle] = idStr;
+        idToHandleMap[idStr] = handle;
+        idToHandleMap[idLower] = handle;
+      }
     }
+  }
+
+  function extractRkeyFromAtUri(uri) {
+    if (!uri || typeof uri !== 'string') return '';
+    var m = /\/app\.bsky\.graph\.follow\/([^\/?#]+)$/i.exec(uri.trim());
+    return m && m[1] ? m[1].trim().toLowerCase() : '';
+  }
+
+  function bindBlueskyFollowUri(handleOrDid, uri) {
+    var rkey = extractRkeyFromAtUri(uri);
+    if (!rkey || !handleOrDid) return;
+    var key = String(handleOrDid).trim().toLowerCase();
+    var resolved = idToHandleMap[key] || normalizeHandle(key) || key;
+    if (resolved) followRkeyMap[rkey] = resolved;
+  }
+
+  function resolveAliasHandle(rawHandle) {
+    var h = normalizeHandle(rawHandle);
+    if (!h) return '';
+    if (idToHandleMap[h]) return idToHandleMap[h];
+    return h;
+  }
+
+  function getStatsEntry(rawHandle) {
+    if (!rawHandle) return null;
+    var direct = statsMap[rawHandle];
+    if (direct && hasUsableStats(direct)) return direct;
+    var alias = idToHandleMap[rawHandle];
+    if (alias && statsMap[alias]) {
+      if (hasUsableStats(statsMap[alias]) || !direct) return statsMap[alias];
+    }
+    var did = userIdMap[rawHandle];
+    if (did) {
+      var didLower = did.toLowerCase();
+      var byDid = statsMap[didLower] || statsMap[did];
+      if (byDid && (hasUsableStats(byDid) || !direct)) return byDid;
+    }
+    return direct || null;
   }
 
   function formatCompactCount(n) {
@@ -1977,6 +2366,26 @@ class OmniWebViewManager(
     return recordStats(rawHandle, null, null, null, null, iFollow, followsMe);
   }
 
+  window.__omniBindBlueskyFollowUri = function(handleOrDid, uri) {
+    try { bindBlueskyFollowUri(handleOrDid, uri); } catch (_) {}
+  };
+
+  window.__omniCanonicalTargetKey = function(rawKey, fallbackHandle) {
+    try {
+      var k = String(rawKey || '').trim().toLowerCase();
+      if (k) {
+        if (followRkeyMap[k]) k = followRkeyMap[k];
+        if (idToHandleMap[k]) return idToHandleMap[k];
+        var nh = normalizeHandle(k);
+        if (nh) return idToHandleMap[nh] || nh;
+        return k;
+      }
+      var fb = normalizeHandle(fallbackHandle || '');
+      if (fb) return idToHandleMap[fb] || fb;
+    } catch (_) {}
+    return '';
+  };
+
   // フォロー／アンフォロー操作を即座に記憶・バッジへ反映するフック
   window.__omniOnFollowAction = function(action, targetKey, fallbackHandle) {
     try {
@@ -1984,6 +2393,7 @@ class OmniWebViewManager(
       var key = String(targetKey || '').trim().toLowerCase();
       var h = '';
       if (key) {
+        if (followRkeyMap[key]) key = followRkeyMap[key];
         if (idToHandleMap[key]) h = idToHandleMap[key];
         else if (!/^\d+$/.test(key)) h = normalizeHandle(key);
       }
@@ -2005,6 +2415,10 @@ class OmniWebViewManager(
           forgetFollowedAt(h);
         }
         recordRelation(h, isFollow, null);
+        var mappedDid = userIdMap[h];
+        if (mappedDid && /^did:/i.test(mappedDid)) {
+          recordRelation(mappedDid.toLowerCase(), isFollow, null);
+        }
         if (isFollow) {
           enqueueFetch(h, true, false);
           scheduleRelBatch(120);
@@ -2020,6 +2434,7 @@ class OmniWebViewManager(
       var key = String(targetKey || '').trim().toLowerCase();
       var h = '';
       if (key) {
+        if (followRkeyMap[key]) key = followRkeyMap[key];
         if (idToHandleMap[key]) h = idToHandleMap[key];
         else if (!/^\d+$/.test(key)) h = normalizeHandle(key);
       }
@@ -2032,7 +2447,7 @@ class OmniWebViewManager(
       }
       if (!h) h = getCurrentProfileHandleFromUrl();
       if (!h || h === selfHandle) return null;
-      var ent = statsMap[h];
+      var ent = getStatsEntry(h);
       if (ent && typeof ent.iFollow === 'boolean') return ent.iFollow;
       if (selfFollowingSet[h]) return true;
       if (followedAtMap[h]) return true;
@@ -2168,12 +2583,15 @@ class OmniWebViewManager(
       // Bluesky app.bsky.graph.getRelationships response item: { did, following, followedBy }
       if (typeof obj.did === 'string' && obj.did.indexOf('did:') === 0 &&
           ('following' in obj || 'followedBy' in obj) && !obj.handle) {
-        var bskyHandle = idToHandleMap[obj.did] || idToHandleMap[obj.did.toLowerCase()];
+        var didKey = obj.did.toLowerCase();
+        var bskyHandle = idToHandleMap[obj.did] || idToHandleMap[didKey];
+        var bOut = typeof obj.following === 'string' ? true : (obj.following === undefined ? false : !!obj.following);
+        var bIn = typeof obj.followedBy === 'string' ? true : (obj.followedBy === undefined ? false : !!obj.followedBy);
+        if (typeof obj.following === 'string') bindBlueskyFollowUri(bskyHandle || didKey, obj.following);
         if (bskyHandle) {
-          var bOut = typeof obj.following === 'string' ? true : (obj.following === undefined ? false : !!obj.following);
-          var bIn = typeof obj.followedBy === 'string' ? true : (obj.followedBy === undefined ? false : !!obj.followedBy);
           if (recordRelation(bskyHandle, bOut, bIn)) foundStats = true;
         }
+        if (recordRelation(didKey, bOut, bIn)) foundStats = true;
       }
 
       // Mastodon /api/v1/accounts/relationships item: { id, following: bool, followed_by: bool }
@@ -2193,12 +2611,20 @@ class OmniWebViewManager(
         (typeof obj.screenName === 'string' && obj.screenName) ||
         (typeof obj.userName === 'string' && obj.userName) ||
         (platform === 'pixiv' && typeof obj.userId === 'string' && obj.userId) ||
+        (platform === 'bluesky' && typeof obj.did === 'string' && obj.did.indexOf('did:') === 0 && obj.did) ||
         '';
       if (candidateHandle) {
         var normH = normalizeHandle(candidateHandle);
+        var bskyDidNorm = (platform === 'bluesky' && typeof obj.did === 'string' && obj.did.indexOf('did:') === 0)
+          ? obj.did.trim().toLowerCase()
+          : '';
+        if (!normH && bskyDidNorm) normH = bskyDidNorm;
         if (normH) {
           var rawId = obj.pk || obj.pk_id || obj.did || obj.id || obj.fbid_v2 || obj.userId;
           bindUserId(normH, rawId);
+          if (platform === 'bluesky' && obj.viewer && typeof obj.viewer === 'object' && typeof obj.viewer.following === 'string') {
+            bindBlueskyFollowUri(normH, obj.viewer.following);
+          }
           var privFlag = typeof obj.is_private === 'boolean' ? obj.is_private
             : (typeof obj.locked === 'boolean' ? obj.locked
             : (typeof obj.isLocked === 'boolean' ? obj.isLocked
@@ -2235,6 +2661,9 @@ class OmniWebViewManager(
             if (recordStats(normH, flwrs, flwng, null, privFlag, rel.iFollow, rel.followsMe)) {
               foundStats = true;
             }
+            if (bskyDidNorm && bskyDidNorm !== normH) {
+              recordStats(bskyDidNorm, flwrs, flwng, null, privFlag, rel.iFollow, rel.followsMe);
+            }
           }
         }
       }
@@ -2262,6 +2691,9 @@ class OmniWebViewManager(
 
   function extractFromHtmlForHandle(html, targetHandle) {
     if (!html || typeof html !== 'string') return false;
+"""
+
+        private val PROFILE_STATS_JS_PART_2: String = """
     var followers = null;
     var following = null;
     var posts = null;
@@ -2420,7 +2852,9 @@ class OmniWebViewManager(
       return u.indexOf('/graphql') >= 0 || u.indexOf('/api/v1/') >= 0;
     }
     if (platform === 'bluesky') {
-      return u.indexOf('/xrpc/app.bsky.') >= 0;
+      return u.indexOf('/xrpc/app.bsky.') >= 0 ||
+             u.indexOf('/xrpc/com.atproto.server.getsession') >= 0 ||
+             u.indexOf('/xrpc/com.atproto.server.refreshsession') >= 0;
     }
     if (platform === 'mastodon') {
       return u.indexOf('/api/v1/') >= 0 || u.indexOf('/api/v2/') >= 0;
@@ -2436,23 +2870,44 @@ class OmniWebViewManager(
            u.indexOf('friend') >= 0 || u.indexOf('relation') >= 0;
   }
 
-  function sniffJsonText(txt) {
+  function sniffJsonText(txt, reqUrl) {
     if (!txt || txt.length > 1800000) return;
-    if (txt.indexOf('follower') < 0 && txt.indexOf('edge_followed_by') < 0 &&
+    var uLower = String(reqUrl || '').toLowerCase();
+    var isBskySession = platform === 'bluesky' &&
+      (uLower.indexOf('com.atproto.server.getsession') >= 0 || uLower.indexOf('com.atproto.server.refreshsession') >= 0);
+    if (!isBskySession &&
+        txt.indexOf('follower') < 0 && txt.indexOf('edge_followed_by') < 0 &&
         txt.indexOf('followersCount') < 0 && txt.indexOf('followsCount') < 0 &&
         txt.indexOf('followed_by') < 0 && txt.indexOf('followedBy') < 0 &&
         txt.indexOf('friendship_status') < 0 && txt.indexOf('follows_viewer') < 0 &&
         txt.indexOf('isFollowed') < 0 && txt.indexOf('is_followed') < 0 &&
         txt.indexOf('viewer_username') < 0 && txt.indexOf('"username"') < 0 &&
-        txt.indexOf('"uniqueId"') < 0 && txt.indexOf('"acct"') < 0) {
+        txt.indexOf('"uniqueId"') < 0 && txt.indexOf('"acct"') < 0 &&
+        !(platform === 'bluesky' && txt.indexOf('"handle"') >= 0)) {
       return;
+    }
+    if (/(?:getfollowers|getfollows|getknownfollowers|searchactors|getlikes|getrepostedby|friendships|followers|following|user\/list)/i.test(uLower)) {
+      afApiBatchSeq++;
     }
     try {
       var clean = txt.indexOf('for (;;);') === 0 ? txt.slice(9) : txt;
       var parsed = JSON.parse(clean);
-      extractFromJsonObject(parsed);
+      if (isBskySession && parsed && typeof parsed === 'object') {
+        if (typeof parsed.did === 'string' && parsed.did.indexOf('did:') === 0) {
+          selfDid = parsed.did;
+        }
+        if (typeof parsed.handle === 'string' && parsed.handle) {
+          var sh = normalizeHandle(parsed.handle);
+          if (sh && selfDid) bindUserId(sh, selfDid);
+          setSelfHandle(parsed.handle);
+        }
+      }
+      var found = extractFromJsonObject(parsed);
       if (platform === 'instagram' || platform === 'bluesky' || platform === 'mastodon') {
         scheduleRelBatch(140);
+      }
+      if (platform === 'bluesky' && (found || isAccountFilterActive())) {
+        scheduleRenderBadges(50);
       }
     } catch (_) {
       try {
@@ -2475,7 +2930,7 @@ class OmniWebViewManager(
         if (isInternal) {
           return origFetchRef.apply(this, arguments);
         }
-        var reqUrl = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        var reqUrl = extractFetchUrl(input);
         try {
           if (init && init.headers) captureRequestHeaders(init.headers);
           if (input && typeof input === 'object' && input.headers) captureRequestHeaders(input.headers);
@@ -2488,7 +2943,7 @@ class OmniWebViewManager(
               if (!res || !res.ok || typeof res.clone !== 'function') return;
               var ct = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
               if (ct.indexOf('json') >= 0 || ct.indexOf('text/plain') >= 0 || ct.indexOf('javascript') >= 0) {
-                res.clone().text().then(sniffJsonText, function() {});
+                res.clone().text().then(function(txt) { sniffJsonText(txt, reqUrl); }, function() {});
               }
             } catch (_) {}
           }, function() {});
@@ -2504,7 +2959,7 @@ class OmniWebViewManager(
     var origSend = XMLHttpRequest.prototype.send;
     if (typeof origOpen === 'function' && typeof origSend === 'function') {
       XMLHttpRequest.prototype.open = function(method, url) {
-        try { this.__omniStatsUrl = url; } catch (_) {}
+        try { this.__omniStatsUrl = extractFetchUrl(url); } catch (_) {}
         return origOpen.apply(this, arguments);
       };
       if (typeof origSetHeader === 'function') {
@@ -2513,19 +2968,17 @@ class OmniWebViewManager(
           return origSetHeader.apply(this, arguments);
         };
       }
-"""
-
-        private val PROFILE_STATS_JS_PART_2: String = """
       XMLHttpRequest.prototype.send = function(body) {
         try {
-          captureRequestMeta(this.__omniStatsUrl, body);
-          if (shouldSniffUrl(this.__omniStatsUrl)) {
+          var xhrUrl = this.__omniStatsUrl;
+          captureRequestMeta(xhrUrl, body);
+          if (shouldSniffUrl(xhrUrl)) {
             this.addEventListener('load', function() {
               try {
                 if (this.status >= 200 && this.status < 300 &&
                     (!this.responseType || this.responseType === 'text') &&
                     typeof this.responseText === 'string') {
-                  sniffJsonText(this.responseText);
+                  sniffJsonText(this.responseText, xhrUrl);
                 }
               } catch (_) {}
             }, { once: true });
@@ -2680,9 +3133,18 @@ class OmniWebViewManager(
           var rawBsky = window.localStorage && window.localStorage.getItem('BSKY_STORAGE');
           if (rawBsky) {
             var parsedBsky = JSON.parse(rawBsky);
-            var bHandle = parsedBsky && parsedBsky.session && parsedBsky.session.currentAccount && parsedBsky.session.currentAccount.handle;
-            if (typeof bHandle === 'string' && bHandle) {
-              setSelfHandle(bHandle);
+            var curAcc = parsedBsky && parsedBsky.session && parsedBsky.session.currentAccount;
+            if (curAcc && typeof curAcc.did === 'string' && curAcc.did.indexOf('did:') === 0) {
+              selfDid = curAcc.did;
+            }
+            if (curAcc && typeof curAcc.handle === 'string' && curAcc.handle) {
+              var bNorm = normalizeHandle(curAcc.handle);
+              if (bNorm && selfDid) bindUserId(bNorm, selfDid);
+              setSelfHandle(curAcc.handle);
+              return;
+            }
+            if (selfDid) {
+              setSelfHandle(selfDid);
               return;
             }
           }
@@ -2851,7 +3313,7 @@ class OmniWebViewManager(
       if (Date.now() < backoffUntil) return;
       if (failedMap[h] && Date.now() - failedMap[h] < 45000) return;
     }
-    var existing = statsMap[h];
+    var existing = getStatsEntry(h);
     var needRel = h !== selfHandle && (!existing || existing.followsMe === null);
     if (!forceRetry && hasUsableStats(existing) && !needRel && (Date.now() - existing.ts) < CACHE_TTL_MS) {
       return;
@@ -2859,7 +3321,7 @@ class OmniWebViewManager(
     if (!forceRetry && hasUsableStats(existing) && needRel) {
       scheduleRelBatch();
       if (platform !== 'instagram' && platform !== 'bluesky' && platform !== 'mastodon') return;
-      if (userIdMap[h]) return;
+      if (userIdMap[h] || (platform === 'bluesky' && h.indexOf('did:') === 0)) return;
     }
     if (inFlight[h]) return;
     if (queuedSet[h]) {
@@ -2875,7 +3337,8 @@ class OmniWebViewManager(
     queuedSet[h] = true;
     if (priority) queue.unshift(h);
     else queue.push(h);
-    if (queue.length > 80) {
+    var maxQueue = isAccountFilterActive() ? 360 : 240;
+    if (queue.length > maxQueue) {
       var dropped = queue.pop();
       if (dropped) delete queuedSet[dropped];
     }
@@ -2884,7 +3347,7 @@ class OmniWebViewManager(
       queueStartTimer = setTimeout(function() {
         queueStartTimer = null;
         processQueue();
-      }, platform === 'bluesky' ? 30 : 20);
+      }, platform === 'bluesky' ? 25 : 20);
     }
   }
 
@@ -2910,15 +3373,15 @@ class OmniWebViewManager(
       var h = rows[i].getAttribute('data-omni-ff-row') || rows[i].getAttribute('data-omni-ff-handle') || '';
       if (!h || h === selfHandle || seen[h]) continue;
       seen[h] = true;
-      var e = statsMap[h];
+      var e = getStatsEntry(h);
       if (e && e.followsMe !== null && e.iFollow !== null) continue;
       if (relQueriedMap[h] && now - relQueriedMap[h] < 120000) continue;
-      if (!userIdMap[h]) continue;
+      if (!userIdMap[h] && !(platform === 'bluesky' && h.indexOf('did:') === 0)) continue;
       targetHandles.push(h);
     }
     var curH = getCurrentProfileHandleFromUrl();
-    if (curH && curH !== selfHandle && !seen[curH] && userIdMap[curH]) {
-      var ce = statsMap[curH];
+    if (curH && curH !== selfHandle && !seen[curH] && (userIdMap[curH] || (platform === 'bluesky' && curH.indexOf('did:') === 0))) {
+      var ce = getStatsEntry(curH);
       if ((!ce || ce.followsMe === null || ce.iFollow === null) && (!relQueriedMap[curH] || now - relQueriedMap[curH] >= 120000)) {
         targetHandles.unshift(curH);
       }
@@ -2932,10 +3395,11 @@ class OmniWebViewManager(
       }
       var dids = [];
       for (var bi = 0; bi < targetHandles.length; bi++) {
-        var d = userIdMap[targetHandles[bi]];
+        var th = targetHandles[bi];
+        var d = userIdMap[th] || (th.indexOf('did:') === 0 ? th : '');
         if (d && d.indexOf('did:') === 0 && d !== selfDid) {
           dids.push(d);
-          relQueriedMap[targetHandles[bi]] = now;
+          relQueriedMap[th] = now;
         }
       }
       if (dids.length === 0) return;
@@ -2950,10 +3414,13 @@ class OmniWebViewManager(
             for (var r = 0; r < data.relationships.length; r++) {
               var rel = data.relationships[r];
               if (rel && rel.did) {
-                var bh = idToHandleMap[rel.did] || idToHandleMap[rel.did.toLowerCase()];
-                if (bh) {
-                  recordRelation(bh, !!rel.following, !!rel.followedBy);
+                var didKey = rel.did.toLowerCase();
+                var bh = idToHandleMap[rel.did] || idToHandleMap[didKey];
+                if (typeof rel.following === 'string') {
+                  bindBlueskyFollowUri(bh || didKey, rel.following);
                 }
+                if (bh) recordRelation(bh, !!rel.following, !!rel.followedBy);
+                recordRelation(didKey, !!rel.following, !!rel.followedBy);
               }
             }
           }
@@ -3207,6 +3674,9 @@ class OmniWebViewManager(
       ? fetchIgViaCapturedGql(handle)
       : Promise.resolve({ ok: false, rateLimited: false });
     return chain.then(function(r0) {
+"""
+
+        private val PROFILE_STATS_JS_PART_3: String = """
       if (r0 && r0.ok) { consecutiveFailures = 0; return; }
       if (r0 && r0.rateLimited) { backoffUntil = Date.now() + 50000; failedMap[handle] = Date.now(); scheduleRenderBadges(); return; }
       return tryHtml(true).then(function(r1) {
@@ -3222,55 +3692,146 @@ class OmniWebViewManager(
     });
   }
 
+  function recordBlueskyProfile(p, requestedKey, resolvedSet) {
+    if (!p || typeof p !== 'object') return '';
+    var nh = p.handle ? normalizeHandle(p.handle) : '';
+    var didRaw = typeof p.did === 'string' && p.did.indexOf('did:') === 0 ? p.did.trim() : '';
+    var didNorm = didRaw ? didRaw.toLowerCase() : '';
+    if (nh && didRaw) {
+      bindUserId(nh, didRaw);
+    }
+    if (didRaw && ((nh && nh === selfHandle) || (selfDid && didNorm === selfDid.toLowerCase()))) {
+      selfDid = didRaw;
+    }
+    if (p.viewer && typeof p.viewer === 'object' && typeof p.viewer.following === 'string') {
+      bindBlueskyFollowUri(nh || didNorm, p.viewer.following);
+    }
+    var rel = extractRelationFromObject(p);
+    if (nh) {
+      recordStats(nh, p.followersCount, p.followsCount, null, null, rel.iFollow, rel.followsMe);
+      if (resolvedSet) resolvedSet[nh] = true;
+    }
+    if (didNorm && didNorm !== nh) {
+      recordStats(didNorm, p.followersCount, p.followsCount, null, null, rel.iFollow, rel.followsMe);
+      if (resolvedSet) resolvedSet[didNorm] = true;
+    }
+    if (requestedKey && requestedKey !== nh && requestedKey !== didNorm) {
+      recordStats(requestedKey, p.followersCount, p.followsCount, null, null, rel.iFollow, rel.followsMe);
+      if (resolvedSet) resolvedSet[requestedKey] = true;
+    }
+    return (didRaw && didRaw !== selfDid) ? didRaw : '';
+  }
+
+  function fetchBlueskySingleFallback(handle) {
+    var actor = (userIdMap[handle] && userIdMap[handle].indexOf('did:') === 0) ? userIdMap[handle] : handle;
+    return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' + encodeURIComponent(actor), {
+      method: 'GET'
+    }).then(function(res) {
+      if (!res) { failedMap[handle] = Date.now(); return; }
+      if (res.status === 429) { backoffUntil = Date.now() + 30000; return; }
+      if (!res.ok) { failedMap[handle] = Date.now(); return; }
+      return res.json().then(function(p) {
+        if (p && (p.handle || p.did)) {
+          var d = recordBlueskyProfile(p, handle, null);
+          if (selfDid && d) {
+            scheduleRelBatch(80);
+          } else if (selfHandle && !selfDid) {
+            fetchBlueskySelfDid(selfHandle);
+          }
+        } else {
+          failedMap[handle] = Date.now();
+        }
+      }).catch(function() { failedMap[handle] = Date.now(); });
+    }).catch(function() { failedMap[handle] = Date.now(); });
+  }
+
   function fetchBlueskyBatch(handles) {
+    if (!handles || handles.length === 0) return Promise.resolve();
     var qs = handles.map(function(h) { return 'actors=' + encodeURIComponent(h); }).join('&');
     return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles?' + qs, {
       method: 'GET'
     }).then(function(res) {
-      if (res.status === 429) {
-        backoffUntil = Date.now() + 45000;
+      if (!res) {
+        for (var ni = 0; ni < handles.length; ni++) failedMap[handles[ni]] = Date.now();
         return;
       }
-      if (!res.ok) return;
+      if (res.status === 429) {
+        backoffUntil = Date.now() + 30000;
+        return;
+      }
+      if (!res.ok) {
+        if (handles.length > 1) {
+          var mid = Math.ceil(handles.length / 2);
+          var left = handles.slice(0, mid);
+          var right = handles.slice(mid);
+          return fetchBlueskyBatch(left).then(function() {
+            if (Date.now() < backoffUntil) return;
+            return fetchBlueskyBatch(right);
+          });
+        }
+        return fetchBlueskySingleFallback(handles[0]);
+      }
       return res.json().then(function(data) {
         var dids = [];
+        var resolvedSet = Object.create(null);
         if (data && Array.isArray(data.profiles)) {
           for (var i = 0; i < data.profiles.length; i++) {
-            var p = data.profiles[i];
-            if (p && p.handle) {
-              var nh = normalizeHandle(p.handle);
-              if (nh && p.did) {
-                bindUserId(nh, p.did);
-                if (nh === selfHandle) selfDid = p.did;
-                else dids.push(p.did);
-              }
-              recordStats(p.handle, p.followersCount, p.followsCount, null, null, null, null);
+            var d = recordBlueskyProfile(data.profiles[i], null, resolvedSet);
+            if (d) dids.push(d);
+          }
+        }
+        var missingSingle = [];
+        for (var m = 0; m < handles.length; m++) {
+          var reqH = handles[m];
+          var mappedDid = userIdMap[reqH] ? userIdMap[reqH].toLowerCase() : '';
+          var mappedHandle = idToHandleMap[reqH] || '';
+          if (!resolvedSet[reqH] && !(mappedDid && resolvedSet[mappedDid]) && !(mappedHandle && resolvedSet[mappedHandle])) {
+            if (mappedDid && mappedDid.indexOf('did:') === 0 && missingSingle.length < 3) {
+              missingSingle.push(reqH);
+            } else {
+              failedMap[reqH] = Date.now();
             }
           }
         }
+        var postChain = Promise.resolve();
+        if (missingSingle.length > 0) {
+          postChain = missingSingle.reduce(function(acc, mh) {
+            return acc.then(function() { return fetchBlueskySingleFallback(mh); });
+          }, postChain);
+        }
         if (selfDid && dids.length > 0) {
           var rQs = 'actor=' + encodeURIComponent(selfDid) + '&' + dids.slice(0, 25).map(function(d) { return 'others=' + encodeURIComponent(d); }).join('&');
-          return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.graph.getRelationships?' + rQs, {
-            method: 'GET'
-          }).then(function(rRes) {
-            if (!rRes || !rRes.ok) return;
-            return rRes.json().then(function(rData) {
-              if (rData && Array.isArray(rData.relationships)) {
-                for (var r = 0; r < rData.relationships.length; r++) {
-                  var rel = rData.relationships[r];
-                  if (rel && rel.did) {
-                    var bh = idToHandleMap[rel.did] || idToHandleMap[rel.did.toLowerCase()];
-                    if (bh) recordRelation(bh, !!rel.following, !!rel.followedBy);
+          postChain = postChain.then(function() {
+            return internalFetch('https://public.api.bsky.app/xrpc/app.bsky.graph.getRelationships?' + rQs, {
+              method: 'GET'
+            }).then(function(rRes) {
+              if (!rRes || !rRes.ok) return;
+              return rRes.json().then(function(rData) {
+                if (rData && Array.isArray(rData.relationships)) {
+                  for (var r = 0; r < rData.relationships.length; r++) {
+                    var rel = rData.relationships[r];
+                    if (rel && rel.did) {
+                      var didKey = rel.did.toLowerCase();
+                      var bh = idToHandleMap[rel.did] || idToHandleMap[didKey];
+                      if (typeof rel.following === 'string') {
+                        bindBlueskyFollowUri(bh || didKey, rel.following);
+                      }
+                      if (bh) recordRelation(bh, !!rel.following, !!rel.followedBy);
+                      recordRelation(didKey, !!rel.following, !!rel.followedBy);
+                    }
                   }
                 }
-              }
+              }).catch(function() {});
             }).catch(function() {});
-          }).catch(function() {});
+          });
         } else if (selfHandle && !selfDid) {
           fetchBlueskySelfDid(selfHandle);
         }
+        return postChain;
       });
-    }).catch(function() {});
+    }).catch(function() {
+      for (var ci = 0; ci < handles.length; ci++) failedMap[handles[ci]] = Date.now();
+    });
   }
 
   function fetchMastodonProfile(handle) {
@@ -3365,23 +3926,20 @@ class OmniWebViewManager(
     if (platform === 'bluesky') {
       if (activeWorkers > 0) return;
       activeWorkers++;
-      var batch = queue.splice(0, 20);
+      var batch = queue.splice(0, 25);
       for (var i = 0; i < batch.length; i++) {
         delete queuedSet[batch[i]];
         inFlight[batch[i]] = true;
       }
-      var doneBsky = function() {
+      var doneBatch = function() {
         for (var j = 0; j < batch.length; j++) delete inFlight[batch[j]];
+        scheduleRenderBadges(30);
         setTimeout(function() {
           activeWorkers = Math.max(0, activeWorkers - 1);
           processQueue();
-        }, 220);
+        }, 140);
       };
-      try {
-        Promise.resolve(fetchBlueskyBatch(batch)).then(doneBsky, doneBsky);
-      } catch (_) {
-        doneBsky();
-      }
+      Promise.resolve(fetchBlueskyBatch(batch)).then(doneBatch, doneBatch);
       return;
     }
 
@@ -3393,27 +3951,23 @@ class OmniWebViewManager(
         inFlight[handle] = true;
         activeWorkers++;
         scheduleRenderBadges();
+        var req;
         var delayMs = 420;
-        var doneOne = function() {
+        if (platform === 'instagram') { req = fetchInstagramProfile(handle); delayMs = 240; }
+        else if (platform === 'threads') { req = fetchThreadsProfile(handle); delayMs = 520; }
+        else if (platform === 'mastodon') { req = fetchMastodonProfile(handle); delayMs = 240; }
+        else if (platform === 'misskey') { req = fetchMisskeyProfile(handle); delayMs = 260; }
+        else if (platform === 'tiktok') { req = fetchTikTokProfile(handle); delayMs = 680; }
+        else if (platform === 'pixiv') { req = fetchPixivProfile(handle); delayMs = 320; }
+        else { req = Promise.resolve(); delayMs = 300; }
+        var doneSingle = function() {
           delete inFlight[handle];
           setTimeout(function() {
             activeWorkers = Math.max(0, activeWorkers - 1);
             processQueue();
           }, delayMs);
         };
-        try {
-          var req;
-          if (platform === 'instagram') { req = fetchInstagramProfile(handle); delayMs = 240; }
-          else if (platform === 'threads') { req = fetchThreadsProfile(handle); delayMs = 520; }
-          else if (platform === 'mastodon') { req = fetchMastodonProfile(handle); delayMs = 240; }
-          else if (platform === 'misskey') { req = fetchMisskeyProfile(handle); delayMs = 260; }
-          else if (platform === 'tiktok') { req = fetchTikTokProfile(handle); delayMs = 680; }
-          else if (platform === 'pixiv') { req = fetchPixivProfile(handle); delayMs = 320; }
-          else { req = Promise.resolve(); delayMs = 300; }
-          Promise.resolve(req).then(doneOne, doneOne);
-        } catch (_) {
-          doneOne();
-        }
+        Promise.resolve(req).then(doneSingle, doneSingle);
       })();
     }
   }
@@ -3476,26 +4030,26 @@ class OmniWebViewManager(
       '}' +
       '.omni-ff-badge{' +
       'display:inline-flex;align-items:center;gap:2px;padding:1px 5px;' +
-      'border-radius:999px;font-size:9px;font-weight:600;line-height:1.25;' +
+      'border-radius:999px;font-size:10px;font-weight:600;line-height:1.3;' +
       'background:rgba(21,156,171,0.16);border:1px solid rgba(21,156,171,0.46);' +
       'color:inherit;white-space:nowrap;opacity:0.95;pointer-events:none;' +
       '}' +
       '.omni-ff-wrap.is-row .omni-ff-badge{pointer-events:auto;cursor:pointer;}' +
       '.omni-ff-badge.is-link{' +
       'pointer-events:auto;cursor:pointer;position:relative;' +
-      '-webkit-tap-highlight-color:transparent;touch-action:manipulation;' +
       'transition:transform 90ms ease-out,filter 90ms ease-out;' +
       '}' +
       '.omni-ff-badge.is-link::after{' +
-      'content:"";position:absolute;left:-3px;right:-3px;top:-6px;bottom:-6px;' +
+      'content:\"\";position:absolute;left:-3px;right:-3px;top:-4px;bottom:-4px;' +
       '}' +
-      '.omni-ff-badge.is-link:active{transform:scale(0.93);filter:brightness(1.25);}' +
+      '.omni-ff-badge.is-link:hover{filter:brightness(1.18);text-decoration:underline;}' +
+      '.omni-ff-badge.is-link:active{transform:scale(0.94);filter:brightness(1.25);}' +
       '@keyframes omni-ff-open-pop{' +
       '0%{transform:scale(0.9);box-shadow:0 0 0 0 rgba(56,189,248,0.75);}' +
       '100%{transform:scale(1);box-shadow:0 0 0 7px rgba(56,189,248,0);}' +
       '}' +
       '.omni-ff-badge.is-opening{animation:omni-ff-open-pop 360ms ease-out;}' +
-      '.omni-ff-badge.is-heavy-icon{padding:1px 6px;font-size:11px;line-height:1.2;}' +
+      '.omni-ff-badge.is-heavy-icon{padding:1px 6px;font-size:12px;line-height:1.2;}' +
       '.omni-ff-badge.is-pending{' +
       'background:rgba(148,163,184,0.12);border-color:rgba(148,163,184,0.32);opacity:0.72;' +
       '}' +
@@ -3511,7 +4065,7 @@ class OmniWebViewManager(
       '}' +
       '.omni-ff-rel{' +
       'display:inline-flex;align-items:center;gap:2px;padding:1px 5px;' +
-      'border-radius:999px;font-size:9px;font-weight:700;line-height:1.25;' +
+      'border-radius:999px;font-size:10px;font-weight:700;line-height:1.3;' +
       'white-space:nowrap;pointer-events:none;' +
       '}' +
       '.omni-ff-rel.is-mutual{' +
@@ -3535,6 +4089,14 @@ class OmniWebViewManager(
       '[data-omni-ff-heavy="1"]{' +
       'box-shadow:inset 3px 0 0 rgba(245,158,11,0.9) !important;' +
       'background-color:rgba(245,158,11,0.06) !important;' +
+      '}' +
+      'html.omni-af-active [data-omni-af-state="hide"],' +
+      'html.omni-af-active [data-omni-af-state="pending"]{' +
+      'display:none !important;' +
+      '}' +
+      'html.omni-af-active [data-omni-af-state="hide"][data-omni-af-tail-probe="1"]{' +
+      'display:block !important;height:1px !important;min-height:1px !important;max-height:1px !important;' +
+      'overflow:hidden !important;opacity:0 !important;pointer-events:none !important;margin:0 !important;padding:0 !important;border:0 !important;' +
       '}';
     (document.head || document.documentElement).appendChild(style);
   }
@@ -3597,9 +4159,6 @@ class OmniWebViewManager(
       }
     }
 
-"""
-
-        private val PROFILE_STATS_JS_PART_3: String = """
     if (!relText && !statsText) return null;
     return {
       relKind: relKind,
@@ -3688,7 +4247,7 @@ class OmniWebViewManager(
 
   var lastBadgeOpenAt = 0;
 
-  // 人数ピルのタップ: 人数表示中はバックグラウンドの新規タブで開く、取得中/再取得表示中は優先再取得
+  // 人数ピルのクリック: 人数表示中はバックグラウンドの新規タブで開く、取得中/再取得表示中は優先再取得
   function bindStatBadgeClick(statEl, wrap, handle) {
     statEl.addEventListener('click', function(ev) {
       var state = statEl.getAttribute('data-omni-ff-state') || '';
@@ -3746,7 +4305,7 @@ class OmniWebViewManager(
       var nextState = isBanner ? 'banner' : 'stats';
       if (statEl.getAttribute('data-omni-ff-state') !== nextState) statEl.setAttribute('data-omni-ff-state', nextState);
       if (statEl.textContent !== display.statsText) statEl.textContent = display.statsText;
-      var tip = isBanner ? display.statsTitle : display.statsTitle + '（タップで裏タブに開く）';
+      var tip = isBanner ? display.statsTitle : display.statsTitle + '（クリックで裏タブに開く）';
       if (statEl.title !== tip) statEl.title = tip;
       var aria = isBanner && display.isFollowingHeavy ? 'フォロー多め' : tip;
       if (statEl.getAttribute('aria-label') !== aria) statEl.setAttribute('aria-label', aria);
@@ -3800,8 +4359,9 @@ class OmniWebViewManager(
   function isBadgeTargetLink(a, handle) {
     try {
       if (a.closest('nav, [role="navigation"]')) return false;
-      var txt = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!txt || txt.length > 48) return false;
+      var txt = stripInvisibleChars(a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
+      var maxLen = platform === 'bluesky' ? 96 : 48;
+      if (!txt || txt.length > maxLen) return false;
       if (NON_USER_TEXT_RE.test(txt)) return false;
       var curH = getCurrentProfileHandleFromUrl();
       if (curH === handle && a.closest('header')) return false;
@@ -3820,20 +4380,20 @@ class OmniWebViewManager(
       }
       var imgs = row.querySelectorAll('img[alt]');
       for (var j = 0; j < imgs.length; j++) {
-        var alt = (imgs[j].getAttribute('alt') || '').trim();
-        var am = /^@?([a-z0-9._-]{1,40})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
+        var alt = stripInvisibleChars(imgs[j].getAttribute('alt') || '').trim();
+        var am = /^@?([a-z0-9._-]{1,64})(?:のプロフィール写真|'s profile picture)/i.exec(alt);
         if (am) {
           var ah = normalizeHandle(am[1]);
           if (ah) return ah;
         }
       }
       var spans = row.querySelectorAll('span, div');
-      for (var k = 0; k < spans.length && k < 40; k++) {
+      for (var k = 0; k < spans.length && k < 50; k++) {
         var s = spans[k];
         if (s.children && s.children.length > 0) continue;
         if (s.closest('button, [role="button"], .omni-ff-wrap')) continue;
-        var t = (s.textContent || '').trim();
-        if (!t || t.length > 40 || /\s/.test(t) || NON_USER_TEXT_RE.test(t)) continue;
+        var t = stripInvisibleChars(s.textContent || '').trim();
+        if (!t || t.length > 80 || /\s/.test(t) || NON_USER_TEXT_RE.test(t)) continue;
         var nh = normalizeHandle(t);
         if (nh && (userIdMap[nh] || t[0] === '@' || /[._0-9]/.test(nh) || /^[a-z][a-z0-9._]{2,30}$/.test(nh))) {
           return nh;
@@ -3846,39 +4406,54 @@ class OmniWebViewManager(
   function findRowTextColumn(row, btn, handle) {
     try {
       var anchor = null;
+      var fallbackLink = null;
       var links = row.querySelectorAll('a[href]');
       for (var i = 0; i < links.length; i++) {
-        if (extractHandleFromLink(links[i]) === handle && !links[i].querySelector('img, video, canvas')) {
-          anchor = links[i];
-          break;
+        if (extractHandleFromLink(links[i]) === handle) {
+          if (!links[i].querySelector('img, video, canvas')) {
+            anchor = links[i];
+            break;
+          }
+          if (!fallbackLink && stripInvisibleChars(links[i].textContent || '').trim()) {
+            fallbackLink = links[i];
+          }
         }
       }
       if (!anchor) {
+        var aliasH = idToHandleMap[handle] || '';
         var leaves = row.querySelectorAll('span, div');
-        for (var j = 0; j < leaves.length && j < 40; j++) {
+        for (var j = 0; j < leaves.length && j < 50; j++) {
           var el = leaves[j];
           if (el.children && el.children.length > 0) continue;
           if (el.closest('button, [role="button"], .omni-ff-wrap')) continue;
-          var txt = (el.textContent || '').trim().replace(/^@+/, '').toLowerCase();
-          if (txt === handle) {
+          var txt = stripInvisibleChars(el.textContent || '').trim().replace(/^@+/, '').toLowerCase();
+          if (txt && (txt === handle || (aliasH && txt === aliasH))) {
             anchor = el;
             break;
           }
         }
       }
+      if (!anchor && fallbackLink) {
+        anchor = fallbackLink;
+      }
       if (!anchor) return null;
       var cur = anchor;
-      var best = anchor.parentElement || anchor;
-      for (var step = 0; step < 5 && cur && cur !== row; step++) {
+      var best = anchor.parentElement && anchor.parentElement !== row ? anchor.parentElement : anchor;
+      var anchorHasImg = !!anchor.querySelector('img[width], canvas');
+      var maxColH = platform === 'bluesky' ? 340 : 180;
+      for (var step = 0; step < 6 && cur && cur !== row; step++) {
         var p = cur.parentElement;
         if (!p || p === row) break;
-        if (p.contains(btn)) break;
-        if (p.querySelector('img[width], canvas')) break;
+        if (btn && p.contains(btn)) break;
+        if (!anchorHasImg && p.querySelector('img[width], canvas')) break;
         var r = p.getBoundingClientRect();
-        if (r.width >= 90 && r.height >= 24 && r.height <= 130) {
+        if (r.width >= 90 && r.height >= 20 && r.height <= maxColH) {
           best = p;
         }
         cur = p;
+      }
+      if (btn && best.contains(btn)) {
+        best = anchor;
       }
       return best;
     } catch (_) {
@@ -3948,7 +4523,7 @@ class OmniWebViewManager(
 
   function upsertRowBadge(row, container, handle, btn, placements) {
     ensureStyles();
-    var entry = statsMap[handle];
+    var entry = getStatsEntry(handle);
     var display = formatBadgeDisplay(entry, handle, true);
 
     if (display && display.isFollowingHeavy) {
@@ -4046,6 +4621,9 @@ class OmniWebViewManager(
     if (mode === 'overlay') {
       var base = String(pl.basePad);
       if (row.getAttribute('data-omni-ff-padbase') !== base) row.setAttribute('data-omni-ff-padbase', base);
+"""
+
+        private val PROFILE_STATS_JS_PART_4: String = """
       // 元の下余白はバッジの下に残し、バッジ分の高さだけ余白を足す
       var bottomPx = Math.max(2, pl.basePad) + 'px';
       if (w.style.bottom !== bottomPx) w.style.bottom = bottomPx;
@@ -4310,32 +4888,56 @@ class OmniWebViewManager(
     }
   }
 
+  function clearStaleRowWraps(row, keepHandle) {
+    try {
+      var wraps = row.querySelectorAll('.omni-ff-wrap');
+      for (var i = 0; i < wraps.length; i++) {
+        if (wraps[i].getAttribute('data-omni-ff-user') !== keepHandle) {
+          wraps[i].remove();
+        }
+      }
+    } catch (_) {}
+  }
+
   function scanFollowListRows(rootScope) {
     var listContext = detectSelfListPageContext();
     var scope = rootScope || document;
     var placements = [];
+    var processedRows = typeof Set === 'function' ? new Set() : null;
+    var afActive = isAccountFilterActive();
     try {
       var btns = scope.querySelectorAll('button, [role="button"]');
-      var maxBtns = rootScope ? 320 : 280;
+      var maxBtns = rootScope ? 2500 : 2500;
       for (var i = 0; i < btns.length && i < maxBtns; i++) {
         var btn = btns[i];
         if (btn.closest('nav, [role="navigation"], .omni-ff-wrap')) continue;
-        var bTxt = (btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
+        var bTxt = stripInvisibleChars(btn.innerText || btn.textContent || '').replace(/\s+/g, ' ').trim();
         if (!bTxt || bTxt.length > 22 || !FOLLOW_LIST_BTN_RE.test(bTxt)) continue;
 
-        // すでに特定済みの行はレイアウト計算(getBoundingClientRect)をスキップして高速更新
+        // すでに特定済みの行は React 仮想リストの DOM 再利用がないかだけ検証して高速更新
         var row = btn.closest('[data-omni-ff-row]');
         var handle = row ? (row.getAttribute('data-omni-ff-row') || '') : '';
+        if (row && handle) {
+          var freshH = extractHandleFromRow(row);
+          if (freshH && freshH !== handle) {
+            handle = freshH;
+            row.setAttribute('data-omni-ff-row', handle);
+            clearStaleRowWraps(row, handle);
+            if (rowColCache) rowColCache.delete(row);
+            if (rowWrapCache) rowWrapCache.delete(row);
+          }
+        }
         if (!row || !handle) {
           row = null;
           var cur = btn.parentElement;
-          for (var depth = 0; depth < 7 && cur && cur !== document.body; depth++) {
+          var maxRowH = platform === 'bluesky' ? 440 : 280;
+          for (var depth = 0; depth < 10 && cur && cur !== document.body; depth++) {
             var rect = cur.getBoundingClientRect();
-            if (rect.height >= 40 && rect.height <= 200 && rect.width >= 200) {
+            if (rect.height >= 36 && rect.height <= maxRowH && rect.width >= 180) {
               var followBtnCount = 0;
               var subBtns = cur.querySelectorAll('button, [role="button"]');
               for (var sb = 0; sb < subBtns.length; sb++) {
-                var st = (subBtns[sb].innerText || subBtns[sb].textContent || '').replace(/\s+/g, ' ').trim();
+                var st = stripInvisibleChars(subBtns[sb].innerText || subBtns[sb].textContent || '').replace(/\s+/g, ' ').trim();
                 if (st && st.length <= 22 && FOLLOW_LIST_BTN_RE.test(st)) followBtnCount++;
               }
               if (followBtnCount === 1) {
@@ -4343,6 +4945,10 @@ class OmniWebViewManager(
                 if (hCand) {
                   row = cur;
                   handle = hCand;
+                  var curTid = (cur.getAttribute('data-testid') || '').toLowerCase();
+                  if (platform === 'bluesky' && curTid.indexOf('profilecard') >= 0) {
+                    break;
+                  }
                   break;
                 }
               }
@@ -4353,15 +4959,16 @@ class OmniWebViewManager(
           row.setAttribute('data-omni-ff-row', handle);
         }
 
+        if (processedRows) processedRows.add(row);
         var col = getRowTextColumn(row, btn, handle);
         if (!col) continue;
 
         inferRelationFromRowDom(row, bTxt, handle, listContext);
 
-        var ent = statsMap[handle];
+        var ent = getStatsEntry(handle);
         var needStats = !hasUsableStats(ent);
-        var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && !!userIdMap[handle];
-        if ((needStats || needRel) && isInViewport(row)) {
+        var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && (!!userIdMap[handle] || (platform === 'bluesky' && handle.indexOf('did:') === 0));
+        if ((needStats || needRel) && (afActive || isInViewport(row))) {
           if (needStats) {
             enqueueFetch(handle, false, false);
           } else if (needRel) {
@@ -4369,6 +4976,45 @@ class OmniWebViewManager(
           }
         }
         upsertRowBadge(row, col, handle, btn, placements);
+      }
+
+      // Bluesky: フォローボタンが無い ProfileCard 行（自分自身・ミュート・特殊カード等）も確実に拾う
+      if (platform === 'bluesky') {
+        var cards = scope.querySelectorAll('[data-testid*="profileCard"], [data-testid*="ProfileCard"]');
+        for (var ci = 0; ci < cards.length && ci < 2000; ci++) {
+          var card = cards[ci];
+          if (processedRows && processedRows.has(card)) continue;
+          if (card.closest('nav, [role="navigation"], header, .omni-ff-wrap')) continue;
+          if (card.querySelector('[data-omni-ff-row]')) continue;
+          var ch = extractHandleFromRow(card);
+          if (!ch) continue;
+          var prevCh = card.getAttribute('data-omni-ff-row') || '';
+          if (prevCh && prevCh !== ch) {
+            clearStaleRowWraps(card, ch);
+            if (rowColCache) rowColCache.delete(card);
+            if (rowWrapCache) rowWrapCache.delete(card);
+          }
+          card.setAttribute('data-omni-ff-row', ch);
+          var cBtn = null;
+          var cBtns = card.querySelectorAll('button, [role="button"]');
+          for (var cbi = 0; cbi < cBtns.length; cbi++) {
+            var cbt = stripInvisibleChars(cBtns[cbi].innerText || cBtns[cbi].textContent || '').replace(/\s+/g, ' ').trim();
+            if (cbt && cbt.length <= 22 && FOLLOW_LIST_BTN_RE.test(cbt)) {
+              cBtn = cBtns[cbi];
+              break;
+            }
+          }
+          var cCol = getRowTextColumn(card, cBtn, ch);
+          if (!cCol) continue;
+          var cEnt = getStatsEntry(ch);
+          var cNeedStats = !hasUsableStats(cEnt);
+          var cNeedRel = ch !== selfHandle && (!cEnt || cEnt.followsMe === null) && (!!userIdMap[ch] || ch.indexOf('did:') === 0);
+          if ((cNeedStats || cNeedRel) && (afActive || isInViewport(card))) {
+            if (cNeedStats) enqueueFetch(ch, false, false);
+            else if (cNeedRel) scheduleRelBatch(160);
+          }
+          upsertRowBadge(card, cCol, ch, cBtn, placements);
+        }
       }
     } catch (_) {}
     try {
@@ -4379,6 +5025,11 @@ class OmniWebViewManager(
   // 現在開いているプロフィールページのDOMから人数＆相互状態を読み取り、ヘッダーにインライン表示する（全SNS対応）
   function scanCurrentProfilePage() {
     try {
+      var pathname = (window.location && window.location.pathname) || '';
+      // フォロー・フォロワー一覧やいいね一覧などのサブページでは一覧カードの数字を誤ってプロフィール主へ記録しない
+      if (/\/(?:followers|following|follows|known-followers|liked-by|reposted-by|quotes|mutuals|friends)(?:\/|$)/i.test(pathname)) {
+        return;
+      }
       var curHandle = getCurrentProfileHandleFromUrl();
       if (!curHandle) return;
       var root = document.querySelector('main, header, [role="main"]') || document.body;
@@ -4406,7 +5057,7 @@ class OmniWebViewManager(
         }
         var headerBtns = headerScope.querySelectorAll('button, [role="button"]');
         for (var i = 0; i < headerBtns.length && i < 30; i++) {
-          var bt = (headerBtns[i].innerText || headerBtns[i].textContent || '').replace(/\s+/g, ' ').trim();
+          var bt = stripInvisibleChars(headerBtns[i].innerText || headerBtns[i].textContent || '').replace(/\s+/g, ' ').trim();
           if (!bt || bt.length > 22) continue;
           if (BTN_IS_MUTUAL_RE.test(bt)) { iFollow = true; followsMe = true; break; }
           if (BTN_IS_FOLLOW_BACK_RE.test(bt)) { iFollow = false; followsMe = true; break; }
@@ -4421,7 +5072,7 @@ class OmniWebViewManager(
 
       if (curHandle === selfHandle) return;
 
-      var entry = statsMap[curHandle];
+      var entry = getStatsEntry(curHandle);
       if (!hasUsableStats(entry) || (entry && entry.followsMe === null)) {
         enqueueFetch(curHandle, true, false);
         scheduleRelBatch();
@@ -4468,12 +5119,12 @@ class OmniWebViewManager(
             if (h) enqueueFetch(h, false, false);
           }
         }
-      }, { rootMargin: '160px' });
+      }, { rootMargin: '200px' });
     }
   } catch (_) {}
 
   function applyBadgeToLink(a, handle) {
-    var entry = statsMap[handle];
+    var entry = getStatsEntry(handle);
     var display = formatBadgeDisplay(entry, handle, false);
     if (!display) return;
 
@@ -4505,6 +5156,458 @@ class OmniWebViewManager(
     } catch (_) {}
   }
 
+  // ==================== アカウント条件フィルタ（F/FW・フォロー多め絞り込み） ====================
+  function postAccountFilterMessage(type, payload) {
+    try {
+      var shortType = type === 'omnisns:account-filter-get-config'
+        ? 'account-filter-get-config'
+        : (type === 'omnisns:account-filter-state' ? 'account-filter-state' : type);
+      var ch = __omniFollowChannel || window.OmniFollowChannel;
+      if (ch && typeof ch.postMessage === 'function') {
+        ch.postMessage(JSON.stringify(Object.assign({ token: __omniFollowToken, type: shortType }, payload || {})));
+        return true;
+      }
+      var br = __omniFollowBridge || window.OmniFollowBridge;
+      if (br) {
+        if (shortType === 'account-filter-get-config' && typeof br.onAccountFilterGetConfig === 'function') {
+          br.onAccountFilterGetConfig(__omniFollowToken);
+          return true;
+        }
+        if (shortType === 'account-filter-state' && typeof br.onAccountFilterState === 'function') {
+          var p = payload || {};
+          br.onAccountFilterState(__omniFollowToken, !!p.active, p.matched | 0, p.hidden | 0, p.pending | 0, !!p.autoFetching);
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function reportAccountFilterState(active, matched, hidden, pending, autoFetching) {
+    var key = (active ? '1' : '0') + ':' + (matched | 0) + ':' + (hidden | 0) + ':' + (pending | 0) + ':' + (autoFetching ? '1' : '0');
+    if (key === afLastStateKey) return false;
+    afLastStateKey = key;
+    postAccountFilterMessage('omnisns:account-filter-state', {
+      active: !!active,
+      matched: matched | 0,
+      hidden: hidden | 0,
+      pending: pending | 0,
+      autoFetching: !!autoFetching
+    });
+    try {
+      window.dispatchEvent(new CustomEvent('omnisns:af-updated', {
+        detail: { active: !!active, matched: matched | 0, hidden: hidden | 0, pending: pending | 0, autoFetching: !!autoFetching }
+      }));
+    } catch (_) {}
+    return true;
+  }
+
+  function afResetPagination(nextKey) {
+    afActiveContextKey = nextKey || '';
+    afEmptyPulseCount = 0;
+    afReachedEnd = false;
+    afPulseInProgress = false;
+    afAutoFetching = false;
+    if (afCooldownTimer) {
+      clearTimeout(afCooldownTimer);
+      afCooldownTimer = null;
+    }
+  }
+
+  function afIsScrollableBox(el) {
+    if (!el || el === document.body || el === document.documentElement) return true;
+    try {
+      var oy = window.getComputedStyle(el).overflowY;
+      return oy === 'auto' || oy === 'scroll' || oy === 'overlay';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function afFindScrollContainer(ctx) {
+    try {
+      var candidates = [ctx.root].concat(Array.prototype.slice.call(ctx.root.querySelectorAll('div, ul')));
+      var best = null;
+      var bestScore = 0;
+      for (var i = 0; i < candidates.length && i < 200; i++) {
+        var el = candidates[i];
+        if (el === document.body || el === document.documentElement) continue;
+        if (!afIsScrollableBox(el)) continue;
+        var ch = el.clientHeight || 0;
+        if (ch < 100) continue;
+        var hasRow = !!el.querySelector('[data-omni-ff-row]');
+        var score = ch + (hasRow ? 10000 : 0);
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+      if (best) return best;
+    } catch (_) {}
+    return ctx.isDialog ? ctx.root : (document.scrollingElement || document.documentElement);
+  }
+
+  function findAccountFilterListContext(activeDialog) {
+    var pathname = (window.location && window.location.pathname) || '';
+    var search = (window.location && window.location.search) || '';
+    var full = pathname + search;
+    if (activeDialog && activeDialog.querySelector('[data-omni-ff-row]')) {
+      return {
+        root: activeDialog,
+        isDialog: true,
+        owner: getCurrentProfileHandleFromUrl() || '',
+        key: 'afdlg:' + full
+      };
+    }
+    var mainEl = document.querySelector('main, [role="main"]') || document.body;
+    if (!mainEl) return null;
+    if (platform === 'bluesky') {
+      var bsMatch = /^\/profile\/([^\/?#]+)\/(followers|follows|known-followers|lists\/[^\/?#]+|post\/[^\/?#]+\/(?:liked-by|reposted-by|quotes))(\/|$)/i.exec(pathname);
+      if (bsMatch || /^\/(?:search|starter-pack)(?:\/|$)/i.test(pathname)) {
+        var owner = bsMatch ? normalizeHandle(bsMatch[1]) : '';
+        return { root: mainEl, isDialog: false, owner: owner, key: 'afbsky:' + full };
+      }
+    }
+    if (/(?:followers|following|follows|known-followers|liked-by|reposted-by|starter-pack|friends|members|people|users|search|lists)/i.test(full)) {
+      return {
+        root: mainEl,
+        isDialog: false,
+        owner: getCurrentProfileHandleFromUrl() || '',
+        key: 'afpage:' + full
+      };
+    }
+    var rows = mainEl.querySelectorAll('[data-omni-ff-row]');
+    var listRowCount = 0;
+    for (var i = 0; i < rows.length && listRowCount < 2; i++) {
+      if (!rows[i].closest('header, nav, [role="navigation"], [data-testid*="feedItem"], [data-testid*="postThreadItem"]')) {
+        listRowCount++;
+      }
+    }
+    if (listRowCount >= 2) {
+      return {
+        root: mainEl,
+        isDialog: false,
+        owner: getCurrentProfileHandleFromUrl() || '',
+        key: 'afrows:' + full
+      };
+    }
+    return null;
+  }
+
+  function resolveFilterHideTarget(row, listRoot, handle, owner) {
+    var cur = row;
+    try {
+      for (var step = 0; step < 3 && cur && cur.parentElement && cur.parentElement !== listRoot && cur.parentElement !== document.body; step++) {
+        var parent = cur.parentElement;
+        var tag = parent.tagName;
+        if (tag === 'MAIN' || tag === 'UL' || tag === 'OL' || tag === 'SECTION' || tag === 'HEADER' || tag === 'NAV' || tag === 'ARTICLE') break;
+        if (afIsScrollableBox(parent)) break;
+        if (parent.children && parent.children.length > 2) break;
+        if (parent.querySelector('input, h1, h2, [role="heading"], [role="tablist"]')) break;
+        if (parent.querySelectorAll('[data-omni-ff-row]').length !== 1) break;
+        var pLinks = parent.querySelectorAll('a[href]');
+        var hasOtherUser = false;
+        for (var li = 0; li < pLinks.length && li < 12; li++) {
+          var lh = extractHandleFromLink(pLinks[li]);
+          if (lh && lh !== handle && lh !== owner) {
+            hasOtherUser = true;
+            break;
+          }
+        }
+        if (hasOtherUser) break;
+        cur = parent;
+      }
+    } catch (_) {}
+    return cur;
+  }
+
+  function evaluateAccountFilter(entry, handle) {
+    if (!isAccountFilterActive()) return 'match';
+    if (!handle || handle === selfHandle) return 'match';
+    var cfg = accountFilterConfig;
+    var needFollowing = cfg.minFollowing !== null || cfg.maxFollowing !== null || !!cfg.followingGreaterThanFollowers;
+    var needFollowers = cfg.minFollowers !== null || cfg.maxFollowers !== null || !!cfg.followingGreaterThanFollowers;
+    var hasFollowing = !!(entry && typeof entry.following === 'number');
+    var hasFollowers = !!(entry && typeof entry.followers === 'number');
+    if ((needFollowing && !hasFollowing) || (needFollowers && !hasFollowers)) {
+      var alias = idToHandleMap[handle] || '';
+      var isBusy = !!(inFlight[handle] || queuedSet[handle] || (alias && (inFlight[alias] || queuedSet[alias])));
+      var hasFailed = !!(failedMap[handle] || (alias && failedMap[alias]));
+      if (hasFailed && !isBusy) return 'hide';
+      return 'pending';
+    }
+    if (cfg.minFollowing !== null && entry.following < cfg.minFollowing) return 'hide';
+    if (cfg.maxFollowing !== null && entry.following > cfg.maxFollowing) return 'hide';
+    if (cfg.minFollowers !== null && entry.followers < cfg.minFollowers) return 'hide';
+    if (cfg.maxFollowers !== null && entry.followers > cfg.maxFollowers) return 'hide';
+    if (cfg.followingGreaterThanFollowers && !(entry.following > entry.followers)) return 'hide';
+    return 'match';
+  }
+
+  function clearAccountFilterDom() {
+    try {
+      if (document.documentElement) {
+        document.documentElement.classList.remove('omni-af-active');
+      }
+      var marked = document.querySelectorAll('[data-omni-af-state], [data-omni-af-tail-probe]');
+      for (var i = 0; i < marked.length; i++) {
+        marked[i].removeAttribute('data-omni-af-state');
+        marked[i].removeAttribute('data-omni-af-tail-probe');
+      }
+      var sp = document.getElementById('omni-af-spacer');
+      if (sp && sp.parentNode) sp.parentNode.removeChild(sp);
+    } catch (_) {}
+  }
+
+  function triggerAfPaginationPulse(ctx, scrollEl, matchedTargets, allTargets, statsSnap) {
+    afPulseInProgress = true;
+    afAutoFetching = true;
+    afLastPulseAt = Date.now();
+    var beforeTotal = allTargets.length;
+    var beforeSeq = afApiBatchSeq;
+    reportAccountFilterState(true, statsSnap.matched, statsSnap.hidden, statsSnap.pending, true);
+
+    var anchorRow = matchedTargets.length > 0 ? matchedTargets[matchedTargets.length - 1] : allTargets[allTargets.length - 1];
+    var spacer = document.getElementById('omni-af-spacer');
+    if (!spacer) {
+      spacer = document.createElement('div');
+      spacer.id = 'omni-af-spacer';
+      spacer.setAttribute('aria-hidden', 'true');
+    }
+    var pushPx = Math.max(1400, (window.innerHeight || 800) * 2);
+    spacer.style.cssText = 'display:block;width:1px;height:' + pushPx + 'px;flex-shrink:0;pointer-events:none;opacity:0;';
+    try {
+      if (anchorRow && anchorRow.parentNode) anchorRow.after(spacer);
+      else ctx.root.appendChild(spacer);
+    } catch (_) {}
+
+    var raf = window.requestAnimationFrame || function(fn) { setTimeout(fn, 16); };
+    raf(function() {
+      raf(function() {
+        try {
+          spacer.style.height = '0px';
+          var tailRows = allTargets.slice(-3);
+          for (var ti = 0; ti < tailRows.length; ti++) {
+            if (tailRows[ti].getAttribute('data-omni-af-state') === 'hide') {
+              tailRows[ti].setAttribute('data-omni-af-tail-probe', '1');
+            }
+          }
+          var isDocScroll = scrollEl === document.scrollingElement || scrollEl === document.documentElement || scrollEl === document.body;
+          if (!isDocScroll && scrollEl && matchedTargets.length < AF_MIN_VISIBLE_MATCHES) {
+            var maxTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+            if (maxTop > 0 && maxTop <= 240) scrollEl.scrollTop = maxTop;
+          }
+          if (scrollEl && scrollEl !== window) scrollEl.dispatchEvent(new Event('scroll', { bubbles: true }));
+          ctx.root.dispatchEvent(new Event('scroll', { bubbles: true }));
+          window.dispatchEvent(new Event('scroll'));
+          setTimeout(function() {
+            try {
+              if (spacer.parentNode) spacer.parentNode.removeChild(spacer);
+              for (var k = 0; k < tailRows.length; k++) tailRows[k].removeAttribute('data-omni-af-tail-probe');
+            } catch (_) {}
+          }, 150);
+        } catch (_) {}
+
+        setTimeout(function() {
+          afPulseInProgress = false;
+          var nowRows = ctx.root ? ctx.root.querySelectorAll('[data-omni-ff-row]').length : 0;
+          if (nowRows > beforeTotal || afApiBatchSeq > beforeSeq) {
+            afEmptyPulseCount = 0;
+          } else {
+            afEmptyPulseCount++;
+            if (afEmptyPulseCount >= AF_MAX_EMPTY_PULSES) {
+              afReachedEnd = true;
+              afAutoFetching = false;
+            }
+          }
+          scheduleRenderBadges(40);
+        }, 760);
+      });
+    });
+  }
+
+  function maybeAfAutoFetchNextPage(ctx, matchedTargets, allTargets, statsSnap) {
+    if (!isAccountFilterActive() || !ctx || !ctx.root) {
+      afAutoFetching = false;
+      return;
+    }
+    if (afPulseInProgress || statsSnap.pending > 0 || afReachedEnd || allTargets.length === 0) {
+      if (afReachedEnd) afAutoFetching = false;
+      return;
+    }
+    var scrollEl = afFindScrollContainer(ctx);
+    var isDocScroll = scrollEl === document.scrollingElement || scrollEl === document.documentElement || scrollEl === document.body;
+    var viewportBottom = isDocScroll
+      ? (window.innerHeight || document.documentElement.clientHeight || 700)
+      : scrollEl.getBoundingClientRect().bottom;
+    var needsMore = false;
+    if (matchedTargets.length === 0) {
+      needsMore = true;
+    } else {
+      var lastRect = matchedTargets[matchedTargets.length - 1].getBoundingClientRect();
+      if (viewportBottom - lastRect.bottom > -180) {
+        needsMore = true;
+      } else if (matchedTargets.length < AF_MIN_VISIBLE_MATCHES) {
+        var viewH = isDocScroll ? viewportBottom : (scrollEl.clientHeight || 0);
+        var scrollH = isDocScroll
+          ? Math.max(scrollEl.scrollHeight || 0, document.body ? document.body.scrollHeight : 0)
+          : (scrollEl.scrollHeight || 0);
+        if (scrollH <= viewH + 100) needsMore = true;
+      }
+    }
+    if (!needsMore) {
+      afAutoFetching = false;
+      return;
+    }
+    var elapsed = Date.now() - afLastPulseAt;
+    if (elapsed < AF_PULSE_COOLDOWN_MS) {
+      afAutoFetching = true;
+      if (!afCooldownTimer) {
+        afCooldownTimer = setTimeout(function() {
+          afCooldownTimer = null;
+          scheduleRenderBadges(20);
+        }, AF_PULSE_COOLDOWN_MS - elapsed + 20);
+      }
+      return;
+    }
+    triggerAfPaginationPulse(ctx, scrollEl, matchedTargets, allTargets, statsSnap);
+  }
+
+  function applyAccountFilter(activeDialog) {
+    if (!isAccountFilterActive()) {
+      var hadActive = !!(document.documentElement && document.documentElement.classList.contains('omni-af-active'));
+      if (hadActive || document.querySelector('[data-omni-af-state]')) {
+        clearAccountFilterDom();
+      }
+      afResetPagination('');
+      reportAccountFilterState(false, 0, 0, 0, false);
+      return;
+    }
+
+    ensureStyles();
+    if (document.documentElement) {
+      document.documentElement.classList.add('omni-af-active');
+    }
+
+    var ctx = findAccountFilterListContext(activeDialog);
+    if (!ctx || !ctx.root) {
+      var stray = document.querySelectorAll('[data-omni-af-state]');
+      for (var si = 0; si < stray.length; si++) {
+        stray[si].removeAttribute('data-omni-af-state');
+        stray[si].removeAttribute('data-omni-af-tail-probe');
+      }
+      afResetPagination('');
+      reportAccountFilterState(false, 0, 0, 0, false);
+      return;
+    }
+
+    if (ctx.key !== afActiveContextKey) {
+      afResetPagination(ctx.key);
+    }
+
+    var rows = ctx.root.querySelectorAll('[data-omni-ff-row]');
+    var activeTargets = typeof Set === 'function' ? new Set() : null;
+    var allTargets = [];
+    var matchedTargets = [];
+    var matched = 0;
+    var hidden = 0;
+    var pending = 0;
+
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (row.closest('header, nav, [role="navigation"], [data-testid*="feedItem"], [data-testid*="postThreadItem"]')) continue;
+      var handle = (row.getAttribute('data-omni-ff-row') || '').trim();
+      if (!handle) continue;
+      if (ctx.owner && handle === ctx.owner) continue;
+      var target = resolveFilterHideTarget(row, ctx.root, handle, ctx.owner);
+      if (activeTargets) {
+        if (activeTargets.has(target)) continue;
+        activeTargets.add(target);
+      }
+      var entry = getStatsEntry(handle);
+      var state = evaluateAccountFilter(entry, handle);
+      if (state === 'pending') {
+        enqueueFetch(handle, false, false);
+        pending++;
+      } else if (state === 'hide') {
+        hidden++;
+      } else {
+        matched++;
+        matchedTargets.push(target);
+      }
+      if (target.getAttribute('data-omni-af-state') !== state) {
+        target.setAttribute('data-omni-af-state', state);
+      }
+      if (state === 'match' && target.hasAttribute('data-omni-af-tail-probe')) {
+        target.removeAttribute('data-omni-af-tail-probe');
+      }
+      allTargets.push(target);
+    }
+
+    // コンテキスト外や再利用で不要になった古い属性を除去
+    var prevMarked = document.querySelectorAll('[data-omni-af-state]');
+    for (var pi = 0; pi < prevMarked.length; pi++) {
+      var pm = prevMarked[pi];
+      if (activeTargets && !activeTargets.has(pm)) {
+        pm.removeAttribute('data-omni-af-state');
+        pm.removeAttribute('data-omni-af-tail-probe');
+      }
+    }
+
+    var snap = { matched: matched, hidden: hidden, pending: pending };
+    if (pending === 0 && allTargets.length > 0) {
+      maybeAfAutoFetchNextPage(ctx, matchedTargets, allTargets, snap);
+    } else if (pending > 0) {
+      afAutoFetching = false;
+    }
+    reportAccountFilterState(true, matched, hidden, pending, afAutoFetching);
+  }
+
+  function sanitizeAfBound(val) {
+    if (val === null || val === undefined || val === '') return null;
+    var n = Number(val);
+    if (!isFinite(n) || n < 0) return null;
+    return Math.min(1000000000, Math.floor(n));
+  }
+
+  window.__omniAccountFilterApplyConfig = function(cfg) {
+    if (!cfg || typeof cfg !== 'object') return;
+    var minF = sanitizeAfBound(cfg.minFollowing);
+    var maxF = sanitizeAfBound(cfg.maxFollowing);
+    if (minF !== null && maxF !== null && minF > maxF) { var tmp1 = minF; minF = maxF; maxF = tmp1; }
+    var minFw = sanitizeAfBound(cfg.minFollowers);
+    var maxFw = sanitizeAfBound(cfg.maxFollowers);
+    if (minFw !== null && maxFw !== null && minFw > maxFw) { var tmp2 = minFw; minFw = maxFw; maxFw = tmp2; }
+    accountFilterConfig = {
+      enabled: !!cfg.enabled,
+      minFollowing: minF,
+      maxFollowing: maxF,
+      minFollowers: minFw,
+      maxFollowers: maxFw,
+      followingGreaterThanFollowers: !!cfg.followingGreaterThanFollowers
+    };
+    afLastStateKey = '';
+    afReachedEnd = false;
+    afEmptyPulseCount = 0;
+    if (!isAccountFilterActive()) {
+      clearAccountFilterDom();
+      reportAccountFilterState(false, 0, 0, 0, false);
+    } else {
+"""
+
+        private val PROFILE_STATS_JS_PART_5: String = """
+      ensureStyles();
+      if (pageBooted) {
+        scanAndRender();
+      } else {
+        scheduleRenderBadges(30);
+      }
+    }
+  };
+  window.__omniEvaluateAccountFilter = function(entry, handle) {
+    return evaluateAccountFilter(entry, handle);
+  };
+
   function scanAndRender() {
     detectDynamicPlatformFromDom();
     detectPageTheme();
@@ -4515,6 +5618,7 @@ class OmniWebViewManager(
     var activeDialog = document.querySelector('[role="dialog"]');
     if (activeDialog && activeDialog.querySelector('a[href], button, [role="button"]')) {
       scanFollowListRows(activeDialog);
+      applyAccountFilter(activeDialog);
       scheduleRelBatch(160);
       return;
     }
@@ -4523,22 +5627,37 @@ class OmniWebViewManager(
     scanFollowListRows(null);
 
     var links = document.querySelectorAll('a[href]');
-    var maxLinks = platform === 'instagram' ? 600 : 1200;
+    var maxLinks = platform === 'instagram' ? 1200 : 4000;
     for (var i = 0; i < links.length && i < maxLinks; i++) {
       var a = links[i];
       if (a.closest('[data-omni-ff-row], .omni-ff-wrap')) continue;
+      var curHref = a.getAttribute('href') || '';
+      var prevHref = a.getAttribute('data-omni-ff-href');
       var handle = a.getAttribute('data-omni-ff-handle');
+      if (prevHref !== null && prevHref !== curHref) {
+        // React 仮想リスト等で <a> の href が差し替わった場合は再解析し、旧バッジを掃除
+        var oldNext = a.nextElementSibling;
+        if (oldNext && oldNext.classList && oldNext.classList.contains('omni-ff-wrap')) {
+          oldNext.remove();
+        }
+        a.removeAttribute('data-omni-ff-handle');
+        a.removeAttribute('data-omni-ff-target');
+        handle = null;
+      }
       if (handle === '') continue;
       if (handle === null) {
         handle = extractHandleFromLink(a);
+        a.setAttribute('data-omni-ff-href', curHref);
         a.setAttribute('data-omni-ff-handle', handle || '');
-        if (handle) {
-          (function(linkEl, h) {
-            linkEl.addEventListener('pointerenter', function() {
-              enqueueFetch(h, true, false);
+        if (handle && !a.__omniFfHoverBound) {
+          a.__omniFfHoverBound = true;
+          a.addEventListener('pointerenter', function() {
+            var hh = this.getAttribute('data-omni-ff-handle');
+            if (hh) {
+              enqueueFetch(hh, true, false);
               scheduleRelBatch(120);
-            }, { passive: true });
-          })(a, handle);
+            }
+          }, { passive: true });
         }
       }
       if (handle) {
@@ -4554,12 +5673,12 @@ class OmniWebViewManager(
           }
         }
         if (targetState === '1') {
-          var ent = statsMap[handle];
+          var ent = getStatsEntry(handle);
           if (hasAnyDisplayData(ent, handle)) {
             applyBadgeToLink(a, handle);
           }
           var needStats = !hasUsableStats(ent);
-          var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && !!userIdMap[handle];
+          var needRel = handle !== selfHandle && (!ent || ent.followsMe === null) && (!!userIdMap[handle] || (platform === 'bluesky' && handle.indexOf('did:') === 0));
           if ((needStats || needRel) && isInViewport(a)) {
             if (needStats) {
               enqueueFetch(handle, false, false);
@@ -4570,6 +5689,7 @@ class OmniWebViewManager(
         }
       }
     }
+    applyAccountFilter(null);
     scheduleRelBatch();
   }
 
@@ -4628,8 +5748,13 @@ class OmniWebViewManager(
       scanAndRender();
     }, 900);
     try {
-      window.addEventListener('scroll', function() {
+      window.addEventListener('scroll', function(ev) {
         var now = Date.now();
+        if (ev && ev.isTrusted && afReachedEnd && now - afLastPulseAt > 1500 && now - afLastUserScrollAt > 800) {
+          afReachedEnd = false;
+          afEmptyPulseCount = Math.max(0, AF_MAX_EMPTY_PULSES - 2);
+        }
+        if (!ev || ev.isTrusted) afLastUserScrollAt = now;
         if (now - lastScrollScanAt < 260) return;
         lastScrollScanAt = now;
         scheduleRenderBadges(260);
@@ -4680,6 +5805,7 @@ class OmniWebViewManager(
   function boot() {
     window.__omniResolveProfileHandle = getCurrentProfileHandleFromUrl;
     window.__omniExtractHandleFromRow = extractHandleFromRow;
+    postAccountFilterMessage('omnisns:account-filter-get-config', {});
     try {
       window.addEventListener('storage', function(ev) {
         if (ev && ev.key === FOLLOWED_AT_KEY) {
@@ -4714,6 +5840,8 @@ class OmniWebViewManager(
             PROFILE_STATS_JS_PART_1,
             PROFILE_STATS_JS_PART_2,
             PROFILE_STATS_JS_PART_3,
+            PROFILE_STATS_JS_PART_4,
+            PROFILE_STATS_JS_PART_5,
         ).joinToString("\n")
 
         val LONG_PRESS_NEW_TAB_JS: String = """
@@ -6157,6 +7285,12 @@ class OmniWebViewManager(
     byUser.forEach(function(ent, uLowerKey) {
       var row = findRowElement(ent.links, uLowerKey, ctx);
       if (!row) return;
+      var afEl = row.hasAttribute('data-omni-af-state') ? row : row.closest('[data-omni-af-state]');
+      var afState = afEl ? afEl.getAttribute('data-omni-af-state') : '';
+      if (document.documentElement && document.documentElement.classList.contains('omni-af-active') &&
+          (afState === 'hide' || afState === 'pending')) {
+        return;
+      }
       seenInContext.add(uLowerKey);
       var cached = judged.get(uLowerKey);
       if (cached !== undefined) {
@@ -6264,6 +7398,7 @@ class OmniWebViewManager(
   };
 
   hookNetwork();
+  window.addEventListener('omnisns:af-updated', function() { if (enabled) scheduleScan(30); });
   window.addEventListener('popstate', function() { if (enabled) scheduleScan(30); });
   window.addEventListener('scroll', function(ev) {
     if (!enabled) return;
@@ -7194,7 +8329,7 @@ class OmniWebViewPlatformView(
             while (bridgeEventTimestamps.isNotEmpty() && now - bridgeEventTimestamps.first() > 1000L) {
                 bridgeEventTimestamps.removeFirst()
             }
-            if (bridgeEventTimestamps.size >= 25) return false
+            if (bridgeEventTimestamps.size >= 60) return false
             bridgeEventTimestamps.addLast(now)
             return true
         }
@@ -7697,6 +8832,23 @@ class OmniWebViewPlatformView(
                                     ),
                                 )
                             }
+                            "account-filter-get-config" -> {
+                                if (!allowBridgeEvent()) return@addWebMessageListener
+                                invokeDart("onAccountFilterGetConfig", null)
+                            }
+                            "account-filter-state" -> {
+                                if (!allowBridgeEvent()) return@addWebMessageListener
+                                invokeDart(
+                                    "onAccountFilterState",
+                                    mapOf(
+                                        "active" to obj.optBoolean("active", false),
+                                        "matched" to obj.optInt("matched", 0),
+                                        "hidden" to obj.optInt("hidden", 0),
+                                        "pending" to obj.optInt("pending", 0),
+                                        "autoFetching" to obj.optBoolean("autoFetching", false),
+                                    ),
+                                )
+                            }
                         }
                     } catch (_: Throwable) {
                     }
@@ -7777,6 +8929,27 @@ class OmniWebViewPlatformView(
                                         "active" to active,
                                         "matched" to matched,
                                         "hidden" to hidden,
+                                        "autoFetching" to autoFetching,
+                                    ),
+                                )
+                            }
+                        },
+                        onAccountFilterGetConfigCb = {
+                            mainHandler.post {
+                                if (disposed || target !== webView || !allowBridgeEvent()) return@post
+                                invokeDart("onAccountFilterGetConfig", null)
+                            }
+                        },
+                        onAccountFilterStateCb = { active, matched, hidden, pending, autoFetching ->
+                            mainHandler.post {
+                                if (disposed || target !== webView || !allowBridgeEvent()) return@post
+                                invokeDart(
+                                    "onAccountFilterState",
+                                    mapOf(
+                                        "active" to active,
+                                        "matched" to matched,
+                                        "hidden" to hidden,
+                                        "pending" to pending,
                                         "autoFetching" to autoFetching,
                                     ),
                                 )

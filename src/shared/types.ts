@@ -162,6 +162,23 @@ export interface UpdateFollowSyncPatch {
   gistId?: string;
 }
 
+export interface AccountFilterSettings {
+  enabled: boolean;
+  minFollowing?: number | null;
+  maxFollowing?: number | null;
+  minFollowers?: number | null;
+  maxFollowers?: number | null;
+  followingGreaterThanFollowers: boolean;
+}
+
+export interface AccountFilterLiveState {
+  active: boolean;
+  matched: number;
+  hidden: number;
+  pending: number;
+  autoFetching: boolean;
+}
+
 export interface AppSettings {
   theme: ThemeMode;
   /** ウィンドウを閉じる際にトレイへ最小化するか */
@@ -182,6 +199,8 @@ export interface AppSettings {
   gesture: GestureSettings;
   /** フォロー数クロスデバイス同期設定 */
   followSync?: FollowSyncSettings;
+  /** アカウント条件フィルタ設定（フォロー数・フォロワー数・フォロー多め） */
+  accountFilter?: AccountFilterSettings;
 }
 
 export interface ArchivedInstance {

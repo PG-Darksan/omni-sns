@@ -1518,4 +1518,149 @@ void main() {
     expect(rt.followWindowHours, 6);
     expect(rt.catalogOrder, ['bluesky', 'threads']);
   });
+
+  test('AccountFilterSettings sanitizes bounds, formats summary, and roundtrips inside AppSettings', () {
+    const emptyEnabled = AccountFilterSettings(enabled: true);
+    expect(emptyEnabled.hasAnyCondition, isFalse);
+    expect(emptyEnabled.isActive, isFalse);
+
+    final swapped = const AccountFilterSettings(
+      enabled: true,
+      minFollowing: 500,
+      maxFollowing: 100,
+      minFollowers: 50,
+      followingGreaterThanFollowers: true,
+    ).sanitized();
+    expect(swapped.isActive, isTrue);
+    expect(swapped.minFollowing, 100);
+    expect(swapped.maxFollowing, 500);
+    expect(swapped.minFollowers, 50);
+    expect(swapped.summaryLabel, 'F 100〜500 · FW 50以上 · F>FW');
+
+    final jsCfg = swapped.toJsConfig();
+    expect(jsCfg['enabled'], isTrue);
+    expect(jsCfg['minFollowing'], 100);
+    expect(jsCfg['maxFollowing'], 500);
+    expect(jsCfg['minFollowers'], 50);
+    expect(jsCfg['followingGreaterThanFollowers'], isTrue);
+
+    final appSettings = AppSettings(accountFilter: swapped);
+    final restored = AppSettings.fromJson(appSettings.toJson());
+    expect(restored.accountFilter.isActive, isTrue);
+    expect(restored.accountFilter.minFollowing, 100);
+    expect(restored.accountFilter.maxFollowing, 500);
+    expect(restored.accountFilter.minFollowers, 50);
+    expect(restored.accountFilter.followingGreaterThanFollowers, isTrue);
+
+    // 旧設定 JSON（accountFilter キー無し）からの後方互換読み込み
+    final legacy = AppSettings.fromJson(const {'isDarkMode': true});
+    expect(legacy.accountFilter.isActive, isFalse);
+  });
+
+  test('OmniWebViewController dispatches account filter get-config and state callbacks', () async {
+    const channel = MethodChannel('com.pgdarksan.omnisns/webview_95');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async => null);
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+
+    var configRequested = 0;
+    final states = <(bool, int, int, int, bool)>[];
+    final ctrl = OmniWebViewController(
+      initialUrl: 'https://bsky.app/',
+      profileName: 'omnisns_bsky_af',
+      userAgent: buildMobileUserAgent(),
+      onAccountFilterGetConfig: () => configRequested++,
+      onAccountFilterState: (active, matched, hidden, pending, autoFetching) {
+        states.add((active, matched, hidden, pending, autoFetching));
+      },
+    );
+    ctrl.attachPlatformView(95);
+
+    const codec = StandardMethodCodec();
+    Future<void> sendNative(String method, [Map<String, dynamic>? args]) async {
+      final completer = Completer<void>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
+        channel.name,
+        codec.encodeMethodCall(MethodCall(method, args)),
+        (_) => completer.complete(),
+      );
+      await completer.future;
+    }
+
+    await sendNative('onAccountFilterGetConfig');
+    await sendNative('onAccountFilterState', {
+      'active': true,
+      'matched': 4,
+      'hidden': 9,
+      'pending': 2,
+      'autoFetching': false,
+    });
+    expect(configRequested, 1);
+    expect(states, [(true, 4, 9, 2, false)]);
+    ctrl.dispose();
+  });
+
+  testWidgets('HomeScreen account condition filter sheet saves conditions and displays live bar', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    const mgrChannel = MethodChannel('com.pgdarksan.omnisns/webview_manager');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(mgrChannel, (call) async {
+      if (call.method == 'isMultiProfileSupported') return true;
+      return true;
+    });
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(mgrChannel, null);
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(
+          store: AppStore(),
+          onThemeChanged: (_) {},
+        ),
+      ),
+    );
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    final chip = find.byKey(const ValueKey('account-filter-chip'));
+    expect(chip, findsOneWidget);
+    expect(find.byKey(const ValueKey('account-filter-status-bar')), findsNothing);
+
+    // 条件未設定状態でタップすると条件設定シートが開く
+    await tester.tap(chip);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(find.byKey(const ValueKey('af-sheet-min-following')), findsOneWidget);
+    await tester.enterText(
+      find.byKey(const ValueKey('af-sheet-min-following')),
+      '100',
+    );
+    await tester.tap(find.byKey(const ValueKey('af-sheet-following-gt')));
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('af-sheet-save')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(find.byKey(const ValueKey('account-filter-status-bar')), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('account-filter-status-bar')),
+        matching: find.textContaining('F 100以上 · F>FW'),
+      ),
+      findsOneWidget,
+    );
+
+    // 再度チップをタップするとクイック OFF できる
+    await tester.tap(chip);
+    await tester.pump();
+    expect(find.byKey(const ValueKey('account-filter-status-bar')), findsNothing);
+  });
 }

@@ -53,6 +53,14 @@ typedef OmniWebViewJevStateCallback = void Function(
   int hidden,
   bool autoFetching,
 );
+typedef OmniWebViewAccountFilterGetConfigCallback = void Function();
+typedef OmniWebViewAccountFilterStateCallback = void Function(
+  bool active,
+  int matched,
+  int hidden,
+  int pending,
+  bool autoFetching,
+);
 
 /// Android ネイティブ WebView マルチプロファイル管理ブリッジ
 class OmniWebViewManager {
@@ -171,6 +179,8 @@ class OmniWebViewController {
     this.onJevGetConfig,
     this.onJevCheckAccounts,
     this.onJevState,
+    this.onAccountFilterGetConfig,
+    this.onAccountFilterState,
   })  : _pendingUrl = initialUrl,
         _isActive = initiallyActive;
 
@@ -193,6 +203,8 @@ class OmniWebViewController {
   final OmniWebViewJevGetConfigCallback? onJevGetConfig;
   final OmniWebViewJevCheckAccountsCallback? onJevCheckAccounts;
   final OmniWebViewJevStateCallback? onJevState;
+  final OmniWebViewAccountFilterGetConfigCallback? onAccountFilterGetConfig;
+  final OmniWebViewAccountFilterStateCallback? onAccountFilterState;
 
   MethodChannel? _channel;
   String? _pendingUrl;
@@ -390,6 +402,21 @@ class OmniWebViewController {
         final hidden = (map['hidden'] as num?)?.toInt() ?? 0;
         final autoFetching = map['autoFetching'] == true;
         onJevState?.call(active, matched, hidden, autoFetching);
+      case 'onAccountFilterGetConfig':
+        onAccountFilterGetConfig?.call();
+      case 'onAccountFilterState':
+        final active = map['active'] == true;
+        final matched = (map['matched'] as num?)?.toInt() ?? 0;
+        final hidden = (map['hidden'] as num?)?.toInt() ?? 0;
+        final pending = (map['pending'] as num?)?.toInt() ?? 0;
+        final autoFetching = map['autoFetching'] == true;
+        onAccountFilterState?.call(
+          active,
+          matched,
+          hidden,
+          pending,
+          autoFetching,
+        );
     }
     return null;
   }

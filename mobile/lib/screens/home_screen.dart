@@ -91,6 +91,22 @@ class _JevTabLiveState {
   final bool autoFetching;
 }
 
+class _AccountFilterTabLiveState {
+  const _AccountFilterTabLiveState({
+    this.active = false,
+    this.matched = 0,
+    this.hidden = 0,
+    this.pending = 0,
+    this.autoFetching = false,
+  });
+
+  final bool active;
+  final int matched;
+  final int hidden;
+  final int pending;
+  final bool autoFetching;
+}
+
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const String _gmailUrl = 'https://mail.google.com/';
   static const String _gmailProfileName = 'omnisns_gmail';
@@ -127,6 +143,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final Map<String, List<_ExtraSubTab>> _extraTabs = {};
   final Map<String, String?> _activeSubTabId = {};
   final Map<String, _JevTabLiveState> _jevLiveByKey = {};
+  final Map<String, _AccountFilterTabLiveState> _accountFilterLiveByKey = {};
   int _jevCheckingCount = 0;
   int _subTabSeq = 0;
   final Map<String, String> _lastActiveByGroup = {};
@@ -828,6 +845,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           autoFetching: autoFetching,
         );
       },
+      onAccountFilterGetConfig: () {
+        _pushAccountFilterConfigToController(controller);
+      },
+      onAccountFilterState: (active, matched, hidden, pending, autoFetching) {
+        _updateAccountFilterLiveState(
+          'main:${instance.instanceId}',
+          active: active,
+          matched: matched,
+          hidden: hidden,
+          pending: pending,
+          autoFetching: autoFetching,
+        );
+      },
     );
 
     _controllers[instance.instanceId] = controller;
@@ -916,6 +946,101 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _pushJevConfigToController(tab.controller, resetJudged: resetJudged);
       }
     }
+  }
+
+  _AccountFilterTabLiveState _currentAccountFilterLiveState(
+    ServiceInstance? active,
+  ) {
+    if (_isGmailOpen || active == null) {
+      return const _AccountFilterTabLiveState();
+    }
+    return _accountFilterLiveByKey[_activeJevKeyFor(active)] ??
+        const _AccountFilterTabLiveState();
+  }
+
+  void _updateAccountFilterLiveState(
+    String key, {
+    required bool active,
+    required int matched,
+    required int hidden,
+    required int pending,
+    required bool autoFetching,
+  }) {
+    final prev = _accountFilterLiveByKey[key];
+    if (prev != null &&
+        prev.active == active &&
+        prev.matched == matched &&
+        prev.hidden == hidden &&
+        prev.pending == pending &&
+        prev.autoFetching == autoFetching) {
+      return;
+    }
+    if (active) {
+      _accountFilterLiveByKey[key] = _AccountFilterTabLiveState(
+        active: active,
+        matched: matched,
+        hidden: hidden,
+        pending: pending,
+        autoFetching: autoFetching,
+      );
+    } else {
+      _accountFilterLiveByKey.remove(key);
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _pushAccountFilterConfigToController(OmniWebViewController ctrl) {
+    if (ctrl.isDisposed) return;
+    final payload = jsonEncode(_settings.accountFilter.toJsConfig());
+    unawaited(
+      ctrl.evaluateJavascript(
+        'window.__omniAccountFilterApplyConfig && window.__omniAccountFilterApplyConfig($payload);',
+      ),
+    );
+  }
+
+  void _syncAccountFilterConfigToAllControllers() {
+    if (!_settings.accountFilter.isActive) {
+      _accountFilterLiveByKey.clear();
+    }
+    for (final ctrl in _controllers.values) {
+      _pushAccountFilterConfigToController(ctrl);
+    }
+    for (final list in _extraTabs.values) {
+      for (final tab in list) {
+        _pushAccountFilterConfigToController(tab.controller);
+      }
+    }
+  }
+
+  Future<void> _updateAccountFilterSettings(
+    AccountFilterSettings next, {
+    String? toastMessage,
+  }) async {
+    final sanitized = next.sanitized();
+    setState(() {
+      _settings = _settings.copyWith(accountFilter: sanitized);
+    });
+    _syncAccountFilterConfigToAllControllers();
+    await _persist();
+    if (toastMessage != null && mounted) {
+      _showSnack(toastMessage);
+    }
+  }
+
+  Future<void> _quickToggleAccountFilter() async {
+    final af = _settings.accountFilter;
+    if (!af.hasAnyCondition) {
+      await _showAccountFilterSheet();
+      return;
+    }
+    final next = af.copyWith(enabled: !af.enabled).sanitized();
+    await _updateAccountFilterSettings(
+      next,
+      toastMessage: next.isActive
+          ? 'アカウント条件フィルタ ON（${next.summaryLabel}）'
+          : 'アカウント条件フィルタ OFF',
+    );
   }
 
   Future<void> _handleJevCheckFromWebView(
@@ -1169,6 +1294,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           autoFetching: autoFetching,
         );
       },
+      onAccountFilterGetConfig: () => _pushAccountFilterConfigToController(ctrl),
+      onAccountFilterState: (active, matched, hidden, pending, autoFetching) {
+        _updateAccountFilterLiveState(
+          'sub:$tabId',
+          active: active,
+          matched: matched,
+          hidden: hidden,
+          pending: pending,
+          autoFetching: autoFetching,
+        );
+      },
     );
 
     subTab = _ExtraSubTab(
@@ -1229,6 +1365,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final removed = list.removeAt(idx);
     removed.controller.dispose();
     _jevLiveByKey.remove('sub:$tabId');
+    _accountFilterLiveByKey.remove('sub:$tabId');
     if (_activeSubTabId[instanceId] == tabId) {
       final nextId = pickNextActiveSubTabAfterClose(
         list.map((t) => t.tabId).toList(),
@@ -1253,10 +1390,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       for (final t in list) {
         t.controller.dispose();
         _jevLiveByKey.remove('sub:${t.tabId}');
+        _accountFilterLiveByKey.remove('sub:${t.tabId}');
       }
     }
     _activeSubTabId.remove(instanceId);
     _jevLiveByKey.remove('main:$instanceId');
+    _accountFilterLiveByKey.remove('main:$instanceId');
   }
 
   bool _stepActiveSubTab(int delta) {
@@ -2772,6 +2911,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           onToggleDesktopMode: (!_isGmailOpen && active != null)
               ? (desktop) => _toggleDesktopMode(active, forceDesktop: desktop)
               : null,
+          accountFilterSummary: _settings.accountFilter.isActive
+              ? 'ON · ${_settings.accountFilter.summaryLabel}'
+              : (_settings.accountFilter.hasAnyCondition
+                  ? 'OFF · ${_settings.accountFilter.summaryLabel}'
+                  : 'OFF · フォロー数・フォロワー数・フォロー多めで絞り込み（無料）'),
+          onOpenAccountFilterSettings: () => _showAccountFilterSheet(),
           jevSummary: _jev.isActive
               ? 'ON · 分類「${_jev.category}」· 累計 ${JevService.formatCostCompact(_jev.totalCostUsd)}'
               : 'OFF · 分類「${_jev.category}」· 累計 ${JevService.formatCostCompact(_jev.totalCostUsd)}',
@@ -3507,6 +3652,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           if (active != null && !_isGmailOpen) {
                             await _toggleDesktopMode(active);
                           }
+                        case 'account-filter':
+                          await _showAccountFilterSheet();
                         case 'jev-filter':
                           await _showJevSettingsSheet();
                         case 'toggle-header':
@@ -3587,6 +3734,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                                   : 'PC版サイトで表示',
                             ),
                           ),
+                        PopupMenuItem(
+                          value: 'account-filter',
+                          child: Text(
+                            _settings.accountFilter.isActive
+                                ? '条件フィルタ: ${_settings.accountFilter.summaryLabel}（ON）'
+                                : 'アカウント条件フィルタ（F/FW）',
+                          ),
+                        ),
                         PopupMenuItem(
                           value: 'jev-filter',
                           child: Text(
@@ -3696,6 +3851,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 active != null &&
                 (_extraTabs[active.instanceId]?.isNotEmpty ?? false))
               _buildSubTabStrip(active),
+            if (!_isGmailOpen &&
+                active != null &&
+                _settings.accountFilter.isActive)
+              _buildAccountFilterStatusBar(active),
             if (!_isGmailOpen &&
                 active != null &&
                 (_jev.isActive ||
@@ -3816,6 +3975,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ),
                   ] else if (active != null) ...[
                     const Spacer(),
+                    Tooltip(
+                      message: _settings.accountFilter.isActive
+                          ? '条件フィルタ ON（${_settings.accountFilter.summaryLabel}）· 長押しで設定'
+                          : 'アカウント条件フィルタ（F/FW）· タップ/長押しで設定',
+                      child: InkWell(
+                        key: const ValueKey('collapsed-account-filter-chip'),
+                        borderRadius: BorderRadius.circular(99),
+                        onTap: _quickToggleAccountFilter,
+                        onLongPress: _showAccountFilterSheet,
+                        child: Container(
+                          width: 28,
+                          height: 24,
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: _settings.accountFilter.isActive
+                                ? colorScheme.tertiaryContainer
+                                : colorScheme.surface,
+                            borderRadius: BorderRadius.circular(99),
+                            border: Border.all(
+                              color: _settings.accountFilter.isActive
+                                  ? colorScheme.tertiary
+                                  : colorScheme.outlineVariant,
+                            ),
+                          ),
+                          child: Icon(
+                            Icons.tune_rounded,
+                            size: 15,
+                            color: _settings.accountFilter.isActive
+                                ? colorScheme.onTertiaryContainer
+                                : colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
                     Tooltip(
                       message: _jev.isActive
                           ? '分類フィルタ ON（${_jev.category}）· 長押しで設定'
@@ -4285,6 +4479,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(4, 5, 2, 5),
+              child: Tooltip(
+                message: _settings.accountFilter.isActive
+                    ? '条件フィルタ ON（${_settings.accountFilter.summaryLabel}）· 長押しで設定'
+                    : 'アカウント条件フィルタ（F/FW）· タップ/長押しで設定',
+                child: InkWell(
+                  key: const ValueKey('account-filter-chip'),
+                  borderRadius: BorderRadius.circular(99),
+                  onTap: _quickToggleAccountFilter,
+                  onLongPress: _showAccountFilterSheet,
+                  child: Container(
+                    width: 30,
+                    height: 28,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: _settings.accountFilter.isActive
+                          ? colorScheme.tertiaryContainer
+                          : colorScheme.surface,
+                      borderRadius: BorderRadius.circular(99),
+                      border: Border.all(
+                        color: _settings.accountFilter.isActive
+                            ? colorScheme.tertiary
+                            : colorScheme.outlineVariant,
+                      ),
+                    ),
+                    child: Icon(
+                      Icons.tune_rounded,
+                      size: 16,
+                      color: _settings.accountFilter.isActive
+                          ? colorScheme.onTertiaryContainer
+                          : colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(2, 5, 2, 5),
               child: Tooltip(
                 message: _jev.isActive
                     ? '分類フィルタ ON（${_jev.category}）· 長押しで設定'
@@ -5226,6 +5457,87 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildAccountFilterStatusBar(ServiceInstance active) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final af = _settings.accountFilter;
+    final live = _currentAccountFilterLiveState(active);
+    final summary = af.summaryLabel;
+    final busy = live.pending > 0
+        ? '（取得中 ${live.pending}件）'
+        : (live.autoFetching ? '（次ページ取得中…）' : '');
+    final statusText = live.active
+        ? '条件[$summary] 表示 ${live.matched}件 / 非表示 ${live.hidden}件$busy'
+        : '条件フィルタ ON（$summary）';
+
+    return Material(
+      key: const ValueKey('account-filter-status-bar'),
+      color: colorScheme.tertiaryContainer.withValues(alpha: 0.35),
+      child: InkWell(
+        onTap: _showAccountFilterSheet,
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(
+                color: colorScheme.outlineVariant.withValues(alpha: 0.4),
+              ),
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                Icons.tune_rounded,
+                size: 13,
+                color: colorScheme.tertiary,
+              ),
+              const SizedBox(width: 5),
+              Expanded(
+                child: Text(
+                  statusText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: colorScheme.onSurface,
+                        fontWeight: FontWeight.w600,
+                      ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '条件変更',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: colorScheme.tertiary,
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showAccountFilterSheet() async {
+    if (!mounted) return;
+    final result = await showModalBottomSheet<AccountFilterSettings>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => _AccountFilterSheet(
+        initial: _settings.accountFilter,
+      ),
+    );
+    if (!mounted || result == null) return;
+    final sanitized = result.sanitized();
+    await _updateAccountFilterSettings(
+      sanitized,
+      toastMessage: sanitized.isActive
+          ? '条件フィルタを適用しました（${sanitized.summaryLabel}）'
+          : 'アカウント条件フィルタをOFFにしました',
     );
   }
 
@@ -6555,6 +6867,280 @@ class _EditInstanceDialogState extends State<_EditInstanceDialog> {
           child: const Text('保存'),
         ),
       ],
+    );
+  }
+}
+
+class _AccountFilterSheet extends StatefulWidget {
+  const _AccountFilterSheet({required this.initial});
+
+  final AccountFilterSettings initial;
+
+  @override
+  State<_AccountFilterSheet> createState() => _AccountFilterSheetState();
+}
+
+class _AccountFilterSheetState extends State<_AccountFilterSheet> {
+  late bool _enabled;
+  late bool _followingGtFollowers;
+  late final TextEditingController _minFollowingCtrl;
+  late final TextEditingController _maxFollowingCtrl;
+  late final TextEditingController _minFollowersCtrl;
+  late final TextEditingController _maxFollowersCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    final af = widget.initial;
+    _enabled = af.hasAnyCondition ? af.enabled : true;
+    _followingGtFollowers = af.followingGreaterThanFollowers;
+    _minFollowingCtrl =
+        TextEditingController(text: af.minFollowing?.toString() ?? '');
+    _maxFollowingCtrl =
+        TextEditingController(text: af.maxFollowing?.toString() ?? '');
+    _minFollowersCtrl =
+        TextEditingController(text: af.minFollowers?.toString() ?? '');
+    _maxFollowersCtrl =
+        TextEditingController(text: af.maxFollowers?.toString() ?? '');
+  }
+
+  @override
+  void dispose() {
+    _minFollowingCtrl.dispose();
+    _maxFollowingCtrl.dispose();
+    _minFollowersCtrl.dispose();
+    _maxFollowersCtrl.dispose();
+    super.dispose();
+  }
+
+  int? _parseCount(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty) return null;
+    final n = int.tryParse(t);
+    if (n == null || n < 0) return null;
+    return n > AccountFilterSettings.maxBound
+        ? AccountFilterSettings.maxBound
+        : n;
+  }
+
+  void _applyPreset({
+    int? minFollowing,
+    int? maxFollowing,
+    int? minFollowers,
+    int? maxFollowers,
+    bool followingGt = false,
+  }) {
+    setState(() {
+      _enabled = true;
+      _minFollowingCtrl.text = minFollowing?.toString() ?? '';
+      _maxFollowingCtrl.text = maxFollowing?.toString() ?? '';
+      _minFollowersCtrl.text = minFollowers?.toString() ?? '';
+      _maxFollowersCtrl.text = maxFollowers?.toString() ?? '';
+      _followingGtFollowers = followingGt;
+    });
+  }
+
+  void _save() {
+    final minF = _parseCount(_minFollowingCtrl.text);
+    final maxF = _parseCount(_maxFollowingCtrl.text);
+    final minFw = _parseCount(_minFollowersCtrl.text);
+    final maxFw = _parseCount(_maxFollowersCtrl.text);
+    final next = AccountFilterSettings(
+      enabled: _enabled,
+      minFollowing: minF,
+      maxFollowing: maxF,
+      minFollowers: minFw,
+      maxFollowers: maxFw,
+      followingGreaterThanFollowers: _followingGtFollowers,
+    ).sanitized();
+    Navigator.of(context).pop(next);
+  }
+
+  void _clear() {
+    Navigator.of(context).pop(const AccountFilterSettings());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final insetBottom = MediaQuery.of(context).viewInsets.bottom;
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(16, 0, 16, insetBottom + 16),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'アカウント条件フィルタ（F / FW）',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleMedium
+                  ?.copyWith(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'フォロー中・フォロワー一覧や検索結果で、条件を満たすアカウントのみ表示します（無料・APIキー不要）',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              key: const ValueKey('af-sheet-enabled'),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('条件フィルタを有効にする'),
+              value: _enabled,
+              onChanged: (v) => setState(() => _enabled = v),
+            ),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                ActionChip(
+                  label: const Text('フォロー多め (F>FW)'),
+                  onPressed: () => _applyPreset(followingGt: true),
+                ),
+                ActionChip(
+                  label: const Text('F 100以上'),
+                  onPressed: () => _applyPreset(minFollowing: 100),
+                ),
+                ActionChip(
+                  label: const Text('FW 100以上'),
+                  onPressed: () => _applyPreset(minFollowers: 100),
+                ),
+                ActionChip(
+                  label: const Text('F 100以上 & F>FW'),
+                  onPressed: () =>
+                      _applyPreset(minFollowing: 100, followingGt: true),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'フォロー数（Following）',
+              style: Theme.of(context)
+                  .textTheme
+                  .labelLarge
+                  ?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    key: const ValueKey('af-sheet-min-following'),
+                    controller: _minFollowingCtrl,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    decoration: const InputDecoration(
+                      labelText: '以上',
+                      hintText: '指定なし',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: Text('〜'),
+                ),
+                Expanded(
+                  child: TextField(
+                    key: const ValueKey('af-sheet-max-following'),
+                    controller: _maxFollowingCtrl,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    decoration: const InputDecoration(
+                      labelText: '以下',
+                      hintText: '指定なし',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'フォロワー数（Followers）',
+              style: Theme.of(context)
+                  .textTheme
+                  .labelLarge
+                  ?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    key: const ValueKey('af-sheet-min-followers'),
+                    controller: _minFollowersCtrl,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    decoration: const InputDecoration(
+                      labelText: '以上',
+                      hintText: '指定なし',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: Text('〜'),
+                ),
+                Expanded(
+                  child: TextField(
+                    key: const ValueKey('af-sheet-max-followers'),
+                    controller: _maxFollowersCtrl,
+                    keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                    decoration: const InputDecoration(
+                      labelText: '以下',
+                      hintText: '指定なし',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            CheckboxListTile(
+              key: const ValueKey('af-sheet-following-gt'),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('フォロー数の方が多いユーザーのみ表示'),
+              subtitle: const Text('フォロー数 > フォロワー数'),
+              value: _followingGtFollowers,
+              onChanged: (v) =>
+                  setState(() => _followingGtFollowers = v ?? false),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                TextButton(
+                  key: const ValueKey('af-sheet-clear'),
+                  onPressed: _clear,
+                  child: const Text('クリア'),
+                ),
+                const Spacer(),
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('キャンセル'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  key: const ValueKey('af-sheet-save'),
+                  onPressed: _save,
+                  child: const Text('保存して適用'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

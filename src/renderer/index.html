@@ -94,6 +94,15 @@
             <span id="collapsed-gmail-label">Gmail</span>
           </button>
           <button
+            id="btn-collapsed-account-filter"
+            type="button"
+            class="tool-btn af-pill jev-icon-btn accountbar-collapsed-only"
+            title="アカウント条件フィルタ（F/FW人数・フォロー多め / クリックで設定 / 右クリックでON・OFF切替）"
+            aria-label="アカウント条件フィルタ"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+          </button>
+          <button
             id="btn-collapsed-jev"
             type="button"
             class="tool-btn jev-pill jev-icon-btn accountbar-collapsed-only"
@@ -155,6 +164,15 @@
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6l-10 7L2 6"/></svg>
             <span id="open-gmail-label">Gmail</span>
+          </button>
+          <button
+            id="btn-account-filter"
+            type="button"
+            class="tool-btn af-pill jev-icon-btn"
+            title="アカウント条件フィルタ（フォロー数・フォロワー数・フォロー多め / クリックで設定 / 右クリックでON・OFF切替）"
+            aria-label="アカウント条件フィルタ"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           </button>
           <button
             id="btn-jev-filter"
@@ -244,6 +262,11 @@
       <!-- 表示領域の下余白バー（画面下端の入力欄を引き上げつつ、Jev 分類フィルタ状況・費用と下余白調整を表示） -->
       <footer id="viewport-bottom-bar" class="viewport-bottom-bar">
         <div class="bottom-bar-left">
+          <button id="btn-bottom-af-toggle" type="button" class="bottom-af-toggle" title="アカウント条件フィルタ（F/FW人数・フォロー多め）の ON / OFF を切り替え">条件OFF</button>
+          <button id="btn-bottom-af-open" type="button" class="bottom-af-status" title="クリックでアカウント条件フィルタを設定（無料）">
+            <span id="bottom-af-text">条件フィルタ OFF</span>
+          </button>
+          <span class="bottom-bar-sep" aria-hidden="true">|</span>
           <button id="btn-bottom-jev-toggle" type="button" class="bottom-jev-toggle" title="Jev 分類フィルタの ON / OFF を切り替え">OFF</button>
           <button id="btn-bottom-jev-open" type="button" class="bottom-jev-status" title="クリックで Jev 分類フィルタ設定・自由分類入力を開く">
             <span id="bottom-jev-text">Jev 分類フィルタ OFF（分類: 女の子）· 費用 $0 (¥0)</span>
@@ -683,6 +706,85 @@
       <div class="modal-footer modal-footer-between">
         <button id="btn-archived-pick-cancel" type="button" class="btn-secondary">キャンセル</button>
         <button id="btn-archived-pick-new" type="button" class="btn-primary">＋ 新規アカウントを作成</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- アカウント条件フィルタ設定モーダル（フォロー数・フォロワー数・フォロー多め） -->
+  <div id="account-filter-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="af-modal-title">
+    <div class="modal-dialog modal-md af-modal-dialog">
+      <div class="modal-header">
+        <div>
+          <h2 id="af-modal-title">アカウント条件フィルタ（F / FW）</h2>
+          <p class="modal-subtitle">フォロー中・フォロワー一覧や検索結果で、フォロー数・フォロワー数の条件を満たすアカウントだけを表示します（無料・APIキー不要）</p>
+        </div>
+        <button id="btn-close-account-filter" type="button" class="btn-icon" aria-label="閉じる">✕</button>
+      </div>
+      <div class="af-modal-body">
+        <div id="af-live-banner" class="af-live-banner hidden"></div>
+
+        <label class="form-field checkbox-field af-enable-row">
+          <input id="af-enabled" type="checkbox" class="toggle-check" />
+          <span>条件フィルタを有効にする</span>
+        </label>
+
+        <div class="af-presets-wrap">
+          <div class="jev-chips-label">クイックプリセット</div>
+          <div class="af-presets-row">
+            <button type="button" class="af-preset-chip" data-af-preset="following-gt">フォロー多めのみ (F &gt; FW)</button>
+            <button type="button" class="af-preset-chip" data-af-preset="min-f-100">フォロー 100人以上</button>
+            <button type="button" class="af-preset-chip" data-af-preset="min-fw-100">フォロワー 100人以上</button>
+            <button type="button" class="af-preset-chip" data-af-preset="min-f-100-gt">F 100以上 &amp; F &gt; FW</button>
+          </div>
+        </div>
+
+        <div class="af-range-grid">
+          <div class="af-range-card">
+            <div class="af-range-title">フォロー数（Following）</div>
+            <div class="af-range-inputs">
+              <label class="af-num-field">
+                <span>以上</span>
+                <input id="af-min-following" type="number" class="input-field" min="0" max="1000000000" step="1" placeholder="指定なし" />
+              </label>
+              <span class="af-range-sep">〜</span>
+              <label class="af-num-field">
+                <span>以下</span>
+                <input id="af-max-following" type="number" class="input-field" min="0" max="1000000000" step="1" placeholder="指定なし" />
+              </label>
+            </div>
+          </div>
+
+          <div class="af-range-card">
+            <div class="af-range-title">フォロワー数（Followers）</div>
+            <div class="af-range-inputs">
+              <label class="af-num-field">
+                <span>以上</span>
+                <input id="af-min-followers" type="number" class="input-field" min="0" max="1000000000" step="1" placeholder="指定なし" />
+              </label>
+              <span class="af-range-sep">〜</span>
+              <label class="af-num-field">
+                <span>以下</span>
+                <input id="af-max-followers" type="number" class="input-field" min="0" max="1000000000" step="1" placeholder="指定なし" />
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <label class="form-field checkbox-field af-ratio-row">
+          <input id="af-following-gt-followers" type="checkbox" class="toggle-check" />
+          <span>フォロー数の方が多いユーザーのみ表示（フォロー数 &gt; フォロワー数）</span>
+        </label>
+
+        <p class="af-hint">
+          ※ 指定した条件はすべて AND（全条件一致）で絞り込まれます。条件を満たすユーザーが揃うまで自動で取得・次ページ読み込みを行い、Jev AI分類フィルタとも併用できます。
+        </p>
+      </div>
+      <div class="modal-footer modal-footer-between">
+        <button id="btn-af-clear" type="button" class="btn-secondary">条件をクリア</button>
+        <div class="af-footer-right">
+          <button id="btn-af-cancel" type="button" class="btn-secondary">キャンセル</button>
+          <button id="btn-af-save" type="button" class="btn-primary">保存して適用</button>
+        </div>
       </div>
     </div>
   </div>

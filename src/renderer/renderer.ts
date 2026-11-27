@@ -1,6 +1,8 @@
 import { GestureBoardModal } from './gesture-ui';
 import { omniApi } from './omni-api';
 import {
+  AccountFilterLiveState,
+  AccountFilterSettings,
   AddInstancePayload,
   AppConfig,
   ArchivedInstance,
@@ -53,6 +55,7 @@ interface UiState {
   editingInstanceId: string | null;
   editingTemplate: CatalogService | null;
   jev: JevStateSnapshot | null;
+  accountFilterLive: AccountFilterLiveState;
 }
 
 const JEV_PRESET_CATEGORIES = [
@@ -79,7 +82,8 @@ const state: UiState = {
   editingMode: null,
   editingInstanceId: null,
   editingTemplate: null,
-  jev: null
+  jev: null,
+  accountFilterLive: { active: false, matched: 0, hidden: 0, pending: 0, autoFetching: false }
 };
 
 let toastTimer: number | null = null;
@@ -118,6 +122,7 @@ function isAnyModalOpen(): boolean {
     !el('settings-modal').classList.contains('hidden') ||
     !el('gesture-modal').classList.contains('hidden') ||
     !el('follow-modal').classList.contains('hidden') ||
+    !el('account-filter-modal').classList.contains('hidden') ||
     !el('jev-modal').classList.contains('hidden') ||
     !el('archived-pick-modal').classList.contains('hidden') ||
     !el('confirm-modal').classList.contains('hidden')
@@ -2242,6 +2247,217 @@ async function adjustBottomInset(delta: number): Promise<void> {
   await omniApi.updateSettings({ viewportBottomInset: next });
 }
 
+function getAccountFilterSettings(): AccountFilterSettings {
+  const af = state.config?.settings.accountFilter;
+  return {
+    enabled: Boolean(af?.enabled),
+    minFollowing: typeof af?.minFollowing === 'number' && Number.isFinite(af.minFollowing) ? af.minFollowing : null,
+    maxFollowing: typeof af?.maxFollowing === 'number' && Number.isFinite(af.maxFollowing) ? af.maxFollowing : null,
+    minFollowers: typeof af?.minFollowers === 'number' && Number.isFinite(af.minFollowers) ? af.minFollowers : null,
+    maxFollowers: typeof af?.maxFollowers === 'number' && Number.isFinite(af.maxFollowers) ? af.maxFollowers : null,
+    followingGreaterThanFollowers: Boolean(af?.followingGreaterThanFollowers)
+  };
+}
+
+function hasAnyAccountFilterCondition(af: AccountFilterSettings): boolean {
+  return (
+    af.minFollowing != null ||
+    af.maxFollowing != null ||
+    af.minFollowers != null ||
+    af.maxFollowers != null ||
+    af.followingGreaterThanFollowers
+  );
+}
+
+function isAccountFilterActive(af: AccountFilterSettings): boolean {
+  return af.enabled && hasAnyAccountFilterCondition(af);
+}
+
+function formatAccountFilterSummary(af: AccountFilterSettings): string {
+  const parts: string[] = [];
+  if (af.minFollowing != null && af.maxFollowing != null) {
+    parts.push(`F ${af.minFollowing.toLocaleString('ja-JP')}〜${af.maxFollowing.toLocaleString('ja-JP')}`);
+  } else if (af.minFollowing != null) {
+    parts.push(`F ${af.minFollowing.toLocaleString('ja-JP')}以上`);
+  } else if (af.maxFollowing != null) {
+    parts.push(`F ${af.maxFollowing.toLocaleString('ja-JP')}以下`);
+  }
+  if (af.minFollowers != null && af.maxFollowers != null) {
+    parts.push(`FW ${af.minFollowers.toLocaleString('ja-JP')}〜${af.maxFollowers.toLocaleString('ja-JP')}`);
+  } else if (af.minFollowers != null) {
+    parts.push(`FW ${af.minFollowers.toLocaleString('ja-JP')}以上`);
+  } else if (af.maxFollowers != null) {
+    parts.push(`FW ${af.maxFollowers.toLocaleString('ja-JP')}以下`);
+  }
+  if (af.followingGreaterThanFollowers) {
+    parts.push('F>FW');
+  }
+  return parts.join(' · ');
+}
+
+function parseOptionalCountInput(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.min(1_000_000_000, Math.floor(n));
+}
+
+function renderAccountFilterUi(): void {
+  const af = getAccountFilterSettings();
+  const active = isAccountFilterActive(af);
+  const summary = formatAccountFilterSummary(af);
+  const live = state.accountFilterLive;
+
+  const pillTip = active && live.active
+    ? `アカウント条件フィルタ ON（${summary} · 表示 ${live.matched}件 / 非表示 ${live.hidden}件 · クリックで設定 / 右クリックでOFF）`
+    : active
+      ? `アカウント条件フィルタ ON（${summary} · クリックで設定 / 右クリックでOFF）`
+      : summary
+        ? `アカウント条件フィルタ OFF（${summary} · クリックで設定 / 右クリックでON）`
+        : 'アカウント条件フィルタ（フォロー数・フォロワー数・フォロー多め / クリックで設定）';
+
+  const pillBtn = el<HTMLButtonElement>('btn-account-filter');
+  const collapsedBtn = el<HTMLButtonElement>('btn-collapsed-account-filter');
+  pillBtn.title = pillTip;
+  collapsedBtn.title = pillTip;
+  pillBtn.setAttribute('aria-label', pillTip);
+  collapsedBtn.setAttribute('aria-label', pillTip);
+  pillBtn.classList.toggle('af-active', active);
+  collapsedBtn.classList.toggle('af-active', active);
+
+  const toggleBtn = el<HTMLButtonElement>('btn-bottom-af-toggle');
+  const openBtn = el<HTMLButtonElement>('btn-bottom-af-open');
+  const textEl = el<HTMLSpanElement>('bottom-af-text');
+  toggleBtn.textContent = active ? '条件ON' : '条件OFF';
+  toggleBtn.classList.toggle('active', active);
+  openBtn.classList.toggle('active', active);
+
+  let statusText: string;
+  if (active && live.active) {
+    const busyPart = live.pending > 0
+      ? `（取得中 ${live.pending}件）`
+      : live.autoFetching
+        ? '（次ページ取得中…）'
+        : '';
+    statusText = `${summary}: 表示 ${live.matched}件 / 非表示 ${live.hidden}件${busyPart}`;
+  } else if (active) {
+    statusText = `条件ON（${summary}）`;
+  } else if (summary) {
+    statusText = `条件OFF（${summary}）`;
+  } else {
+    statusText = 'F/FW条件フィルタ OFF';
+  }
+  textEl.textContent = statusText;
+
+  if (!el('account-filter-modal').classList.contains('hidden')) {
+    const banner = el<HTMLDivElement>('af-live-banner');
+    if (active && live.active) {
+      const busy = live.pending > 0
+        ? ` · 取得中 ${live.pending}件`
+        : live.autoFetching
+          ? ' · 次ページ取得中…'
+          : '';
+      banner.textContent = `適用中（${summary}）: 表示 ${live.matched}件 / 非表示 ${live.hidden}件${busy}`;
+      banner.classList.remove('hidden');
+    } else {
+      banner.classList.add('hidden');
+    }
+  }
+}
+
+async function openAccountFilterModal(): Promise<void> {
+  const af = getAccountFilterSettings();
+  el<HTMLInputElement>('af-enabled').checked = hasAnyAccountFilterCondition(af) ? af.enabled : true;
+  el<HTMLInputElement>('af-min-following').value = af.minFollowing != null ? String(af.minFollowing) : '';
+  el<HTMLInputElement>('af-max-following').value = af.maxFollowing != null ? String(af.maxFollowing) : '';
+  el<HTMLInputElement>('af-min-followers').value = af.minFollowers != null ? String(af.minFollowers) : '';
+  el<HTMLInputElement>('af-max-followers').value = af.maxFollowers != null ? String(af.maxFollowers) : '';
+  el<HTMLInputElement>('af-following-gt-followers').checked = af.followingGreaterThanFollowers;
+
+  el('account-filter-modal').classList.remove('hidden');
+  renderAccountFilterUi();
+  await syncOverlayToMain();
+  el<HTMLInputElement>('af-min-following').focus();
+}
+
+async function closeAccountFilterModal(): Promise<void> {
+  el('account-filter-modal').classList.add('hidden');
+  await syncOverlayToMain();
+}
+
+async function quickToggleAccountFilter(): Promise<void> {
+  const af = getAccountFilterSettings();
+  if (!hasAnyAccountFilterCondition(af)) {
+    await openAccountFilterModal();
+    return;
+  }
+  const next: AccountFilterSettings = { ...af, enabled: !af.enabled };
+  await omniApi.updateSettings({ accountFilter: next });
+  showToast(
+    next.enabled
+      ? `アカウント条件フィルタ ON（${formatAccountFilterSummary(next)}）`
+      : 'アカウント条件フィルタ OFF'
+  );
+}
+
+async function saveAccountFilterModal(): Promise<void> {
+  let minFollowing = parseOptionalCountInput(el<HTMLInputElement>('af-min-following').value);
+  let maxFollowing = parseOptionalCountInput(el<HTMLInputElement>('af-max-following').value);
+  if (minFollowing != null && maxFollowing != null && minFollowing > maxFollowing) {
+    [minFollowing, maxFollowing] = [maxFollowing, minFollowing];
+  }
+  let minFollowers = parseOptionalCountInput(el<HTMLInputElement>('af-min-followers').value);
+  let maxFollowers = parseOptionalCountInput(el<HTMLInputElement>('af-max-followers').value);
+  if (minFollowers != null && maxFollowers != null && minFollowers > maxFollowers) {
+    [minFollowers, maxFollowers] = [maxFollowers, minFollowers];
+  }
+  const followingGreaterThanFollowers = el<HTMLInputElement>('af-following-gt-followers').checked;
+  const wantEnabled = el<HTMLInputElement>('af-enabled').checked;
+  const next: AccountFilterSettings = {
+    enabled:
+      wantEnabled &&
+      (minFollowing != null ||
+        maxFollowing != null ||
+        minFollowers != null ||
+        maxFollowers != null ||
+        followingGreaterThanFollowers),
+    minFollowing,
+    maxFollowing,
+    minFollowers,
+    maxFollowers,
+    followingGreaterThanFollowers
+  };
+  await omniApi.updateSettings({ accountFilter: next });
+  await closeAccountFilterModal();
+  if (isAccountFilterActive(next)) {
+    showToast(`条件フィルタを適用しました（${formatAccountFilterSummary(next)}）`);
+  } else {
+    showToast('アカウント条件フィルタをOFFにしました');
+  }
+}
+
+async function clearAccountFilterSettings(): Promise<void> {
+  el<HTMLInputElement>('af-enabled').checked = false;
+  el<HTMLInputElement>('af-min-following').value = '';
+  el<HTMLInputElement>('af-max-following').value = '';
+  el<HTMLInputElement>('af-min-followers').value = '';
+  el<HTMLInputElement>('af-max-followers').value = '';
+  el<HTMLInputElement>('af-following-gt-followers').checked = false;
+  await omniApi.updateSettings({
+    accountFilter: {
+      enabled: false,
+      minFollowing: null,
+      maxFollowing: null,
+      minFollowers: null,
+      maxFollowers: null,
+      followingGreaterThanFollowers: false
+    }
+  });
+  await closeAccountFilterModal();
+  showToast('アカウント条件フィルタをクリアしました');
+}
+
 function renderAll(): void {
   recordLastActiveForCurrent();
   applyThemeAndLayout();
@@ -2249,6 +2465,7 @@ function renderAll(): void {
   renderAccountBar();
   renderToolbarAndViewport();
   renderTabBar();
+  renderAccountFilterUi();
   renderJevUi();
   if (state.config?.settings.gesture) {
     gestureModal?.syncSettings(state.config.settings.gesture);
@@ -2792,6 +3009,74 @@ function bindEvents(): void {
     showToast('アプリ設定を保存しました');
   });
 
+  // Account condition filter (F/FW)
+  el<HTMLButtonElement>('btn-account-filter').addEventListener('click', () =>
+    void openAccountFilterModal()
+  );
+  el<HTMLButtonElement>('btn-account-filter').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    void quickToggleAccountFilter();
+  });
+  el<HTMLButtonElement>('btn-collapsed-account-filter').addEventListener('click', () =>
+    void openAccountFilterModal()
+  );
+  el<HTMLButtonElement>('btn-collapsed-account-filter').addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    void quickToggleAccountFilter();
+  });
+  el<HTMLButtonElement>('btn-bottom-af-toggle').addEventListener('click', () =>
+    void quickToggleAccountFilter()
+  );
+  el<HTMLButtonElement>('btn-bottom-af-open').addEventListener('click', () =>
+    void openAccountFilterModal()
+  );
+  el<HTMLButtonElement>('btn-close-account-filter').addEventListener('click', () =>
+    void closeAccountFilterModal()
+  );
+  el<HTMLButtonElement>('btn-af-cancel').addEventListener('click', () =>
+    void closeAccountFilterModal()
+  );
+  el<HTMLDivElement>('account-filter-modal').addEventListener('click', (e) => {
+    if (e.target === el('account-filter-modal')) {
+      void closeAccountFilterModal();
+    }
+  });
+  el<HTMLButtonElement>('btn-af-save').addEventListener('click', () =>
+    void saveAccountFilterModal()
+  );
+  el<HTMLButtonElement>('btn-af-clear').addEventListener('click', () =>
+    void clearAccountFilterSettings()
+  );
+  document.querySelectorAll<HTMLButtonElement>('[data-af-preset]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const preset = btn.dataset.afPreset;
+      el<HTMLInputElement>('af-enabled').checked = true;
+      el<HTMLInputElement>('af-min-following').value = '';
+      el<HTMLInputElement>('af-max-following').value = '';
+      el<HTMLInputElement>('af-min-followers').value = '';
+      el<HTMLInputElement>('af-max-followers').value = '';
+      el<HTMLInputElement>('af-following-gt-followers').checked = false;
+      if (preset === 'following-gt') {
+        el<HTMLInputElement>('af-following-gt-followers').checked = true;
+      } else if (preset === 'min-f-100') {
+        el<HTMLInputElement>('af-min-following').value = '100';
+      } else if (preset === 'min-fw-100') {
+        el<HTMLInputElement>('af-min-followers').value = '100';
+      } else if (preset === 'min-f-100-gt') {
+        el<HTMLInputElement>('af-min-following').value = '100';
+        el<HTMLInputElement>('af-following-gt-followers').checked = true;
+      }
+    });
+  });
+  for (const id of ['af-min-following', 'af-max-following', 'af-min-followers', 'af-max-followers']) {
+    el<HTMLInputElement>(id).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        void saveAccountFilterModal();
+      }
+    });
+  }
+
   // Bottom viewport margin quick adjust & Jev category filter
   el<HTMLButtonElement>('btn-bottom-inset-dec').addEventListener('click', () =>
     void adjustBottomInset(-12)
@@ -2884,6 +3169,8 @@ function bindEvents(): void {
         void resolveConfirmDialog(false);
       } else if (!el('archived-pick-modal').classList.contains('hidden')) {
         void closeArchivedPickModal();
+      } else if (!el('account-filter-modal').classList.contains('hidden')) {
+        void closeAccountFilterModal();
       } else if (!el('jev-modal').classList.contains('hidden')) {
         void closeJevModal();
       } else if (!el('follow-modal').classList.contains('hidden')) {
@@ -3038,6 +3325,9 @@ async function bootstrap(): Promise<void> {
     state.closedTabsCount = payload.closedTabsCount ?? 0;
     state.gmailOpen = Boolean(payload.gmailOpen);
     state.gmailRuntime = payload.gmailRuntime ?? null;
+    if (payload.accountFilterLive) {
+      state.accountFilterLive = payload.accountFilterLive;
+    }
     state.runtimeMap = new Map(payload.runtimeStates.map((rt) => [rt.instanceId, rt]));
     renderAll();
   });
@@ -3053,6 +3343,11 @@ async function bootstrap(): Promise<void> {
   omniApi.onJevUpdated((snap) => {
     state.jev = snap;
     renderJevUi();
+  });
+
+  omniApi.onAccountFilterUpdated((live) => {
+    state.accountFilterLive = live;
+    renderAccountFilterUi();
   });
 
   omniApi.onShortcut((payload) => {
@@ -3078,6 +3373,9 @@ async function bootstrap(): Promise<void> {
   state.closedTabsCount = data.closedTabsCount ?? 0;
   state.gmailOpen = Boolean(data.gmailOpen);
   state.gmailRuntime = data.gmailRuntime ?? null;
+  if (data.accountFilterLive) {
+    state.accountFilterLive = data.accountFilterLive;
+  }
   state.runtimeMap = new Map(data.runtimeStates.map((rt) => [rt.instanceId, rt]));
   state.jev = await omniApi.getJevState().catch(() => null);
 

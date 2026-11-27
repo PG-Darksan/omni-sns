@@ -67,7 +67,7 @@ async fn app_get_bootstrap(
         view_manager::activate_tab(&app, &shared, active_id);
     }
 
-    let (config, runtime_states, closed_tabs_count, gmail_open, gmail_runtime) = {
+    let (config, runtime_states, closed_tabs_count, gmail_open, gmail_runtime, account_filter_live) = {
         let guard = shared.inner.lock().unwrap();
         (
             guard.store.get_config(),
@@ -75,6 +75,7 @@ async fn app_get_bootstrap(
             guard.closed_tabs.len(),
             guard.gmail_open,
             guard.gmail_tab.as_ref().map(|t| t.to_info()),
+            view_manager::active_account_filter_live_inner(&guard),
         )
     };
 
@@ -90,6 +91,7 @@ async fn app_get_bootstrap(
         closed_tabs_count,
         gmail_open,
         gmail_runtime,
+        account_filter_live,
     })
 }
 
@@ -510,12 +512,17 @@ async fn settings_update(
 ) -> Result<AppSettings, String> {
     ensure_shell_webview(&webview)?;
     let explicit_active_change = patch.active_instance_id.is_some();
+    let account_filter_changed = patch.account_filter.is_some();
     let (prev_active, updated) = {
         let mut guard = shared.inner.lock().unwrap();
         let prev = guard.active_instance_id.clone();
         let updated = guard.store.update_settings(patch);
         (prev, updated)
     };
+
+    if account_filter_changed {
+        view_manager::sync_account_filter_to_all_tabs(&app, &shared);
+    }
 
     if let Some(win) = app.get_window("main") {
         let theme = if updated.theme == "light" {

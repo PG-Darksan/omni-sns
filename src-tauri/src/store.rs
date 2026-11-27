@@ -14,10 +14,10 @@ use crate::follow_sync::{
 };
 use crate::gesture::{sanitize_gesture_settings, GestureSettings};
 use crate::models::{
-    AddInstancePayload, AppConfig, AppSettings, ArchivedInstance, SavedSubTab, ServiceInstance,
-    UpdateInstancePatch, UpdateSettingsPatch, WindowBounds, DEFAULT_FOLLOW_WINDOW_HOURS,
-    DEFAULT_VIEWPORT_BOTTOM_INSET, MAX_FOLLOW_WINDOW_HOURS, MAX_VIEWPORT_BOTTOM_INSET,
-    MIN_FOLLOW_WINDOW_HOURS,
+    AccountFilterSettings, AddInstancePayload, AppConfig, AppSettings, ArchivedInstance,
+    SavedSubTab, ServiceInstance, UpdateInstancePatch, UpdateSettingsPatch, WindowBounds,
+    DEFAULT_FOLLOW_WINDOW_HOURS, DEFAULT_VIEWPORT_BOTTOM_INSET, MAX_FOLLOW_WINDOW_HOURS,
+    MAX_VIEWPORT_BOTTOM_INSET, MIN_FOLLOW_WINDOW_HOURS,
 };
 use crate::url_utils::{
     is_valid_hex_color, make_badge_text, normalize_service_url, service_group_key,
@@ -281,6 +281,7 @@ pub fn create_default_settings() -> AppSettings {
             last_sync_at: None,
             last_sync_status: None,
         },
+        account_filter: AccountFilterSettings::default(),
     }
 }
 
@@ -370,6 +371,7 @@ struct RawSettings {
     catalog_order: Option<Vec<String>>,
     gesture: Option<GestureSettings>,
     follow_sync: Option<FollowSyncSettings>,
+    account_filter: Option<AccountFilterSettings>,
 }
 
 #[derive(Deserialize)]
@@ -660,6 +662,9 @@ impl ConfigStore {
                     fs.device_id = format!("win-{}", next_short_hex_id());
                 }
                 settings.follow_sync = fs;
+            }
+            if let Some(af) = rs.account_filter {
+                settings.account_filter = af.sanitized();
             }
             settings.active_instance_id = rs.active_instance_id;
         }
@@ -1423,6 +1428,9 @@ impl ConfigStore {
         }
         if let Some(gesture) = patch.gesture {
             self.config.settings.gesture = sanitize_gesture_settings(gesture);
+        }
+        if let Some(af) = patch.account_filter {
+            self.config.settings.account_filter = af.sanitized();
         }
         self.persist();
         self.config.settings.clone()
@@ -2979,6 +2987,60 @@ mod tests {
         });
         let reloaded = ConfigStore::new(config_path);
         assert_eq!(reloaded.get_settings().viewport_bottom_inset, 64);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn account_filter_settings_sanitizes_and_persists() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("omnisns-rust-af-{}", next_short_hex_id()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+
+        let mut store = ConfigStore::new(config_path.clone());
+        let initial = store.get_settings().account_filter;
+        assert!(!initial.is_active());
+
+        // 条件が空のまま enabled=true にしても is_active() は false
+        let empty_enabled = AccountFilterSettings {
+            enabled: true,
+            ..Default::default()
+        }
+        .sanitized();
+        assert!(!empty_enabled.is_active());
+
+        // 逆転した min/max は自動スワップされ、永続化後も復元される
+        store.update_settings(UpdateSettingsPatch {
+            account_filter: Some(AccountFilterSettings {
+                enabled: true,
+                min_following: Some(500),
+                max_following: Some(100),
+                min_followers: Some(50),
+                max_followers: None,
+                following_greater_than_followers: true,
+            }),
+            ..Default::default()
+        });
+        let saved = store.get_settings().account_filter;
+        assert!(saved.is_active());
+        assert_eq!(saved.min_following, Some(100));
+        assert_eq!(saved.max_following, Some(500));
+        assert_eq!(saved.min_followers, Some(50));
+        assert!(saved.following_greater_than_followers);
+
+        let js_payload = saved.to_js_payload();
+        assert_eq!(js_payload["enabled"], serde_json::json!(true));
+        assert_eq!(js_payload["minFollowing"], serde_json::json!(100));
+        assert_eq!(js_payload["maxFollowing"], serde_json::json!(500));
+        assert_eq!(js_payload["minFollowers"], serde_json::json!(50));
+        assert_eq!(
+            js_payload["followingGreaterThanFollowers"],
+            serde_json::json!(true)
+        );
+
+        let reloaded = ConfigStore::new(config_path);
+        assert_eq!(reloaded.get_settings().account_filter, saved);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

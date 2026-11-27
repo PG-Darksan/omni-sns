@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { CATEGORIES, SERVICE_CATALOG } from '../src/shared/catalog';
 import {
   buildUserAgent,
@@ -280,6 +281,11 @@ test('Windows and Android PROFILE_STATS_JS are valid JS with universal mutual-fo
     assert.ok(js.includes('rowColCache'), `${label} must cache the row text column between scans`);
     assert.ok(js.includes('__omniIsFollowingUser'), `${label} must expose follow-state cache for block-as-unfollow`);
     assert.ok(js.includes('/api/v1/accounts/current_user/'), `${label} must support cookie-based Instagram self-handle fallback`);
+    assert.ok(js.includes('extractFetchUrl'), `${label} must extract URLs from URL/Request fetch inputs`);
+    assert.ok(js.includes('stripInvisibleChars'), `${label} must strip Unicode bidi isolates from Bluesky handles`);
+    assert.ok(js.includes('__omniAccountFilterApplyConfig'), `${label} must expose account condition filter config hook`);
+    assert.ok(js.includes('omni-af-active'), `${label} must style account condition filter hiding`);
+    assert.ok(js.includes('recordBlueskyProfile'), `${label} must record Bluesky stats by handle and DID`);
   }
 });
 
@@ -368,7 +374,218 @@ test('Windows and Android FOLLOW_TRACKER_JS parse cleanly, count followed-user b
     assert.ok(js.includes('__omniIsFollowingUser'), `${label} must inspect followed-user cache before counting block`);
     assert.ok(js.includes('friendships\\/(?:create|destroy|block)'), `${label} must detect Instagram/Threads block endpoints`);
     assert.ok(js.includes('app.bsky.graph.block'), `${label} must detect Bluesky block endpoints`);
+    assert.ok(js.includes('extractFetchUrl'), `${label} must handle URL/Request objects passed to fetch`);
+    assert.ok(js.includes('decodeBytesToString'), `${label} must decode Uint8Array/ArrayBuffer bodies`);
   }
+});
+
+test('Bluesky FOLLOW_TRACKER_JS counts URL/Uint8Array/Request rapid follows accurately without drops or post false-positives', async () => {
+  const winSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src-tauri/src/platform_win.rs'),
+    'utf8'
+  );
+  const winFtMatch = /pub const FOLLOW_TRACKER_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winFtMatch);
+
+  const posted: Array<{ type: string; source?: string; service?: string }> = [];
+  const boundUris: Array<[string, string]> = [];
+  const baseFetch = async (input: unknown) => {
+    const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : (input as { url?: string })?.url || '');
+    const isCreate = u.includes('createRecord');
+    return {
+      ok: true,
+      status: 200,
+      clone() {
+        return {
+          text: async () =>
+            isCreate
+              ? JSON.stringify({ uri: 'at://did:plc:self/app.bsky.graph.follow/rkey_test_1' })
+              : '{}'
+        };
+      }
+    };
+  };
+
+  const sandbox: Record<string, unknown> = {
+    URL,
+    URLSearchParams,
+    TextDecoder,
+    TextEncoder,
+    Uint8Array,
+    ArrayBuffer,
+    Promise,
+    Date,
+    setTimeout,
+    clearTimeout,
+    location: { hostname: 'bsky.app', pathname: '/profile/someone.bsky.social/followers', href: 'https://bsky.app/profile/someone.bsky.social/followers' },
+    document: {
+      addEventListener() {},
+      querySelector() { return null; }
+    },
+    XMLHttpRequest: undefined,
+    chrome: {
+      webview: {
+        postMessage(raw: string) {
+          posted.push(JSON.parse(raw));
+        }
+      }
+    },
+    __omniBindBlueskyFollowUri(subject: string, uri: string) {
+      boundUris.push([subject, uri]);
+    }
+  };
+  sandbox.window = sandbox;
+  sandbox.top = sandbox;
+  sandbox.fetch = baseFetch;
+
+  vm.runInNewContext(winFtMatch[1], sandbox);
+  const hookedFetch = sandbox.fetch as (input: unknown, init?: unknown) => Promise<unknown>;
+
+  // 1. 連続5人を URL オブジェクト + Uint8Array / string body で素早くフォロー → 5件すべてカウント（取りこぼし無し）
+  for (let i = 1; i <= 5; i++) {
+    const bodyJson = JSON.stringify({
+      repo: 'did:plc:self',
+      collection: 'app.bsky.graph.follow',
+      record: { subject: `did:plc:user${i}`, createdAt: new Date().toISOString() }
+    });
+    const body = i % 2 === 1 ? new TextEncoder().encode(bodyJson) : bodyJson;
+    await hookedFetch(new URL('https://pds.bsky.network/xrpc/com.atproto.repo.createRecord'), {
+      method: 'POST',
+      body
+    });
+  }
+
+  // 2. 本文に "app.bsky.graph.follow" を含む通常投稿（app.bsky.feed.post）は誤カウントしない
+  await hookedFetch(new URL('https://pds.bsky.network/xrpc/com.atproto.repo.createRecord'), {
+    method: 'POST',
+    body: JSON.stringify({
+      repo: 'did:plc:self',
+      collection: 'app.bsky.feed.post',
+      record: { text: 'testing app.bsky.graph.follow mention' }
+    })
+  });
+
+  // 3. deleteRecord によるアンフォローを正確にカウントし、その直後の同一ユーザー再フォローもカウントする
+  sandbox.__omniCanonicalTargetKey = (rawKey: string) =>
+    rawKey === 'rkey_test_1' ? 'did:plc:user1' : rawKey;
+  await hookedFetch(new URL('https://pds.bsky.network/xrpc/com.atproto.repo.deleteRecord'), {
+    method: 'POST',
+    body: JSON.stringify({
+      repo: 'did:plc:self',
+      collection: 'app.bsky.graph.follow',
+      rkey: 'rkey_test_1'
+    })
+  });
+  await hookedFetch(new URL('https://pds.bsky.network/xrpc/com.atproto.repo.createRecord'), {
+    method: 'POST',
+    body: JSON.stringify({
+      repo: 'did:plc:self',
+      collection: 'app.bsky.graph.follow',
+      record: { subject: 'did:plc:user1', createdAt: new Date().toISOString() }
+    })
+  });
+
+  // 4. applyWrites でフォロー作成
+  await hookedFetch(new URL('https://pds.bsky.network/xrpc/com.atproto.repo.applyWrites'), {
+    method: 'POST',
+    body: JSON.stringify({
+      repo: 'did:plc:self',
+      writes: [
+        {
+          $type: 'com.atproto.repo.applyWrites#create',
+          collection: 'app.bsky.graph.follow',
+          value: { subject: 'did:plc:user6' }
+        }
+      ]
+    })
+  });
+
+  await new Promise((r) => setTimeout(r, 20));
+
+  const followEvents = posted.filter((m) => m.type === 'omnisns:follow');
+  const unfollowEvents = posted.filter((m) => m.type === 'omnisns:unfollow');
+  assert.equal(followEvents.length, 7, `Expected 7 follows (5 initial + 1 re-follow + 1 applyWrites), got ${followEvents.length}`);
+  assert.equal(unfollowEvents.length, 1, `Expected 1 unfollow, got ${unfollowEvents.length}`);
+  assert.ok(boundUris.length >= 1, 'Expected createRecord follow URI to be bound for rkey resolution');
+});
+
+test('PROFILE_STATS_JS account condition filter evaluates F/FW thresholds and following>followers accurately', () => {
+  const winSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src-tauri/src/platform_win.rs'),
+    'utf8'
+  );
+  const winMatch = /pub const PROFILE_STATS_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winMatch);
+
+  const sandbox: Record<string, unknown> = {
+    URL,
+    URLSearchParams,
+    Promise,
+    Date,
+    Set,
+    WeakMap,
+    setTimeout() { return 1; },
+    clearTimeout() {},
+    setInterval() { return 1; },
+    clearInterval() {},
+    CustomEvent: class { constructor(public type: string, public detail?: unknown) {} },
+    dispatchEvent() {},
+    addEventListener() {},
+    location: { hostname: 'bsky.app', pathname: '/profile/someone.bsky.social/followers', search: '', href: 'https://bsky.app/profile/someone.bsky.social/followers' },
+    history: { pushState() {}, replaceState() {} },
+    document: {
+      readyState: 'loading',
+      visibilityState: 'visible',
+      cookie: '',
+      documentElement: {
+        classList: { add() {}, remove() {}, contains() { return false; } },
+        setAttribute() {},
+        appendChild() {}
+      },
+      head: { appendChild() {} },
+      body: { appendChild() {}, querySelectorAll() { return []; } },
+      getElementById() { return null; },
+      createElement() { return { style: {}, setAttribute() {}, classList: { add() {}, remove() {} } }; },
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+      addEventListener() {}
+    },
+    chrome: { webview: { postMessage() {} } },
+    fetch: async () => ({ ok: false, status: 500 })
+  };
+  sandbox.window = sandbox;
+  sandbox.top = sandbox;
+
+  vm.runInNewContext(winMatch[1], sandbox);
+  const applyCfg = sandbox.__omniAccountFilterApplyConfig as (cfg: Record<string, unknown>) => void;
+  const evalFn = sandbox.__omniEvaluateAccountFilter as (entry: Record<string, unknown> | null, handle: string) => string;
+
+  // OFF のときは常に match
+  applyCfg({ enabled: false, minFollowing: 100 });
+  assert.equal(evalFn({ following: 10, followers: 500 }, 'alice.bsky.social'), 'match');
+
+  // フォロー100人以上 + フォロワー50人以上 + フォロー多め (F > FW)
+  applyCfg({
+    enabled: true,
+    minFollowing: 100,
+    maxFollowing: 1000,
+    minFollowers: 50,
+    maxFollowers: null,
+    followingGreaterThanFollowers: true
+  });
+  assert.equal(evalFn({ following: 200, followers: 100 }, 'match.bsky.social'), 'match');
+  assert.equal(evalFn({ following: 99, followers: 50 }, 'lowf.bsky.social'), 'hide');
+  assert.equal(evalFn({ following: 1001, followers: 50 }, 'highf.bsky.social'), 'hide');
+  assert.equal(evalFn({ following: 200, followers: 49 }, 'lowfw.bsky.social'), 'hide');
+  assert.equal(evalFn({ following: 200, followers: 200 }, 'eq.bsky.social'), 'hide');
+  assert.equal(evalFn({ following: 200, followers: 300 }, 'fwheavy.bsky.social'), 'hide');
+  assert.equal(evalFn(null, 'pending.bsky.social'), 'pending');
+
+  // 逆転した min/max も自動補正される
+  applyCfg({ enabled: true, minFollowing: 300, maxFollowing: 100, followingGreaterThanFollowers: false });
+  assert.equal(evalFn({ following: 200, followers: 999 }, 'mid.bsky.social'), 'match');
+  assert.equal(evalFn({ following: 99, followers: 999 }, 'below.bsky.social'), 'hide');
+  assert.equal(evalFn({ following: 301, followers: 999 }, 'above.bsky.social'), 'hide');
 });
 
 test('catalog reordering and archived account title helpers work cleanly', () => {
