@@ -18,6 +18,8 @@ import {
 import {
   detectPlatformServiceFromUrl,
   formatArchivedAccountTitle,
+  formatResetClock,
+  formatResetRemaining,
   getAccountDisplayLabel,
   getCrossServiceAccountDisplayLabel,
   getServiceGroupKey,
@@ -93,6 +95,8 @@ let dragSourceAccountId: string | null = null;
 let dragSourceCatalogId: string | null = null;
 let lastScrolledAccountId: string | null = null;
 let followModalRefreshTimer: number | null = null;
+let followModalTickTimer: number | null = null;
+let followModalRefreshing = false;
 let gestureModal: GestureBoardModal | null = null;
 
 function el<T extends HTMLElement>(id: string): T {
@@ -1247,7 +1251,34 @@ function renderToolbarAndViewport(): void {
     }
     const winH = Math.max(1, Math.min(168, state.config?.settings.followWindowHours ?? 24));
     const baseTip = `直近${winH}時間 · フォロー ${todayFollow} / アンフォロー ${todayUnfollow}`;
-    const followTip = liveParts.length > 0 ? `${baseTip}\n${liveParts.join(' · ')}` : baseTip;
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const resetTips: string[] = [];
+    if (todayFollow > 0 && typeof counterInst.followFullResetAt === 'number') {
+      const nextR = counterInst.followNextResetAt ?? counterInst.followFullResetAt;
+      const fullR = counterInst.followFullResetAt;
+      if (fullR - nextR >= 60) {
+        resetTips.push(
+          `フォロー回復: 次回 ${formatResetRemaining(nextR - nowSecs)} / 全リセット ${formatResetRemaining(fullR - nowSecs)}`
+        );
+      } else {
+        resetTips.push(`フォローリセットまで: ${formatResetRemaining(fullR - nowSecs)}`);
+      }
+    }
+    if (todayUnfollow > 0 && typeof counterInst.unfollowFullResetAt === 'number') {
+      const nextR = counterInst.unfollowNextResetAt ?? counterInst.unfollowFullResetAt;
+      const fullR = counterInst.unfollowFullResetAt;
+      if (fullR - nextR >= 60) {
+        resetTips.push(
+          `解除回復: 次回 ${formatResetRemaining(nextR - nowSecs)} / 全リセット ${formatResetRemaining(fullR - nowSecs)}`
+        );
+      } else {
+        resetTips.push(`解除リセットまで: ${formatResetRemaining(fullR - nowSecs)}`);
+      }
+    }
+    const tipLines = [baseTip];
+    if (resetTips.length > 0) tipLines.push(...resetTips);
+    if (liveParts.length > 0) tipLines.push(liveParts.join(' · '));
+    const followTip = tipLines.join('\n');
     followBtn.title = followTip;
     collapsedFollowBtn.title = followTip;
   } else if (counterInfo.isCrossSite && counterInfo.effectiveService) {
@@ -1813,6 +1844,89 @@ const followModalDraft = {
   gistDirty: false
 };
 
+function renderResetCountdownBox(
+  box: HTMLElement,
+  count: number,
+  nextResetAt: number | undefined,
+  fullResetAt: number | undefined,
+  nowDate: Date
+): boolean {
+  box.innerHTML = '';
+  if (count <= 0 || typeof fullResetAt !== 'number' || fullResetAt <= 0) {
+    box.classList.add('is-idle');
+    box.textContent = 'リセット待ちなし';
+    box.title = '';
+    return false;
+  }
+
+  const nowSecs = Math.floor(nowDate.getTime() / 1000);
+  const effNext = typeof nextResetAt === 'number' && nextResetAt > 0 ? nextResetAt : fullResetAt;
+  const nextRem = effNext - nowSecs;
+  const fullRem = fullResetAt - nowSecs;
+  box.classList.remove('is-idle');
+
+  if (count > 1 && fullResetAt - effNext >= 60) {
+    const line1 = document.createElement('div');
+    line1.className = 'follow-reset-line';
+    const lbl1 = document.createElement('span');
+    lbl1.textContent = '1件減少まで';
+    const val1 = document.createElement('strong');
+    val1.textContent = formatResetRemaining(nextRem);
+    line1.appendChild(lbl1);
+    line1.appendChild(val1);
+
+    const line2 = document.createElement('div');
+    line2.className = 'follow-reset-line follow-reset-sub';
+    const lbl2 = document.createElement('span');
+    lbl2.textContent = `全リセット ${formatResetRemaining(fullRem)}（${formatResetClock(fullResetAt, nowDate)}）`;
+    line2.appendChild(lbl2);
+
+    box.appendChild(line1);
+    box.appendChild(line2);
+    box.title = `次の1件減少: ${formatResetClock(effNext, nowDate)}\n完全リセット: ${formatResetClock(fullResetAt, nowDate)}`;
+  } else {
+    const line1 = document.createElement('div');
+    line1.className = 'follow-reset-line';
+    const lbl1 = document.createElement('span');
+    lbl1.textContent = 'リセットまで';
+    const val1 = document.createElement('strong');
+    val1.textContent = formatResetRemaining(fullRem);
+    line1.appendChild(lbl1);
+    line1.appendChild(val1);
+
+    const line2 = document.createElement('div');
+    line2.className = 'follow-reset-line follow-reset-sub';
+    line2.textContent = `予定 ${formatResetClock(fullResetAt, nowDate)}`;
+
+    box.appendChild(line1);
+    box.appendChild(line2);
+    box.title = `リセット予定時刻: ${formatResetClock(fullResetAt, nowDate)}`;
+  }
+
+  return nextRem <= 0 || fullRem <= 0;
+}
+
+function updateFollowModalCountdowns(): boolean {
+  const active = getCounterTargetInfo().target;
+  if (!active) return false;
+  const nowDate = new Date();
+  const expiredF = renderResetCountdownBox(
+    el<HTMLElement>('follow-reset-remaining'),
+    active.followCountToday ?? 0,
+    active.followNextResetAt,
+    active.followFullResetAt,
+    nowDate
+  );
+  const expiredU = renderResetCountdownBox(
+    el<HTMLElement>('unfollow-reset-remaining'),
+    active.unfollowCountToday ?? 0,
+    active.unfollowNextResetAt,
+    active.unfollowFullResetAt,
+    nowDate
+  );
+  return expiredF || expiredU;
+}
+
 function renderFollowModal(): void {
   const counterInfo = getCounterTargetInfo();
   const active = counterInfo.target;
@@ -1849,6 +1963,8 @@ function renderFollowModal(): void {
   el<HTMLElement>('unfollow-modal-today').textContent = String(unfollowTodayCount);
   el<HTMLButtonElement>('btn-unfollow-dec').disabled = unfollowTodayCount <= 0;
   el<HTMLButtonElement>('btn-unfollow-reset-today').disabled = unfollowTodayCount <= 0;
+
+  updateFollowModalCountdowns();
 
   // SNS サーバー側の実フォロー中／フォロワー数
   const snsLiveBar = el<HTMLDivElement>('follow-sns-live-bar');
@@ -1982,8 +2098,12 @@ async function openFollowModal(): Promise<void> {
   if (followModalRefreshTimer !== null) {
     window.clearInterval(followModalRefreshTimer);
   }
-  followModalRefreshTimer = window.setInterval(() => {
-    if (el('follow-modal').classList.contains('hidden')) return;
+  if (followModalTickTimer !== null) {
+    window.clearInterval(followModalTickTimer);
+  }
+  const triggerFollowRefresh = () => {
+    if (followModalRefreshing || el('follow-modal').classList.contains('hidden')) return;
+    followModalRefreshing = true;
     void omniApi
       .refreshFollowCounts()
       .then((cfg) => {
@@ -1991,8 +2111,19 @@ async function openFollowModal(): Promise<void> {
         renderToolbarAndViewport();
         renderFollowModal();
       })
-      .catch(() => {});
-  }, 30000);
+      .catch(() => {})
+      .finally(() => {
+        followModalRefreshing = false;
+      });
+  };
+  followModalTickTimer = window.setInterval(() => {
+    if (el('follow-modal').classList.contains('hidden')) return;
+    const expired = updateFollowModalCountdowns();
+    if (expired) {
+      triggerFollowRefresh();
+    }
+  }, 1000);
+  followModalRefreshTimer = window.setInterval(triggerFollowRefresh, 30000);
   await syncOverlayToMain();
 }
 
@@ -2000,6 +2131,10 @@ async function closeFollowModal(): Promise<void> {
   if (followModalRefreshTimer !== null) {
     window.clearInterval(followModalRefreshTimer);
     followModalRefreshTimer = null;
+  }
+  if (followModalTickTimer !== null) {
+    window.clearInterval(followModalTickTimer);
+    followModalTickTimer = null;
   }
   el('follow-modal').classList.add('hidden');
   await syncOverlayToMain();

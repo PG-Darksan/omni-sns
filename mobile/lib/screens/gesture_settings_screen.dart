@@ -109,7 +109,7 @@ class _GestureSettingsScreenState extends State<GestureSettingsScreen> {
                     style: TextStyle(fontWeight: FontWeight.bold),
                   ),
                   subtitle: const Text(
-                    '画面端のジェスチャーボタンから上下左右・斜めにドラッグして操作。ボタン長押しで好きな位置へ移動、上のヘッダーへドラッグすると収納できます。',
+                    '画面端のジェスチャーボタンから上下左右・斜めにドラッグして操作。上のヘッダーへドラッグするだけで収納、長押しで好きな位置へ移動できます。',
                     style: TextStyle(fontSize: 12),
                   ),
                   value: _settings.enabled,

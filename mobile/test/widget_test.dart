@@ -2012,4 +2012,279 @@ void main() {
     await tester.pump();
     expect(updated?.dockedInHeader, isTrue);
   });
+
+  test('Reset countdown formatters, window reset bounds, unread title parser, and sticky unread guard work cleanly', () {
+    // 1. リセット残り時間フォーマッター
+    expect(formatResetRemaining(0), 'まもなく');
+    expect(formatResetRemaining(-5), 'まもなく');
+    expect(formatResetRemaining(42), '42秒');
+    expect(formatResetRemaining(15 * 60 + 8), '15分08秒');
+    expect(formatResetRemaining(23 * 3600 + 5 * 60), '23時間05分');
+    expect(formatResetRemaining(2 * 86400 + 3 * 3600 + 15 * 60), '2日3時間15分');
+
+    final baseDt = DateTime(2026, 11, 28, 9, 30);
+    expect(
+      formatResetClock(
+        DateTime(2026, 11, 28, 14, 5).millisecondsSinceEpoch ~/ 1000,
+        baseDt,
+      ),
+      '14:05',
+    );
+    expect(
+      formatResetClock(
+        DateTime(2026, 11, 29, 8, 15).millisecondsSinceEpoch ~/ 1000,
+        baseDt,
+      ),
+      '明日 08:15',
+    );
+
+    // 2. 複数端末イベント＆減算込みのリセット予定時刻算出
+    const now = 1795400000;
+    final acc = AccountFollowLedger(
+      date: '2026-11-28',
+      devices: {
+        'win-1': DeviceFollowEntry(
+          followEvents: [now - 100000, now - 7200, now - 600],
+          unfollowEvents: [now - 3600],
+          updatedAt: now - 600,
+        ),
+        'and-1': DeviceFollowEntry(
+          followEvents: [now - 3600, now - 120],
+          followDeductions: [now - 60],
+          updatedAt: now - 60,
+        ),
+      },
+    );
+    expect(acc.effectiveWindowFollowCount(now, 24), 3);
+    expect(
+      acc.effectiveWindowFollowResetTimes(now, 24),
+      ((now - 7200) + 24 * 3600, (now - 600) + 24 * 3600),
+    );
+    expect(
+      acc.effectiveWindowUnfollowResetTimes(now, 24),
+      ((now - 3600) + 24 * 3600, (now - 3600) + 24 * 3600),
+    );
+
+    // 3. タイトル未読パーサー（プロフィール年齢誤検知防止）
+    expect(parseUnreadCountFromTitle('• (4) Slack'), 4);
+    expect(parseUnreadCountFromTitle('(0) Instagram'), 0);
+    expect(parseUnreadCountFromTitle('受信トレイ (5) - user@gmail.com'), 5);
+    expect(parseUnreadCountFromTitle('さくら (22) (@sakura) • Instagram写真と動画'), 0);
+    expect(parseUnreadCountFromTitle('Alice [21] / X'), 0);
+
+    // 4. 既読後の残留タイトルバッジ抑制 & 新規通知再表示
+    final (eff1, ack1, set1, _) = resolveTabUnreadUpdate(
+      rawUnread: 1,
+      unreadOverride: 0,
+      cleared: true,
+    );
+    expect(eff1, 0);
+    expect(ack1, 1);
+    expect(set1, isTrue);
+
+    // 残留 "(1)" が再発火しても抑制される
+    final (eff2, ack2, _, _) = resolveTabUnreadUpdate(
+      rawUnread: 1,
+      prevAcknowledged: ack1,
+      prevAckElapsedMs: 1200,
+    );
+    expect(eff2, 0);
+    expect(ack2, 1);
+
+    // 5秒以上クリーン状態が続くと抑制が解除され、次の "(1)" 通知は再表示される
+    final (eff3, ack3, _, clear3) = resolveTabUnreadUpdate(
+      rawUnread: 0,
+      prevAcknowledged: ack2,
+      prevAckElapsedMs: 6000,
+    );
+    expect(eff3, 0);
+    expect(ack3, 0);
+    expect(clear3, isTrue);
+
+    final (eff4, _, _, _) = resolveTabUnreadUpdate(
+      rawUnread: 1,
+      prevAcknowledged: ack3,
+    );
+    expect(eff4, 1);
+  });
+
+  testWidgets('Follow counter sheet displays reset remaining time for follow and unfollow counters', (tester) async {
+    final nowSecs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    SharedPreferences.setMockInitialValues({
+      'omnisns_instances_v1': jsonEncode([
+        {
+          'instanceId': 'ig-main',
+          'serviceId': 'instagram',
+          'name': 'Instagram',
+          'accountLabel': 'メイン',
+          'profileName': 'omnisns_ig-main',
+          'category': 'major-sns',
+          'url': 'https://www.instagram.com/direct/inbox/',
+          'colorHex': '#E1306C',
+          'badge': 'IG',
+          'notificationsEnabled': true,
+          'order': 0,
+          'followCountToday': 2,
+          'followCountTotal': 2,
+          'unfollowCountToday': 1,
+          'unfollowCountTotal': 1,
+          'followEvents': [nowSecs - 7200, nowSecs - 600],
+          'unfollowEvents': [nowSecs - 1800],
+        },
+      ]),
+      'omnisns_settings_v1': jsonEncode({
+        'isDarkMode': true,
+        'activeInstanceId': 'ig-main',
+        'followWindowHours': 24,
+      }),
+    });
+    const mgrChannel = MethodChannel('com.pgdarksan.omnisns/webview_manager');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(mgrChannel, (call) async => true);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform_views, (call) async => null);
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(mgrChannel, null);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform_views, null);
+    });
+
+    tester.view.physicalSize = const Size(400, 820);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final store = AppStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(store: store, onThemeChanged: (_) {}),
+      ),
+    );
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    await tester.tap(find.byKey(const ValueKey('follow-counter-chip')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 350));
+
+    final followCountdown = find.byKey(const ValueKey('follow-sheet-reset-countdown'));
+    final unfollowCountdown = find.byKey(const ValueKey('unfollow-sheet-reset-countdown'));
+    expect(followCountdown, findsOneWidget);
+    expect(unfollowCountdown, findsOneWidget);
+
+    // 複数フォロー（2時間前・10分前）は次回1件減少と全リセットの残り時間を両方表示
+    expect(
+      find.descendant(of: followCountdown, matching: find.textContaining('1件減少まで')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: followCountdown, matching: find.textContaining('全リセット')),
+      findsOneWidget,
+    );
+    // 単一アンフォロー（30分前）はリセットまで残り時間を表示
+    expect(
+      find.descendant(of: unfollowCountdown, matching: find.textContaining('リセットまで')),
+      findsOneWidget,
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+  });
+
+  testWidgets('Gesture orb stows to header by direct drag alone without long press while normal up gesture still works', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'omnisns_settings_v1': jsonEncode({
+        'isDarkMode': true,
+        'gesture': {
+          'enabled': true,
+          'triggerSide': 'right',
+          'handleXFraction': 0.85,
+          'handleYFraction': 0.60,
+          'dockedInHeader': false,
+        },
+      }),
+    });
+    const mgrChannel = MethodChannel('com.pgdarksan.omnisns/webview_manager');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(mgrChannel, (call) async => true);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform_views, (call) async => null);
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(mgrChannel, null);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform_views, null);
+    });
+
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final store = AppStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomeScreen(store: store, onThemeChanged: (_) {}),
+      ),
+    );
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    final orbFinder = find.byKey(const ValueKey('mobile-gesture-orb-0'));
+    expect(orbFinder, findsOneWidget);
+
+    // 1. 中央付近までの通常の上フリックは収納せずジェスチャーのまま
+    final orbCenter1 = tester.getCenter(orbFinder);
+    final normalUp = await tester.startGesture(orbCenter1);
+    await tester.pump(const Duration(milliseconds: 20));
+    await normalUp.moveTo(Offset(orbCenter1.dx, orbCenter1.dy - 120));
+    await tester.pump(const Duration(milliseconds: 20));
+    await normalUp.up();
+    await tester.pump();
+    expect(find.byKey(const ValueKey('mobile-gesture-orb-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsNothing);
+
+    // 2. 上端ヘッダーまで直接ドラッグして引き戻すと収納をキャンセルできる
+    final orbCenter2 = tester.getCenter(orbFinder);
+    final abortDrag = await tester.startGesture(orbCenter2);
+    await tester.pump(const Duration(milliseconds: 20));
+    await abortDrag.moveTo(const Offset(240, 24));
+    await tester.pump(const Duration(milliseconds: 30));
+    expect(find.text('離すとヘッダーに収納します'), findsOneWidget);
+    await abortDrag.moveTo(Offset(240, orbCenter2.dy));
+    await tester.pump(const Duration(milliseconds: 30));
+    await abortDrag.up();
+    await tester.pump();
+    expect(find.byKey(const ValueKey('mobile-gesture-orb-0')), findsOneWidget);
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsNothing);
+
+    // 3. 長押しなし（即座にドラッグ開始）でそのままヘッダーへ持っていって離すと収納される
+    final orbCenter3 = tester.getCenter(orbFinder);
+    final directDock = await tester.startGesture(orbCenter3);
+    await tester.pump(const Duration(milliseconds: 20));
+    await directDock.moveTo(Offset(orbCenter3.dx, orbCenter3.dy - 80));
+    await tester.pump(const Duration(milliseconds: 220)); // live scroll arm 後でも収納へ切替可能
+    await directDock.moveTo(const Offset(240, 22));
+    await tester.pump(const Duration(milliseconds: 40));
+    expect(find.byKey(const ValueKey('header-gesture-dock-target')), findsOneWidget);
+    expect(find.text('離すとヘッダーに収納します'), findsOneWidget);
+    await directDock.up();
+    await tester.pump();
+
+    final saved = await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      final catalog = await store.loadCatalog();
+      final (s, _) = await store.loadState(catalog.services);
+      return s;
+    });
+    expect(find.byKey(const ValueKey('mobile-gesture-orb-0')), findsNothing);
+    expect(find.byKey(const ValueKey('header-gesture-dock-button')), findsOneWidget);
+    expect(saved?.gesture.dockedInHeader, isTrue);
+    expect(saved?.gesture.handleXFraction, closeTo(0.85, 0.01));
+    expect(saved?.gesture.handleYFraction, closeTo(0.60, 0.01));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+  });
 }

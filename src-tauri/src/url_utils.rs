@@ -154,7 +154,8 @@ pub fn is_valid_hex_color(color: &str) -> bool {
 }
 
 /// ページタイトルから未読件数を抽出する。
-/// 例: "(3) X / Messages", "[12] Discord", "• 5 messages", "(99+) Instagram"
+/// 例: "(3) X / Messages", "[12] Discord", "• 5 messages", "(99+) Instagram", "受信トレイ (4) - Gmail"
+/// プロフィール名や投稿タイトル途中の年齢 "(22)" 等は誤検知しない。
 pub fn parse_unread_count_from_title(title: &str) -> u32 {
     if title.is_empty() {
         return 0;
@@ -162,13 +163,14 @@ pub fn parse_unread_count_from_title(title: &str) -> u32 {
 
     let trimmed = title.trim_start();
 
-    // パターン1: 先頭の括弧内数値 "(3)", "(99+)", "[5]"
-    if let Some(num) = extract_leading_bracket_number(trimmed) {
+    // パターン1: 先頭の括弧内数値 "(3)", "(99+)", "[5]"（先頭ドット付き "• (3)" も対応）
+    let after_dot = strip_leading_unread_dot(trimmed);
+    if let Some(num) = extract_leading_bracket_number(after_dot) {
         return num.min(999);
     }
 
-    // パターン2: タイトル途中の "(3)" 等（ただし西暦2026など4桁以上は除外）
-    if let Some(num) = extract_inline_short_bracket_number(title) {
+    // パターン2: 受信箱・通知キーワード直後の "(3)" 等（"受信トレイ (4)", "Inbox (7)", "通知 (2)"）
+    if let Some(num) = extract_keyword_bracket_number(title) {
         return num.min(999);
     }
 
@@ -180,6 +182,16 @@ pub fn parse_unread_count_from_title(title: &str) -> u32 {
     }
 
     0
+}
+
+fn strip_leading_unread_dot(s: &str) -> &str {
+    let mut chars = s.chars();
+    if let Some(first) = chars.next() {
+        if matches!(first, '•' | '●' | '🔴') {
+            return chars.as_str().trim_start();
+        }
+    }
+    s
 }
 
 fn extract_leading_bracket_number(s: &str) -> Option<u32> {
@@ -207,7 +219,21 @@ fn extract_leading_bracket_number(s: &str) -> Option<u32> {
     }
 }
 
-fn extract_inline_short_bracket_number(s: &str) -> Option<u32> {
+const UNREAD_INLINE_KEYWORDS: &[&str] = &[
+    "受信トレイ",
+    "受信箱",
+    "未読",
+    "通知",
+    "メッセージ",
+    "inbox",
+    "messages",
+    "notifications",
+    "notification",
+    "unread",
+    "direct",
+];
+
+fn extract_keyword_bracket_number(s: &str) -> Option<u32> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -224,8 +250,24 @@ fn extract_inline_short_bracket_number(s: &str) -> Option<u32> {
                     k += 1;
                 }
                 if k < bytes.len() && (bytes[k] == b')' || bytes[k] == b']') {
-                    if let Ok(n) = s[start..j].parse::<u32>() {
-                        return Some(n);
+                    let prefix = s[..i].trim_end();
+                    let prefix_lower = prefix.to_lowercase();
+                    let matched_kw = UNREAD_INLINE_KEYWORDS.iter().any(|kw| {
+                        if !prefix_lower.ends_with(kw) {
+                            return false;
+                        }
+                        if kw.is_ascii() {
+                            let before_idx = prefix_lower.len() - kw.len();
+                            before_idx == 0
+                                || !prefix_lower.as_bytes()[before_idx - 1].is_ascii_alphanumeric()
+                        } else {
+                            true
+                        }
+                    });
+                    if matched_kw {
+                        if let Ok(n) = s[start..j].parse::<u32>() {
+                            return Some(n);
+                        }
                     }
                 }
             }
@@ -532,8 +574,17 @@ mod tests {
         assert_eq!(parse_unread_count_from_title("(99+) Instagram"), 99);
         assert_eq!(parse_unread_count_from_title("[12] Discord"), 12);
         assert_eq!(parse_unread_count_from_title("• Slack - general"), 1);
+        assert_eq!(parse_unread_count_from_title("• (4) Slack"), 4);
+        assert_eq!(parse_unread_count_from_title("(0) Instagram"), 0);
+        assert_eq!(parse_unread_count_from_title("受信トレイ (5) - user@gmail.com"), 5);
+        assert_eq!(parse_unread_count_from_title("Inbox (7) - Gmail"), 7);
         assert_eq!(parse_unread_count_from_title("Threads - Home"), 0);
         assert_eq!(parse_unread_count_from_title("Report (2026)"), 0);
+        assert_eq!(
+            parse_unread_count_from_title("さくら (22) (@sakura) • Instagram写真と動画"),
+            0
+        );
+        assert_eq!(parse_unread_count_from_title("Alice [21] / X"), 0);
     }
 
     #[test]

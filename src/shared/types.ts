@@ -73,6 +73,14 @@ export interface ServiceInstance {
   unfollowCountTotal?: number;
   /** 本日カウントの日付 (YYYY-MM-DD) */
   followCountDate?: string;
+  /** 次の1件のフォローカウントが期限切れで減少する予定時刻（UNIX秒） */
+  followNextResetAt?: number;
+  /** フォローカウントがすべて期限切れになり 0 へリセットされる予定時刻（UNIX秒） */
+  followFullResetAt?: number;
+  /** 次の1件のアンフォローカウントが期限切れで減少する予定時刻（UNIX秒） */
+  unfollowNextResetAt?: number;
+  /** アンフォローカウントがすべて期限切れになり 0 へリセットされる予定時刻（UNIX秒） */
+  unfollowFullResetAt?: number;
   /** 自動検出または手動設定されたログイン中アカウントID (@username) */
   detectedHandle?: string;
   /** SNS サーバー上の実フォロー中数（取得済みの場合） */

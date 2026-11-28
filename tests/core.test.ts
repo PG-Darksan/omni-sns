@@ -8,6 +8,8 @@ import {
   buildUserAgent,
   detectPlatformServiceFromUrl,
   formatArchivedAccountTitle,
+  formatResetClock,
+  formatResetRemaining,
   getAccountDisplayLabel,
   getCrossServiceAccountDisplayLabel,
   getServiceGroupKey,
@@ -94,13 +96,19 @@ test('normalizeServiceUrl validates and normalizes URLs safely', () => {
   assert.equal(normalizeServiceUrl('   '), null);
 });
 
-test('parseUnreadCountFromTitle extracts unread badges accurately', () => {
+test('parseUnreadCountFromTitle extracts unread badges accurately without profile-age false positives', () => {
   assert.equal(parseUnreadCountFromTitle('(3) Bluesky / Messages'), 3);
   assert.equal(parseUnreadCountFromTitle('(99+) Instagram'), 99);
   assert.equal(parseUnreadCountFromTitle('[12] Discord'), 12);
   assert.equal(parseUnreadCountFromTitle('• Slack - general'), 1);
+  assert.equal(parseUnreadCountFromTitle('• (4) Slack'), 4);
+  assert.equal(parseUnreadCountFromTitle('(0) Instagram'), 0);
+  assert.equal(parseUnreadCountFromTitle('受信トレイ (5) - user@gmail.com'), 5);
+  assert.equal(parseUnreadCountFromTitle('Inbox (7) - Gmail'), 7);
   assert.equal(parseUnreadCountFromTitle('Threads - Home'), 0);
   assert.equal(parseUnreadCountFromTitle('Report (2026)'), 0);
+  assert.equal(parseUnreadCountFromTitle('さくら (22) (@sakura) • Instagram写真と動画'), 0);
+  assert.equal(parseUnreadCountFromTitle('Alice [21] / X'), 0);
 });
 
 test('shouldOpenInAppPopup allows OAuth and same-site popups while sending external links out', () => {
@@ -681,5 +689,129 @@ test('getCrossServiceAccountDisplayLabel differentiates Instagram and Bluesky ac
     ),
     'メイン'
   );
+});
+
+test('formatResetRemaining and formatResetClock format counter reset countdowns clearly', () => {
+  assert.equal(formatResetRemaining(0), 'まもなく');
+  assert.equal(formatResetRemaining(-10), 'まもなく');
+  assert.equal(formatResetRemaining(45), '45秒');
+  assert.equal(formatResetRemaining(15 * 60 + 8), '15分08秒');
+  assert.equal(formatResetRemaining(23 * 3600 + 5 * 60), '23時間05分');
+  assert.equal(formatResetRemaining(2 * 86400 + 3 * 3600 + 15 * 60), '2日3時間15分');
+
+  const base = new Date(2026, 10, 28, 9, 30, 0);
+  const sameDayTarget = Math.floor(new Date(2026, 10, 28, 14, 5, 0).getTime() / 1000);
+  const tomorrowTarget = Math.floor(new Date(2026, 10, 29, 8, 15, 0).getTime() / 1000);
+  const laterTarget = Math.floor(new Date(2026, 11, 2, 18, 0, 0).getTime() / 1000);
+  assert.equal(formatResetClock(sameDayTarget, base), '14:05');
+  assert.equal(formatResetClock(tomorrowTarget, base), '明日 08:15');
+  assert.equal(formatResetClock(laterTarget, base), '12/2 18:00');
+});
+
+test('Windows and Android UNREAD_SYNC_JS parse cleanly, fit JVM limits, and clear stuck Instagram title badges', () => {
+  const winSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src-tauri/src/platform_win.rs'),
+    'utf8'
+  );
+  const ktSrc = fs.readFileSync(
+    path.resolve(
+      process.cwd(),
+      'mobile/android/app/src/main/kotlin/com/pgdarksan/omni_sns_mobile/OmniWebView.kt'
+    ),
+    'utf8'
+  );
+
+  const winMatch = /const UNREAD_SYNC_JS: &str = r#"([\s\S]*?)"#;/.exec(winSrc);
+  assert.ok(winMatch, 'Windows UNREAD_SYNC_JS must exist');
+  assert.doesNotThrow(() => new Function(winMatch[1]), 'Windows UNREAD_SYNC_JS must parse cleanly');
+
+  const ktMatch = /val UNREAD_SYNC_JS: String = """\r?\n([\s\S]*?)\r?\n[ \t]*"""/.exec(ktSrc);
+  assert.ok(ktMatch, 'Android UNREAD_SYNC_JS must exist');
+  // Kotlin raw string template `${'$'}` resolves to `$` at runtime
+  const andJs = ktMatch[1].replace(/\$\{'\$'\}/g, '$');
+  assert.ok(
+    Buffer.byteLength(andJs, 'utf8') < 60000,
+    'Android UNREAD_SYNC_JS must stay safely under JVM 65535-byte limit'
+  );
+  assert.doesNotThrow(() => new Function(andJs), 'Android UNREAD_SYNC_JS must parse cleanly');
+
+  // Mock Instagram DOM: title is stuck at "(1) Instagram" while nav icons have 0 unread badges
+  const posted: Array<{ type: string; title: string; unreadOverride: number | null; cleared: boolean; rawUnread: number }> = [];
+  let nowMs = 1_700_000_000_000;
+  const FakeDate = class extends Date {
+    static now() {
+      return nowMs;
+    }
+  };
+  const navDmLink = {
+    getAttribute(attr: string) {
+      if (attr === 'aria-label') return 'Direct メッセージ';
+      if (attr === 'href') return '/direct/inbox/';
+      return null;
+    },
+    getBoundingClientRect() {
+      return { width: 40, height: 40 };
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
+  const doc: Record<string, unknown> = {
+    title: '(1) Instagram',
+    hidden: false,
+    visibilityState: 'visible',
+    readyState: 'complete',
+    head: null,
+    documentElement: null,
+    addEventListener() {},
+    querySelectorAll(sel: string) {
+      return sel.includes('/direct/inbox') ? [navDmLink] : [];
+    }
+  };
+  const sandbox: Record<string, unknown> = {
+    Date: FakeDate,
+    Set,
+    Math,
+    Number,
+    String,
+    Array,
+    RegExp,
+    JSON,
+    parseInt,
+    parseFloat,
+    setTimeout: () => 0,
+    setInterval: () => 0,
+    clearTimeout: () => {},
+    location: { hostname: 'www.instagram.com', pathname: '/direct/t/12345/' },
+    history: { pushState() {}, replaceState() {} },
+    document: doc,
+    chrome: {
+      webview: {
+        postMessage(raw: string) {
+          posted.push(JSON.parse(raw));
+        }
+      }
+    },
+    addEventListener() {},
+    getComputedStyle() {
+      return { display: 'block', visibility: 'visible', opacity: '1', backgroundColor: '' };
+    }
+  };
+  sandbox.window = sandbox;
+
+  const winScript = winMatch[1].replace('__OMNI_BRIDGE_TOKEN__', 'tok-test');
+  vm.runInNewContext(winScript, sandbox);
+  // Immediately on boot (< 1.4s settled) it reports initial title without premature clear
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].title, '(1) Instagram');
+  assert.equal(posted[0].cleared, false);
+
+  // After 2 seconds viewing /direct/t/12345/ with 0 unread DOM badges, stuck "(1) " is stripped and cleared
+  nowMs += 2000;
+  (sandbox.__omniCheckUnreadSync as (force: boolean) => void)(false);
+  assert.equal(doc.title, 'Instagram');
+  assert.equal(posted[posted.length - 1].cleared, true);
+  assert.equal(posted[posted.length - 1].unreadOverride, 0);
+  assert.equal(posted[posted.length - 1].rawUnread, 1);
 });
 

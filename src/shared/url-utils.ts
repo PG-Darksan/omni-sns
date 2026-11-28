@@ -126,24 +126,27 @@ export function parseSharedSyncConfig(raw: string): { token: string; gistId: str
 
 /**
  * ページタイトルから未読件数を抽出する。
- * 例: "(3) X / Messages", "[12] Discord", "• 5 messages", "99+ 未読"
+ * 例: "(3) X / Messages", "[12] Discord", "• 5 messages", "受信トレイ (4) - Gmail"
+ * プロフィール名途中の年齢 "(22)" 等は誤検知しない。
  */
 export function parseUnreadCountFromTitle(title: string): number {
   if (!title) return 0;
 
-  // パターン1: 先頭や括弧内の数値 "(3)", "(99+)", "[5]"
-  const bracketMatch = title.match(/^\s*[(\[]\s*(\d+)\+?\s*[)\]]/);
+  // パターン1: 先頭の括弧内数値 "(3)", "(99+)", "[5]"（先頭ドット付き "• (3)" も対応）
+  const bracketMatch = title.match(/^\s*(?:[•●🔴]\s*)?[(\[]\s*(\d+)\+?\s*[)\]]/);
   if (bracketMatch) {
     return Math.min(999, parseInt(bracketMatch[1], 10) || 0);
   }
 
-  // パターン2: タイトル途中の "(3)" 等（ただし西暦2024など4桁以上は除外）
-  const inlineMatch = title.match(/[(\[](\d{1,3})\+?[)\]]/);
-  if (inlineMatch) {
-    return Math.min(999, parseInt(inlineMatch[1], 10) || 0);
+  // パターン2: 受信箱・通知キーワード直後の "(3)" 等（"受信トレイ (4)", "Inbox (7)", "通知 (2)"）
+  const keywordInlineMatch = title.match(
+    /(?:受信トレイ|受信箱|未読|通知|メッセージ|\b(?:inbox|messages|notifications?|unread|direct))\s*[(\[](\d{1,3})\+?[)\]]/i
+  );
+  if (keywordInlineMatch) {
+    return Math.min(999, parseInt(keywordInlineMatch[1], 10) || 0);
   }
 
-  // パターン3: 未読ドット記号（Discord/Slackの "•" や "●"）
+  // パターン3: 未読ドット記号（Discord/Slackの "•" や "●" や "🔴"）
   if (/^\s*[•●🔴]/.test(title)) {
     return 1;
   }
@@ -464,4 +467,49 @@ export function detectPlatformServiceFromUrl(rawUrl?: string | null): string | n
     // ignore
   }
   return null;
+}
+
+/**
+ * カウンターリセットまでの残り秒数を分かりやすい日本語表記へフォーマットする。
+ */
+export function formatResetRemaining(remainingSecs: number): string {
+  const secs = Math.max(0, Math.floor(remainingSecs));
+  if (secs <= 0) return 'まもなく';
+  if (secs < 60) return `${secs}秒`;
+  const totalMins = Math.floor(secs / 60);
+  const remSecs = secs % 60;
+  if (secs < 3600) {
+    return `${totalMins}分${String(remSecs).padStart(2, '0')}秒`;
+  }
+  const totalHours = Math.floor(secs / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  if (secs < 86400) {
+    return `${totalHours}時間${String(mins).padStart(2, '0')}分`;
+  }
+  const days = Math.floor(secs / 86400);
+  const hours = Math.floor((secs % 86400) / 3600);
+  return `${days}日${hours}時間${String(mins).padStart(2, '0')}分`;
+}
+
+/**
+ * リセット予定時刻（UNIX秒）をローカル時計表記へフォーマットする。
+ * 当日なら "HH:mm"、翌日なら "明日 HH:mm"、それ以降は "M/D HH:mm"。
+ */
+export function formatResetClock(targetUnixSecs: number, now = new Date()): string {
+  if (!Number.isFinite(targetUnixSecs) || targetUnixSecs <= 0) return '';
+  const target = new Date(targetUnixSecs * 1000);
+  const hh = String(target.getHours()).padStart(2, '0');
+  const mm = String(target.getMinutes()).padStart(2, '0');
+  const sameDay =
+    target.getFullYear() === now.getFullYear() &&
+    target.getMonth() === now.getMonth() &&
+    target.getDate() === now.getDate();
+  if (sameDay) return `${hh}:${mm}`;
+  const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  const isTomorrow =
+    target.getFullYear() === tomorrow.getFullYear() &&
+    target.getMonth() === tomorrow.getMonth() &&
+    target.getDate() === tomorrow.getDate();
+  if (isTomorrow) return `明日 ${hh}:${mm}`;
+  return `${target.getMonth() + 1}/${target.getDate()} ${hh}:${mm}`;
 }

@@ -70,6 +70,14 @@ pub struct ServiceInstance {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unfollow_events: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_next_reset_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_full_reset_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfollow_next_reset_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfollow_full_reset_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sns_following_count: Option<u32>,

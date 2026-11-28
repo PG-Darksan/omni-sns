@@ -16,6 +16,12 @@ typedef OmniWebViewPageFinishedCallback = void Function(
   bool hadError,
 );
 typedef OmniWebViewTitleChangedCallback = void Function(String title);
+typedef OmniWebViewTitleSyncCallback = void Function(
+  String title,
+  int? unreadOverride,
+  bool cleared,
+  int rawUnread,
+);
 typedef OmniWebViewHistoryChangedCallback = void Function(
   String url,
   bool canGoBack,
@@ -169,6 +175,7 @@ class OmniWebViewController {
     this.onPageStarted,
     this.onPageFinished,
     this.onTitleChanged,
+    this.onTitleSync,
     this.onHistoryChanged,
     this.onWebResourceError,
     this.onExternalScheme,
@@ -193,6 +200,7 @@ class OmniWebViewController {
   final OmniWebViewPageStartedCallback? onPageStarted;
   final OmniWebViewPageFinishedCallback? onPageFinished;
   final OmniWebViewTitleChangedCallback? onTitleChanged;
+  final OmniWebViewTitleSyncCallback? onTitleSync;
   final OmniWebViewHistoryChangedCallback? onHistoryChanged;
   final OmniWebViewErrorCallback? onWebResourceError;
   final OmniWebViewExternalSchemeCallback? onExternalScheme;
@@ -350,6 +358,13 @@ class OmniWebViewController {
       case 'onTitleChanged':
         final title = map['title'] as String? ?? '';
         onTitleChanged?.call(title);
+      case 'onTitleSync':
+        final title = map['title'] as String? ?? '';
+        final rawOv = (map['unreadOverride'] as num?)?.toInt();
+        final unreadOverride = (rawOv != null && rawOv >= 0) ? rawOv : null;
+        final cleared = map['cleared'] as bool? ?? false;
+        final rawUnread = (map['rawUnread'] as num?)?.toInt() ?? 0;
+        onTitleSync?.call(title, unreadOverride, cleared, rawUnread);
       case 'onHistoryChanged':
         final url = map['url'] as String? ?? '';
         final canGoBack = map['canGoBack'] as bool? ?? false;

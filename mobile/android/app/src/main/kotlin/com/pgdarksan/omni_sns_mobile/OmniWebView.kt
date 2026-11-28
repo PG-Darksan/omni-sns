@@ -189,6 +189,7 @@ private class OmniFollowBridge(
     private val onJevStateCb: (Boolean, Int, Int, Boolean) -> Unit,
     private val onAccountFilterGetConfigCb: () -> Unit,
     private val onAccountFilterStateCb: (Boolean, Int, Int, Int, Boolean) -> Unit,
+    private val onTitleSyncCb: (String, Int, Boolean, Int) -> Unit,
 ) {
     @JavascriptInterface
     fun onFollowDetected(token: String?, source: String?, service: String?) {
@@ -268,6 +269,18 @@ private class OmniFollowBridge(
     ) {
         if (token != expectedToken) return
         onAccountFilterStateCb(active, matched, hidden, pending, autoFetching)
+    }
+
+    @JavascriptInterface
+    fun onTitleSync(
+        token: String?,
+        title: String?,
+        unreadOverride: Int,
+        cleared: Boolean,
+        rawUnread: Int,
+    ) {
+        if (token != expectedToken) return
+        onTitleSyncCb(title ?: "", unreadOverride, cleared, rawUnread)
     }
 }
 
@@ -411,6 +424,353 @@ class OmniWebViewManager(
 
         fun buildJevFilterJs(token: String): String =
             JEV_FILTER_JS.replace("__OMNISNS_FOLLOW_TOKEN__", token)
+
+        fun buildUnreadSyncJs(token: String): String =
+            UNREAD_SYNC_JS.replace("__OMNISNS_FOLLOW_TOKEN__", token)
+
+        /**
+         * Instagram 等の SPA で通知／DM を開いた後も document.title の "(1)" バッジが残留する問題と、
+         * Android WebView で SPA の document.title 変更時に onReceivedTitle が発火しない問題を解消するスクリプト。
+         */
+        val UNREAD_SYNC_JS: String = """
+            (function() {
+              if (window.__omniUnreadSyncInstalled) return;
+              window.__omniUnreadSyncInstalled = true;
+
+              var __omniFollowToken = "__OMNISNS_FOLLOW_TOKEN__";
+              var __omniFollowChannel = window.OmniFollowChannel;
+              var __omniFollowBridge = window.OmniFollowBridge;
+
+              var host = '';
+              try { host = String(location.hostname || '').toLowerCase(); } catch (_) {}
+              function matchesHost(domain) { return host === domain || host.slice(-domain.length - 1) === '.' + domain; }
+
+              var LEADING_BRACKET_RE = /^\s*(?:[•●🔴]\s*)?[(\[]\s*(\d+)\+?\s*[)\]]/;
+              var KEYWORD_INLINE_RE = /(?:受信トレイ|受信箱|未読|通知|メッセージ|\b(?:inbox|messages|notifications?|unread|direct))\s*[(\[](\d{1,3})\+?[)\]]/i;
+              var LEADING_DOT_RE = /^\s*[•●🔴]/;
+              var STRIP_PREFIX_RE = /^\s*(?:(?:[•●🔴]\s*)?[(\[]\s*\d+\+?\s*[)\]]\s*|[•●🔴]\s*)/;
+              var OPENED_NOTIF_PATH_RE = /^\/(?:direct\/t\/|notifications?(?:\/|${'$'})|activity(?:\/|${'$'})|messages\/[^/?#]+|t\/[^/?#]+)/i;
+              var NOTIF_HREF_RE = /(?:\/direct\/|\/notifications|\/activity|\/messages|\/chat|\/inbox)/i;
+              var NOTIF_LABEL_RE = /(?:通知|お知らせ|アクティビティ|メッセージ|チャット|受信箱|受信トレイ|notifications?|activity|messages?|direct|inbox|\bdm\b)/i;
+              var ARIA_UNREAD_NUM_RE = /(?:(?:未読|新しい通知|新しいメッセージ|unread|new\s+(?:message|notification)s?)[^0-9]{0,10}(\d{1,3})|(\d{1,3})\s*(?:件の未読|件の新しい|unread|new\s+(?:message|notification)))/i;
+              var ARIA_UNREAD_FLAG_RE = /(?:未読|新しい通知|新しいメッセージ|unread|new\s+(?:message|notification)s?)/i;
+
+              function parseTitleUnread(title) {
+                if (!title) return 0;
+                var m1 = title.match(LEADING_BRACKET_RE);
+                if (m1) return Math.min(999, parseInt(m1[1], 10) || 0);
+                var m2 = title.match(KEYWORD_INLINE_RE);
+                if (m2) return Math.min(999, parseInt(m2[1], 10) || 0);
+                if (LEADING_DOT_RE.test(title)) return 1;
+                return 0;
+              }
+
+              function stripLeadingUnread(title) {
+                if (!title) return '';
+                var stripped = title.replace(STRIP_PREFIX_RE, '').trim();
+                return stripped || title;
+              }
+
+              function isRedDotStyle(el) {
+                try {
+                  var st = window.getComputedStyle(el);
+                  if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') < 0.1) return false;
+                  var bg = st.backgroundColor || '';
+                  var m = bg.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)/i);
+                  if (!m) return false;
+                  var r = parseInt(m[1], 10), g = parseInt(m[2], 10), b = parseInt(m[3], 10);
+                  var a = m[4] !== undefined ? parseFloat(m[4]) : 1;
+                  return a > 0.2 && r >= 185 && g <= 95 && b <= 115;
+                } catch (_) {
+                  return false;
+                }
+              }
+
+              function inspectNavItemUnread(el) {
+                if (!el) return 0;
+                var count = 0;
+                try {
+                  var label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).trim();
+                  if (label) {
+                    var nm = label.match(ARIA_UNREAD_NUM_RE);
+                    if (nm) {
+                      var parsed = parseInt(nm[1] || nm[2] || '0', 10) || 0;
+                      if (parsed > count) count = parsed;
+                    } else if (ARIA_UNREAD_FLAG_RE.test(label)) {
+                      count = Math.max(count, 1);
+                    }
+                  }
+                  var nodes = el.querySelectorAll('span, div');
+                  var lim = Math.min(nodes.length, 24);
+                  for (var i = 0; i < lim; i++) {
+                    var n = nodes[i];
+                    var r = n.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0 || r.width > 42 || r.height > 32) continue;
+                    var txt = (n.textContent || '').trim();
+                    if (/^\d{1,3}\+?${'$'}/.test(txt)) {
+                      var v = parseInt(txt, 10) || 0;
+                      if (v > count) count = v;
+                    } else if (txt === '' && r.width >= 4 && r.width <= 14 && r.height >= 4 && r.height <= 14 && isRedDotStyle(n)) {
+                      count = Math.max(count, 1);
+                    }
+                  }
+                } catch (_) {}
+                return Math.min(999, count);
+              }
+
+              function detectSiteDomUnread() {
+                var isIg = matchesHost('instagram.com');
+                var isThreads = matchesHost('threads.com') || matchesHost('threads.net');
+                var isBsky = matchesHost('bsky.app');
+                var isX = matchesHost('x.com') || matchesHost('twitter.com');
+                if (!isIg && !isThreads && !isBsky && !isX) return { known: false, count: 0 };
+
+                try {
+                  var candidates = [];
+                  var seen = new Set();
+                  function addEl(el) {
+                    if (!el || seen.has(el)) return;
+                    var rect = el.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) return;
+                    seen.add(el);
+                    candidates.push(el);
+                  }
+
+                  var navSelectors = isIg
+                    ? 'a[href*="/direct/inbox"], a[href*="/notifications"], nav a[aria-label*="通知"], nav a[aria-label*="Notification"], nav [role="button"][aria-label*="通知"], nav [role="button"][aria-label*="Notification"], [role="navigation"] a[href*="/direct/"], [role="navigation"] [aria-label*="通知"], [role="navigation"] [aria-label*="Notification"]'
+                    : isThreads
+                    ? 'a[href*="/activity"], nav a[href*="/activity"], [role="navigation"] a[href*="/activity"]'
+                    : isBsky
+                    ? 'a[href*="/notifications"], a[href*="/messages"], nav a[href*="/notifications"], nav a[href*="/messages"]'
+                    : 'a[href*="/notifications"], a[href*="/messages"], nav a[href*="/notifications"], nav a[href*="/messages"]';
+
+                  var found = document.querySelectorAll(navSelectors);
+                  for (var i = 0; i < found.length; i++) addEl(found[i]);
+                  if (candidates.length === 0) return { known: false, count: 0 };
+
+                  var total = 0;
+                  for (var j = 0; j < candidates.length; j++) {
+                    total += inspectNavItemUnread(candidates[j]);
+                  }
+                  return { known: true, count: Math.min(999, total) };
+                } catch (_) {
+                  return { known: false, count: 0 };
+                }
+              }
+
+              function isNotifOrDmTarget(target) {
+                try {
+                  var el = target && target.nodeType === 1 ? target : (target && target.parentElement);
+                  if (!el) return false;
+                  var hit = el.closest('a, button, [role="button"], [role="link"], [role="tab"]');
+                  if (!hit) return false;
+                  var href = hit.getAttribute('href') || '';
+                  if (href && NOTIF_HREF_RE.test(href)) return true;
+                  var label = ((hit.getAttribute('aria-label') || '') + ' ' + (hit.getAttribute('title') || '')).trim();
+                  if (label && NOTIF_LABEL_RE.test(label)) return true;
+                  var txt = (hit.textContent || '').trim();
+                  if (txt && txt.length <= 40 && NOTIF_LABEL_RE.test(txt)) return true;
+                } catch (_) {}
+                return false;
+              }
+
+              var lastVisibleAt = document.hidden ? 0 : Date.now();
+              var lastInteractionAt = 0;
+              var lastNotifActionAt = 0;
+              var notifActionRawUnread = 0;
+              var lastRawUnread = parseTitleUnread(document.title || '');
+              var lastIncreaseAt = lastRawUnread > 0 ? Date.now() : 0;
+              var suppressTitleMutation = false;
+              var lastSentKey = '';
+
+              function postTitleSync(title, unreadOverride, cleared, rawUnread) {
+                var key = title + '|' + String(unreadOverride) + '|' + (cleared ? '1' : '0') + '|' + String(rawUnread);
+                if (key === lastSentKey) return;
+                lastSentKey = key;
+                try {
+                  var ch = __omniFollowChannel || window.OmniFollowChannel;
+                  if (ch && typeof ch.postMessage === 'function') {
+                    ch.postMessage(JSON.stringify({
+                      token: __omniFollowToken,
+                      type: 'title-sync',
+                      title: title,
+                      unreadOverride: unreadOverride === null ? -1 : unreadOverride,
+                      cleared: !!cleared,
+                      rawUnread: rawUnread
+                    }));
+                    return;
+                  }
+                  var br = __omniFollowBridge || window.OmniFollowBridge;
+                  if (br && typeof br.onTitleSync === 'function') {
+                    br.onTitleSync(__omniFollowToken, title, unreadOverride === null ? -1 : unreadOverride, !!cleared, rawUnread);
+                  }
+                } catch (_) {}
+              }
+
+              function runSync(force) {
+                if (suppressTitleMutation) return;
+                var now = Date.now();
+                var visible = !document.hidden && document.visibilityState !== 'hidden';
+                var rawTitle = typeof document.title === 'string' ? document.title : '';
+                var rawUnread = parseTitleUnread(rawTitle);
+                if (rawUnread > lastRawUnread) {
+                  lastIncreaseAt = now;
+                }
+                lastRawUnread = rawUnread;
+
+                var reportTitle = rawTitle;
+                var unreadOverride = null;
+                var cleared = false;
+
+                if (visible && rawUnread > 0) {
+                  var dom = detectSiteDomUnread();
+                  var path = '';
+                  try { path = location.pathname || ''; } catch (_) {}
+                  var inOpenedNotif = OPENED_NOTIF_PATH_RE.test(path);
+                  var recentNotif = lastNotifActionAt > 0 && (now - lastNotifActionAt) >= 700 && (now - lastNotifActionAt) < 15000;
+                  var recentInteract = lastInteractionAt > 0 && (now - lastInteractionAt) >= 700 && (now - lastInteractionAt) < 15000;
+                  var settledInc = (now - lastIncreaseAt) >= 1000;
+                  var visibleSettled = lastVisibleAt > 0 && (now - lastVisibleAt) >= 1400;
+
+                  if (dom.known && dom.count < rawUnread && settledInc && (visibleSettled || recentInteract || recentNotif || inOpenedNotif)) {
+                    if (dom.count === 0) {
+                      cleared = true;
+                      unreadOverride = 0;
+                      var clean = stripLeadingUnread(rawTitle);
+                      if (clean && clean !== rawTitle) {
+                        suppressTitleMutation = true;
+                        try { document.title = clean; } catch (_) {}
+                        suppressTitleMutation = false;
+                        reportTitle = clean;
+                      }
+                    } else {
+                      unreadOverride = dom.count;
+                    }
+                  } else if (!dom.known && settledInc && ((recentNotif && rawUnread <= Math.max(1, notifActionRawUnread)) || (inOpenedNotif && (visibleSettled || recentInteract)))) {
+                    cleared = true;
+                    unreadOverride = 0;
+                    var cleanFallback = stripLeadingUnread(rawTitle);
+                    if (cleanFallback && cleanFallback !== rawTitle) {
+                      suppressTitleMutation = true;
+                      try { document.title = cleanFallback; } catch (_) {}
+                      suppressTitleMutation = false;
+                      reportTitle = cleanFallback;
+                    }
+                  }
+                }
+
+                if (force) lastSentKey = '';
+                postTitleSync(reportTitle, unreadOverride, cleared, rawUnread);
+              }
+
+              function scheduleChecks(delays) {
+                for (var i = 0; i < delays.length; i++) {
+                  (function(ms) {
+                    setTimeout(function() { runSync(false); }, ms);
+                  })(delays[i]);
+                }
+              }
+
+              function onRouteChange() {
+                var path = '';
+                try { path = location.pathname || ''; } catch (_) {}
+                if (OPENED_NOTIF_PATH_RE.test(path)) {
+                  lastNotifActionAt = Date.now();
+                  notifActionRawUnread = parseTitleUnread(document.title || '');
+                }
+                scheduleChecks([250, 1200, 2400]);
+              }
+
+              try {
+                var origPush = history.pushState;
+                if (typeof origPush === 'function') {
+                  history.pushState = function() {
+                    var res = origPush.apply(this, arguments);
+                    onRouteChange();
+                    return res;
+                  };
+                }
+                var origReplace = history.replaceState;
+                if (typeof origReplace === 'function') {
+                  history.replaceState = function() {
+                    var res = origReplace.apply(this, arguments);
+                    onRouteChange();
+                    return res;
+                  };
+                }
+              } catch (_) {}
+
+              window.addEventListener('popstate', onRouteChange, { passive: true });
+              window.addEventListener('hashchange', onRouteChange, { passive: true });
+
+              document.addEventListener('click', function(e) {
+                if (!e || e.isTrusted === false) return;
+                var now = Date.now();
+                lastInteractionAt = now;
+                if (isNotifOrDmTarget(e.target)) {
+                  lastNotifActionAt = now;
+                  notifActionRawUnread = parseTitleUnread(document.title || '');
+                }
+                scheduleChecks([400, 1300, 2600]);
+              }, true);
+
+              document.addEventListener('visibilitychange', function() {
+                if (!document.hidden && document.visibilityState !== 'hidden') {
+                  lastVisibleAt = Date.now();
+                  scheduleChecks([150, 1500, 2800]);
+                }
+              }, { passive: true });
+
+              window.addEventListener('focus', function() {
+                lastVisibleAt = Date.now();
+                scheduleChecks([150, 1500]);
+              }, { passive: true });
+
+              function attachTitleObserver() {
+                try {
+                  var head = document.head || document.documentElement;
+                  if (!head || typeof MutationObserver === 'undefined') return;
+                  var mo = new MutationObserver(function(muts) {
+                    if (suppressTitleMutation) return;
+                    for (var i = 0; i < muts.length; i++) {
+                      var t = muts[i].target;
+                      if ((t && t.nodeName === 'TITLE') || (t && t.parentNode && t.parentNode.nodeName === 'TITLE')) {
+                        runSync(false);
+                        return;
+                      }
+                      if (muts[i].addedNodes && muts[i].addedNodes.length) {
+                        for (var j = 0; j < muts[i].addedNodes.length; j++) {
+                          if (muts[i].addedNodes[j] && muts[i].addedNodes[j].nodeName === 'TITLE') {
+                            runSync(false);
+                            return;
+                          }
+                        }
+                      }
+                    }
+                  });
+                  mo.observe(head, { childList: true, subtree: true, characterData: true });
+                } catch (_) {}
+              }
+
+              if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', function() {
+                  attachTitleObserver();
+                  runSync(true);
+                }, { once: true });
+              } else {
+                attachTitleObserver();
+                runSync(true);
+              }
+
+              setInterval(function() {
+                if (!document.hidden && document.visibilityState !== 'hidden') {
+                  runSync(false);
+                }
+              }, 2000);
+
+              window.__omniCheckUnreadSync = function(force) { runSync(!!force); };
+            })();
+        """.trimIndent()
 
         /**
          * 全フレーム（iframe含む）のドキュメント開始前に注入する Autofill ガードスクリプト。
@@ -8236,6 +8596,17 @@ class OmniWebViewPlatformView(
         applyBackgroundThrottle()
         ensureLoadedOnActivation()
         scheduleActivationRedrawKicks()
+        try {
+            val curTitle = webView.title
+            if (!curTitle.isNullOrEmpty()) {
+                invokeDart("onTitleChanged", mapOf("title" to curTitle))
+            }
+            webView.evaluateJavascript(
+                "if(window.__omniCheckUnreadSync){window.__omniCheckUnreadSync(true);}",
+                null,
+            )
+        } catch (_: Throwable) {
+        }
     }
 
     /**
@@ -8849,6 +9220,18 @@ class OmniWebViewPlatformView(
                                     ),
                                 )
                             }
+                            "title-sync" -> {
+                                if (!allowBridgeEvent()) return@addWebMessageListener
+                                invokeDart(
+                                    "onTitleSync",
+                                    mapOf(
+                                        "title" to obj.optString("title", ""),
+                                        "unreadOverride" to obj.optInt("unreadOverride", -1),
+                                        "cleared" to obj.optBoolean("cleared", false),
+                                        "rawUnread" to obj.optInt("rawUnread", 0),
+                                    ),
+                                )
+                            }
                         }
                     } catch (_: Throwable) {
                     }
@@ -8955,6 +9338,20 @@ class OmniWebViewPlatformView(
                                 )
                             }
                         },
+                        onTitleSyncCb = { title, unreadOverride, cleared, rawUnread ->
+                            mainHandler.post {
+                                if (disposed || target !== webView || !allowBridgeEvent()) return@post
+                                invokeDart(
+                                    "onTitleSync",
+                                    mapOf(
+                                        "title" to title,
+                                        "unreadOverride" to unreadOverride,
+                                        "cleared" to cleared,
+                                        "rawUnread" to rawUnread,
+                                    ),
+                                )
+                            }
+                        },
                     ),
                     "OmniFollowBridge",
                 )
@@ -8985,6 +9382,11 @@ class OmniWebViewPlatformView(
                     OmniWebViewManager.buildJevFilterJs(token),
                     setOf("*"),
                 )
+                WebViewCompat.addDocumentStartJavaScript(
+                    target,
+                    OmniWebViewManager.buildUnreadSyncJs(token),
+                    setOf("*"),
+                )
                 true
             } else {
                 false
@@ -9005,6 +9407,7 @@ class OmniWebViewPlatformView(
             target.evaluateJavascript(OmniWebViewManager.buildProfileStatsJs(mainFollowToken), null)
             target.evaluateJavascript(OmniWebViewManager.buildLongPressNewTabJs(mainFollowToken), null)
             target.evaluateJavascript(OmniWebViewManager.buildJevFilterJs(mainFollowToken), null)
+            target.evaluateJavascript(OmniWebViewManager.buildUnreadSyncJs(mainFollowToken), null)
         } catch (_: Throwable) {
         }
     }
@@ -9436,6 +9839,10 @@ class OmniWebViewPlatformView(
                         "canGoForward" to view.canGoForward(),
                     ),
                 )
+                val histTitle = view.title
+                if (!histTitle.isNullOrEmpty()) {
+                    invokeDart("onTitleChanged", mapOf("title" to histTitle))
+                }
             }
 
             override fun onReceivedError(

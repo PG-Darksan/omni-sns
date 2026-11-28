@@ -96,11 +96,56 @@ pub struct BrowserTabEntry {
     pub title: String,
     pub favicon_url: Option<String>,
     pub unread_count: u32,
+    pub acknowledged_raw_unread: u32,
+    pub acknowledged_at: Option<Instant>,
     pub is_loading: bool,
     pub is_sleeping: bool,
     pub can_go_back: bool,
     pub can_go_forward: bool,
     pub load_error: Option<String>,
+}
+
+const ACK_CLEAN_GRACE_MS: u128 = 5000;
+
+/// タイトル由来の未読件数と JS 側の通知既読クリア判定を統合し、
+/// `(表示未読数, 次回抑制ベースライン, 抑制時刻を更新するか, 抑制時刻をクリアするか)` を返す。
+pub fn resolve_tab_unread_update(
+    raw_unread: u32,
+    unread_override: Option<u32>,
+    cleared: bool,
+    prev_acknowledged: u32,
+    prev_ack_elapsed_ms: Option<u128>,
+) -> (u32, u32, bool, bool) {
+    let clamped_raw = raw_unread.min(999);
+    if cleared {
+        let next_ack = clamped_raw.max(prev_acknowledged);
+        return (0, next_ack, next_ack > 0, next_ack == 0);
+    }
+    if let Some(ov) = unread_override {
+        let clamped_ov = ov.min(999);
+        if clamped_ov == 0 {
+            let next_ack = clamped_raw.max(prev_acknowledged);
+            return (0, next_ack, next_ack > 0, next_ack == 0);
+        }
+        return (clamped_ov, 0, false, true);
+    }
+    if clamped_raw == 0 {
+        if prev_acknowledged > 0 {
+            let elapsed = prev_ack_elapsed_ms.unwrap_or(ACK_CLEAN_GRACE_MS);
+            if elapsed >= ACK_CLEAN_GRACE_MS {
+                return (0, 0, false, true);
+            }
+            return (0, prev_acknowledged, false, false);
+        }
+        return (0, 0, false, true);
+    }
+    if prev_acknowledged > 0 {
+        if clamped_raw > prev_acknowledged {
+            return (clamped_raw - prev_acknowledged, prev_acknowledged, false, false);
+        }
+        return (0, prev_acknowledged, false, false);
+    }
+    (clamped_raw, 0, false, false)
 }
 
 impl BrowserTabEntry {
@@ -115,6 +160,8 @@ impl BrowserTabEntry {
             title,
             favicon_url: None,
             unread_count: 0,
+            acknowledged_raw_unread: 0,
+            acknowledged_at: None,
             is_loading: false,
             is_sleeping: true,
             can_go_back: false,
@@ -190,16 +237,78 @@ impl ServiceTabs {
         self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
     }
 
+    /// 同一アカウント内の複数サブタブで同じ未読数を重複加算したり、
+    /// 裏タブの古い未読バッジが残り続けるのを防ぐため最大値で集約する。
+    fn effective_unread_count(&self) -> u32 {
+        self.tabs.iter().map(|t| t.unread_count).max().unwrap_or(0)
+    }
+
+    fn apply_tab_title_and_unread(
+        &mut self,
+        tab_id: &str,
+        expected_label: &str,
+        clean_title: String,
+        raw_unread: u32,
+        unread_override: Option<u32>,
+        cleared: bool,
+    ) -> bool {
+        let is_active_tab = self.active_tab_id == tab_id;
+        let Some(pos) = self.tabs.iter().position(|t| t.tab_id == tab_id) else {
+            return false;
+        };
+        if self.tabs[pos].webview_label.as_deref() != Some(expected_label) {
+            return false;
+        }
+        let prev_unread = self.tabs[pos].unread_count;
+        let prev_title = self.tabs[pos].title.clone();
+        let prev_ack = self.tabs[pos].acknowledged_raw_unread;
+        let elapsed_ms = self.tabs[pos].acknowledged_at.map(|t| t.elapsed().as_millis());
+        let (eff_unread, next_ack, set_ack_now, clear_ack_now) = resolve_tab_unread_update(
+            raw_unread,
+            unread_override,
+            cleared,
+            prev_ack,
+            elapsed_ms,
+        );
+        let now = Instant::now();
+        {
+            let tab = &mut self.tabs[pos];
+            tab.title = clean_title;
+            tab.unread_count = eff_unread;
+            tab.acknowledged_raw_unread = next_ack;
+            if set_ack_now {
+                tab.acknowledged_at = Some(now);
+            } else if clear_ack_now {
+                tab.acknowledged_at = None;
+            }
+        }
+        let mut sibling_cleared = false;
+        // アクティブタブで未読が 0 になった（または既読クリアされた）場合、
+        // 同一アカウントの裏サブタブに残留している古い未読バッジも一括でクリアする。
+        if is_active_tab && eff_unread == 0 && (cleared || prev_unread > 0 || self.tabs.iter().any(|t| t.tab_id != tab_id && t.unread_count > 0)) {
+            for (i, sib) in self.tabs.iter_mut().enumerate() {
+                if i == pos {
+                    continue;
+                }
+                if sib.unread_count > 0 {
+                    sib.acknowledged_raw_unread =
+                        sib.acknowledged_raw_unread.max(sib.unread_count).max(next_ack);
+                    sib.acknowledged_at = Some(now);
+                    sib.unread_count = 0;
+                    sibling_cleared = true;
+                }
+            }
+        }
+        sibling_cleared || prev_unread != eff_unread || prev_title != self.tabs[pos].title
+    }
+
     fn to_runtime_state(
         &self,
         inst: &ServiceInstance,
         cross_site: Option<&(String, String)>,
     ) -> TabRuntimeState {
         let active = self.active_tab();
-        let total_unread: u32 = self
-            .tabs
-            .iter()
-            .fold(0u32, |acc, t| acc.saturating_add(t.unread_count));
+        let total_unread = self.effective_unread_count();
         TabRuntimeState {
             instance_id: inst.instance_id.clone(),
             current_url: active
@@ -515,9 +624,7 @@ pub fn update_window_title(app: &AppHandle, shared: &SharedState) {
                 continue;
             }
             if let Some(svc) = guard.services.get(&inst.instance_id) {
-                for tab in &svc.tabs {
-                    total = total.saturating_add(tab.unread_count);
-                }
+                total = total.saturating_add(svc.effective_unread_count());
             }
         }
         if total > 0 {
@@ -1481,6 +1588,24 @@ pub fn activate_tab(app: &AppHandle, shared: &SharedState, instance_id: Option<S
     }
 
     update_bounds_from_window(app, shared);
+
+    if let Some(ref id) = instance_id {
+        let active_label = {
+            let guard = shared.inner.lock().unwrap();
+            guard
+                .services
+                .get(id)
+                .and_then(|s| s.active_tab())
+                .and_then(|t| t.webview_label.clone())
+        };
+        if let Some(label) = active_label {
+            if let Some(wv) = app.get_webview(&label) {
+                let _ = wv.eval(
+                    "if(window.__omniCheckUnreadSync){window.__omniCheckUnreadSync(false);}",
+                );
+            }
+        }
+    }
 }
 
 pub fn activate_subtab(app: &AppHandle, shared: &SharedState, instance_id: &str, tab_id: &str) {
@@ -1860,6 +1985,8 @@ pub fn close_subtab(
                 tab.is_sleeping = true;
                 tab.is_loading = false;
                 tab.unread_count = 0;
+                tab.acknowledged_raw_unread = 0;
+                tab.acknowledged_at = None;
                 tab.can_go_back = false;
                 tab.can_go_forward = false;
                 tab.load_error = None;
@@ -2373,7 +2500,8 @@ fn create_tab_webview(
             .initialization_script(crate::platform_win::build_follow_tracker_js(&bridge_token))
             .initialization_script(crate::platform_win::build_profile_stats_js(&bridge_token))
             .initialization_script(crate::platform_win::build_long_press_new_tab_js(&bridge_token))
-            .initialization_script(crate::platform_win::build_jev_filter_js(&bridge_token));
+            .initialization_script(crate::platform_win::build_jev_filter_js(&bridge_token))
+            .initialization_script(crate::platform_win::build_unread_sync_js(&bridge_token));
     }
 
     let builder = builder
@@ -2389,23 +2517,20 @@ fn create_tab_webview(
             } else {
                 title
             };
-            let unread = parse_unread_count_from_title(&clean_title);
+            let raw_unread = parse_unread_count_from_title(&clean_title);
             let changed = {
                 let mut guard = shared_for_title.inner.lock().unwrap();
                 let mut multi = false;
                 let updated = if let Some(svc) = guard.services.get_mut(&id_for_title) {
                     multi = svc.tabs.len() >= 2;
-                    if let Some(tab) = svc.tab_mut(&tid_for_title) {
-                        if tab.webview_label.as_deref() == Some(label_for_title.as_str()) {
-                            tab.title = clean_title;
-                            tab.unread_count = unread;
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
+                    svc.apply_tab_title_and_unread(
+                        &tid_for_title,
+                        &label_for_title,
+                        clean_title,
+                        raw_unread,
+                        None,
+                        false,
+                    )
                 } else {
                     false
                 };
@@ -2786,6 +2911,13 @@ fn attach_windows_handlers(
     let shared_af = shared.clone();
     let tid_af = tid.clone();
     let label_af = wv_label.clone();
+
+    let app_ts = app.clone();
+    let shared_ts = shared.clone();
+    let id_ts = instance_id.clone();
+    let tid_ts = tid.clone();
+    let label_ts = wv_label.clone();
+    let fallback_name_ts = instance.name.clone();
 
     let callbacks = crate::platform_win::TabWebviewCallbacks {
         on_navigation_starting: Arc::new(move || {
@@ -3173,6 +3305,43 @@ fn attach_windows_handlers(
         on_account_filter_message: Arc::new(move |raw_msg| {
             handle_account_filter_message_from_tab(&app_af, &shared_af, &tid_af, &label_af, &raw_msg);
         }),
+        on_title_sync: Arc::new(move |synced_title, unread_override, cleared, js_raw_unread| {
+            let clean_title = if synced_title.trim().is_empty() {
+                fallback_name_ts.clone()
+            } else {
+                synced_title
+            };
+            let parsed_from_title = parse_unread_count_from_title(&clean_title);
+            let raw_unread = if cleared {
+                js_raw_unread.max(parsed_from_title)
+            } else {
+                parsed_from_title
+            };
+            let changed = {
+                let mut guard = shared_ts.inner.lock().unwrap();
+                let mut multi = false;
+                let updated = if let Some(svc) = guard.services.get_mut(&id_ts) {
+                    multi = svc.tabs.len() >= 2;
+                    svc.apply_tab_title_and_unread(
+                        &tid_ts,
+                        &label_ts,
+                        clean_title,
+                        raw_unread,
+                        unread_override,
+                        cleared,
+                    )
+                } else {
+                    false
+                };
+                if updated && multi {
+                    persist_service_tabs(&mut guard, &id_ts);
+                }
+                updated
+            };
+            if changed {
+                emit_runtime_updated(&app_ts, &shared_ts, &id_ts);
+            }
+        }),
     };
 
     let instance_home_url = fallback_url.clone();
@@ -3266,6 +3435,8 @@ pub fn sleep_tab(app: &AppHandle, shared: &SharedState, instance_id: &str) {
                 tab.is_sleeping = true;
                 tab.is_loading = false;
                 tab.unread_count = 0;
+                tab.acknowledged_raw_unread = 0;
+                tab.acknowledged_at = None;
                 tab.load_error = None;
             }
         }
@@ -3429,6 +3600,8 @@ pub fn set_gmail_open(app: &AppHandle, shared: &SharedState, open: Option<bool>)
                     title: "Gmail".to_string(),
                     favicon_url: None,
                     unread_count: 0,
+                    acknowledged_raw_unread: 0,
+                    acknowledged_at: None,
                     is_loading: false,
                     is_sleeping: true,
                     can_go_back: false,
@@ -3811,6 +3984,7 @@ fn create_gmail_webview(app: &AppHandle, shared: &SharedState) {
             }),
             on_jev_message: Arc::new(move |_| {}),
             on_account_filter_message: Arc::new(move |_| {}),
+            on_title_sync: Arc::new(move |_, _, _, _| {}),
         };
 
         let _ = webview.with_webview(move |platform_wv| {
@@ -4110,6 +4284,8 @@ pub fn perform_tab_action(app: &AppHandle, shared: &SharedState, instance_id: &s
                         tab.is_sleeping = true;
                         tab.is_loading = false;
                         tab.unread_count = 0;
+                        tab.acknowledged_raw_unread = 0;
+                        tab.acknowledged_at = None;
                         tab.load_error = None;
                     }
                 }
@@ -4777,4 +4953,93 @@ pub async fn trigger_follow_sync_now(
     }
 
     Err("GitHub Personal Access Token（gist権限）を入力してください".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_tab_unread_update_clears_stuck_badge_and_accepts_new_notifications() {
+        // 1. Initial notification "(1) Instagram"
+        let (eff, ack, set_t, _) = resolve_tab_unread_update(1, None, false, 0, None);
+        assert_eq!(eff, 1);
+        assert_eq!(ack, 0);
+        assert!(!set_t);
+
+        // 2. User opens notification, JS strips stuck "(1)" and sends cleared=true
+        let (eff, ack, set_t, _) = resolve_tab_unread_update(1, Some(0), true, 0, None);
+        assert_eq!(eff, 0);
+        assert_eq!(ack, 1);
+        assert!(set_t);
+
+        // 3. Clean title arrives immediately (< 5s grace) -> ack preserved so React re-write stays suppressed
+        let (eff, ack, _, _) = resolve_tab_unread_update(0, None, false, ack, Some(500));
+        assert_eq!(eff, 0);
+        assert_eq!(ack, 1);
+
+        // 4. Instagram React re-applies stuck "(1) Instagram" -> still suppressed!
+        let (eff, ack, _, _) = resolve_tab_unread_update(1, None, false, ack, Some(1500));
+        assert_eq!(eff, 0);
+        assert_eq!(ack, 1);
+
+        // 5. Genuine 2nd notification arrives while stuck at 1 -> shows 1 new!
+        let (eff, _, _, _) = resolve_tab_unread_update(2, None, false, ack, Some(2000));
+        assert_eq!(eff, 1);
+
+        // 6. Title stays clean for >= 5s -> ack resets to 0 so future "(1)" shows immediately
+        let (eff, ack, _, clear_t) = resolve_tab_unread_update(0, None, false, ack, Some(6000));
+        assert_eq!(eff, 0);
+        assert_eq!(ack, 0);
+        assert!(clear_t);
+
+        let (eff, _, _, _) = resolve_tab_unread_update(1, None, false, ack, None);
+        assert_eq!(eff, 1);
+    }
+
+    #[test]
+    fn service_tabs_deduplicates_unread_and_clears_stale_background_subtabs() {
+        let mut t1 = BrowserTabEntry {
+            tab_id: "t1".to_string(),
+            instance_id: "ig-1".to_string(),
+            webview_label: Some("wv-1".to_string()),
+            creation_epoch: 1,
+            warming_until: None,
+            current_url: "https://www.instagram.com/direct/inbox/".to_string(),
+            title: "(1) Instagram".to_string(),
+            favicon_url: None,
+            unread_count: 1,
+            acknowledged_raw_unread: 0,
+            acknowledged_at: None,
+            is_loading: false,
+            is_sleeping: false,
+            can_go_back: false,
+            can_go_forward: false,
+            load_error: None,
+        };
+        let mut t2 = t1.clone();
+        t2.tab_id = "t2".to_string();
+        t2.webview_label = Some("wv-2".to_string());
+        t1.unread_count = 1;
+        t2.unread_count = 1;
+
+        let mut svc = ServiceTabs {
+            tabs: vec![t1, t2],
+            active_tab_id: "t1".to_string(),
+        };
+        // Two tabs of same Instagram account with (1) each must aggregate to 1, not 2
+        assert_eq!(svc.effective_unread_count(), 1);
+
+        // Reading notification on active tab clears stale background subtab too
+        assert!(svc.apply_tab_title_and_unread(
+            "t1",
+            "wv-1",
+            "Instagram".to_string(),
+            0,
+            None,
+            false,
+        ));
+        assert_eq!(svc.effective_unread_count(), 0);
+        assert_eq!(svc.tabs[1].unread_count, 0);
+    }
 }

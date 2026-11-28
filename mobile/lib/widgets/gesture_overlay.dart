@@ -149,6 +149,7 @@ class MobileGestureOverlay extends StatefulWidget {
 
 class MobileGestureOverlayState extends State<MobileGestureOverlay> {
   static const double _headerDockThresholdY = 34.0;
+  static const double _dragDockThresholdY = 44.0;
 
   final GlobalKey _layerKey = GlobalKey();
   final GesturePath _path = GesturePath();
@@ -159,6 +160,8 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
   Offset? _lastGlobal;
   bool _isDraggingGesture = false;
   bool _isMovingHandle = false;
+  bool _isDraggingToHeaderDock = false;
+  bool _abortedHeaderDock = false;
   bool _isOverHeaderDock = false;
   bool _isLiveScrolling = false;
   String _liveScrollAction = '';
@@ -191,7 +194,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
   }
 
   void _resetActiveGesture({bool notifyParent = false}) {
-    final wasMoving = _isMovingHandle;
+    final wasOverlayGhost = _isMovingHandle || _isDraggingToHeaderDock;
     _longPressTimer?.cancel();
     _longPressTimer = null;
     _stopLiveScroll();
@@ -201,10 +204,14 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     _lastGlobal = null;
     _isDraggingGesture = false;
     _isMovingHandle = false;
+    _isDraggingToHeaderDock = false;
+    _abortedHeaderDock = false;
     _isOverHeaderDock = false;
     _previewXFrac = null;
     _previewYFrac = null;
-    if (notifyParent && wasMoving && widget.onHandleMoveDragChanged != null) {
+    if (notifyParent &&
+        wasOverlayGhost &&
+        widget.onHandleMoveDragChanged != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         widget.onHandleMoveDragChanged?.call(null, false);
       });
@@ -249,6 +256,21 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     return widget.onDockToHeader != null && local.dy <= _headerDockThresholdY;
   }
 
+  double _effectiveDragDockThresholdY() {
+    final startY = _downLocal?.dy ?? 120.0;
+    if (startY >= 84.0) return _dragDockThresholdY;
+    return min(24.0, startY - 20.0);
+  }
+
+  /// 長押しなしの直接ドラッグでヘッダー収納ゾーンへ到達したか判定する。
+  /// 上方向へ一定距離ドラッグしたときのみ発動し、上端配置オーブの横・下ジェスチャー誤作動を防ぐ。
+  bool _isDragInHeaderDockZone(Offset local) {
+    if (widget.onDockToHeader == null || _downLocal == null) return false;
+    final startY = _downLocal!.dy;
+    if (local.dy >= startY - 16.0) return false;
+    return local.dy <= _effectiveDragDockThresholdY();
+  }
+
   void _stopLiveScroll() {
     _liveScrollArmTimer?.cancel();
     _liveScrollArmTimer = null;
@@ -259,7 +281,17 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
   }
 
   void _maybeArmLiveScroll() {
-    if (_isLiveScrolling) return;
+    if (_isLiveScrolling || _isDraggingToHeaderDock || _abortedHeaderDock) return;
+    if (widget.onDockToHeader != null &&
+        _currentLocal != null &&
+        _downLocal != null &&
+        _currentLocal!.dy <= 96.0 &&
+        _currentLocal!.dy < _downLocal!.dy - 24.0) {
+      // 上端のヘッダー収納ゾーンへ近づいている最中は連続スクロールを開始しない
+      _liveScrollArmTimer?.cancel();
+      _liveScrollArmTimer = null;
+      return;
+    }
     final shape = _path.shape;
     if (!isSingleStrokeShape(shape)) {
       _liveScrollArmTimer?.cancel();
@@ -315,6 +347,8 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     _lastGlobal = e.position;
     _isDraggingGesture = false;
     _isMovingHandle = false;
+    _isDraggingToHeaderDock = false;
+    _abortedHeaderDock = false;
     _isOverHeaderDock = false;
     _stopLiveScroll();
     _path.reset(local, tremor: widget.settings.tremor.toDouble());
@@ -376,6 +410,45 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
       }
     }
 
+    // 長押しなしの直接ドラッグで上部ヘッダー収納ゾーンへ到達したら即座に収納モードへ切替
+    if (_isDraggingToHeaderDock) {
+      final leaveThreshold = _effectiveDragDockThresholdY() + 24.0;
+      if (local.dy <= leaveThreshold && local.dy < _downLocal!.dy - 12.0) {
+        if (!_isOverHeaderDock) {
+          HapticFeedback.selectionClick();
+          setState(() {
+            _isOverHeaderDock = true;
+          });
+        }
+        widget.onHandleMoveDragChanged?.call(e.position, true);
+      } else {
+        setState(() {
+          _isDraggingToHeaderDock = false;
+          _isOverHeaderDock = false;
+          _abortedHeaderDock = true;
+        });
+        widget.onHandleMoveDragChanged?.call(null, false);
+      }
+      return;
+    }
+
+    if (_isDragInHeaderDockZone(local)) {
+      _stopLiveScroll();
+      HapticFeedback.selectionClick();
+      setState(() {
+        _isDraggingToHeaderDock = true;
+        _isOverHeaderDock = true;
+        _abortedHeaderDock = false;
+      });
+      widget.onHandleMoveDragChanged?.call(e.position, true);
+      return;
+    }
+
+    if (_abortedHeaderDock) {
+      if (mounted) setState(() {});
+      return;
+    }
+
     if (_isLiveScrolling) {
       // ライブスクロール中は縦方向の直線長さと速度のみ更新（自由曲線は描かない）
       _path.advanceLiveScroll(local);
@@ -394,6 +467,8 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     _longPressTimer = null;
 
     final wasMoving = _isMovingHandle;
+    final wasDockDragging = _isDraggingToHeaderDock;
+    final wasAbortedDock = _abortedHeaderDock;
     final wasOverDock = _isOverHeaderDock;
     final wasDragging = _isDraggingGesture;
     final wasLiveScroll = _isLiveScrolling;
@@ -407,6 +482,8 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
     _lastGlobal = null;
     _isDraggingGesture = false;
     _isMovingHandle = false;
+    _isDraggingToHeaderDock = false;
+    _abortedHeaderDock = false;
     _isOverHeaderDock = false;
 
     if (wasMoving) {
@@ -428,9 +505,19 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
       return;
     }
 
+    if (wasDockDragging) {
+      widget.onHandleMoveDragChanged?.call(null, false);
+      if (mounted) setState(() {});
+      if (!cancelled && wasOverDock && widget.onDockToHeader != null) {
+        HapticFeedback.mediumImpact();
+        widget.onDockToHeader!();
+      }
+      return;
+    }
+
     if (mounted) setState(() {});
 
-    if (cancelled) return;
+    if (cancelled || wasAbortedDock) return;
 
     if (wasDragging) {
       if (wasLiveScroll) {
@@ -468,7 +555,7 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
       _lastTapAt = now;
       showNotice(
         widget.onDockToHeader != null
-            ? 'ドラッグでジェスチャー · 長押しで移動/ヘッダーへ収納 · 2回タップで設定'
+            ? '上へドラッグで収納 · 長押しで位置移動 · 2回タップで設定'
             : 'ドラッグでジェスチャー · 長押しで移動 · 2回タップで設定',
       );
     }
@@ -524,18 +611,20 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
         final mappedAction =
             shape.isNotEmpty ? settings.actionFor(shape) : 'none';
         final hideLocalOrbWhileMoving =
-            _isMovingHandle && widget.onHandleMoveDragChanged != null;
+            (_isMovingHandle || _isDraggingToHeaderDock) &&
+                widget.onHandleMoveDragChanged != null;
 
         return Stack(
           clipBehavior: Clip.none,
           children: [
             // フルビューポート軌跡 & ガイド HUD（非ドラッグ時はタッチ完全透過）
-            if (_isDraggingGesture)
+            if (_isDraggingGesture && !_isDraggingToHeaderDock)
               Positioned.fill(
                 child: IgnorePointer(
                   child: Stack(
                     children: [
                       if (settings.showTrail &&
+                          !_abortedHeaderDock &&
                           _path.everRecognized &&
                           !_path.invalidated &&
                           _path.vertices.length >= 2)
@@ -553,11 +642,12 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
                           right: 16,
                           child: Center(
                             child: _buildLiveHudPill(
-                              shape: shape,
+                              shape: _abortedHeaderDock ? '' : shape,
                               action: _isLiveScrolling
                                   ? _liveScrollAction
                                   : mappedAction,
-                              invalidated: _path.invalidated,
+                              invalidated:
+                                  _abortedHeaderDock || _path.invalidated,
                               isLiveScroll: _isLiveScrolling,
                             ),
                           ),
@@ -567,8 +657,8 @@ class MobileGestureOverlayState extends State<MobileGestureOverlay> {
                 ),
               ),
 
-            // 移動モード中のガイド
-            if (_isMovingHandle)
+            // 移動・ヘッダー収納モード中のガイド
+            if (_isMovingHandle || _isDraggingToHeaderDock)
               Positioned(
                 top: 18,
                 left: 16,

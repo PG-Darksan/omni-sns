@@ -30,6 +30,27 @@ pub fn count_events_in_window(events: &[u64], min_exclusive: u64, cutoff: u64) -
         .count()
 }
 
+/// 指定ウィンドウ内で有効なイベント群から `(次の1件が減少する UNIX 秒, 全件リセットされて 0 になる UNIX 秒)` を算出する。
+pub fn window_event_reset_bounds(
+    events: &[u64],
+    min_exclusive: u64,
+    cutoff: u64,
+    window_secs: u64,
+) -> (Option<u64>, Option<u64>) {
+    let mut oldest: Option<u64> = None;
+    let mut newest: Option<u64> = None;
+    for &t in events {
+        if t > min_exclusive && t >= cutoff {
+            oldest = Some(oldest.map_or(t, |cur| cur.min(t)));
+            newest = Some(newest.map_or(t, |cur| cur.max(t)));
+        }
+    }
+    (
+        oldest.map(|t| t.saturating_add(window_secs)),
+        newest.map(|t| t.saturating_add(window_secs)),
+    )
+}
+
 pub fn normalize_account_handle(raw: &str) -> Option<String> {
     let clean = raw.trim().trim_start_matches('@').to_lowercase();
     if clean.is_empty() || clean.len() > 64 {
@@ -364,6 +385,101 @@ impl AccountFollowLedger {
             }
         }
         sum.clamp(0, u32::MAX as i64) as u32
+    }
+
+    /// 指定時間内（直近 `window_hours` 時間）のフォローカウントについて、
+    /// `(次の1件が減少する UNIX 秒, 全件リセットされて 0 になる UNIX 秒)` を返す。
+    pub fn effective_window_follow_reset_times(
+        &self,
+        now_secs: u64,
+        window_hours: u32,
+    ) -> (Option<u64>, Option<u64>) {
+        let window_secs = window_hours.clamp(1, 168) as u64 * 3600;
+        let cutoff = now_secs.saturating_sub(window_secs);
+        let reset_at = self.follow_reset_at;
+        let mut active: Vec<u64> = Vec::new();
+        let mut total_deductions: usize = 0;
+        for entry in self.devices.values() {
+            let has_events = !entry.follow_events.is_empty() || !entry.follow_deductions.is_empty();
+            if has_events {
+                for &t in &entry.follow_events {
+                    if t > reset_at && t >= cutoff {
+                        active.push(t);
+                    }
+                }
+                total_deductions = total_deductions.saturating_add(count_events_in_window(
+                    &entry.follow_deductions,
+                    reset_at,
+                    cutoff,
+                ));
+            } else if entry.today > 0
+                && entry.today_epoch >= self.reset_epoch
+                && entry.updated_at > reset_at
+                && entry.updated_at >= cutoff
+            {
+                let n = (entry.today as usize).min(1000);
+                active.resize(active.len() + n, entry.updated_at);
+            }
+        }
+        if active.is_empty() || total_deductions >= active.len() {
+            return (None, None);
+        }
+        active.sort_unstable();
+        if total_deductions > 0 {
+            let keep = active.len() - total_deductions;
+            active.truncate(keep);
+        }
+        let next_at = active.first().map(|&t| t.saturating_add(window_secs));
+        let full_at = active.last().map(|&t| t.saturating_add(window_secs));
+        (next_at, full_at)
+    }
+
+    /// 指定時間内（直近 `window_hours` 時間）のアンフォローカウントについて、
+    /// `(次の1件が減少する UNIX 秒, 全件リセットされて 0 になる UNIX 秒)` を返す。
+    pub fn effective_window_unfollow_reset_times(
+        &self,
+        now_secs: u64,
+        window_hours: u32,
+    ) -> (Option<u64>, Option<u64>) {
+        let window_secs = window_hours.clamp(1, 168) as u64 * 3600;
+        let cutoff = now_secs.saturating_sub(window_secs);
+        let reset_at = self.unfollow_reset_at;
+        let mut active: Vec<u64> = Vec::new();
+        let mut total_deductions: usize = 0;
+        for entry in self.devices.values() {
+            let has_events =
+                !entry.unfollow_events.is_empty() || !entry.unfollow_deductions.is_empty();
+            if has_events {
+                for &t in &entry.unfollow_events {
+                    if t > reset_at && t >= cutoff {
+                        active.push(t);
+                    }
+                }
+                total_deductions = total_deductions.saturating_add(count_events_in_window(
+                    &entry.unfollow_deductions,
+                    reset_at,
+                    cutoff,
+                ));
+            } else if entry.unfollow_today > 0
+                && entry.unfollow_today_epoch >= self.unfollow_reset_epoch
+                && entry.updated_at > reset_at
+                && entry.updated_at >= cutoff
+            {
+                let n = (entry.unfollow_today as usize).min(1000);
+                active.resize(active.len() + n, entry.updated_at);
+            }
+        }
+        if active.is_empty() || total_deductions >= active.len() {
+            return (None, None);
+        }
+        active.sort_unstable();
+        if total_deductions > 0 {
+            let keep = active.len() - total_deductions;
+            active.truncate(keep);
+        }
+        let next_at = active.first().map(|&t| t.saturating_add(window_secs));
+        let full_at = active.last().map(|&t| t.saturating_add(window_secs));
+        (next_at, full_at)
     }
 
     pub fn max_follow_event_ts(&self) -> u64 {
@@ -1164,5 +1280,49 @@ mod tests {
 
         // Once sanitized, merging local again with itself must NOT keep reporting changes
         assert!(!local.has_newer_data_than(&local, "2026-11-23"));
+    }
+
+    #[test]
+    fn window_reset_times_compute_oldest_and_newest_across_devices_and_deductions() {
+        let now: u64 = 1_795_400_000;
+        let window_hours: u32 = 24;
+        let window_secs: u64 = window_hours as u64 * 3600;
+        let mut acc = AccountFollowLedger {
+            date: "2026-11-28".to_string(),
+            ..Default::default()
+        };
+        acc.devices.insert(
+            "win-1".to_string(),
+            DeviceFollowEntry {
+                follow_events: vec![now - 100_000, now - 7200, now - 600],
+                unfollow_events: vec![now - 3600],
+                updated_at: now - 600,
+                ..Default::default()
+            },
+        );
+        acc.devices.insert(
+            "and-1".to_string(),
+            DeviceFollowEntry {
+                follow_events: vec![now - 3600, now - 120],
+                follow_deductions: vec![now - 60],
+                updated_at: now - 60,
+                ..Default::default()
+            },
+        );
+        assert_eq!(acc.effective_window_follow_count(now, window_hours), 3);
+        let (f_next, f_full) = acc.effective_window_follow_reset_times(now, window_hours);
+        assert_eq!(f_next, Some((now - 7200) + window_secs));
+        assert_eq!(f_full, Some((now - 600) + window_secs));
+
+        let (u_next, u_full) = acc.effective_window_unfollow_reset_times(now, window_hours);
+        assert_eq!(u_next, Some((now - 3600) + window_secs));
+        assert_eq!(u_full, Some((now - 3600) + window_secs));
+
+        // 1時間ウィンドウでは cutoff = now - 3600（境界含む）により [now-3600, now-600, now-120] から
+        // 減算1件を除いた [now-3600, now-600] が有効となる
+        assert_eq!(acc.effective_window_follow_count(now, 1), 2);
+        let (f_next_1h, f_full_1h) = acc.effective_window_follow_reset_times(now, 1);
+        assert_eq!(f_next_1h, Some(now));
+        assert_eq!(f_full_1h, Some((now - 600) + 3600));
     }
 }

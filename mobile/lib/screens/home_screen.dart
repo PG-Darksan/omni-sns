@@ -140,6 +140,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final JevService _jev = JevService();
   final Map<String, OmniWebViewController> _controllers = {};
   final Map<String, TabRuntimeState> _runtimeMap = {};
+  final Map<String, ({int rawUnread, DateTime? at})> _unreadAckByInstance = {};
   final Map<String, List<_ExtraSubTab>> _extraTabs = {};
   final Map<String, String?> _activeSubTabId = {};
   final Map<String, _JevTabLiveState> _jevLiveByKey = {};
@@ -711,7 +712,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       },
       onPageFinished: (url, title, canBack, canFwd, hadError) {
         final safeTitle = title.trim().isEmpty ? instance.name : title;
-        final unread = parseUnreadCountFromTitle(safeTitle);
+        final unread = _resolveInstanceUnread(
+          instance.instanceId,
+          rawUnread: parseUnreadCountFromTitle(safeTitle),
+        );
         final validUrl = isHttpOrHttpsUrl(url);
         if (validUrl) {
           _clearCrossSiteHintIfReturned(instance.instanceId, url);
@@ -733,7 +737,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       },
       onTitleChanged: (title) {
         final safeTitle = title.trim().isEmpty ? instance.name : title;
-        final unread = parseUnreadCountFromTitle(safeTitle);
+        final unread = _resolveInstanceUnread(
+          instance.instanceId,
+          rawUnread: parseUnreadCountFromTitle(safeTitle),
+        );
+        _updateRuntime(
+          instance.instanceId,
+          (cur) => cur.copyWith(
+            title: safeTitle,
+            unreadCount: unread,
+          ),
+        );
+      },
+      onTitleSync: (title, unreadOverride, cleared, jsRawUnread) {
+        final safeTitle = title.trim().isEmpty ? instance.name : title;
+        final parsed = parseUnreadCountFromTitle(safeTitle);
+        final rawUnread =
+            cleared ? max(jsRawUnread, parsed) : parsed;
+        final unread = _resolveInstanceUnread(
+          instance.instanceId,
+          rawUnread: rawUnread,
+          unreadOverride: unreadOverride,
+          cleared: cleared,
+        );
         _updateRuntime(
           instance.instanceId,
           (cur) => cur.copyWith(
@@ -2568,6 +2594,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         getFollowSyncSettings: () => _followSyncSettings,
         getFollowWindowHours: () => _settings.followWindowHours,
         onChangeFollowWindowHours: _updateFollowWindowHours,
+        onRefreshFollowCounts: _refreshFollowWindowCounts,
         formatSyncClock: _formatSyncClock,
         onAdjustFollow: _adjustFollowCount,
         onResetFollow: (id, resetTotal) =>
@@ -2738,10 +2765,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _showSnack('「${group.displayName} / $nextLabel」を追加しました（独立セッション）');
   }
 
+  int _resolveInstanceUnread(
+    String instanceId, {
+    required int rawUnread,
+    int? unreadOverride,
+    bool cleared = false,
+  }) {
+    final prev = _unreadAckByInstance[instanceId];
+    final now = DateTime.now();
+    final elapsedMs = prev?.at != null
+        ? now.difference(prev!.at!).inMilliseconds
+        : null;
+    final (effUnread, nextAck, setAckNow, clearAckNow) = resolveTabUnreadUpdate(
+      rawUnread: rawUnread,
+      unreadOverride: unreadOverride,
+      cleared: cleared,
+      prevAcknowledged: prev?.rawUnread ?? 0,
+      prevAckElapsedMs: elapsedMs,
+    );
+    if (clearAckNow && nextAck == 0) {
+      _unreadAckByInstance.remove(instanceId);
+    } else if (nextAck > 0) {
+      _unreadAckByInstance[instanceId] = (
+        rawUnread: nextAck,
+        at: setAckNow ? now : prev?.at,
+      );
+    }
+    return effUnread;
+  }
+
   void _sleepInstance(String instanceId) {
     final removed = _controllers.remove(instanceId);
     removed?.dispose();
     _disposeExtraSubTabsFor(instanceId);
+    _unreadAckByInstance.remove(instanceId);
     _updateRuntime(
       instanceId,
       (cur) => cur.copyWith(
@@ -6179,7 +6236,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                         Text(
-                          'Android · v1.8.7',
+                          'Android · v1.8.8',
                           style: TextStyle(fontSize: 11, color: Colors.grey),
                         ),
                       ],
@@ -6965,6 +7022,7 @@ class _FollowCounterSheet extends StatefulWidget {
     required this.getFollowSyncSettings,
     required this.getFollowWindowHours,
     required this.onChangeFollowWindowHours,
+    required this.onRefreshFollowCounts,
     required this.formatSyncClock,
     required this.onAdjustFollow,
     required this.onResetFollow,
@@ -6985,6 +7043,7 @@ class _FollowCounterSheet extends StatefulWidget {
   final FollowSyncSettings Function() getFollowSyncSettings;
   final int Function() getFollowWindowHours;
   final Future<void> Function(int hours) onChangeFollowWindowHours;
+  final VoidCallback onRefreshFollowCounts;
   final String Function(int? unixSecs) formatSyncClock;
   final Future<void> Function(String instanceId, int delta) onAdjustFollow;
   final Future<void> Function(String instanceId, bool resetTotal) onResetFollow;
@@ -7010,6 +7069,7 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
   late final TextEditingController _tokenCtrl;
   late final TextEditingController _gistCtrl;
   late final TextEditingController _windowHoursCtrl;
+  Timer? _countdownTimer;
   bool _isSyncing = false;
 
   @override
@@ -7025,15 +7085,129 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
     _gistCtrl = TextEditingController(text: fs.gistId);
     _windowHoursCtrl =
         TextEditingController(text: '${widget.getFollowWindowHours()}');
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final current = widget.getInstances().cast<ServiceInstance?>().firstWhere(
+            (i) => i?.instanceId == widget.targetInstanceId,
+            orElse: () => null,
+          );
+      if (current != null) {
+        final now = DateTime.now();
+        final nowSecs = now.millisecondsSinceEpoch ~/ 1000;
+        final winH = widget.getFollowWindowHours();
+        final (fNext, fFull) = current.effectiveFollowResetTimes(winH, now);
+        final (uNext, uFull) = current.effectiveUnfollowResetTimes(winH, now);
+        final expired = (fNext != null && nowSecs >= fNext) ||
+            (fFull != null && nowSecs >= fFull) ||
+            (uNext != null && nowSecs >= uNext) ||
+            (uFull != null && nowSecs >= uFull);
+        if (expired) {
+          widget.onRefreshFollowCounts();
+        }
+      }
+      setState(() {});
+    });
   }
 
   @override
   void dispose() {
+    _countdownTimer?.cancel();
     _handleCtrl.dispose();
     _tokenCtrl.dispose();
     _gistCtrl.dispose();
     _windowHoursCtrl.dispose();
     super.dispose();
+  }
+
+  Widget _buildResetCountdownBlock({
+    required Key key,
+    required int count,
+    required int? nextResetAt,
+    required int? fullResetAt,
+    required DateTime now,
+    required Color accentColor,
+    required ColorScheme colorScheme,
+  }) {
+    if (count <= 0 || fullResetAt == null || fullResetAt <= 0) {
+      return Container(
+        key: key,
+        width: double.infinity,
+        constraints: const BoxConstraints(minHeight: 32),
+        alignment: Alignment.center,
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+        child: Text(
+          'リセット待ちなし',
+          style: TextStyle(
+            fontSize: 10,
+            color: colorScheme.onSurfaceVariant.withValues(alpha: 0.72),
+          ),
+        ),
+      );
+    }
+
+    final nowSecs = now.millisecondsSinceEpoch ~/ 1000;
+    final effNext = (nextResetAt != null && nextResetAt > 0)
+        ? nextResetAt
+        : fullResetAt;
+    final nextRem = effNext - nowSecs;
+    final fullRem = fullResetAt - nowSecs;
+    final showSplit = count > 1 && (fullResetAt - effNext) >= 60;
+
+    return Container(
+      key: key,
+      width: double.infinity,
+      constraints: const BoxConstraints(minHeight: 32),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+      decoration: BoxDecoration(
+        color: colorScheme.surface.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: showSplit
+              ? [
+                  Text(
+                    '1件減少まで ${formatResetRemaining(nextRem)}',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w700,
+                      color: accentColor,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  Text(
+                    '全リセット ${formatResetRemaining(fullRem)}（${formatResetClock(fullResetAt, now)}）',
+                    style: TextStyle(
+                      fontSize: 9.5,
+                      color: colorScheme.onSurfaceVariant,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ]
+              : [
+                  Text(
+                    'リセットまで ${formatResetRemaining(fullRem)}',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w700,
+                      color: accentColor,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  Text(
+                    '予定 ${formatResetClock(fullResetAt, now)}',
+                    style: TextStyle(
+                      fontSize: 9.5,
+                      color: colorScheme.onSurfaceVariant,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
+        ),
+      ),
+    );
   }
 
   Future<void> _applyWindowHours(int hours) async {
@@ -7084,6 +7258,10 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
     final followCount = current.effectiveFollowCountInWindow(windowHours, now);
     final unfollowCount =
         current.effectiveUnfollowCountInWindow(windowHours, now);
+    final (followNextResetAt, followFullResetAt) =
+        current.effectiveFollowResetTimes(windowHours, now);
+    final (unfollowNextResetAt, unfollowFullResetAt) =
+        current.effectiveUnfollowResetTimes(windowHours, now);
     var allFollowSum = 0;
     var allUnfollowSum = 0;
     for (final inst in instances) {
@@ -7269,6 +7447,16 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
                               color: colorScheme.primary,
                             ),
                           ),
+                          const SizedBox(height: 4),
+                          _buildResetCountdownBlock(
+                            key: const ValueKey('follow-sheet-reset-countdown'),
+                            count: followCount,
+                            nextResetAt: followNextResetAt,
+                            fullResetAt: followFullResetAt,
+                            now: now,
+                            accentColor: colorScheme.primary,
+                            colorScheme: colorScheme,
+                          ),
                           const SizedBox(height: 6),
                           Row(
                             children: [
@@ -7359,6 +7547,16 @@ class _FollowCounterSheetState extends State<_FollowCounterSheet> {
                               fontWeight: FontWeight.w800,
                               color: Colors.redAccent,
                             ),
+                          ),
+                          const SizedBox(height: 4),
+                          _buildResetCountdownBlock(
+                            key: const ValueKey('unfollow-sheet-reset-countdown'),
+                            count: unfollowCount,
+                            nextResetAt: unfollowNextResetAt,
+                            fullResetAt: unfollowFullResetAt,
+                            now: now,
+                            accentColor: Colors.redAccent,
+                            colorScheme: colorScheme,
                           ),
                           const SizedBox(height: 6),
                           Row(

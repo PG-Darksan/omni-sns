@@ -37,6 +37,68 @@ int countEventsInWindow(
   return c;
 }
 
+/// 指定ウィンドウ内で有効なイベント群から `(次の1件が減少する UNIX 秒, 全件リセットされて 0 になる UNIX 秒)` を算出する。
+(int?, int?) windowEventResetBounds(
+  Iterable<int> events,
+  int minExclusive,
+  int cutoff,
+  int windowSecs,
+) {
+  int? oldest;
+  int? newest;
+  for (final t in events) {
+    if (t > minExclusive && t >= cutoff) {
+      if (oldest == null || t < oldest) oldest = t;
+      if (newest == null || t > newest) newest = t;
+    }
+  }
+  return (
+    oldest != null ? oldest + windowSecs : null,
+    newest != null ? newest + windowSecs : null,
+  );
+}
+
+/// カウンターリセットまでの残り秒数を分かりやすい日本語表記へフォーマットする。
+String formatResetRemaining(int remainingSecs) {
+  final secs = remainingSecs <= 0 ? 0 : remainingSecs;
+  if (secs <= 0) return 'まもなく';
+  if (secs < 60) return '$secs秒';
+  final totalMins = secs ~/ 60;
+  final remSecs = secs % 60;
+  if (secs < 3600) {
+    return '$totalMins分${remSecs.toString().padLeft(2, '0')}秒';
+  }
+  final totalHours = secs ~/ 3600;
+  final mins = (secs % 3600) ~/ 60;
+  if (secs < 86400) {
+    return '$totalHours時間${mins.toString().padLeft(2, '0')}分';
+  }
+  final days = secs ~/ 86400;
+  final hours = (secs % 86400) ~/ 3600;
+  return '$days日$hours時間${mins.toString().padLeft(2, '0')}分';
+}
+
+/// リセット予定時刻（UNIX秒）をローカル時計表記へフォーマットする。
+String formatResetClock(int targetUnixSecs, [DateTime? now]) {
+  if (targetUnixSecs <= 0) return '';
+  final ref = now ?? DateTime.now();
+  final target = DateTime.fromMillisecondsSinceEpoch(targetUnixSecs * 1000);
+  final hh = target.hour.toString().padLeft(2, '0');
+  final mm = target.minute.toString().padLeft(2, '0');
+  if (target.year == ref.year &&
+      target.month == ref.month &&
+      target.day == ref.day) {
+    return '$hh:$mm';
+  }
+  final tomorrow = DateTime(ref.year, ref.month, ref.day + 1);
+  if (target.year == tomorrow.year &&
+      target.month == tomorrow.month &&
+      target.day == tomorrow.day) {
+    return '明日 $hh:$mm';
+  }
+  return '${target.month}/${target.day} $hh:$mm';
+}
+
 void applyWindowDelta({
   required List<int> events,
   required List<int> deductions,
@@ -300,6 +362,10 @@ class ServiceInstance {
     this.followCountDate,
     this.followEvents = const [],
     this.unfollowEvents = const [],
+    this.followNextResetAt,
+    this.followFullResetAt,
+    this.unfollowNextResetAt,
+    this.unfollowFullResetAt,
     this.detectedHandle,
     this.snsFollowingCount,
     this.snsFollowersCount,
@@ -326,6 +392,10 @@ class ServiceInstance {
   final String? followCountDate;
   final List<int> followEvents;
   final List<int> unfollowEvents;
+  final int? followNextResetAt;
+  final int? followFullResetAt;
+  final int? unfollowNextResetAt;
+  final int? unfollowFullResetAt;
   final String? detectedHandle;
   final int? snsFollowingCount;
   final int? snsFollowersCount;
@@ -372,6 +442,32 @@ class ServiceInstance {
     return unfollowCountToday;
   }
 
+  /// 指定時間内のフォローカウントのリセット予定時刻 `(次の1件減少, 全リセット)`（UNIX秒）。
+  (int?, int?) effectiveFollowResetTimes(int windowHours, [DateTime? now]) {
+    if (followEvents.isNotEmpty) {
+      final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+      final windowSecs = h * 3600;
+      final nowSecs = (now ?? DateTime.now()).millisecondsSinceEpoch ~/ 1000;
+      final cutoff = nowSecs > windowSecs ? nowSecs - windowSecs : 0;
+      return windowEventResetBounds(followEvents, 0, cutoff, windowSecs);
+    }
+    if (followCountToday <= 0) return (null, null);
+    return (followNextResetAt, followFullResetAt);
+  }
+
+  /// 指定時間内のアンフォローカウントのリセット予定時刻 `(次の1件減少, 全リセット)`（UNIX秒）。
+  (int?, int?) effectiveUnfollowResetTimes(int windowHours, [DateTime? now]) {
+    if (unfollowEvents.isNotEmpty) {
+      final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+      final windowSecs = h * 3600;
+      final nowSecs = (now ?? DateTime.now()).millisecondsSinceEpoch ~/ 1000;
+      final cutoff = nowSecs > windowSecs ? nowSecs - windowSecs : 0;
+      return windowEventResetBounds(unfollowEvents, 0, cutoff, windowSecs);
+    }
+    if (unfollowCountToday <= 0) return (null, null);
+    return (unfollowNextResetAt, unfollowFullResetAt);
+  }
+
   /// 指定時間ウィンドウ方式でフォロー回数を delta (+1 / -1) 増減した新しいインスタンスを返す。
   ServiceInstance withFollowWindowDelta(
     int delta, {
@@ -405,8 +501,13 @@ class ServiceInstance {
     }
     final finalEvents =
         pruneEventTimestamps(nextEvents, 0, retentionCutoff);
+    final windowSecs = h * 3600;
     final nextCount = countEventsInWindow(finalEvents, 0, cutoff);
     final nextUfCount = countEventsInWindow(unfollowEvents, 0, cutoff);
+    final (fNext, fFull) =
+        windowEventResetBounds(finalEvents, 0, cutoff, windowSecs);
+    final (uNext, uFull) =
+        windowEventResetBounds(unfollowEvents, 0, cutoff, windowSecs);
     return copyWith(
       followCountToday: nextCount,
       followCountTotal: nextCount,
@@ -414,6 +515,12 @@ class ServiceInstance {
       unfollowCountTotal: nextUfCount,
       followCountDate: today,
       followEvents: finalEvents,
+      followNextResetAt: fNext,
+      followFullResetAt: fFull,
+      clearFollowResetTimes: fFull == null,
+      unfollowNextResetAt: uNext,
+      unfollowFullResetAt: uFull,
+      clearUnfollowResetTimes: uFull == null,
     );
   }
 
@@ -426,8 +533,11 @@ class ServiceInstance {
     final today = formatLocalYmd(dt);
     final nowSecs = dt.millisecondsSinceEpoch ~/ 1000;
     final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
-    final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+    final windowSecs = h * 3600;
+    final cutoff = nowSecs > windowSecs ? nowSecs - windowSecs : 0;
     final nextUfCount = countEventsInWindow(unfollowEvents, 0, cutoff);
+    final (uNext, uFull) =
+        windowEventResetBounds(unfollowEvents, 0, cutoff, windowSecs);
     return copyWith(
       followCountToday: 0,
       followCountTotal: 0,
@@ -435,6 +545,10 @@ class ServiceInstance {
       unfollowCountTotal: nextUfCount,
       followCountDate: today,
       followEvents: const [],
+      clearFollowResetTimes: true,
+      unfollowNextResetAt: uNext,
+      unfollowFullResetAt: uFull,
+      clearUnfollowResetTimes: uFull == null,
     );
   }
 
@@ -471,8 +585,13 @@ class ServiceInstance {
     }
     final finalEvents =
         pruneEventTimestamps(nextEvents, 0, retentionCutoff);
+    final windowSecs = h * 3600;
     final nextFCount = countEventsInWindow(followEvents, 0, cutoff);
     final nextUfCount = countEventsInWindow(finalEvents, 0, cutoff);
+    final (fNext, fFull) =
+        windowEventResetBounds(followEvents, 0, cutoff, windowSecs);
+    final (uNext, uFull) =
+        windowEventResetBounds(finalEvents, 0, cutoff, windowSecs);
     return copyWith(
       followCountToday: nextFCount,
       followCountTotal: nextFCount,
@@ -480,6 +599,12 @@ class ServiceInstance {
       unfollowCountTotal: nextUfCount,
       followCountDate: today,
       unfollowEvents: finalEvents,
+      followNextResetAt: fNext,
+      followFullResetAt: fFull,
+      clearFollowResetTimes: fFull == null,
+      unfollowNextResetAt: uNext,
+      unfollowFullResetAt: uFull,
+      clearUnfollowResetTimes: uFull == null,
     );
   }
 
@@ -492,8 +617,11 @@ class ServiceInstance {
     final today = formatLocalYmd(dt);
     final nowSecs = dt.millisecondsSinceEpoch ~/ 1000;
     final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
-    final cutoff = nowSecs > h * 3600 ? nowSecs - h * 3600 : 0;
+    final windowSecs = h * 3600;
+    final cutoff = nowSecs > windowSecs ? nowSecs - windowSecs : 0;
     final nextFCount = countEventsInWindow(followEvents, 0, cutoff);
+    final (fNext, fFull) =
+        windowEventResetBounds(followEvents, 0, cutoff, windowSecs);
     return copyWith(
       followCountToday: nextFCount,
       followCountTotal: nextFCount,
@@ -501,6 +629,10 @@ class ServiceInstance {
       unfollowCountTotal: 0,
       followCountDate: today,
       unfollowEvents: const [],
+      followNextResetAt: fNext,
+      followFullResetAt: fFull,
+      clearFollowResetTimes: fFull == null,
+      clearUnfollowResetTimes: true,
     );
   }
 
@@ -576,6 +708,12 @@ class ServiceInstance {
     String? followCountDate,
     List<int>? followEvents,
     List<int>? unfollowEvents,
+    int? followNextResetAt,
+    int? followFullResetAt,
+    bool clearFollowResetTimes = false,
+    int? unfollowNextResetAt,
+    int? unfollowFullResetAt,
+    bool clearUnfollowResetTimes = false,
     String? detectedHandle,
     bool clearDetectedHandle = false,
     int? snsFollowingCount,
@@ -603,6 +741,18 @@ class ServiceInstance {
       followCountDate: followCountDate ?? this.followCountDate,
       followEvents: followEvents ?? this.followEvents,
       unfollowEvents: unfollowEvents ?? this.unfollowEvents,
+      followNextResetAt: clearFollowResetTimes
+          ? null
+          : (followNextResetAt ?? this.followNextResetAt),
+      followFullResetAt: clearFollowResetTimes
+          ? null
+          : (followFullResetAt ?? this.followFullResetAt),
+      unfollowNextResetAt: clearUnfollowResetTimes
+          ? null
+          : (unfollowNextResetAt ?? this.unfollowNextResetAt),
+      unfollowFullResetAt: clearUnfollowResetTimes
+          ? null
+          : (unfollowFullResetAt ?? this.unfollowFullResetAt),
       detectedHandle: clearDetectedHandle
           ? null
           : (detectedHandle ?? this.detectedHandle),
@@ -1094,20 +1244,23 @@ String? normalizeServiceUrl(String rawInput) {
   return parsed.toString();
 }
 
-/// ページタイトルから未読件数を抽出する
+/// ページタイトルから未読件数を抽出する（プロフィール名途中の年齢 "(22)" 等は誤検知しない）
 int parseUnreadCountFromTitle(String title) {
   if (title.isEmpty) return 0;
 
   final startMatch =
-      RegExp(r'^\s*[(\[]\s*(\d+)\+?\s*[)\]]').firstMatch(title);
+      RegExp(r'^\s*(?:[•●🔴]\s*)?[(\[]\s*(\d+)\+?\s*[)\]]').firstMatch(title);
   if (startMatch != null) {
     final n = int.tryParse(startMatch.group(1) ?? '') ?? 0;
     return n.clamp(0, 999);
   }
 
-  final inlineMatch = RegExp(r'[(\[](\d{1,3})\+?[)\]]').firstMatch(title);
-  if (inlineMatch != null) {
-    final n = int.tryParse(inlineMatch.group(1) ?? '') ?? 0;
+  final keywordInlineMatch = RegExp(
+    r'(?:受信トレイ|受信箱|未読|通知|メッセージ|\b(?:inbox|messages|notifications?|unread|direct))\s*[(\[](\d{1,3})\+?[)\]]',
+    caseSensitive: false,
+  ).firstMatch(title);
+  if (keywordInlineMatch != null) {
+    final n = int.tryParse(keywordInlineMatch.group(1) ?? '') ?? 0;
     return n.clamp(0, 999);
   }
 
@@ -1116,6 +1269,51 @@ int parseUnreadCountFromTitle(String title) {
   }
 
   return 0;
+}
+
+const int kUnreadAckCleanGraceMs = 5000;
+
+/// タイトル由来の未読件数と JS 側の通知既読クリア判定を統合し、
+/// `(表示未読数, 次回抑制ベースライン, 抑制時刻を更新するか, 抑制時刻をクリアするか)` を返す。
+(int, int, bool, bool) resolveTabUnreadUpdate({
+  required int rawUnread,
+  int? unreadOverride,
+  bool cleared = false,
+  int prevAcknowledged = 0,
+  int? prevAckElapsedMs,
+}) {
+  final clampedRaw = rawUnread.clamp(0, 999);
+  if (cleared) {
+    final nextAck =
+        clampedRaw > prevAcknowledged ? clampedRaw : prevAcknowledged;
+    return (0, nextAck, nextAck > 0, nextAck == 0);
+  }
+  if (unreadOverride != null) {
+    final clampedOv = unreadOverride.clamp(0, 999);
+    if (clampedOv == 0) {
+      final nextAck =
+          clampedRaw > prevAcknowledged ? clampedRaw : prevAcknowledged;
+      return (0, nextAck, nextAck > 0, nextAck == 0);
+    }
+    return (clampedOv, 0, false, true);
+  }
+  if (clampedRaw == 0) {
+    if (prevAcknowledged > 0) {
+      final elapsed = prevAckElapsedMs ?? kUnreadAckCleanGraceMs;
+      if (elapsed >= kUnreadAckCleanGraceMs) {
+        return (0, 0, false, true);
+      }
+      return (0, prevAcknowledged, false, false);
+    }
+    return (0, 0, false, true);
+  }
+  if (prevAcknowledged > 0) {
+    if (clampedRaw > prevAcknowledged) {
+      return (clampedRaw - prevAcknowledged, prevAcknowledged, false, false);
+    }
+    return (0, prevAcknowledged, false, false);
+  }
+  return (clampedRaw, 0, false, false);
 }
 
 String makeBadgeText(String name) {
@@ -1580,6 +1778,79 @@ class AccountFollowLedger {
     return sum.clamp(0, 999999);
   }
 
+  /// 指定時間内（直近 `windowHours` 時間）のフォローカウントのリセット予定時刻
+  /// `(次の1件減少, 全リセット)`（UNIX秒）を返す。
+  (int?, int?) effectiveWindowFollowResetTimes(int nowSecs, int windowHours) {
+    final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final windowSecs = h * 3600;
+    final cutoff = nowSecs > windowSecs ? nowSecs - windowSecs : 0;
+    final active = <int>[];
+    var totalDeductions = 0;
+    for (final entry in devices.values) {
+      final hasEvents =
+          entry.followEvents.isNotEmpty || entry.followDeductions.isNotEmpty;
+      if (hasEvents) {
+        for (final t in entry.followEvents) {
+          if (t > followResetAt && t >= cutoff) active.add(t);
+        }
+        totalDeductions +=
+            countEventsInWindow(entry.followDeductions, followResetAt, cutoff);
+      } else if (entry.today > 0 &&
+          entry.todayEpoch >= resetEpoch &&
+          entry.updatedAt > followResetAt &&
+          entry.updatedAt >= cutoff) {
+        final n = entry.today > 1000 ? 1000 : entry.today;
+        for (var i = 0; i < n; i++) {
+          active.add(entry.updatedAt);
+        }
+      }
+    }
+    if (active.isEmpty || totalDeductions >= active.length) {
+      return (null, null);
+    }
+    active.sort();
+    final keep = active.length - totalDeductions;
+    return (active.first + windowSecs, active[keep - 1] + windowSecs);
+  }
+
+  /// 指定時間内（直近 `windowHours` 時間）のアンフォローカウントのリセット予定時刻
+  /// `(次の1件減少, 全リセット)`（UNIX秒）を返す。
+  (int?, int?) effectiveWindowUnfollowResetTimes(int nowSecs, int windowHours) {
+    final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+    final windowSecs = h * 3600;
+    final cutoff = nowSecs > windowSecs ? nowSecs - windowSecs : 0;
+    final active = <int>[];
+    var totalDeductions = 0;
+    for (final entry in devices.values) {
+      final hasEvents = entry.unfollowEvents.isNotEmpty ||
+          entry.unfollowDeductions.isNotEmpty;
+      if (hasEvents) {
+        for (final t in entry.unfollowEvents) {
+          if (t > unfollowResetAt && t >= cutoff) active.add(t);
+        }
+        totalDeductions += countEventsInWindow(
+          entry.unfollowDeductions,
+          unfollowResetAt,
+          cutoff,
+        );
+      } else if (entry.unfollowToday > 0 &&
+          entry.unfollowTodayEpoch >= unfollowResetEpoch &&
+          entry.updatedAt > unfollowResetAt &&
+          entry.updatedAt >= cutoff) {
+        final n = entry.unfollowToday > 1000 ? 1000 : entry.unfollowToday;
+        for (var i = 0; i < n; i++) {
+          active.add(entry.updatedAt);
+        }
+      }
+    }
+    if (active.isEmpty || totalDeductions >= active.length) {
+      return (null, null);
+    }
+    active.sort();
+    final keep = active.length - totalDeductions;
+    return (active.first + windowSecs, active[keep - 1] + windowSecs);
+  }
+
   int maxFollowEventTs() {
     var mx = followResetAt;
     for (final entry in devices.values) {
@@ -1992,19 +2263,28 @@ class FollowSyncSettings {
 }) {
   var changed = false;
   final h = windowHours.clamp(minFollowWindowHours, maxFollowWindowHours);
+  final windowSecs = h * 3600;
   final now = nowSecs ?? nowUnixSecs();
-  final cutoff = now > h * 3600 ? now - h * 3600 : 0;
+  final cutoff = now > windowSecs ? now - windowSecs : 0;
   final out = instances.map((inst) {
     final key = makeAccountSyncKey(inst.serviceId, inst.detectedHandle);
     final acc = key != null ? ledger.accounts[key] : null;
     if (acc == null) {
       final fCnt = countEventsInWindow(inst.followEvents, 0, cutoff);
       final uCnt = countEventsInWindow(inst.unfollowEvents, 0, cutoff);
+      final (fNext, fFull) =
+          windowEventResetBounds(inst.followEvents, 0, cutoff, windowSecs);
+      final (uNext, uFull) =
+          windowEventResetBounds(inst.unfollowEvents, 0, cutoff, windowSecs);
       if (inst.followCountToday != fCnt ||
           inst.followCountTotal != fCnt ||
           inst.unfollowCountToday != uCnt ||
           inst.unfollowCountTotal != uCnt ||
-          inst.followCountDate != today) {
+          inst.followCountDate != today ||
+          inst.followNextResetAt != fNext ||
+          inst.followFullResetAt != fFull ||
+          inst.unfollowNextResetAt != uNext ||
+          inst.unfollowFullResetAt != uFull) {
         changed = true;
         return inst.copyWith(
           followCountToday: fCnt,
@@ -2012,12 +2292,20 @@ class FollowSyncSettings {
           unfollowCountToday: uCnt,
           unfollowCountTotal: uCnt,
           followCountDate: today,
+          followNextResetAt: fNext,
+          followFullResetAt: fFull,
+          clearFollowResetTimes: fFull == null,
+          unfollowNextResetAt: uNext,
+          unfollowFullResetAt: uFull,
+          clearUnfollowResetTimes: uFull == null,
         );
       }
       return inst;
     }
     final sumFollow = acc.effectiveWindowFollowCount(now, h);
     final sumUnfollow = acc.effectiveWindowUnfollowCount(now, h);
+    final (fNext, fFull) = acc.effectiveWindowFollowResetTimes(now, h);
+    final (uNext, uFull) = acc.effectiveWindowUnfollowResetTimes(now, h);
     final nextFlwng = acc.snsFollowing ?? inst.snsFollowingCount;
     final nextFlwrs = acc.snsFollowers ?? inst.snsFollowersCount;
     if (inst.followCountToday != sumFollow ||
@@ -2025,6 +2313,10 @@ class FollowSyncSettings {
         inst.unfollowCountToday != sumUnfollow ||
         inst.unfollowCountTotal != sumUnfollow ||
         inst.followCountDate != today ||
+        inst.followNextResetAt != fNext ||
+        inst.followFullResetAt != fFull ||
+        inst.unfollowNextResetAt != uNext ||
+        inst.unfollowFullResetAt != uFull ||
         inst.snsFollowingCount != nextFlwng ||
         inst.snsFollowersCount != nextFlwrs) {
       changed = true;
@@ -2034,6 +2326,12 @@ class FollowSyncSettings {
         unfollowCountToday: sumUnfollow,
         unfollowCountTotal: sumUnfollow,
         followCountDate: today,
+        followNextResetAt: fNext,
+        followFullResetAt: fFull,
+        clearFollowResetTimes: fFull == null,
+        unfollowNextResetAt: uNext,
+        unfollowFullResetAt: uFull,
+        clearUnfollowResetTimes: uFull == null,
         snsFollowingCount: nextFlwng,
         snsFollowersCount: nextFlwrs,
       );

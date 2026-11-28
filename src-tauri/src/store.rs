@@ -9,8 +9,8 @@ use serde::Deserialize;
 use crate::catalog;
 use crate::follow_sync::{
     count_events_in_window, make_account_sync_key, normalize_account_handle, now_unix_secs,
-    prune_event_timestamps, AccountFollowLedger, DeviceFollowEntry, FollowSyncLedger,
-    FollowSyncSettings, UpdateFollowSyncPatch, MAX_EVENT_RETENTION_SECS,
+    prune_event_timestamps, window_event_reset_bounds, AccountFollowLedger, DeviceFollowEntry,
+    FollowSyncLedger, FollowSyncSettings, UpdateFollowSyncPatch, MAX_EVENT_RETENTION_SECS,
 };
 use crate::gesture::{sanitize_gesture_settings, GestureSettings};
 use crate::models::{
@@ -171,14 +171,21 @@ fn normalize_local_window_counts(
     now_secs: u64,
     window_hours: u32,
 ) {
-    let cutoff = now_secs.saturating_sub(window_hours.clamp(MIN_FOLLOW_WINDOW_HOURS, MAX_FOLLOW_WINDOW_HOURS) as u64 * 3600);
+    let window_secs = window_hours.clamp(MIN_FOLLOW_WINDOW_HOURS, MAX_FOLLOW_WINDOW_HOURS) as u64 * 3600;
+    let cutoff = now_secs.saturating_sub(window_secs);
     let f_count = count_events_in_window(&inst.follow_events, 0, cutoff) as u32;
     let u_count = count_events_in_window(&inst.unfollow_events, 0, cutoff) as u32;
+    let (f_next, f_full) = window_event_reset_bounds(&inst.follow_events, 0, cutoff, window_secs);
+    let (u_next, u_full) = window_event_reset_bounds(&inst.unfollow_events, 0, cutoff, window_secs);
     inst.follow_count_today = f_count;
     inst.unfollow_count_today = u_count;
     inst.follow_count_total = f_count;
     inst.unfollow_count_total = u_count;
     inst.follow_count_date = today.to_string();
+    inst.follow_next_reset_at = f_next;
+    inst.follow_full_reset_at = f_full;
+    inst.unfollow_next_reset_at = u_next;
+    inst.unfollow_full_reset_at = u_full;
 }
 
 fn project_ledger_to_instances_inner(
@@ -190,22 +197,35 @@ fn project_ledger_to_instances_inner(
 ) -> bool {
     let mut changed = false;
     let clamped_hours = window_hours.clamp(MIN_FOLLOW_WINDOW_HOURS, MAX_FOLLOW_WINDOW_HOURS);
-    let cutoff = now_secs.saturating_sub(clamped_hours as u64 * 3600);
+    let window_secs = clamped_hours as u64 * 3600;
+    let cutoff = now_secs.saturating_sub(window_secs);
     for inst in instances.iter_mut() {
         let Some(ref handle) = inst.detected_handle else {
             let f_count = count_events_in_window(&inst.follow_events, 0, cutoff) as u32;
             let u_count = count_events_in_window(&inst.unfollow_events, 0, cutoff) as u32;
+            let (f_next, f_full) =
+                window_event_reset_bounds(&inst.follow_events, 0, cutoff, window_secs);
+            let (u_next, u_full) =
+                window_event_reset_bounds(&inst.unfollow_events, 0, cutoff, window_secs);
             if inst.follow_count_today != f_count
                 || inst.follow_count_total != f_count
                 || inst.unfollow_count_today != u_count
                 || inst.unfollow_count_total != u_count
                 || inst.follow_count_date != today
+                || inst.follow_next_reset_at != f_next
+                || inst.follow_full_reset_at != f_full
+                || inst.unfollow_next_reset_at != u_next
+                || inst.unfollow_full_reset_at != u_full
             {
                 inst.follow_count_today = f_count;
                 inst.follow_count_total = f_count;
                 inst.unfollow_count_today = u_count;
                 inst.unfollow_count_total = u_count;
                 inst.follow_count_date = today.to_string();
+                inst.follow_next_reset_at = f_next;
+                inst.follow_full_reset_at = f_full;
+                inst.unfollow_next_reset_at = u_next;
+                inst.unfollow_full_reset_at = u_full;
                 changed = true;
             }
             continue;
@@ -216,34 +236,56 @@ fn project_ledger_to_instances_inner(
         let Some(acc) = ledger.accounts.get(&key) else {
             let f_count = count_events_in_window(&inst.follow_events, 0, cutoff) as u32;
             let u_count = count_events_in_window(&inst.unfollow_events, 0, cutoff) as u32;
+            let (f_next, f_full) =
+                window_event_reset_bounds(&inst.follow_events, 0, cutoff, window_secs);
+            let (u_next, u_full) =
+                window_event_reset_bounds(&inst.unfollow_events, 0, cutoff, window_secs);
             if inst.follow_count_today != f_count
                 || inst.follow_count_total != f_count
                 || inst.unfollow_count_today != u_count
                 || inst.unfollow_count_total != u_count
                 || inst.follow_count_date != today
+                || inst.follow_next_reset_at != f_next
+                || inst.follow_full_reset_at != f_full
+                || inst.unfollow_next_reset_at != u_next
+                || inst.unfollow_full_reset_at != u_full
             {
                 inst.follow_count_today = f_count;
                 inst.follow_count_total = f_count;
                 inst.unfollow_count_today = u_count;
                 inst.unfollow_count_total = u_count;
                 inst.follow_count_date = today.to_string();
+                inst.follow_next_reset_at = f_next;
+                inst.follow_full_reset_at = f_full;
+                inst.unfollow_next_reset_at = u_next;
+                inst.unfollow_full_reset_at = u_full;
                 changed = true;
             }
             continue;
         };
         let sum_follow = acc.effective_window_follow_count(now_secs, clamped_hours);
         let sum_unfollow = acc.effective_window_unfollow_count(now_secs, clamped_hours);
+        let (f_next, f_full) = acc.effective_window_follow_reset_times(now_secs, clamped_hours);
+        let (u_next, u_full) = acc.effective_window_unfollow_reset_times(now_secs, clamped_hours);
         if inst.follow_count_today != sum_follow
             || inst.follow_count_total != sum_follow
             || inst.unfollow_count_today != sum_unfollow
             || inst.unfollow_count_total != sum_unfollow
             || inst.follow_count_date != today
+            || inst.follow_next_reset_at != f_next
+            || inst.follow_full_reset_at != f_full
+            || inst.unfollow_next_reset_at != u_next
+            || inst.unfollow_full_reset_at != u_full
         {
             inst.follow_count_today = sum_follow;
             inst.follow_count_total = sum_follow;
             inst.unfollow_count_today = sum_unfollow;
             inst.unfollow_count_total = sum_unfollow;
             inst.follow_count_date = today.to_string();
+            inst.follow_next_reset_at = f_next;
+            inst.follow_full_reset_at = f_full;
+            inst.unfollow_next_reset_at = u_next;
+            inst.unfollow_full_reset_at = u_full;
             changed = true;
         }
         if let Some(flwng) = acc.sns_following {
@@ -313,6 +355,10 @@ pub fn create_default_instances() -> Vec<ServiceInstance> {
             follow_count_date: today.clone(),
             follow_events: Vec::new(),
             unfollow_events: Vec::new(),
+            follow_next_reset_at: None,
+            follow_full_reset_at: None,
+            unfollow_next_reset_at: None,
+            unfollow_full_reset_at: None,
             detected_handle: None,
             sns_following_count: None,
             sns_followers_count: None,
@@ -549,6 +595,10 @@ fn parse_raw_instance(
         follow_count_date: today.to_string(),
         follow_events,
         unfollow_events,
+        follow_next_reset_at: None,
+        follow_full_reset_at: None,
+        unfollow_next_reset_at: None,
+        unfollow_full_reset_at: None,
         detected_handle: item
             .detected_handle
             .as_deref()
@@ -1060,6 +1110,10 @@ impl ConfigStore {
             follow_count_date: local_today_ymd(),
             follow_events: Vec::new(),
             unfollow_events: Vec::new(),
+            follow_next_reset_at: None,
+            follow_full_reset_at: None,
+            unfollow_next_reset_at: None,
+            unfollow_full_reset_at: None,
             detected_handle: None,
             sns_following_count: None,
             sns_followers_count: None,
@@ -1980,6 +2034,10 @@ impl ConfigStore {
                 self.config.instances[idx].unfollow_count_total = 0;
                 self.config.instances[idx].follow_events.clear();
                 self.config.instances[idx].unfollow_events.clear();
+                self.config.instances[idx].follow_next_reset_at = None;
+                self.config.instances[idx].follow_full_reset_at = None;
+                self.config.instances[idx].unfollow_next_reset_at = None;
+                self.config.instances[idx].unfollow_full_reset_at = None;
             }
             ui_changed = true;
         }
@@ -2133,6 +2191,10 @@ impl ConfigStore {
         inst.unfollow_count_total = 0;
         inst.follow_events.clear();
         inst.unfollow_events.clear();
+        inst.follow_next_reset_at = None;
+        inst.follow_full_reset_at = None;
+        inst.unfollow_next_reset_at = None;
+        inst.unfollow_full_reset_at = None;
         self.persist();
         true
     }
@@ -2170,6 +2232,10 @@ impl ConfigStore {
                 self.config.instances[idx].unfollow_count_total = 0;
                 self.config.instances[idx].follow_events.clear();
                 self.config.instances[idx].unfollow_events.clear();
+                self.config.instances[idx].follow_next_reset_at = None;
+                self.config.instances[idx].follow_full_reset_at = None;
+                self.config.instances[idx].unfollow_next_reset_at = None;
+                self.config.instances[idx].unfollow_full_reset_at = None;
             }
             let updated = self.config.instances[idx].clone();
             self.persist();
